@@ -30,6 +30,14 @@
             <el-option label="开板" value="opened" />
           </el-select>
         </el-form-item>
+        <el-form-item label="流通盘">
+          <el-select v-model="filters.maxFreeFloat" placeholder="全部" clearable style="width: 100px">
+            <el-option label="50亿以下" :value="50" />
+            <el-option label="100亿以下" :value="100" />
+            <el-option label="200亿以下" :value="200" />
+            <el-option label="500亿以下" :value="500" />
+          </el-select>
+        </el-form-item>
         <el-form-item>
           <el-button @click="resetFilters">重置</el-button>
           <el-button type="warning" @click="refreshData" :loading="refreshing">刷新数据</el-button>
@@ -91,7 +99,7 @@
             </template>
             <!-- 封单 -->
             <template v-else-if="col.prop === 'seal_amount'">
-              {{ row.seal_amount ? row.seal_amount.toFixed(0) : '-' }}
+              {{ row.seal_amount ? (row.seal_amount / 10000).toFixed(2) : '-' }}
             </template>
             <!-- 换手率 -->
             <template v-else-if="col.prop === 'turnover_rate'">
@@ -100,6 +108,10 @@
             <!-- 成交额 -->
             <template v-else-if="col.prop === 'amount'">
               {{ row.amount ? row.amount.toFixed(0) : '-' }}
+            </template>
+            <!-- 自由流通市值 -->
+            <template v-else-if="col.prop === 'free_float_value'">
+              {{ row.free_float_value ? row.free_float_value.toFixed(0) : '-' }}
             </template>
 
           </template>
@@ -157,9 +169,10 @@ const defaultColumns: ColumnConfig[] = [
   { prop: 'open_count', label: '开板', width: 65, align: 'center', slot: true },
   { prop: 'final_seal_time', label: '回封时间', width: 90, align: 'center', slot: true },
   { prop: 'limit_up_price', label: '涨停价', width: 85, align: 'right', slot: true },
-  { prop: 'seal_amount', label: '封单(万)', width: 95, align: 'right', slot: true },
+  { prop: 'seal_amount', label: '封单(亿)', width: 95, align: 'right', slot: true },
   { prop: 'turnover_rate', label: '换手率', width: 80, align: 'right', slot: true },
   { prop: 'amount', label: '成交额(万)', width: 100, align: 'right', slot: true },
+  { prop: 'free_float_value', label: '流通盘(万)', width: 100, align: 'right', slot: true },
   { prop: 'limit_up_reason', label: '涨停原因', minWidth: 180, showOverflowTooltip: true }
 ]
 
@@ -190,7 +203,8 @@ const filters = reactive({
   tradeDate: new Date().toISOString().slice(0, 10), // 默认今天
   continuousDays: undefined as number | undefined,
   reasonCategory: '',
-  status: ''
+  status: '',
+  maxFreeFloat: undefined as number | undefined  // 流通盘上限(亿)
 })
 
 // 禁用未来日期
@@ -209,7 +223,7 @@ watch(
 
 // 本地筛选条件变化时应用筛选
 watch(
-  () => [filters.continuousDays, filters.status],
+  () => [filters.continuousDays, filters.status, filters.maxFreeFloat],
   () => {
     applyFilters()
   }
@@ -372,6 +386,11 @@ function applyFilters() {
   } else if (filters.status === 'opened') {
     filtered = filtered.filter(item => !item.is_sealed)
   }
+  // 流通盘筛选（free_float_value 是万元，转换成亿比较）
+  if (filters.maxFreeFloat) {
+    const maxInWan = filters.maxFreeFloat * 10000  // 亿转万
+    filtered = filtered.filter(item => item.free_float_value && item.free_float_value <= maxInWan)
+  }
   
   // 应用排序
   let sorted = [...filtered]
@@ -414,6 +433,7 @@ function resetFilters() {
   filters.tradeDate = today
   filters.continuousDays = undefined
   filters.status = ''
+  filters.maxFreeFloat = undefined
   
   if (dateChanged) {
     // 日期变了，重新获取数据

@@ -291,6 +291,7 @@ async def get_realtime_limit_up(
             current_price=item.get("limit_up_price", 0),
             turnover_rate=item.get("turnover_rate", 0),
             amount=item.get("amount", 0),
+            free_float_value=item.get("free_float_value"),
             market=market,
             industry=None
         ))

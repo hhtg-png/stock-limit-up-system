@@ -18,6 +18,7 @@ export interface LimitUpRecord {
   current_price: number
   turnover_rate?: number
   amount?: number
+  free_float_value?: number  // 自由流通市值(万元)
   market: string
   industry?: string
 }

@@ -95,80 +95,38 @@ class EastMoneyCrawler(BaseCrawler):
             return []
     
     async def _fetch_free_float(self, stock_code: str, price: float = 0) -> Optional[float]:
-        """获取单只股票的自由流通市值
+        """获取单只股票的自由流通市值（从东方财富 f183 字段）
         
-        通过F10股东数据计算：自由流通市值 = (流通股 - 核心大股东持股) × 当前价
+        f183: 自由流通市值（排除大股东、战略投资者等不实际参与交易的持股）
         真实换手率 = 成交额 / 自由流通市值 × 100%
         """
         try:
             import httpx
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Referer": "https://emweb.securities.eastmoney.com/",
+            
+            # 构造股票代码格式: 0.XXXXXX(深圳) / 1.XXXXXX(上海)
+            if stock_code.startswith("6"):
+                secid = f"1.{stock_code}"
+            else:
+                secid = f"0.{stock_code}"
+            
+            url = "https://push2.eastmoney.com/api/qt/stock/get"
+            params = {
+                "secid": secid,
+                "fields": "f183"  # f183 = 自由流通市值
             }
             
-            # 构造股票代码格式 (SZ/SH)
-            if stock_code.startswith("6"):
-                code_fmt = f"SH{stock_code}"
-            else:
-                code_fmt = f"SZ{stock_code}"
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Referer": "https://quote.eastmoney.com/",
+            }
             
-            async with httpx.AsyncClient(timeout=10, headers=headers) as client:
-                # 1. 获取当前价格（如果未传入）
-                if price <= 0:
-                    prefix = "sz" if stock_code.startswith(("0", "3")) else "sh"
-                    qq_url = f"https://qt.gtimg.cn/q={prefix}{stock_code}"
-                    qq_resp = await client.get(qq_url)
-                    qq_text = qq_resp.text
-                    if '"' in qq_text:
-                        fields = qq_text.split('"')[1].split('~')
-                        if len(fields) > 3 and fields[3]:
-                            price = float(fields[3])
+            async with httpx.AsyncClient(timeout=5, headers=headers) as client:
+                resp = await client.get(url, params=params)
+                data = resp.json()
                 
-                if price <= 0:
-                    return None
-                
-                # 2. 获取F10股东数据
-                f10_url = "https://emweb.securities.eastmoney.com/PC_HSF10/ShareholderResearch/PageAjax"
-                f10_resp = await client.get(f10_url, params={"code": code_fmt})
-                f10_data = f10_resp.json()
-                
-                # 获取十大流通股东数据
-                sdltgd = f10_data.get('sdltgd', [])
-                if not sdltgd:
-                    return None
-                
-                # 计算流通股本（从第一大流通股东的比例反推）
-                top1 = sdltgd[0]
-                top1_hold = top1.get('HOLD_NUM', 0)
-                top1_ratio = top1.get('FREE_HOLDNUM_RATIO', 0)
-                
-                if not top1_hold or not top1_ratio:
-                    return None
-                
-                if isinstance(top1_ratio, str):
-                    top1_ratio = float(top1_ratio)
-                
-                # 流通股本 = 第一大股东持股 / 占比
-                circulation_shares = top1_hold / (top1_ratio / 100)
-                
-                # 计算大股东持股总量（只统计占比>=5%的核心大股东）
-                major_holder_shares = 0
-                for gd in sdltgd:
-                    ratio = gd.get('FREE_HOLDNUM_RATIO', 0)
-                    if isinstance(ratio, str):
-                        ratio = float(ratio) if ratio else 0
-                    if ratio >= 5.0:  # 占比>=5%视为核心大股东
-                        major_holder_shares += gd.get('HOLD_NUM', 0)
-                
-                # 自由流通股 = 流通股 - 大股东持股
-                free_float_shares = circulation_shares - major_holder_shares
-                
-                # 自由流通市值 = 自由流通股 × 当前价
-                free_float_mv = free_float_shares * price
-                
-                if free_float_mv > 0:
-                    return free_float_mv
+                f183 = data.get("data", {}).get("f183")
+                if f183 and isinstance(f183, (int, float)) and f183 > 0:
+                    return float(f183)
         except Exception:
             pass
         return None
@@ -214,16 +172,20 @@ class EastMoneyCrawler(BaseCrawler):
             await asyncio.gather(*[fetch_with_limit(c) for c in codes_to_fetch])
             logger.info(f"[{self.name}] 自由流通市值获取: {success_count}/{len(codes_to_fetch)} 只")
         
-        # 用自由流通市值重新计算真实换手率
+        # 用自由流通市值重新计算真实换手率，并暴露自由流通市值
         enriched = 0
         for item in data_list:
             code = item.get("stock_code", "")
             free_float = self._free_float_cache.get(code)
             amount_raw = item.get("amount", 0) * 10000  # amount已转为万元，转回元
             
-            if free_float and free_float > 0 and amount_raw > 0:
-                real_turnover = round((amount_raw / free_float) * 100, 2)
-                item["turnover_rate"] = real_turnover
+            if free_float and free_float > 0:
+                # 记录自由流通市值（万元）
+                item["free_float_value"] = round(free_float / 10000, 2)
+                
+                if amount_raw > 0:
+                    real_turnover = round((amount_raw / free_float) * 100, 2)
+                    item["turnover_rate"] = real_turnover
                 enriched += 1
         
         if enriched:

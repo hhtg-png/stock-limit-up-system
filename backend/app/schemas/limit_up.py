@@ -50,6 +50,7 @@ class LimitUpRealtime(LimitUpBase):
     current_price: float = Field(..., description="当前价")
     turnover_rate: Optional[float] = Field(None, description="换手率(%)")
     amount: Optional[float] = Field(None, description="成交额(万元)")
+    free_float_value: Optional[float] = Field(None, description="自由流通市值(万元)，排除大股东持股")
     market: str = Field(..., description="市场")
     industry: Optional[str] = Field(None, description="行业")
 
