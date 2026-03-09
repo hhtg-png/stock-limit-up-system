@@ -107,11 +107,11 @@
             </template>
             <!-- 成交额 -->
             <template v-else-if="col.prop === 'amount'">
-              {{ row.amount ? row.amount.toFixed(0) : '-' }}
+              {{ row.amount ? (row.amount / 10000).toFixed(2) : '-' }}
             </template>
             <!-- 自由流通市值 -->
             <template v-else-if="col.prop === 'free_float_value'">
-              {{ row.free_float_value ? row.free_float_value.toFixed(0) : '-' }}
+              {{ row.free_float_value ? (row.free_float_value / 10000).toFixed(2) : '-' }}
             </template>
 
           </template>
@@ -171,8 +171,8 @@ const defaultColumns: ColumnConfig[] = [
   { prop: 'limit_up_price', label: '涨停价', width: 85, align: 'right', slot: true },
   { prop: 'seal_amount', label: '封单(亿)', width: 95, align: 'right', slot: true },
   { prop: 'turnover_rate', label: '换手率', width: 80, align: 'right', slot: true },
-  { prop: 'amount', label: '成交额(万)', width: 100, align: 'right', slot: true },
-  { prop: 'free_float_value', label: '流通盘(万)', width: 100, align: 'right', slot: true },
+    { prop: 'amount', label: '成交额(亿)', width: 100, align: 'right', slot: true },
+    { prop: 'free_float_value', label: '流通盘(亿)', width: 100, align: 'right', slot: true },
   { prop: 'limit_up_reason', label: '涨停原因', minWidth: 180, showOverflowTooltip: true }
 ]
 
