@@ -172,20 +172,15 @@ class EastMoneyCrawler(BaseCrawler):
             await asyncio.gather(*[fetch_with_limit(c) for c in codes_to_fetch])
             logger.info(f"[{self.name}] 自由流通市值获取: {success_count}/{len(codes_to_fetch)} 只")
         
-        # 用自由流通市值重新计算真实换手率，并暴露自由流通市值
+        # 用自由流通市值暴露到前端（不覆盖换手率，保留东财原始值）
         enriched = 0
         for item in data_list:
             code = item.get("stock_code", "")
             free_float = self._free_float_cache.get(code)
-            amount_raw = item.get("amount", 0) * 10000  # amount已转为万元，转回元
             
             if free_float and free_float > 0:
                 # 记录自由流通市值（万元）
                 item["free_float_value"] = round(free_float / 10000, 2)
-                
-                if amount_raw > 0:
-                    real_turnover = round((amount_raw / free_float) * 100, 2)
-                    item["turnover_rate"] = real_turnover
                 enriched += 1
         
         if enriched:
