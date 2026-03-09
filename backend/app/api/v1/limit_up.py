@@ -25,10 +25,10 @@ _ths_reason_cache: Dict[str, str] = {}
 _ths_reason_cache_time: float = 0
 _THS_CACHE_TTL = 300  # 5分钟
 
-# 东方财富涨停列表缓存（30秒有效，包含涨停原因等）
+# 东方财富涨停列表缓存（10秒有效，包含涨停原因等）
 _em_list_cache: List[Dict] = []
 _em_list_cache_time: float = 0
-_EM_LIST_CACHE_TTL = 30  # 30秒更新一次涨停列表
+_EM_LIST_CACHE_TTL = 10  # 10秒更新一次涨停列表（从30秒缩短）
 
 
 async def _fetch_ths_reason_map() -> Dict[str, str]:
@@ -130,34 +130,53 @@ async def get_realtime_limit_up(
     if trade_date is None:
         trade_date = date.today()
     
+    is_today = (trade_date == date.today())
     now = time.time()
     
-    # 1. 检查涨停列表缓存（30秒更新一次）
-    if not _em_list_cache or (now - _em_list_cache_time) >= _EM_LIST_CACHE_TTL:
-        # 后台更新缓存（不阻塞当前请求）
-        async def update_cache():
-            global _em_list_cache, _em_list_cache_time
-            try:
-                raw_data, reason_map = await asyncio.gather(
-                    em_crawler.crawl(trade_date),
-                    _fetch_ths_reason_map()
-                )
-                if raw_data:
-                    _em_list_cache = _enrich_reasons(raw_data, reason_map)
-                    _em_list_cache_time = time.time()
-                    logger.info(f"涨停列表缓存已更新: {len(_em_list_cache)} 条")
-            except Exception as e:
-                logger.error(f"更新涨停列表缓存失败: {e}")
-        
-        if not _em_list_cache:
-            # 首次加载必须等待
-            await update_cache()
+    # 历史日期：直接从东方财富 API 获取（不用缓存）
+    if not is_today:
+        logger.info(f"查询历史涨停数据: {trade_date}")
+        raw_data, reason_map = await asyncio.gather(
+            em_crawler.crawl(trade_date),
+            _fetch_ths_reason_map()
+        )
+        if raw_data:
+            raw_data = _enrich_reasons(raw_data, reason_map)
         else:
-            # 后台更新，不阻塞
-            asyncio.create_task(update_cache())
-    
-    raw_data = _em_list_cache
-    reason_map = _ths_reason_cache
+            raw_data = []
+    else:
+        # 今天：使用缓存 + 实时更新
+        # 1. 检查涨停列表缓存（10秒更新一次）
+        if not _em_list_cache or (now - _em_list_cache_time) >= _EM_LIST_CACHE_TTL:
+            # 后台更新缓存（不阻塞当前请求）
+            async def update_cache():
+                global _em_list_cache, _em_list_cache_time
+                try:
+                    from app.core.websocket_manager import manager
+                    data, reasons = await asyncio.gather(
+                        em_crawler.crawl(trade_date),
+                        _fetch_ths_reason_map()
+                    )
+                    if data:
+                        _em_list_cache = _enrich_reasons(data, reasons)
+                        _em_list_cache_time = time.time()
+                        logger.info(f"涨停列表缓存已更新: {len(_em_list_cache)} 条")
+                        # 广播推送涨停列表更新
+                        if manager.connection_count > 0:
+                            await manager.broadcast_limit_up_list(_em_list_cache)
+                            logger.info(f"WebSocket 广播涨停列表: {len(_em_list_cache)} 条")
+                except Exception as e:
+                    logger.error(f"更新涨停列表缓存失败: {e}")
+            
+            if not _em_list_cache:
+                # 首次加载必须等待
+                await update_cache()
+            else:
+                # 后台更新，不阻塞
+                asyncio.create_task(update_cache())
+        
+        raw_data = _em_list_cache
+        reason_map = _ths_reason_cache
     
     if not raw_data:
         # 如果没有数据，回退到数据库

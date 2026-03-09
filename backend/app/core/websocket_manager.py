@@ -28,7 +28,7 @@ class ConnectionManager:
         async with self._lock:
             self.active_connections[client_id] = websocket
             self.subscriptions[client_id] = set()
-            self.message_types[client_id] = {"limit_up_alert", "big_order_alert", "status_change", "market_update", "continuous_ladder"}
+            self.message_types[client_id] = {"limit_up_alert", "big_order_alert", "status_change", "market_update", "continuous_ladder", "limit_up_update"}
         logger.info(f"WebSocket connected: {client_id}, total: {len(self.active_connections)}")
     
     async def disconnect(self, client_id: str):
@@ -156,6 +156,13 @@ class ConnectionManager:
         await self.broadcast(
             data,
             "continuous_ladder"
+        )
+    
+    async def broadcast_limit_up_list(self, data: list):
+        """广播涨停列表更新"""
+        await self.broadcast(
+            {"list": data},
+            "limit_up_update"
         )
     
     @property

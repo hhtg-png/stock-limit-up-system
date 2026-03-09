@@ -18,10 +18,10 @@
               <el-icon><DataBoard /></el-icon>
               <span>涨停监控</span>
             </el-menu-item>
-            <el-menu-item index="/statistics">
+            <!-- <el-menu-item index="/statistics">
               <el-icon><PieChart /></el-icon>
               <span>报表分析</span>
-            </el-menu-item>
+            </el-menu-item> -->
             <el-menu-item index="/continuous">
               <el-icon><TrendCharts /></el-icon>
               <span>连板梯队</span>
@@ -84,7 +84,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import {
   DataBoard, PieChart, Setting,
@@ -95,16 +95,24 @@ import AlertPanel from '@/components/alert/AlertPanel.vue'
 import { useWebSocket } from '@/composables/useWebSocket'
 import { useSpeech } from '@/composables/useSpeech'
 import { useAlertStore } from '@/stores/alert'
+import { useConfigStore } from '@/stores/config'
+import { getConfig } from '@/api/config'
 import dayjs from 'dayjs'
 
 const route = useRoute()
 const alertStore = useAlertStore()
+const configStore = useConfigStore()
 const { connect, isConnected } = useWebSocket()
 
 const isCollapsed = ref(false)
 const showAlertPanel = ref(false)
-const alertEnabled = ref(true)
 const currentTime = ref(dayjs().format('HH:mm:ss'))
+
+// 播报开关与 configStore 同步
+const alertEnabled = computed({
+  get: () => configStore.config.alert_limit_up_enabled,
+  set: (val) => configStore.setConfig({ alert_limit_up_enabled: val })
+})
 
 // 当前路由
 const currentRoute = computed(() => route.path)
@@ -148,9 +156,22 @@ const toggleAlert = (enabled: boolean) => {
   }
 }
 
+// 应用启动时加载配置
+async function initConfig() {
+  try {
+    const data = await getConfig()
+    configStore.setConfig(data)
+  } catch (e) {
+    console.error('Load config error:', e)
+  }
+}
+
 // 更新时间
 let timeInterval: number
-onMounted(() => {
+onMounted(async () => {
+  // 先加载配置，确保播报开关正确
+  await initConfig()
+  // 然后连接 WebSocket
   connect()
   timeInterval = window.setInterval(() => {
     currentTime.value = dayjs().format('HH:mm:ss')

@@ -29,6 +29,15 @@ class DataScheduler:
         if self._is_running:
             return
         
+        # 涨停列表实时推送（交易时段每3秒）
+        self.scheduler.add_job(
+            self._push_limit_up_realtime,
+            IntervalTrigger(seconds=3),
+            id="limit_up_push",
+            name="涨停列表实时推送",
+            max_instances=1
+        )
+        
         # 盘中Level-2数据采集（每3秒）
         self.scheduler.add_job(
             self._collect_l2_data,
@@ -348,6 +357,69 @@ class DataScheduler:
         
         except Exception as e:
             logger.error(f"Clear cache error: {e}")
+    
+    async def _push_limit_up_realtime(self):
+        """交易时段每3秒主动推送涨停列表"""
+        if not is_trading_time():
+            return
+        
+        try:
+            from app.crawlers.eastmoney_crawler import em_crawler
+            from app.data_collectors.tencent_api import tencent_api
+            from app.core.websocket_manager import manager
+            from datetime import date
+            import asyncio
+            
+            # 检查是否有 WebSocket 连接
+            if manager.connection_count == 0:
+                return
+            
+            trade_date = date.today()
+            
+            # 并行获取东方财富数据和同花顺涨停原因
+            from app.api.v1.limit_up import _fetch_ths_reason_map, _enrich_reasons
+            
+            raw_data, reason_map = await asyncio.gather(
+                em_crawler.crawl(trade_date),
+                _fetch_ths_reason_map()
+            )
+            
+            if not raw_data:
+                return
+            
+            # 用同花顺涨停原因替换
+            enriched_data = _enrich_reasons(raw_data, reason_map)
+            
+            # 获取股票代码列表
+            stock_codes = [item.get("stock_code", "") for item in enriched_data if item.get("stock_code")]
+            
+            # 用腾讯 API 实时更新封板状态
+            realtime_quotes = {}
+            if stock_codes:
+                try:
+                    realtime_quotes = await tencent_api.get_quotes_batch(stock_codes)
+                except Exception as e:
+                    logger.debug(f"腾讯API获取失败: {e}")
+            
+            # 更新封板状态
+            for item in enriched_data:
+                code = item.get("stock_code", "")
+                tencent_quote = realtime_quotes.get(code)
+                if tencent_quote:
+                    price = tencent_quote.get("price", 0)
+                    limit_up_price = tencent_quote.get("limit_up", 0)
+                    bid1_volume = tencent_quote.get("bid1_volume", 0)
+                    if price and limit_up_price and price >= limit_up_price - 0.001:
+                        item["is_final_sealed"] = bid1_volume > 0
+                        if bid1_volume > 0:
+                            item["seal_amount"] = bid1_volume * limit_up_price / 100
+            
+            # 广播推送
+            await manager.broadcast_limit_up_list(enriched_data)
+            logger.debug(f"涨停列表已推送: {len(enriched_data)} 条, 连接数: {manager.connection_count}")
+        
+        except Exception as e:
+            logger.error(f"涨停列表推送失败: {e}")
 
 
 # 全局调度器实例

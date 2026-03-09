@@ -3,17 +3,25 @@
     <!-- 筛选区 -->
     <div class="filter-bar card">
       <el-form inline>
-        <el-form-item label="连板天数">
-          <el-select v-model="filters.minContinuousDays" placeholder="全部" clearable style="width: 120px">
-            <el-option label="2板以上" :value="2" />
-            <el-option label="3板以上" :value="3" />
-            <el-option label="4板以上" :value="4" />
-            <el-option label="5板以上" :value="5" />
-          </el-select>
+        <el-form-item label="日期">
+          <el-date-picker
+            v-model="filters.tradeDate"
+            type="date"
+            placeholder="选择日期"
+            format="MM-DD"
+            value-format="YYYY-MM-DD"
+            :disabled-date="disabledDate"
+            style="width: 120px"
+            :clearable="false"
+          />
         </el-form-item>
-        <el-form-item label="涨停原因">
-          <el-select v-model="filters.reasonCategory" placeholder="全部" clearable style="width: 140px">
-            <el-option v-for="r in reasonCategories" :key="r" :label="r" :value="r" />
+        <el-form-item label="连板">
+          <el-select v-model="filters.continuousDays" placeholder="全部" clearable style="width: 100px">
+            <el-option label="首板" :value="1" />
+            <el-option label="2板" :value="2" />
+            <el-option label="3板" :value="3" />
+            <el-option label="4板" :value="4" />
+            <el-option label="5板+" :value="5" />
           </el-select>
         </el-form-item>
         <el-form-item label="状态">
@@ -23,10 +31,8 @@
           </el-select>
         </el-form-item>
         <el-form-item>
-          <el-button type="primary" @click="applyFilters">查询</el-button>
           <el-button @click="resetFilters">重置</el-button>
           <el-button type="warning" @click="refreshData" :loading="refreshing">刷新数据</el-button>
-          <el-button @click="exportData">导出</el-button>
         </el-form-item>
         <el-form-item label="排序">
           <el-button-group size="small">
@@ -95,15 +101,7 @@
             <template v-else-if="col.prop === 'amount'">
               {{ row.amount ? row.amount.toFixed(0) : '-' }}
             </template>
-            <!-- 操作 -->
-            <template v-else-if="col.prop === 'actions'">
-              <el-button link type="primary" @click.stop="addToWatch(row)">
-                <el-icon><Star /></el-icon>
-              </el-button>
-              <el-button link type="primary" @click.stop="goToDetail(row.stock_code)">
-                <el-icon><View /></el-icon>
-              </el-button>
-            </template>
+
           </template>
         </el-table-column>
       </el-table>
@@ -112,19 +110,21 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, onMounted, onUnmounted, computed, nextTick } from 'vue'
+import { ref, reactive, onMounted, onUnmounted, computed, nextTick, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { Star, View } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { getRealtimeLimitUp, refreshLimitUpData, getTableColumns, saveTableColumns } from '@/api/limit-up'
 import { useConfigStore } from '@/stores/config'
 import { useSpeech } from '@/composables/useSpeech'
+import { useWebSocket } from '@/composables/useWebSocket'
 import type { LimitUpRealtime } from '@/types/limit-up'
 import Sortable from 'sortablejs'
 
 const router = useRouter()
 const configStore = useConfigStore()
 const { announceNewStocks } = useSpeech()
+const { isConnected, onLimitUpUpdate, offLimitUpUpdate } = useWebSocket()
 
 const loading = ref(false)
 const refreshing = ref(false)
@@ -160,8 +160,7 @@ const defaultColumns: ColumnConfig[] = [
   { prop: 'seal_amount', label: '封单(万)', width: 95, align: 'right', slot: true },
   { prop: 'turnover_rate', label: '换手率', width: 80, align: 'right', slot: true },
   { prop: 'amount', label: '成交额(万)', width: 100, align: 'right', slot: true },
-  { prop: 'limit_up_reason', label: '涨停原因', minWidth: 180, showOverflowTooltip: true },
-  { prop: 'actions', label: '操作', width: 90, fixed: 'right', align: 'center', slot: true }
+  { prop: 'limit_up_reason', label: '涨停原因', minWidth: 180, showOverflowTooltip: true }
 ]
 
 // 当前列顺序
@@ -188,10 +187,33 @@ const visibleColumns = computed(() => {
 })
 
 const filters = reactive({
-  minContinuousDays: undefined as number | undefined,
+  tradeDate: new Date().toISOString().slice(0, 10), // 默认今天
+  continuousDays: undefined as number | undefined,
   reasonCategory: '',
   status: ''
 })
+
+// 禁用未来日期
+function disabledDate(date: Date) {
+  return date > new Date()
+}
+
+// 筛选条件变化时自动触发查询
+watch(
+  () => filters.tradeDate,
+  (newDate) => {
+    // 切换日期时重新获取数据（不播报）
+    fetchData(true)
+  }
+)
+
+// 本地筛选条件变化时应用筛选
+watch(
+  () => [filters.continuousDays, filters.status],
+  () => {
+    applyFilters()
+  }
+)
 
 // 所有数据（筛选前）
 let allRecords: LimitUpRealtime[] = []
@@ -244,34 +266,25 @@ async function loadColumnOrder() {
   }
 }
 
-// 获取数据
-async function fetchData() {
+// 获取数据（HTTP）
+// skipAnnounce: 是否跳过播报（切换日期时为 true）
+async function fetchData(skipAnnounce = false) {
   loading.value = true
   try {
-    const response = await getRealtimeLimitUp()
+    const response = await getRealtimeLimitUp({
+      trade_date: filters.tradeDate
+    })
     
     // 从响应中提取数据数组
     const newRecords = response.data || []
     
-    // 检测新涨停并播报
-    if (allRecords.length > 0 && configStore.config.alert_limit_up_enabled) {
-      const oldCodes = new Set(allRecords.map(r => r.stock_code))
-      const newStocks = newRecords.filter(r => !oldCodes.has(r.stock_code))
-      if (newStocks.length > 0) {
-        announceNewStocks(newStocks.map(s => ({ stock_name: s.stock_name, limit_up_reason: s.limit_up_reason })))
-      }
+    // 只有不跳过播报时才检测新涨停
+    if (!skipAnnounce) {
+      detectAndAnnounce(newRecords)
     }
     
     allRecords = newRecords
-    
-    // 提取实际存在的分类，用于筛选下拉
-    const cats = new Set<string>()
-    allRecords.forEach(item => {
-      if (item.reason_category) cats.add(item.reason_category)
-    })
-    reasonCategories.value = [...cats].sort()
-    
-    // 应用本地筛选
+    updateCategories()
     applyFilters()
   } catch (e) {
     console.error('Fetch error:', e)
@@ -281,12 +294,75 @@ async function fetchData() {
   }
 }
 
+// WebSocket 推送的数据更新处理
+function handleWsUpdate(rawData: any[]) {
+  if (!rawData || rawData.length === 0) return
+  
+  // 转换数据格式
+  const newRecords: LimitUpRealtime[] = rawData.map(item => ({
+    stock_code: item.stock_code || '',
+    stock_name: item.stock_name || '',
+    trade_date: item.trade_date || '',
+    first_limit_up_time: item.first_limit_up_time,
+    final_seal_time: item.final_seal_time,
+    limit_up_reason: item.limit_up_reason || '',
+    reason_category: item.reason_category || '其他',
+    continuous_limit_up_days: item.continuous_limit_up_days || 1,
+    open_count: item.open_count || 0,
+    is_sealed: item.is_final_sealed ?? true,
+    current_status: item.is_final_sealed ? 'sealed' : 'opened',
+    seal_amount: item.seal_amount || 0,
+    seal_volume: item.seal_volume,
+    limit_up_price: item.limit_up_price || 0,
+    current_price: item.current_price || item.limit_up_price || 0,
+    turnover_rate: item.turnover_rate || 0,
+    amount: item.amount || 0,
+    market: item.market || 'SZ',
+    industry: item.industry
+  }))
+  
+  // 检测新涨停并播报
+  detectAndAnnounce(newRecords)
+  
+  allRecords = newRecords
+  updateCategories()
+  applyFilters()
+  
+  console.log(`WebSocket 更新涨停列表: ${newRecords.length} 条`)
+}
+
+// 检测新涨停并播报
+function detectAndAnnounce(newRecords: LimitUpRealtime[]) {
+  if (allRecords.length > 0 && configStore.config.alert_limit_up_enabled) {
+    const oldCodes = new Set(allRecords.map(r => r.stock_code))
+    const newStocks = newRecords.filter(r => !oldCodes.has(r.stock_code))
+    if (newStocks.length > 0) {
+      announceNewStocks(newStocks.map(s => ({ stock_name: s.stock_name, limit_up_reason: s.limit_up_reason })))
+    }
+  }
+}
+
+// 更新分类列表
+function updateCategories() {
+  const cats = new Set<string>()
+  allRecords.forEach(item => {
+    if (item.reason_category) cats.add(item.reason_category)
+  })
+  reasonCategories.value = [...cats].sort()
+}
+
 // 本地筛选
 function applyFilters() {
   let filtered = allRecords
   
-  if (filters.minContinuousDays) {
-    filtered = filtered.filter(item => item.continuous_limit_up_days >= filters.minContinuousDays!)
+  if (filters.continuousDays) {
+    if (filters.continuousDays === 5) {
+      // 5板+：>=5
+      filtered = filtered.filter(item => item.continuous_limit_up_days >= 5)
+    } else {
+      // 首板/2板/3板/4板：精确匹配
+      filtered = filtered.filter(item => item.continuous_limit_up_days === filters.continuousDays)
+    }
   }
   if (filters.reasonCategory) {
     filtered = filtered.filter(item => item.reason_category === filters.reasonCategory)
@@ -332,10 +408,20 @@ function setSortBy(type: 'time' | 'reseal_time' | 'seal_amount' | 'continuous_da
 
 // 重置筛选
 function resetFilters() {
-  filters.minContinuousDays = undefined
-  filters.reasonCategory = ''
+  const today = new Date().toISOString().slice(0, 10)
+  const dateChanged = filters.tradeDate !== today
+  
+  filters.tradeDate = today
+  filters.continuousDays = undefined
   filters.status = ''
-  applyFilters()
+  
+  if (dateChanged) {
+    // 日期变了，重新获取数据
+    fetchData(true)
+  } else {
+    // 日期没变，只应用筛选
+    applyFilters()
+  }
 }
 
 // 刷新数据（从开盘啦/同花顺重新获取涨停原因和状态）
@@ -444,12 +530,9 @@ function exportData() {
   URL.revokeObjectURL(url)
 }
 
-onMounted(async () => {
-  await loadColumnOrder()
-  fetchData()
-  await nextTick()
-  initSortable()
-  // 盘中每30秒自动刷新
+// 启动轮询（作为 WebSocket 断连时的备用）
+function startPolling() {
+  if (refreshTimer) return
   refreshTimer = window.setInterval(() => {
     const now = new Date()
     const hour = now.getHours()
@@ -464,13 +547,42 @@ onMounted(async () => {
       fetchData()
     }
   }, 30000)  // 30秒
-})
+}
 
-onUnmounted(() => {
+// 停止轮询
+function stopPolling() {
   if (refreshTimer) {
     clearInterval(refreshTimer)
     refreshTimer = null
   }
+}
+
+onMounted(async () => {
+  await loadColumnOrder()
+  // 首次加载数据
+  fetchData()
+  await nextTick()
+  initSortable()
+  
+  // 订阅 WebSocket 涨停列表更新
+  onLimitUpUpdate(handleWsUpdate)
+  
+  // 根据 WebSocket 连接状态决定是否启用轮询
+  watch(isConnected, (connected) => {
+    if (connected) {
+      // WebSocket 已连接，停止轮询
+      stopPolling()
+    } else {
+      // WebSocket 断连，启用轮询作为备用
+      startPolling()
+    }
+  }, { immediate: true })
+})
+
+onUnmounted(() => {
+  // 取消 WebSocket 订阅
+  offLimitUpUpdate(handleWsUpdate)
+  stopPolling()
   if (sortableInstance) {
     sortableInstance.destroy()
     sortableInstance = null

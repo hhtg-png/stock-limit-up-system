@@ -9,6 +9,10 @@ interface WebSocketMessage {
   timestamp: string
 }
 
+// 涨停列表更新回调
+type LimitUpUpdateCallback = (data: any[]) => void
+const limitUpUpdateCallbacks: Set<LimitUpUpdateCallback> = new Set()
+
 export function useWebSocket() {
   const ws = ref<WebSocket | null>(null)
   const isConnected = ref(false)
@@ -138,6 +142,20 @@ export function useWebSocket() {
       case 'market_update':
         // 处理行情更新
         break
+      
+      case 'limit_up_update':
+        // 涨停列表更新，通知所有订阅者
+        const listData = message.data?.list || []
+        limitUpUpdateCallbacks.forEach(cb => {
+          try {
+            cb(listData)
+          } catch (e) {
+            console.error('Limit up update callback error:', e)
+          }
+        })
+        // 同时更新 store
+        limitUpStore.setList(listData)
+        break
     }
   }
 
@@ -153,6 +171,16 @@ export function useWebSocket() {
 
   function unsubscribeStocks(codes: string[]) {
     send({ type: 'unsubscribe_stocks', data: { stocks: codes } })
+  }
+
+  // 订阅涨停列表更新
+  function onLimitUpUpdate(callback: LimitUpUpdateCallback) {
+    limitUpUpdateCallbacks.add(callback)
+  }
+
+  // 取消订阅涨停列表更新
+  function offLimitUpUpdate(callback: LimitUpUpdateCallback) {
+    limitUpUpdateCallbacks.delete(callback)
   }
 
   function startPing() {
@@ -194,6 +222,8 @@ export function useWebSocket() {
     disconnect,
     send,
     subscribeStocks,
-    unsubscribeStocks
+    unsubscribeStocks,
+    onLimitUpUpdate,
+    offLimitUpUpdate
   }
 }

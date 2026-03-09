@@ -5,10 +5,14 @@ import { useConfigStore } from '@/stores/config'
 const speechRate = ref(1.2) // 语速
 const speechVolume = ref(0.8) // 音量
 
-// 动态获取开关状态
+// 动态获取开关状态（必须同时检查初始化状态）
 function getSpeechEnabled(): boolean {
   try {
     const configStore = useConfigStore()
+    // 如果配置未初始化，默认不播报，避免意外播报
+    if (!configStore.initialized) {
+      return false
+    }
     return configStore.config.alert_limit_up_enabled
   } catch {
     return false
