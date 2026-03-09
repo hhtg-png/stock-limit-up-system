@@ -247,21 +247,19 @@ class EastMoneyCrawler(BaseCrawler):
                 if price:
                     price = price / 1000  # 东方财富价格需要除以1000
                 
-                # 流通市值（用于计算实际换手率）
+                # 流通市值
                 float_market_value = item.get("ltsz", 0) or item.get("lt", 0) or item.get("float_market_value", 0)
                 
                 # 成交额(元)
                 amount_raw = item.get("amount", 0)
                 amount = amount_raw / 10000 if amount_raw else 0  # 转为万元
                 
-                # 计算实际换手率 = 成交额 / 流通市值 * 100
-                if float_market_value and float_market_value > 0 and amount_raw:
-                    hs = round((amount_raw / float_market_value) * 100, 2)
+                # 换手率：直接使用东财原始值
+                hs = item.get("hs", 0)
+                if isinstance(hs, (int, float)) and hs > 0:
+                    hs = round(hs, 2)
                 else:
-                    # 如果没有流通市值，使用数据源提供的换手率
-                    hs = item.get("hs", 0)
-                    if hs and hs > 100:
-                        hs = hs / 100
+                    hs = 0
                 
                 # 封单金额
                 fund = item.get("fund", 0)
