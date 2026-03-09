@@ -101,10 +101,6 @@
             <template v-else-if="col.prop === 'seal_amount'">
               {{ row.seal_amount ? (row.seal_amount / 10000).toFixed(2) : '-' }}
             </template>
-            <!-- 换手率 -->
-            <template v-else-if="col.prop === 'turnover_rate'">
-              {{ formatTurnoverRate(row.turnover_rate) }}
-            </template>
             <!-- 成交额 -->
             <template v-else-if="col.prop === 'amount'">
               {{ row.amount ? (row.amount / 10000).toFixed(2) : '-' }}
@@ -170,8 +166,7 @@ const defaultColumns: ColumnConfig[] = [
   { prop: 'final_seal_time', label: '回封时间', width: 90, align: 'center', slot: true },
   { prop: 'limit_up_price', label: '涨停价', width: 85, align: 'right', slot: true },
   { prop: 'seal_amount', label: '封单(亿)', width: 95, align: 'right', slot: true },
-  { prop: 'turnover_rate', label: '换手率', width: 80, align: 'right', slot: true },
-    { prop: 'amount', label: '成交额(亿)', width: 100, align: 'right', slot: true },
+  { prop: 'amount', label: '成交额(亿)', width: 100, align: 'right', slot: true },
     { prop: 'free_float_value', label: '流通盘(亿)', width: 100, align: 'right', slot: true },
   { prop: 'limit_up_reason', label: '涨停原因', minWidth: 180, showOverflowTooltip: true }
 ]
@@ -329,7 +324,6 @@ function handleWsUpdate(rawData: any[]) {
     seal_volume: item.seal_volume,
     limit_up_price: item.limit_up_price || 0,
     current_price: item.current_price || item.limit_up_price || 0,
-    turnover_rate: item.turnover_rate || 0,
     amount: item.amount || 0,
     market: item.market || 'SZ',
     industry: item.industry
@@ -485,12 +479,6 @@ function goToDetail(code: string) {
 function addToWatch(row: LimitUpRealtime) {
   configStore.addToWatchList(row.stock_code)
   ElMessage.success(`已添加 ${row.stock_name} 到自选`)
-}
-
-// 格式化换手率（数据已是百分比格式，如1.71表示1.71%）
-function formatTurnoverRate(rate: number | undefined | null): string {
-  if (rate == null || rate === 0) return '-'
-  return rate.toFixed(2) + '%'
 }
 
 // 获取状态类型
