@@ -94,11 +94,11 @@ class EastMoneyCrawler(BaseCrawler):
             logger.error(traceback.format_exc())
             return []
     
-    async def _fetch_free_float(self, stock_code: str, price: float = 0) -> Optional[float]:
-        """获取单只股票的自由流通市值（从东方财富 f183 字段）
+    async def _fetch_stock_realtime(self, stock_code: str) -> Optional[Dict]:
+        """获取个股实时数据（换手率、自由流通市值）
         
-        f183: 自由流通市值（排除大股东、战略投资者等不实际参与交易的持股）
-        真实换手率 = 成交额 / 自由流通市值 × 100%
+        f168: 换手率（万分比，需除以100）
+        f183: 自由流通市值
         """
         try:
             import httpx
@@ -112,7 +112,7 @@ class EastMoneyCrawler(BaseCrawler):
             url = "https://push2.eastmoney.com/api/qt/stock/get"
             params = {
                 "secid": secid,
-                "fields": "f183"  # f183 = 自由流通市值
+                "fields": "f168,f183"  # f168=换手率, f183=自由流通市值
             }
             
             headers = {
@@ -122,20 +122,27 @@ class EastMoneyCrawler(BaseCrawler):
             
             async with httpx.AsyncClient(timeout=5, headers=headers) as client:
                 resp = await client.get(url, params=params)
-                data = resp.json()
+                data = resp.json().get("data", {})
                 
-                f183 = data.get("data", {}).get("f183")
+                result = {}
+                # f168 是万分比，需要除以100得到百分比
+                f168 = data.get("f168")
+                if f168 and isinstance(f168, (int, float)):
+                    result["turnover_rate"] = round(f168 / 100, 2)
+                
+                f183 = data.get("f183")
                 if f183 and isinstance(f183, (int, float)) and f183 > 0:
-                    return float(f183)
+                    result["free_float"] = float(f183)
+                
+                return result if result else None
         except Exception:
             pass
         return None
     
     async def _enrich_real_turnover(self, data_list: List[Dict]):
-        """批量获取自由流通市值，计算真实换手率
+        """批量获取个股实时数据，更新换手率和自由流通市值
         
-        真实换手率 = 成交额 / 自由流通市值 × 100%
-        自由流通市值排除了大股东、战略投资者等不实际参与交易的持股
+        从个股API获取更准确的换手率(f168)和自由流通市值(f183)
         """
         today = date.today()
         
@@ -144,11 +151,7 @@ class EastMoneyCrawler(BaseCrawler):
             self._free_float_cache.clear()
             self._free_float_cache_date = today
         
-        # 构建价格字典
-        prices = {item.get("stock_code"): item.get("limit_up_price", 0) 
-                  for item in data_list if item.get("stock_code") and item.get("limit_up_price", 0) > 0}
-        
-        # 找出需要获取自由流通市值的股票
+        # 找出需要获取数据的股票
         codes_to_fetch = []
         for item in data_list:
             code = item.get("stock_code", "")
@@ -163,28 +166,33 @@ class EastMoneyCrawler(BaseCrawler):
             async def fetch_with_limit(code: str):
                 nonlocal success_count
                 async with semaphore:
-                    price = prices.get(code, 0)
-                    val = await self._fetch_free_float(code, price)
-                    if val:
-                        self._free_float_cache[code] = val
+                    result = await self._fetch_stock_realtime(code)
+                    if result:
+                        self._free_float_cache[code] = result
                         success_count += 1
             
             await asyncio.gather(*[fetch_with_limit(c) for c in codes_to_fetch])
-            logger.info(f"[{self.name}] 自由流通市值获取: {success_count}/{len(codes_to_fetch)} 只")
+            logger.info(f"[{self.name}] 个股实时数据获取: {success_count}/{len(codes_to_fetch)} 只")
         
-        # 用自由流通市值暴露到前端（不覆盖换手率，保留东财原始值）
+        # 更新换手率和自由流通市值
         enriched = 0
         for item in data_list:
             code = item.get("stock_code", "")
-            free_float = self._free_float_cache.get(code)
+            cached = self._free_float_cache.get(code)
             
-            if free_float and free_float > 0:
+            if cached:
+                # 更新换手率（从个股API获取的f168更准确）
+                if "turnover_rate" in cached:
+                    item["turnover_rate"] = cached["turnover_rate"]
+                
                 # 记录自由流通市值（万元）
-                item["free_float_value"] = round(free_float / 10000, 2)
+                if "free_float" in cached and cached["free_float"] > 0:
+                    item["free_float_value"] = round(cached["free_float"] / 10000, 2)
+                
                 enriched += 1
         
         if enriched:
-            logger.info(f"[{self.name}] 真实换手率已计算: {enriched}/{len(data_list)} 只")
+            logger.info(f"[{self.name}] 实时数据已更新: {enriched}/{len(data_list)} 只")
     
     def parse(self, content: Any, is_sealed: bool = True) -> List[Dict]:
         """解析API响应"""
