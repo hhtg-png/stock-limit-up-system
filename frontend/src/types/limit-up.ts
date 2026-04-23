@@ -18,6 +18,7 @@ export interface LimitUpRecord {
   current_price: number
   turnover_rate?: number
   amount?: number
+  tradable_market_value?: number
   market: string
   industry?: string
 }

@@ -97,6 +97,21 @@ export function useWebSocket() {
         })
         break
 
+      case 'limit_up_snapshot':
+        limitUpStore.setSnapshot(
+          message.data.trade_date || '',
+          message.data.items || []
+        )
+        break
+
+      case 'limit_up_delta':
+        limitUpStore.applyDelta(
+          message.data.upsert || [],
+          message.data.remove || [],
+          message.data.trade_date || ''
+        )
+        break
+
       case 'big_order_alert':
         const direction = message.data.direction === 'buy' ? '买入' : '卖出'
         const amount = (message.data.amount / 10000).toFixed(2)

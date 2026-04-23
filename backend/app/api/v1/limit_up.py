@@ -16,90 +16,10 @@ from app.schemas.limit_up import (
     LimitUpDetail, LimitUpHistoryQuery, LimitUpReasonStats,
     LimitUpRealtimeResponse
 )
+from app.services.realtime_limit_up_service import realtime_limit_up_service
 from app.utils.trade_date import get_trade_date_with_fallback
 
 router = APIRouter()
-
-# 同花顺涨停原因缓存（5分钟有效）
-_ths_reason_cache: Dict[str, str] = {}
-_ths_reason_cache_time: float = 0
-_THS_CACHE_TTL = 300  # 5分钟
-
-
-async def _fetch_ths_reason_map() -> Dict[str, str]:
-    """从同花顺获取涨停原因映射 {stock_code: reason}，带5分钟缓存"""
-    global _ths_reason_cache, _ths_reason_cache_time
-    import time
-    
-    now = time.time()
-    if _ths_reason_cache and (now - _ths_reason_cache_time) < _THS_CACHE_TTL:
-        logger.debug(f"使用同花顺涨停原因缓存: {len(_ths_reason_cache)} 条")
-        return _ths_reason_cache
-    
-    try:
-        from app.crawlers.tonghuashun_crawler import ths_crawler
-        ths_data = await ths_crawler.crawl()
-        reason_map = {}
-        for item in ths_data:
-            code = item.get("stock_code", "")
-            reason = item.get("limit_up_reason", "")
-            if code and reason:
-                reason_map[code] = reason
-        if reason_map:
-            _ths_reason_cache = reason_map
-            _ths_reason_cache_time = now
-            logger.info(f"同花顺涨停原因获取成功: {len(reason_map)} 条")
-        else:
-            logger.warning("同花顺未返回涨停原因数据")
-        return reason_map
-    except Exception as e:
-        logger.warning(f"同花顺涨停原因获取失败: {e}")
-        return _ths_reason_cache  # 失败时返回旧缓存
-    finally:
-        try:
-            from app.crawlers.tonghuashun_crawler import ths_crawler
-            await ths_crawler.close_client()
-        except:
-            pass
-
-
-def _enrich_reasons(raw_data: List[Dict], reason_map: Dict[str, str]) -> List[Dict]:
-    """用同花顺的涨停原因替换东方财富的行业板块名"""
-    if not reason_map:
-        return raw_data
-    enriched = 0
-    for item in raw_data:
-        code = item.get("stock_code", "")
-        if code in reason_map:
-            item["limit_up_reason"] = reason_map[code]
-            item["reason_category"] = _classify_reason_simple(reason_map[code])
-            enriched += 1
-    if enriched:
-        logger.info(f"涨停原因已补充: {enriched}/{len(raw_data)} 条")
-    return raw_data
-
-
-def _classify_reason_simple(reason: str) -> str:
-    """简单分类涨停原因"""
-    if not reason:
-        return "其他"
-    category_keywords = {
-        "新能源": ["新能源", "锂电", "光伏", "风电", "储能", "充电桩", "电池", "氢能"],
-        "人工智能": ["AI", "人工智能", "算力", "大模型", "机器人", "智能", "DeepSeek"],
-        "半导体": ["半导体", "芯片", "集成电路", "封装", "光刻", "晶圆", "存储"],
-        "医药医疗": ["医药", "医疗", "生物", "疫苗", "创新药", "器械", "制药"],
-        "军工": ["军工", "国防", "航空", "航天", "舰船", "武器"],
-        "消费": ["消费", "白酒", "食品", "饮料", "零售", "电商", "酿酒"],
-        "金融": ["金融", "银行", "保险", "证券", "券商"],
-        "房地产": ["房地产", "地产", "房企", "物业"],
-        "数字经济": ["数字经济", "数据", "云计算", "大数据", "信创", "软件"],
-        "汽车": ["汽车", "整车", "零部件", "新能源车"],
-    }
-    for category, keywords in category_keywords.items():
-        for keyword in keywords:
-            if keyword in reason:
-                return category
-    return "其他"
 
 
 @router.get("/realtime", response_model=LimitUpRealtimeResponse, summary="获取实时涨停列表")
@@ -111,21 +31,10 @@ async def get_realtime_limit_up(
     db: AsyncSession = Depends(get_db)
 ):
     """获取实时涨停列表（东方财富数据+同花顺涨停原因）"""
-    from app.crawlers.eastmoney_crawler import em_crawler
-    import asyncio
-    
     if trade_date is None:
         trade_date = date.today()
-    
-    # 并行获取：东方财富实时数据 + 同花顺涨停原因
-    raw_data, reason_map = await asyncio.gather(
-        em_crawler.crawl(trade_date),
-        _fetch_ths_reason_map()
-    )
-    
-    # 用同花顺涨停原因替换东方财富行业板块名
-    if raw_data:
-        raw_data = _enrich_reasons(raw_data, reason_map)
+
+    raw_data = await realtime_limit_up_service.get_realtime_limit_up_list(trade_date)
     
     if not raw_data:
         # 如果没有数据，回退到数据库
@@ -159,6 +68,7 @@ async def get_realtime_limit_up(
                 current_price=record.close_price or record.limit_up_price or 0,
                 turnover_rate=record.turnover_rate,
                 amount=record.amount,
+                tradable_market_value=None,
                 market=stock.market,
                 industry=stock.industry
             ))
@@ -178,8 +88,8 @@ async def get_realtime_limit_up(
         if reason_category and item.get("reason_category") != reason_category:
             continue
         
-        is_sealed = item.get("is_final_sealed", True)
-        current_status = "sealed" if is_sealed else "opened"
+        is_sealed = item.get("is_sealed", item.get("is_final_sealed", True))
+        current_status = item.get("current_status", "sealed" if is_sealed else "opened")
         
         # 格式化时间
         first_time = item.get("first_limit_up_time")
@@ -187,14 +97,8 @@ async def get_realtime_limit_up(
         first_time_str = first_time.strftime("%H:%M:%S") if first_time else None
         final_time_str = final_time.strftime("%H:%M:%S") if final_time else None
         
-        # 市场判断
         code = item.get("stock_code", "")
-        if code.startswith("6"):
-            market = "SH"
-        elif code.startswith("0") or code.startswith("3"):
-            market = "SZ"
-        else:
-            market = "SZ"
+        market = item.get("market", "SH" if code.startswith("6") else "SZ")
         
         limit_up_list.append(LimitUpRealtime(
             stock_code=code,
@@ -211,11 +115,12 @@ async def get_realtime_limit_up(
             seal_amount=item.get("seal_amount", 0),
             seal_volume=None,
             limit_up_price=item.get("limit_up_price", 0),
-            current_price=item.get("limit_up_price", 0),
+            current_price=item.get("current_price", item.get("limit_up_price", 0)),
             turnover_rate=item.get("turnover_rate", 0),
             amount=item.get("amount", 0),
+            tradable_market_value=item.get("tradable_market_value"),
             market=market,
-            industry=None
+            industry=item.get("industry")
         ))
     
     # 排序
@@ -240,37 +145,14 @@ async def get_limit_up_detail(
     db: AsyncSession = Depends(get_db)
 ):
     """获取单只股票的涨停详情（优先从实时数据获取）"""
-    from app.crawlers.eastmoney_crawler import em_crawler
-    import asyncio
-    
     if trade_date is None:
         trade_date = date.today()
-    
-    # 并行获取：东方财富实时数据 + 同花顺涨停原因
-    raw_data, reason_map = await asyncio.gather(
-        em_crawler.crawl(trade_date),
-        _fetch_ths_reason_map()
-    )
-    
-    # 用同花顺涨停原因替换东方财富行业板块名
-    if raw_data:
-        raw_data = _enrich_reasons(raw_data, reason_map)
-    
-    realtime_record = None
-    for item in raw_data:
-        if item.get("stock_code") == stock_code:
-            realtime_record = item
-            break
+    realtime_record = await realtime_limit_up_service.get_realtime_limit_up_item(stock_code, trade_date)
     
     if realtime_record:
         # 从实时数据构建响应
         code = realtime_record.get("stock_code", "")
-        if code.startswith("6"):
-            market = "SH"
-        elif code.startswith("0") or code.startswith("3"):
-            market = "SZ"
-        else:
-            market = "SZ"
+        market = realtime_record.get("market", "SH" if code.startswith("6") else "SZ")
         
         first_time = realtime_record.get("first_limit_up_time")
         final_time = realtime_record.get("final_seal_time")
@@ -287,14 +169,18 @@ async def get_limit_up_detail(
             continuous_limit_up_days=realtime_record.get("continuous_limit_up_days", 1),
             open_count=realtime_record.get("open_count", 0),
             is_final_sealed=realtime_record.get("is_final_sealed", True),
-            current_status="sealed" if realtime_record.get("is_final_sealed", True) else "opened",
+            current_status=realtime_record.get(
+                "current_status",
+                "sealed" if realtime_record.get("is_final_sealed", True) else "opened"
+            ),
             seal_amount=realtime_record.get("seal_amount", 0),
             limit_up_price=realtime_record.get("limit_up_price", 0),
             turnover_rate=realtime_record.get("turnover_rate", 0),
             amount=realtime_record.get("amount", 0),
-            data_source="EM",
+            tradable_market_value=realtime_record.get("tradable_market_value"),
+            data_source="EM+THS+Tencent",
             market=market,
-            industry=None,
+            industry=realtime_record.get("industry"),
             status_changes=[]
         )
     
@@ -346,6 +232,7 @@ async def get_limit_up_detail(
         limit_up_price=record.limit_up_price,
         turnover_rate=record.turnover_rate,
         amount=record.amount,
+        tradable_market_value=None,
         data_source=record.data_source,
         market=stock.market,
         industry=stock.industry,

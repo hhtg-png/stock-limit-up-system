@@ -47,6 +47,10 @@ class Settings(BaseSettings):
     # WebSocket配置
     WS_HEARTBEAT_INTERVAL: int = 30  # 心跳间隔(秒)
     WS_MAX_CONNECTIONS: int = 100  # 最大连接数
+
+    # Tushare 配置
+    TUSHARE_TOKEN: Optional[str] = None
+    TUSHARE_API_URL: str = "http://api.tushare.pro"
     
     # 播报配置
     ALERT_DEDUP_INTERVAL: int = 300  # 去重间隔(秒)

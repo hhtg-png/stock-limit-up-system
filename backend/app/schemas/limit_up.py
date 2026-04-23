@@ -28,6 +28,7 @@ class LimitUpRecord(LimitUpBase):
     limit_up_price: Optional[float] = Field(None, description="涨停价")
     turnover_rate: Optional[float] = Field(None, description="换手率(%)")
     amount: Optional[float] = Field(None, description="成交额(万元)")
+    tradable_market_value: Optional[float] = Field(None, description="实际流通值(万元)")
     data_source: Optional[str] = Field(None, description="数据来源")
     
     class Config:
@@ -50,6 +51,7 @@ class LimitUpRealtime(LimitUpBase):
     current_price: float = Field(..., description="当前价")
     turnover_rate: Optional[float] = Field(None, description="换手率(%)")
     amount: Optional[float] = Field(None, description="成交额(万元)")
+    tradable_market_value: Optional[float] = Field(None, description="实际流通值(万元)")
     market: str = Field(..., description="市场")
     industry: Optional[str] = Field(None, description="行业")
 

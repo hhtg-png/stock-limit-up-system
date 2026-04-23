@@ -11,6 +11,9 @@ import httpx
 
 from app.core.websocket_manager import manager
 from app.data_collectors.tencent_api import tencent_api
+from app.services.realtime_limit_up_service import realtime_limit_up_service
+from app.services.realtime_limit_up_alert_tracker import RealtimeLimitUpAlertTracker
+from app.services.realtime_limit_up_stream_tracker import RealtimeLimitUpStreamTracker
 from loguru import logger
 
 router = APIRouter()
@@ -22,6 +25,13 @@ cache_update_time: datetime = datetime.min
 # 自由流通市值缓存（用于计算真实换手率）
 free_float_cache: Dict[str, float] = {}  # code -> 自由流通市值
 free_float_cache_date: date = date.min
+
+# 实时涨停列表/播报 watcher
+realtime_alert_tracker = RealtimeLimitUpAlertTracker()
+realtime_stream_tracker = RealtimeLimitUpStreamTracker()
+realtime_sync_task: Optional[asyncio.Task] = None
+REALTIME_SYNC_INTERVAL = 2
+REALTIME_SYNC_IDLE_INTERVAL = 30
 
 
 @router.websocket("/ws/realtime")
@@ -35,6 +45,7 @@ async def websocket_endpoint(
         client_id = str(uuid.uuid4())[:8]
     
     await manager.connect(websocket, client_id)
+    await ensure_realtime_sync_watcher()
     
     try:
         # 发送连接成功消息
@@ -46,6 +57,7 @@ async def websocket_endpoint(
             },
             "timestamp": datetime.now().isoformat()
         })
+        await send_realtime_limit_up_snapshot(client_id)
         
         # 心跳任务
         async def heartbeat():
@@ -79,6 +91,7 @@ async def websocket_endpoint(
         logger.error(f"WebSocket error for {client_id}: {e}")
     finally:
         await manager.disconnect(client_id)
+        await stop_realtime_sync_watcher_if_idle()
 
 
 async def handle_client_message(client_id: str, message: dict):
@@ -110,6 +123,108 @@ async def handle_client_message(client_id: str, message: dict):
         # 取消订阅消息类型
         types = data.get("types", [])
         await manager.unsubscribe_message_type(client_id, types)
+
+
+async def ensure_realtime_sync_watcher():
+    """确保实时涨停同步 watcher 已启动"""
+    global realtime_sync_task
+
+    if realtime_sync_task and not realtime_sync_task.done():
+        return
+
+    realtime_sync_task = asyncio.create_task(realtime_sync_loop())
+    logger.info("Realtime sync watcher started")
+
+
+async def stop_realtime_sync_watcher_if_idle():
+    """没有连接时停止 watcher，避免空转"""
+    global realtime_sync_task
+
+    if manager.connection_count > 0:
+        return
+
+    if realtime_sync_task and not realtime_sync_task.done():
+        realtime_sync_task.cancel()
+        try:
+            await realtime_sync_task
+        except asyncio.CancelledError:
+            pass
+        logger.info("Realtime sync watcher stopped")
+    realtime_sync_task = None
+
+
+async def send_realtime_limit_up_snapshot(client_id: str):
+    """向新连接客户端发送当前实时涨停列表快照"""
+    trade_date = date.today()
+    snapshot = realtime_stream_tracker.get_cached_snapshot(trade_date)
+    if not is_trading_time():
+        if not snapshot or not snapshot.get("data", {}).get("items"):
+            return
+
+    if snapshot is None:
+        realtime_data = await realtime_limit_up_service.get_realtime_limit_up_list(trade_date)
+        snapshot = realtime_stream_tracker.sync(realtime_data, trade_date)
+        if snapshot is None:
+            snapshot = realtime_stream_tracker.get_cached_snapshot(trade_date)
+
+    if snapshot:
+        await manager.send_personal_message(
+            {
+                **snapshot,
+                "timestamp": datetime.now().isoformat(),
+            },
+            client_id,
+        )
+
+
+async def realtime_sync_loop():
+    """基于实时涨停池的列表同步与新增涨停播报循环"""
+    while True:
+        try:
+            if manager.connection_count == 0:
+                await asyncio.sleep(1)
+                continue
+
+            if not is_trading_time():
+                await asyncio.sleep(REALTIME_SYNC_IDLE_INTERVAL)
+                continue
+
+            trade_date = date.today()
+            realtime_data = await realtime_limit_up_service.get_realtime_limit_up_list(trade_date)
+            sync_message = realtime_stream_tracker.sync(realtime_data, trade_date)
+            if sync_message:
+                await broadcast_realtime_sync_message(sync_message)
+
+            alerts = realtime_alert_tracker.collect_new_alerts(realtime_data, trade_date)
+
+            for alert in alerts:
+                await manager.broadcast_limit_up_alert(
+                    alert["stock_code"],
+                    alert["stock_name"],
+                    alert["time"],
+                    alert.get("reason"),
+                    alert.get("continuous_days", 1),
+                )
+
+            await asyncio.sleep(REALTIME_SYNC_INTERVAL)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"Realtime sync watcher error: {e}")
+            await asyncio.sleep(REALTIME_SYNC_INTERVAL)
+
+
+async def broadcast_realtime_sync_message(message: dict):
+    """广播实时涨停列表快照或增量更新"""
+    msg_type = message.get("type")
+    payload = message.get("data", {})
+
+    if msg_type == "limit_up_snapshot":
+        await manager.broadcast_limit_up_snapshot(payload)
+        return
+
+    if msg_type == "limit_up_delta":
+        await manager.broadcast_limit_up_delta(payload)
 
 
 def is_trading_time() -> bool:

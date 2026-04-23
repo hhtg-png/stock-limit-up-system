@@ -5,6 +5,8 @@ import type { LimitUpRealtime } from '@/types/limit-up'
 export const useLimitUpStore = defineStore('limitUp', () => {
   // 实时涨停列表
   const realtimeList = ref<LimitUpRealtime[]>([])
+  const tradeDate = ref('')
+  const lastSyncAt = ref('')
   
   // 加载状态
   const loading = ref(false)
@@ -61,8 +63,17 @@ export const useLimitUpStore = defineStore('limitUp', () => {
   })
 
   // 设置列表
-  function setList(list: LimitUpRealtime[]) {
-    realtimeList.value = list
+  function setList(list: LimitUpRealtime[], snapshotTradeDate = '') {
+    realtimeList.value = [...list]
+    if (snapshotTradeDate) {
+      tradeDate.value = snapshotTradeDate
+    }
+    lastSyncAt.value = new Date().toISOString()
+  }
+
+  // 设置完整快照
+  function setSnapshot(snapshotTradeDate: string, list: LimitUpRealtime[]) {
+    setList(list, snapshotTradeDate)
   }
 
   // 更新单条记录
@@ -81,6 +92,42 @@ export const useLimitUpStore = defineStore('limitUp', () => {
     }
   }
 
+  // 删除记录
+  function removeItems(codes: string[]) {
+    if (codes.length === 0) return
+    const removed = new Set(codes)
+    realtimeList.value = realtimeList.value.filter(item => !removed.has(item.stock_code))
+    lastSyncAt.value = new Date().toISOString()
+  }
+
+  // 应用 WebSocket 增量更新
+  function applyDelta(
+    upsert: LimitUpRealtime[],
+    remove: string[] = [],
+    deltaTradeDate = ''
+  ) {
+    if (deltaTradeDate && tradeDate.value && tradeDate.value !== deltaTradeDate) {
+      setSnapshot(deltaTradeDate, upsert)
+      return
+    }
+
+    const itemMap = new Map(
+      realtimeList.value.map(item => [item.stock_code, item] as const)
+    )
+
+    remove.forEach(code => itemMap.delete(code))
+    upsert.forEach(item => {
+      const previous = itemMap.get(item.stock_code)
+      itemMap.set(item.stock_code, previous ? { ...previous, ...item } : item)
+    })
+
+    realtimeList.value = Array.from(itemMap.values())
+    if (deltaTradeDate) {
+      tradeDate.value = deltaTradeDate
+    }
+    lastSyncAt.value = new Date().toISOString()
+  }
+
   // 设置筛选条件
   function setFilters(newFilters: Partial<typeof filters.value>) {
     Object.assign(filters.value, newFilters)
@@ -88,13 +135,18 @@ export const useLimitUpStore = defineStore('limitUp', () => {
 
   return {
     realtimeList,
+    tradeDate,
+    lastSyncAt,
     loading,
     filters,
     filteredList,
     stats,
     setList,
+    setSnapshot,
     updateItem,
     addItem,
+    removeItems,
+    applyDelta,
     setFilters
   }
 })

@@ -5,8 +5,11 @@ from fastapi import WebSocket
 from typing import Dict, Set, Optional, List
 import asyncio
 import json
+import time as time_module
 from datetime import datetime
 from loguru import logger
+
+from app.config import settings
 
 
 class ConnectionManager:
@@ -21,6 +24,8 @@ class ConnectionManager:
         self.message_types: Dict[str, Set[str]] = {}
         # 连接锁
         self._lock = asyncio.Lock()
+        # 涨停播报去重 {stock_code: timestamp}
+        self._limit_up_alert_cache: Dict[str, float] = {}
     
     async def connect(self, websocket: WebSocket, client_id: str):
         """建立连接"""
@@ -28,7 +33,15 @@ class ConnectionManager:
         async with self._lock:
             self.active_connections[client_id] = websocket
             self.subscriptions[client_id] = set()
-            self.message_types[client_id] = {"limit_up_alert", "big_order_alert", "status_change", "market_update", "continuous_ladder"}
+            self.message_types[client_id] = {
+                "limit_up_alert",
+                "big_order_alert",
+                "status_change",
+                "market_update",
+                "continuous_ladder",
+                "limit_up_snapshot",
+                "limit_up_delta",
+            }
         logger.info(f"WebSocket connected: {client_id}, total: {len(self.active_connections)}")
     
     async def disconnect(self, client_id: str):
@@ -107,6 +120,13 @@ class ConnectionManager:
                                         time: str, reason: Optional[str] = None,
                                         continuous_days: int = 1):
         """广播涨停提醒"""
+        now = time_module.time()
+        last_alert_time = self._limit_up_alert_cache.get(stock_code)
+        if last_alert_time is not None and now - last_alert_time < settings.ALERT_DEDUP_INTERVAL:
+            logger.debug(f"Skip duplicate limit_up_alert for {stock_code}")
+            return
+
+        self._limit_up_alert_cache[stock_code] = now
         await self.broadcast(
             {
                 "stock_code": stock_code,
@@ -156,6 +176,20 @@ class ConnectionManager:
         await self.broadcast(
             data,
             "continuous_ladder"
+        )
+
+    async def broadcast_limit_up_snapshot(self, data: dict):
+        """广播实时涨停列表快照"""
+        await self.broadcast(
+            data,
+            "limit_up_snapshot"
+        )
+
+    async def broadcast_limit_up_delta(self, data: dict):
+        """广播实时涨停列表增量更新"""
+        await self.broadcast(
+            data,
+            "limit_up_delta"
         )
     
     @property

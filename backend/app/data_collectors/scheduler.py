@@ -22,7 +22,7 @@ class DataScheduler:
         # 监控股票缓存
         self._monitored_stocks: List[Dict] = []
         self._stocks_cache_time: datetime = datetime.min
-        self._STOCKS_CACHE_TTL = 300  # 5分钟刷新一次监控列表
+        self._STOCKS_CACHE_TTL = 10  # 10秒刷新一次监控列表，优先跟随实时涨停池
     
     def start(self):
         """启动调度器"""
@@ -84,10 +84,22 @@ class DataScheduler:
             logger.info("DataScheduler stopped")
     
     async def _get_monitored_stocks(self, db) -> List[Dict]:
-        """获取需要监控的股票列表（当日涨停股票），带缓存"""
+        """获取需要监控的股票列表（优先实时涨停池，其次数据库），带缓存"""
         now = datetime.now()
         if (now - self._stocks_cache_time).total_seconds() < self._STOCKS_CACHE_TTL and self._monitored_stocks:
             return self._monitored_stocks
+
+        try:
+            from app.services.realtime_limit_up_service import realtime_limit_up_service
+
+            realtime_stocks = await realtime_limit_up_service.get_monitored_stocks(db)
+            if realtime_stocks:
+                self._monitored_stocks = realtime_stocks
+                self._stocks_cache_time = now
+                logger.info(f"Monitored stocks refreshed from realtime pool: {len(self._monitored_stocks)} stocks")
+                return self._monitored_stocks
+        except Exception as e:
+            logger.warning(f"Load monitored stocks from realtime pool failed, fallback to database: {e}")
         
         from app.models.limit_up import LimitUpRecord
         from app.models.stock import Stock

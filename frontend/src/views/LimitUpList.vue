@@ -89,44 +89,43 @@
             {{ formatTurnoverRate(row.turnover_rate) }}
           </template>
         </el-table-column>
-        <el-table-column prop="amount" label="成交额(万)" width="100" align="right">
+        <el-table-column prop="amount" label="成交额(亿)" width="100" align="right">
           <template #default="{ row }">
-            {{ row.amount ? row.amount.toFixed(0) : '-' }}
+            {{ formatAmountInYi(row.amount) }}
+          </template>
+        </el-table-column>
+        <el-table-column prop="tradable_market_value" label="实际流通值(亿)" width="120" align="right">
+          <template #default="{ row }">
+            {{ formatTradableMarketValue(row.tradable_market_value) }}
           </template>
         </el-table-column>
         <el-table-column prop="reason_category" label="题材" width="100" />
         <el-table-column prop="limit_up_reason" label="涨停原因" min-width="180" show-overflow-tooltip />
-        <el-table-column label="操作" width="90" fixed="right" align="center">
-          <template #default="{ row }">
-            <el-button link type="primary" @click.stop="addToWatch(row)">
-              <el-icon><Star /></el-icon>
-            </el-button>
-            <el-button link type="primary" @click.stop="goToDetail(row.stock_code)">
-              <el-icon><View /></el-icon>
-            </el-button>
-          </template>
-        </el-table-column>
       </el-table>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, onMounted } from 'vue'
+import { computed, ref, reactive, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
-import { Star, View } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { getRealtimeLimitUp, refreshLimitUpData } from '@/api/limit-up'
-import { useConfigStore } from '@/stores/config'
+import { useLimitUpStore } from '@/stores/limit-up'
 import type { LimitUpRealtime } from '@/types/limit-up'
 
 const router = useRouter()
-const configStore = useConfigStore()
+const limitUpStore = useLimitUpStore()
 
 const loading = ref(false)
 const refreshing = ref(false)
-const tableData = ref<LimitUpRealtime[]>([])
-const reasonCategories = ref<string[]>([])
+const isFetching = ref(false)
+const tableSort = ref<{ prop: string; order: 'ascending' | 'descending' | null }>({
+  prop: '',
+  order: null
+})
+const RESYNC_INTERVAL = 90000
+let refreshTimer: number | null = null
 
 const filters = reactive({
   minContinuousDays: undefined as number | undefined,
@@ -134,39 +133,24 @@ const filters = reactive({
   status: ''
 })
 
-// 所有数据（筛选前）
-let allRecords: LimitUpRealtime[] = []
-
-// 获取数据
-async function fetchData() {
-  loading.value = true
-  try {
-    const response = await getRealtimeLimitUp()
-    
-    // 从响应中提取数据数组
-    allRecords = response.data || []
-    
-    // 提取实际存在的分类，用于筛选下拉
-    const cats = new Set<string>()
-    allRecords.forEach(item => {
-      if (item.reason_category) cats.add(item.reason_category)
-    })
-    reasonCategories.value = [...cats].sort()
-    
-    // 应用本地筛选
-    applyFilters()
-  } catch (e) {
-    console.error('Fetch error:', e)
-    ElMessage.error('获取数据失败')
-  } finally {
-    loading.value = false
-  }
+interface FetchOptions {
+  showLoading?: boolean
+  silent?: boolean
 }
 
-// 本地筛选
-function applyFilters() {
-  let filtered = allRecords
-  
+const reasonCategories = computed(() => {
+  const cats = new Set<string>()
+  limitUpStore.realtimeList.forEach(item => {
+    if (item.reason_category) {
+      cats.add(item.reason_category)
+    }
+  })
+  return [...cats].sort()
+})
+
+const tableData = computed(() => {
+  let filtered = [...limitUpStore.realtimeList]
+
   if (filters.minContinuousDays) {
     filtered = filtered.filter(item => item.continuous_limit_up_days >= filters.minContinuousDays!)
   }
@@ -178,19 +162,64 @@ function applyFilters() {
   } else if (filters.status === 'opened') {
     filtered = filtered.filter(item => !item.is_sealed)
   }
-  
-  tableData.value = filtered
+
+  const { prop, order } = tableSort.value
+  if (!prop || !order) {
+    return filtered
+  }
+
+  const sortOrder = order === 'ascending' ? 1 : -1
+  return [...filtered].sort((a: any, b: any) => {
+    const va = a[prop]
+    const vb = b[prop]
+
+    if (va == null && vb == null) return 0
+    if (va == null) return 1
+    if (vb == null) return -1
+
+    if (typeof va === 'string' || typeof vb === 'string') {
+      return String(va).localeCompare(String(vb)) * sortOrder
+    }
+
+    return (va - vb) * sortOrder
+  })
+})
+
+async function fetchData(options: FetchOptions = {}) {
+  const { showLoading = limitUpStore.realtimeList.length === 0, silent = false } = options
+  if (isFetching.value) return
+
+  isFetching.value = true
+  if (showLoading) {
+    loading.value = true
+  }
+
+  try {
+    const response = await getRealtimeLimitUp()
+    limitUpStore.setSnapshot(response.trade_date, response.data || [])
+  } catch (e) {
+    console.error('Fetch error:', e)
+    if (!silent) {
+      ElMessage.error('获取数据失败')
+    }
+  } finally {
+    isFetching.value = false
+    if (showLoading) {
+      loading.value = false
+    }
+  }
 }
 
-// 重置筛选
+function applyFilters() {
+  // 列表已由计算属性自动响应筛选条件变化
+}
+
 function resetFilters() {
   filters.minContinuousDays = undefined
   filters.reasonCategory = ''
   filters.status = ''
-  applyFilters()
 }
 
-// 刷新数据（从开盘啦/同花顺重新获取涨停原因和状态）
 async function refreshData() {
   try {
     await ElMessageBox.confirm(
@@ -198,14 +227,13 @@ async function refreshData() {
       '刷新数据',
       { type: 'warning' }
     )
-    
+
     refreshing.value = true
     await refreshLimitUpData()
     ElMessage.success('刷新请求已提交，请稍后刷新页面查看')
-    
-    // 3秒后自动刷新数据
+
     setTimeout(() => {
-      fetchData()
+      fetchData({ showLoading: false, silent: true })
     }, 3000)
   } catch (e: any) {
     if (e !== 'cancel') {
@@ -217,93 +245,34 @@ async function refreshData() {
   }
 }
 
-// 排序
-function handleSortChange({ prop, order }: any) {
-  if (!order) {
-    // 取消排序，恢复筛选后的默认顺序
-    applyFilters()
-    return
+function handleSortChange({ prop, order }: { prop?: string; order?: 'ascending' | 'descending' | null }) {
+  tableSort.value = {
+    prop: prop || '',
+    order: order || null
   }
-  
-  const sortOrder = order === 'ascending' ? 1 : -1
-  tableData.value.sort((a: any, b: any) => {
-    const va = a[prop]
-    const vb = b[prop]
-    
-    // 空值排到最后
-    if (va == null && vb == null) return 0
-    if (va == null) return 1
-    if (vb == null) return -1
-    
-    // 字符串比较（时间等）
-    if (typeof va === 'string' || typeof vb === 'string') {
-      return String(va).localeCompare(String(vb)) * sortOrder
-    }
-    
-    // 数值比较
-    return (va - vb) * sortOrder
-  })
 }
 
-// 行点击
 function handleRowClick(row: LimitUpRealtime) {
   router.push(`/stock/${row.stock_code}`)
 }
 
-// 跳转详情
-function goToDetail(code: string) {
-  router.push(`/stock/${code}`)
-}
-
-// 添加自选
-function addToWatch(row: LimitUpRealtime) {
-  configStore.addToWatchList(row.stock_code)
-  ElMessage.success(`已添加 ${row.stock_name} 到自选`)
-}
-
-// 格式化换手率（数据已是百分比格式，如1.71表示1.71%）
 function formatTurnoverRate(rate: number | undefined | null): string {
   if (rate == null || rate === 0) return '-'
   return rate.toFixed(2) + '%'
 }
 
-// 获取状态类型
-function getStatusType(row: LimitUpRealtime): string {
-  const status = row.current_status || (row.is_sealed ? 'sealed' : 'opened')
-  switch (status) {
-    case 'sealed':
-    case 'final_sealed':
-      return 'danger'
-    case 'opened':
-      return 'warning'
-    case 'broken':
-      return 'info'
-    default:
-      return row.is_sealed ? 'danger' : 'warning'
-  }
+function formatAmountInYi(value: number | undefined | null): string {
+  if (value == null || value === 0) return '-'
+  return (value / 10000).toFixed(2)
 }
 
-// 获取状态文案
-function getStatusText(row: LimitUpRealtime): string {
-  const status = row.current_status || (row.is_sealed ? 'sealed' : 'opened')
-  switch (status) {
-    case 'sealed':
-      return '封板中'
-    case 'final_sealed':
-      return '封板至收盘'
-    case 'opened':
-      return row.open_count > 0 ? `开板${row.open_count}次` : '开板'
-    case 'broken':
-      return '已炸板'
-    default:
-      return row.is_sealed ? '封板' : '开板'
-  }
+function formatTradableMarketValue(value: number | undefined | null): string {
+  if (value == null || value === 0) return '-'
+  return (value / 10000).toFixed(2)
 }
 
-// 导出数据
 function exportData() {
-  // 简单的CSV导出
-  const headers = ['代码', '名称', '连板', '首封时间', '状态', '封单(万)', '涨停原因']
+  const headers = ['代码', '名称', '连板', '首封时间', '状态', '封单(万)', '成交额(亿)', '实际流通值(亿)', '涨停原因']
   const rows = tableData.value.map(item => [
     item.stock_code,
     item.stock_name,
@@ -311,9 +280,11 @@ function exportData() {
     item.first_limit_up_time || '',
     item.is_sealed ? '封板' : '开板',
     item.seal_amount?.toFixed(0) || '',
+    formatAmountInYi(item.amount),
+    formatTradableMarketValue(item.tradable_market_value),
     item.limit_up_reason || ''
   ])
-  
+
   const csv = [headers, ...rows].map(row => row.join(',')).join('\n')
   const blob = new Blob(['\ufeff' + csv], { type: 'text/csv;charset=utf-8' })
   const url = URL.createObjectURL(blob)
@@ -325,7 +296,18 @@ function exportData() {
 }
 
 onMounted(() => {
-  fetchData()
+  fetchData({ showLoading: limitUpStore.realtimeList.length === 0 })
+  refreshTimer = window.setInterval(() => {
+    if (document.visibilityState !== 'visible') return
+    fetchData({ showLoading: false, silent: true })
+  }, RESYNC_INTERVAL)
+})
+
+onUnmounted(() => {
+  if (refreshTimer) {
+    clearInterval(refreshTimer)
+    refreshTimer = null
+  }
 })
 </script>
 
