@@ -37,8 +37,12 @@
               <span class="turnover" v-if="stock.real_turnover_rate">
                 {{ stock.real_turnover_rate.toFixed(1) }}%
               </span>
-              <span class="change positive" v-if="stock.change_pct != null">
-                +{{ stock.change_pct?.toFixed(2) }}%
+              <span
+                v-if="stock.change_pct != null"
+                class="change"
+                :class="{ positive: (stock.change_pct || 0) > 0, negative: (stock.change_pct || 0) < 0 }"
+              >
+                {{ formatChange(stock.change_pct) }}
               </span>
             </div>
           </div>

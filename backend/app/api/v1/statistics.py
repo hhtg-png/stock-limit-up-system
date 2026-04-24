@@ -11,10 +11,12 @@ from app.database import get_db
 from app.models.stock import Stock
 from app.models.limit_up import LimitUpRecord
 from app.models.market_data import DailyStatistics
+from app.services.continuous_ladder_service import continuous_ladder_service
+from app.services.realtime_limit_up_service import realtime_limit_up_service
 from app.schemas.statistics import (
     DailyStats, SectorStats, ContinuousLadder, BreakStats, MarketOverview,
     SectorStatsResponse, ContinuousLadderResponse,
-    YesterdayContinuousStock, YesterdayContinuousLadder, YesterdayContinuousResponse
+    YesterdayContinuousLadder, YesterdayContinuousResponse
 )
 import httpx
 from loguru import logger
@@ -170,121 +172,30 @@ async def get_continuous_realtime(
     min_days: int = Query(2, description="最小连板天数，默认2")
 ):
     """
-    从东方财富获取实时连板梯队数据
-    - 直接从东方财富 API 获取，数据更准确
-    - 包含封板/炸板状态
+    从实时涨停池获取连板梯队数据
+    - 统一使用实时涨停池口径
+    - 同时包含当前封板和炸板状态
     """
     if trade_date is None:
         trade_date = date.today()
-    
-    date_str = trade_date.strftime("%Y%m%d")
-    
+
     try:
-        # 从东方财富获取今日涨停池数据
-        url = "https://push2ex.eastmoney.com/getTopicZTPool"
-        params = {
-            "ut": "7eea3edcaed734bea9cbfc24409ed989",
-            "dpt": "wz.ztzt",
-            "Pageindex": "0",
-            "pagesize": "10000",
-            "sort": "fbt:asc",
-            "date": date_str,
-        }
-        
-        logger.info(f"请求今日涨停池: {url}, date={date_str}")
-        
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"}, params=params)
-            data = resp.json()
-        
-        if not data.get("data") or not data["data"].get("pool"):
-            logger.warning("东方财富返回空数据")
-            return {
-                "trade_date": str(trade_date),
-                "is_fallback": False,
-                "data": []
-            }
-        
-        pool = data["data"]["pool"]
-        logger.info(f"获取到 {len(pool)} 只涨停股")
-        
-        # 按连板天数分组
-        ladder_map = {}  # {连板天数: [股票列表]}
-        
-        for item in pool:
-            # lbc: 连板次数
-            continuous_days = item.get("lbc", 1)
-            if continuous_days < min_days:
-                continue
-            
-            code = item.get("c", "")
-            name = item.get("n", "")
-            
-            # fbt: 首次封板时间（时间戳）
-            fbt = item.get("fbt", 0)
-            first_limit_up_time = None
-            if fbt:
-                try:
-                    from datetime import datetime
-                    fbt_str = str(fbt)
-                    if len(fbt_str) == 6:
-                        hour = int(fbt_str[:2])
-                        minute = int(fbt_str[2:4])
-                        second = int(fbt_str[4:6])
-                        first_limit_up_time = f"{hour:02d}:{minute:02d}:{second:02d}"
-                except:
-                    pass
-            
-            # zbc: 炸板次数（今天曾经炸板过多少次）
-            # 注意：涨停池中的股票都是当前封住的，zbc>0只是表示之前炸板过但现在回封了
-            open_count = item.get("zbc", 0)
-            is_sealed = True  # 涨停池中的股票都是当前封板状态
-            
-            # hybk: 行业板块/涨停原因
-            reason = item.get("hybk", "")
-            
-            # zdp: 涨跌幅（已是百分比形式）
-            change_pct = item.get("zdp", 0)
-            if change_pct:
-                change_pct = round(change_pct, 2)
-            
-            if continuous_days not in ladder_map:
-                ladder_map[continuous_days] = []
-            
-            ladder_map[continuous_days].append({
-                "stock_code": code,
-                "stock_name": name,
-                "first_limit_up_time": first_limit_up_time,
-                "reason": reason,
-                "is_sealed": is_sealed,
-                "open_count": open_count,
-                "change_pct": change_pct
-            })
-        
-        # 构建响应数据
-        ladder_list = []
-        for days in sorted(ladder_map.keys(), reverse=True):
-            stocks = ladder_map[days]
-            # 按首封时间排序
-            stocks.sort(key=lambda x: x.get("first_limit_up_time") or "23:59:59")
-            ladder_list.append({
-                "continuous_days": days,
-                "count": len(stocks),
-                "stocks": stocks
-            })
-        
+        realtime_items = await realtime_limit_up_service.get_realtime_limit_up_list(trade_date)
+        ladder_list = continuous_ladder_service.build_realtime_ladder(
+            realtime_items,
+            min_days=min_days,
+        )
         return {
             "trade_date": str(trade_date),
             "is_fallback": False,
-            "data": ladder_list
+            "data": ladder_list,
         }
-        
     except Exception as e:
         logger.error(f"获取实时连板数据失败: {e}")
         return {
             "trade_date": str(trade_date),
             "is_fallback": False,
-            "data": []
+            "data": [],
         }
 
 
@@ -292,7 +203,6 @@ async def get_continuous_realtime(
 async def get_yesterday_continuous(
     trade_date: Optional[date] = Query(None, description="今日日期，默认今天"),
     min_days: int = Query(2, description="最小连板天数，默认2"),
-    db: AsyncSession = Depends(get_db)
 ):
     """
     获取昨日连板股票的今日表现（从东方财富实时获取）
@@ -337,88 +247,15 @@ async def get_yesterday_continuous(
             )
         
         pool = data["data"]["pool"]
-        
-        # 同时获取今日涨停池数据，用于判断今日是否涨停
-        today_zt_url = "https://push2ex.eastmoney.com/getTopicZTPool"
-        today_zt_params = {
-            "ut": "7eea3edcaed734bea9cbfc24409ed989",
-            "dpt": "wz.ztzt",
-            "Pageindex": "0",
-            "pagesize": "10000",
-            "sort": "fbt:asc",
-            "date": date_str,
-        }
-        
-        async with httpx.AsyncClient(timeout=10) as client:
-            today_resp = await client.get(today_zt_url, headers={"User-Agent": "Mozilla/5.0"}, params=today_zt_params)
-            today_data = today_resp.json()
-        
-        # 构建今日涨停股票集合
-        today_zt_stocks = {}  # {code: {is_sealed, open_count}}
-        if today_data.get("data") and today_data["data"].get("pool"):
-            for item in today_data["data"]["pool"]:
-                code = item.get("c", "")
-                # zbc: 炸板次数
-                open_count = item.get("zbc", 0)
-                # 如果炸板次数为0，说明全天未开板（封板）
-                today_zt_stocks[code] = {
-                    "is_sealed": open_count == 0,
-                    "open_count": open_count
-                }
-        
-        # 按连板天数分组
-        ladder_map = {}  # {连板天数: [股票列表]}
-        
-        for item in pool:
-            # ylbc: 昨日连板数
-            yesterday_days = item.get("ylbc", 1)
-            if yesterday_days < min_days:
-                continue
-            
-            code = item.get("c", "")
-            name = item.get("n", "")
-            # zdp: 涨跌幅（已经是百分比形式，如 -4.13, 1.18）
-            change_pct = item.get("zdp", 0)
-            if change_pct:
-                change_pct = round(change_pct, 2)
-            
-            # 判断今日状态
-            if code in today_zt_stocks:
-                zt_info = today_zt_stocks[code]
-                if zt_info["is_sealed"]:
-                    today_status = "sealed"  # 封板
-                else:
-                    today_status = "opened"  # 炸板
-            else:
-                today_status = "broken"  # 断板（今日未涨停）
-            
-            if yesterday_days not in ladder_map:
-                ladder_map[yesterday_days] = []
-            
-            ladder_map[yesterday_days].append(YesterdayContinuousStock(
-                stock_code=code,
-                stock_name=name,
-                yesterday_days=yesterday_days,
-                today_status=today_status,
-                today_change_pct=change_pct
-            ))
-        
-        # 构建响应数据
-        ladder_list = []
-        for days in sorted(ladder_map.keys(), reverse=True):
-            stocks = ladder_map[days]
-            sealed_count = sum(1 for s in stocks if s.today_status == "sealed")
-            opened_count = sum(1 for s in stocks if s.today_status == "opened")
-            broken_count = sum(1 for s in stocks if s.today_status == "broken")
-            
-            ladder_list.append(YesterdayContinuousLadder(
-                continuous_days=days,
-                count=len(stocks),
-                sealed_count=sealed_count,
-                opened_count=opened_count,
-                broken_count=broken_count,
-                stocks=stocks
-            ))
+        realtime_items = await realtime_limit_up_service.get_realtime_limit_up_list(trade_date)
+        ladder_list = [
+            YesterdayContinuousLadder(**ladder)
+            for ladder in continuous_ladder_service.build_yesterday_ladder(
+                pool,
+                realtime_items,
+                min_days=min_days,
+            )
+        ]
         
         # 计算昨日日期（简单减一天，实际应该是上一交易日）
         yesterday_date = trade_date - timedelta(days=1)

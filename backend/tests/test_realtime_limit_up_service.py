@@ -53,12 +53,16 @@ class RealtimeLimitUpServiceTests(unittest.IsolatedAsyncioTestCase):
                 "price": 10.5,
                 "amount": 8888.0,
                 "turnover_rate": 6.8,
+                "change_pct": 10.0,
+                "bid1_volume": 12345,
             },
             "300001": {
                 "code": "300001",
                 "price": 19.66,
                 "amount": 9999.0,
                 "turnover_rate": 9.1,
+                "change_pct": 8.9,
+                "bid1_volume": 0,
             },
         }
 
@@ -86,6 +90,8 @@ class RealtimeLimitUpServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sealed["turnover_rate"], 6.8)
         self.assertEqual(sealed["amount"], 8888.0)
         self.assertEqual(sealed["tradable_market_value"], 10500.0)
+        self.assertEqual(sealed["change_pct"], 10.0)
+        self.assertEqual(sealed["bid1_volume"], 12345)
         self.assertEqual(sealed["current_status"], "sealed")
         self.assertTrue(sealed["is_sealed"])
 
@@ -97,6 +103,8 @@ class RealtimeLimitUpServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(opened["turnover_rate"], 9.1)
         self.assertEqual(opened["amount"], 9999.0)
         self.assertEqual(opened["tradable_market_value"], 9830.0)
+        self.assertEqual(opened["change_pct"], 8.9)
+        self.assertEqual(opened["bid1_volume"], 0)
         self.assertEqual(opened["current_status"], "opened")
         self.assertFalse(opened["is_sealed"])
 

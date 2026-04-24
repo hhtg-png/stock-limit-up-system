@@ -63,10 +63,14 @@ export interface ContinuousLadder {
     stock_code: string
     stock_name: string
     first_limit_up_time?: string
+    final_seal_time?: string
     reason?: string
     is_sealed?: boolean
     open_count?: number
     change_pct?: number
+    bid1_volume?: number
+    turnover_rate?: number
+    real_turnover_rate?: number
   }[]
 }
 

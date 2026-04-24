@@ -280,10 +280,14 @@ class RealtimeLimitUpService:
             current_price = quote.get("price", 0) or merged.get("limit_up_price", 0)
             amount = quote.get("amount", 0) or merged.get("amount", 0)
             turnover_rate = quote.get("turnover_rate", 0) or merged.get("turnover_rate", 0)
+            change_pct = quote.get("change_pct")
+            bid1_volume = quote.get("bid1_volume", 0)
         else:
             current_price = merged.get("limit_up_price", 0)
             amount = merged.get("amount", 0)
             turnover_rate = merged.get("turnover_rate", 0)
+            change_pct = None
+            bid1_volume = 0
 
         is_sealed = bool(merged.get("is_final_sealed", True))
         merged["is_sealed"] = is_sealed
@@ -291,6 +295,8 @@ class RealtimeLimitUpService:
         merged["current_price"] = current_price
         merged["amount"] = amount
         merged["turnover_rate"] = turnover_rate
+        merged["change_pct"] = change_pct
+        merged["bid1_volume"] = bid1_volume
         if float_share and current_price:
             merged["tradable_market_value"] = round(float_share * current_price, 2)
         else:
