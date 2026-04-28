@@ -58,7 +58,7 @@ class MarketReviewStockDaily(Base):
 
     __tablename__ = "market_review_stock_daily"
     __table_args__ = (
-        UniqueConstraint("trade_date", "stock_id", name="uq_review_stock_daily"),
+        UniqueConstraint("trade_date", "stock_code", name="uq_review_stock_daily"),
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -98,7 +98,7 @@ class MarketReviewLimitUpEvent(Base):
     __table_args__ = (
         UniqueConstraint(
             "trade_date",
-            "stock_id",
+            "stock_code",
             "event_type",
             "event_seq",
             name="uq_review_limitup_event",
