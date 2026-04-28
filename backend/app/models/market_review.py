@@ -9,12 +9,14 @@ from sqlalchemy import (
     Date,
     DateTime,
     Float,
+    ForeignKey,
     Integer,
     JSON,
     String,
     Time,
     UniqueConstraint,
 )
+from sqlalchemy.orm import relationship
 
 from app.database import Base
 
@@ -56,11 +58,12 @@ class MarketReviewStockDaily(Base):
 
     __tablename__ = "market_review_stock_daily"
     __table_args__ = (
-        UniqueConstraint("trade_date", "stock_code", name="uq_review_stock_daily"),
+        UniqueConstraint("trade_date", "stock_id", name="uq_review_stock_daily"),
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     trade_date = Column(Date, nullable=False, comment="交易日期")
+    stock_id = Column(Integer, ForeignKey("stocks.id"), nullable=False, index=True, comment="股票ID")
     stock_code = Column(String(10), nullable=False, comment="股票代码")
     stock_name = Column(String(50), nullable=False, comment="股票名称")
     board_type = Column(String(20), default="main", nullable=False, comment="板块类型")
@@ -85,6 +88,7 @@ class MarketReviewStockDaily(Base):
     data_quality_flag = Column(String(20), default="ok", nullable=False, comment="数据质量标记")
     created_at = Column(DateTime, default=datetime.now, nullable=False, comment="创建时间")
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, nullable=False, comment="更新时间")
+    stock = relationship("Stock")
 
 
 class MarketReviewLimitUpEvent(Base):
@@ -94,7 +98,7 @@ class MarketReviewLimitUpEvent(Base):
     __table_args__ = (
         UniqueConstraint(
             "trade_date",
-            "stock_code",
+            "stock_id",
             "event_type",
             "event_seq",
             name="uq_review_limitup_event",
@@ -103,6 +107,7 @@ class MarketReviewLimitUpEvent(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     trade_date = Column(Date, nullable=False, index=True, comment="交易日期")
+    stock_id = Column(Integer, ForeignKey("stocks.id"), nullable=False, index=True, comment="股票ID")
     stock_code = Column(String(10), nullable=False, index=True, comment="股票代码")
     event_type = Column(String(20), nullable=False, index=True, comment="事件类型")
     event_time = Column(Time, comment="事件时间")
@@ -110,3 +115,4 @@ class MarketReviewLimitUpEvent(Base):
     source_name = Column(String(20), nullable=False, comment="来源名称")
     payload_json = Column(JSON, default=dict, nullable=False, comment="事件载荷")
     created_at = Column(DateTime, default=datetime.now, nullable=False, comment="创建时间")
+    stock = relationship("Stock")
