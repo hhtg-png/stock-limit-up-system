@@ -23,6 +23,7 @@ webdriver-manager==4.0.1
 
 # 通达信数据
 pytdx==1.72
+akshare==1.16.88
 
 # 任务调度
 apscheduler==3.10.4
