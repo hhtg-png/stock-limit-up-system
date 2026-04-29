@@ -417,6 +417,66 @@ class MarketReviewPipelineServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([row.stock_code for row in event_rows_on_authoritative_date], ["600001"])
         self.assertEqual(event_rows_on_drift_date, [])
 
+    async def test_persist_payload_with_truthy_non_boolean_authority_raises_and_preserves_existing_rows(self):
+        service = MarketReviewPipelineService(session_factory=self.session_factory)
+        await service.run_for_date(
+            date(2026, 4, 28),
+            calc_version=1,
+            normalized=self._normalized_input(),
+        )
+
+        malformed_payload = {
+            "trade_date": date(2026, 4, 28),
+            "is_authoritative": "false",
+            "metric_row": {
+                "trade_date": date(2026, 4, 28),
+                "limit_up_count": 0,
+                "limit_down_count": 0,
+                "continuous_count": 0,
+                "max_board_height": 0,
+                "market_turnover": 0.0,
+                "up_count_ex_st": 0,
+                "down_count_ex_st": 0,
+                "source_status": "placeholder",
+                "calc_version": 2,
+            },
+            "stock_rows": [],
+            "event_rows": [],
+            "source_status": "placeholder",
+        }
+
+        async with self.session_factory() as session:
+            with self.assertRaisesRegex(RuntimeError, "authoritative|placeholder|incomplete"):
+                await service.persist_payload(session, malformed_payload)
+
+        async with self.session_factory() as session:
+            metric = (
+                await session.execute(
+                    select(MarketReviewDailyMetric).where(
+                        MarketReviewDailyMetric.trade_date == date(2026, 4, 28)
+                    )
+                )
+            ).scalar_one()
+            stock_rows = (
+                await session.execute(
+                    select(MarketReviewStockDaily).where(
+                        MarketReviewStockDaily.trade_date == date(2026, 4, 28)
+                    )
+                )
+            ).scalars().all()
+            event_rows = (
+                await session.execute(
+                    select(MarketReviewLimitUpEvent).where(
+                        MarketReviewLimitUpEvent.trade_date == date(2026, 4, 28)
+                    )
+                )
+            ).scalars().all()
+
+        self.assertEqual(metric.calc_version, 1)
+        self.assertEqual(metric.source_status, "stubbed")
+        self.assertEqual([row.stock_code for row in stock_rows], ["600001"])
+        self.assertEqual([row.stock_code for row in event_rows], ["600001"])
+
     async def test_run_for_date_with_placeholder_source_raises_and_preserves_existing_rows(self):
         service = MarketReviewPipelineService(session_factory=self.session_factory)
         await service.run_for_date(

@@ -186,7 +186,7 @@ class MarketReviewPipelineService:
         return False
 
     def _ensure_authoritative_payload(self, payload: Dict[str, Any]) -> None:
-        if payload.get("is_authoritative"):
+        if payload.get("is_authoritative") is True:
             return
         trade_date = payload.get("trade_date")
         source_status = payload.get("source_status") or (payload.get("metric_row") or {}).get("source_status")
