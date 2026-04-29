@@ -62,6 +62,7 @@ class MarketReviewDetailResponse(BaseModel):
     """市场复盘明细响应"""
 
     trade_date: date
+    is_fallback: bool = Field(False, description="是否回退到历史数据")
     stocks: list[MarketReviewStockItem] = Field(default_factory=list)
 
 
@@ -77,4 +78,5 @@ class MarketReviewLadderResponse(BaseModel):
     """市场复盘梯队响应"""
 
     trade_date: date
+    is_fallback: bool = Field(False, description="是否回退到历史数据")
     ladders: list[MarketReviewLadderItem] = Field(default_factory=list)

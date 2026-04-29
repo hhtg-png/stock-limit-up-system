@@ -1,6 +1,6 @@
 import asyncio
 import unittest
-from datetime import date
+from datetime import date, time
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
 import app.models  # noqa: F401
-from app.api.v1 import api_router
+from app.api.v1.review import router as review_router
 from app.database import Base, get_db
 from app.models.market_review import MarketReviewDailyMetric, MarketReviewStockDaily
 from app.models.stock import Stock
@@ -30,7 +30,7 @@ class MarketReviewApiTests(unittest.TestCase):
         asyncio.run(self._seed_data())
 
         self.app = FastAPI()
-        self.app.include_router(api_router, prefix="/api/v1")
+        self.app.include_router(review_router, prefix="/api/v1/statistics/review")
 
         async def override_get_db():
             async with self.session_factory() as session:
@@ -123,12 +123,12 @@ class MarketReviewApiTests(unittest.TestCase):
             )
             session.add_all(
                 [
-                    self._stock_row(1, "600001", "Alpha", 4, True, True, False, 7.1, 200000.0, "AI"),
-                    self._stock_row(2, "600002", "Beta", 4, True, True, False, 8.8, 300000.0, "Robotics"),
-                    self._stock_row(3, "600003", "Gamma", 3, True, False, True, 6.5, 400000.0, "Chip"),
-                    self._stock_row(4, "600004", "Delta", 2, False, False, True, 4.2, 50000.0, "EV"),
-                    self._stock_row(5, "600005", "Epsilon", 1, True, True, False, 2.5, 600000.0, "Retail"),
-                    self._stock_row(6, "600006", "Zeta", 2, True, True, False, 5.0, 250000.0, "Finance"),
+                    self._stock_row(1, "600001", "Alpha", 4, True, True, False, 7.1, 200000.0, "AI", time(9, 31)),
+                    self._stock_row(2, "600002", "Beta", 4, True, False, True, 8.8, 300000.0, "Robotics", time(9, 29)),
+                    self._stock_row(3, "600003", "Gamma", 3, True, False, True, 6.5, 400000.0, "Chip", time(9, 45)),
+                    self._stock_row(4, "600004", "Delta", 2, False, False, True, 4.2, 50000.0, "EV", time(10, 5)),
+                    self._stock_row(5, "600005", "Epsilon", 1, True, True, False, 2.5, 600000.0, "Retail", time(9, 40)),
+                    self._stock_row(6, "600006", "Zeta", 2, True, True, False, 5.0, 250000.0, "Finance", time(9, 35)),
                 ]
             )
             await session.commit()
@@ -145,6 +145,7 @@ class MarketReviewApiTests(unittest.TestCase):
         change_pct,
         amount,
         limit_up_reason,
+        first_limit_time,
     ):
         return MarketReviewStockDaily(
             trade_date=date(2026, 4, 28),
@@ -160,6 +161,7 @@ class MarketReviewApiTests(unittest.TestCase):
             today_opened_close=today_opened_close,
             today_broken=today_opened_close,
             today_continuous_days=today_continuous_days,
+            first_limit_time=first_limit_time,
             change_pct=change_pct,
             amount=amount,
             limit_up_reason=limit_up_reason,
@@ -210,14 +212,27 @@ class MarketReviewApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         self.assertEqual(payload["trade_date"], "2026-04-28")
+        self.assertEqual(payload["is_fallback"], False)
         self.assertEqual(
             [stock["stock_code"] for stock in payload["stocks"]],
             ["600002", "600001", "600003", "600006", "600004", "600005"],
         )
         self.assertEqual(payload["stocks"][0]["limit_up_reason"], "Robotics")
-        self.assertEqual(payload["stocks"][2]["today_opened_close"], True)
+        self.assertEqual(payload["stocks"][0]["today_opened_close"], True)
 
-    def test_ladder_endpoint_groups_descending_and_filters_non_qualifying_stocks(self):
+    def test_detail_endpoint_falls_back_to_latest_available_review_date(self):
+        response = self.client.get(
+            "/api/v1/statistics/review/detail",
+            params={"trade_date": "2026-05-02"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["trade_date"], "2026-04-28")
+        self.assertEqual(payload["is_fallback"], True)
+        self.assertEqual(payload["stocks"][0]["stock_code"], "600002")
+
+    def test_ladder_endpoint_groups_descending_filters_and_orders_sealed_before_opened(self):
         response = self.client.get(
             "/api/v1/statistics/review/ladder",
             params={"trade_date": "2026-04-28"},
@@ -226,6 +241,7 @@ class MarketReviewApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         self.assertEqual(payload["trade_date"], "2026-04-28")
+        self.assertEqual(payload["is_fallback"], False)
         self.assertEqual(
             [ladder["continuous_days"] for ladder in payload["ladders"]],
             [4, 3, 2],
@@ -233,7 +249,7 @@ class MarketReviewApiTests(unittest.TestCase):
         self.assertEqual(payload["ladders"][0]["count"], 2)
         self.assertEqual(
             [stock["stock_code"] for stock in payload["ladders"][0]["stocks"]],
-            ["600002", "600001"],
+            ["600001", "600002"],
         )
         ladder_stock_codes = {
             stock["stock_code"]
@@ -242,6 +258,18 @@ class MarketReviewApiTests(unittest.TestCase):
         }
         self.assertNotIn("600004", ladder_stock_codes)
         self.assertNotIn("600005", ladder_stock_codes)
+
+    def test_ladder_endpoint_falls_back_to_latest_available_review_date(self):
+        response = self.client.get(
+            "/api/v1/statistics/review/ladder",
+            params={"trade_date": "2026-05-02"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["trade_date"], "2026-04-28")
+        self.assertEqual(payload["is_fallback"], True)
+        self.assertEqual(payload["ladders"][0]["stocks"][0]["stock_code"], "600001")
 
 
 if __name__ == "__main__":

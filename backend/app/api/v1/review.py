@@ -4,7 +4,7 @@
 from datetime import date
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import select
+from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
@@ -20,6 +20,23 @@ from app.schemas.market_review import (
 )
 
 router = APIRouter()
+
+
+async def _resolve_review_trade_date(
+    db: AsyncSession,
+    requested_date: date,
+) -> tuple[date, bool]:
+    """按复盘明细表解析实际可用的交易日期。"""
+    result = await db.execute(
+        select(MarketReviewStockDaily.trade_date)
+        .where(MarketReviewStockDaily.trade_date <= requested_date)
+        .order_by(desc(MarketReviewStockDaily.trade_date))
+        .limit(1)
+    )
+    resolved_date = result.scalar_one_or_none()
+    if resolved_date is None:
+        return requested_date, False
+    return resolved_date, resolved_date != requested_date
 
 
 @router.get("/daily", response_model=MarketReviewDailyResponse, summary="获取复盘日级指标")
@@ -53,9 +70,10 @@ async def get_market_review_detail(
     db: AsyncSession = Depends(get_db),
 ):
     """获取指定交易日的市场复盘个股明细。"""
+    resolved_date, is_fallback = await _resolve_review_trade_date(db, trade_date)
     result = await db.execute(
         select(MarketReviewStockDaily)
-        .where(MarketReviewStockDaily.trade_date == trade_date)
+        .where(MarketReviewStockDaily.trade_date == resolved_date)
         .order_by(
             MarketReviewStockDaily.today_continuous_days.desc(),
             MarketReviewStockDaily.amount.desc(),
@@ -64,7 +82,8 @@ async def get_market_review_detail(
     stocks = [MarketReviewStockItem.model_validate(row) for row in result.scalars().all()]
 
     return MarketReviewDetailResponse(
-        trade_date=trade_date,
+        trade_date=resolved_date,
+        is_fallback=is_fallback,
         stocks=stocks,
     )
 
@@ -75,16 +94,19 @@ async def get_market_review_ladder(
     db: AsyncSession = Depends(get_db),
 ):
     """获取指定交易日的市场复盘连板梯队。"""
+    resolved_date, is_fallback = await _resolve_review_trade_date(db, trade_date)
     result = await db.execute(
         select(MarketReviewStockDaily)
         .where(
-            MarketReviewStockDaily.trade_date == trade_date,
+            MarketReviewStockDaily.trade_date == resolved_date,
             MarketReviewStockDaily.today_touched_limit_up.is_(True),
             MarketReviewStockDaily.today_continuous_days >= 2,
         )
         .order_by(
             MarketReviewStockDaily.today_continuous_days.desc(),
-            MarketReviewStockDaily.amount.desc(),
+            MarketReviewStockDaily.today_sealed_close.desc(),
+            MarketReviewStockDaily.first_limit_time.asc(),
+            MarketReviewStockDaily.stock_code.asc(),
         )
     )
 
@@ -105,6 +127,7 @@ async def get_market_review_ladder(
         current_ladder.count = len(current_ladder.stocks)
 
     return MarketReviewLadderResponse(
-        trade_date=trade_date,
+        trade_date=resolved_date,
+        is_fallback=is_fallback,
         ladders=ladders,
     )
