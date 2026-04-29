@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import date, datetime, time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 from typing import Any, Awaitable, Callable, Dict, Iterable, Optional
 
@@ -29,6 +30,9 @@ class MarketReviewSourceService:
     """Collects authoritative market-review inputs from existing market sources."""
 
     YESTERDAY_POOL_API = "https://push2ex.eastmoney.com/getYesterdayZTPool"
+    EASTMONEY_STOCK_KLINE_API = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+    HISTORICAL_BREADTH_WINDOW_DAYS = 60
+    HISTORICAL_BREADTH_MAX_WORKERS = 16
 
     def __init__(
         self,
@@ -45,6 +49,7 @@ class MarketReviewSourceService:
         self.quote_fetcher = quote_fetcher or tencent_api.get_quotes_batch
         self.market_stats_fetcher = market_stats_fetcher or self._fetch_market_stats
         self.current_date_provider = current_date_provider
+        self._historical_market_stats_cache: Dict[date, Dict[str, Any]] = {}
 
     async def collect_for_date(self, trade_date: date) -> Dict[str, Any]:
         today_result, yesterday_result, market_stats = await asyncio.gather(
@@ -176,7 +181,15 @@ class MarketReviewSourceService:
     async def _fetch_market_stats(self, trade_date: date) -> Dict[str, Any]:
         stored_stats = await self._load_daily_statistics(trade_date)
         if trade_date != self.current_date_provider():
-            return stored_stats
+            try:
+                historical_stats = await asyncio.to_thread(
+                    self._fetch_historical_market_stats_sync,
+                    trade_date,
+                )
+            except Exception as exc:
+                logger.warning(f"Historical market stats fetch failed for {trade_date}: {exc}")
+                historical_stats = {}
+            return self._merge_market_stats(historical_stats, stored_stats)
 
         try:
             live_stats = await asyncio.to_thread(self._fetch_live_market_stats_sync)
@@ -187,28 +200,7 @@ class MarketReviewSourceService:
         if not live_stats:
             return stored_stats
 
-        return {
-            "limit_down_count": int(
-                live_stats.get("limit_down_count")
-                or stored_stats.get("limit_down_count", 0)
-                or 0
-            ),
-            "market_turnover": float(
-                live_stats.get("market_turnover")
-                or stored_stats.get("market_turnover", 0.0)
-                or 0.0
-            ),
-            "up_count_ex_st": int(
-                live_stats.get("up_count_ex_st")
-                or stored_stats.get("up_count_ex_st", 0)
-                or 0
-            ),
-            "down_count_ex_st": int(
-                live_stats.get("down_count_ex_st")
-                or stored_stats.get("down_count_ex_st", 0)
-                or 0
-            ),
-        }
+        return self._merge_market_stats(live_stats, stored_stats)
 
     async def _load_daily_statistics(self, trade_date: date) -> Dict[str, Any]:
         async with self.session_factory() as session:
@@ -226,6 +218,202 @@ class MarketReviewSourceService:
             "up_count_ex_st": int(stats.up_count or 0),
             "down_count_ex_st": int(stats.down_count or 0),
         }
+
+    def _fetch_historical_market_stats_sync(self, trade_date: date) -> Dict[str, Any]:
+        stats = dict(self._historical_market_stats_cache.get(trade_date) or {})
+
+        try:
+            exchange_turnover = self._fetch_exchange_market_turnover_sync(trade_date)
+            if exchange_turnover:
+                stats["market_turnover"] = exchange_turnover
+        except Exception as exc:
+            logger.warning(f"Exchange market turnover fetch failed for {trade_date}: {exc}")
+
+        if not self._historical_breadth_present(stats):
+            try:
+                stats.update(self._fetch_historical_market_breadth_sync(trade_date))
+            except Exception as exc:
+                logger.warning(f"Historical market breadth fetch failed for {trade_date}: {exc}")
+
+        if stats:
+            cached = dict(self._historical_market_stats_cache.get(trade_date) or {})
+            cached.update(stats)
+            self._historical_market_stats_cache[trade_date] = cached
+        return stats
+
+    def _fetch_exchange_market_turnover_sync(self, trade_date: date) -> float:
+        import akshare as ak
+
+        trade_date_str = trade_date.strftime("%Y%m%d")
+        sse_df = ak.stock_sse_deal_daily(date=trade_date_str)
+        szse_df = ak.stock_szse_summary(date=trade_date_str)
+        return self._extract_exchange_market_turnover(sse_df, szse_df)
+
+    def _extract_exchange_market_turnover(self, sse_df: Any, szse_df: Any) -> float:
+        sse_turnover = self._extract_numeric_from_frame(
+            sse_df,
+            row_column="单日情况",
+            row_value="成交金额",
+            value_column="股票",
+        )
+        szse_turnover_yuan = self._extract_numeric_from_frame(
+            szse_df,
+            row_column="证券类别",
+            row_value="股票",
+            value_column="成交金额",
+        )
+        szse_turnover = szse_turnover_yuan / 100000000 if szse_turnover_yuan else 0.0
+        return round(float(sse_turnover or 0.0) + float(szse_turnover or 0.0), 2)
+
+    def _extract_numeric_from_frame(
+        self,
+        frame: Any,
+        row_column: str,
+        row_value: str,
+        value_column: str,
+    ) -> float:
+        if frame is None or getattr(frame, "empty", True):
+            return 0.0
+        if row_column not in frame or value_column not in frame:
+            return 0.0
+
+        matches = frame[frame[row_column].astype(str) == row_value]
+        if matches.empty:
+            return 0.0
+        return self._to_float(matches.iloc[0][value_column]) or 0.0
+
+    def _fetch_historical_market_breadth_sync(self, trade_date: date) -> Dict[str, Any]:
+        if self._historical_breadth_present(self._historical_market_stats_cache.get(trade_date, {})):
+            return self._historical_market_stats_cache[trade_date]
+
+        import akshare as ak
+
+        stock_df = ak.stock_info_a_code_name()
+        if stock_df is None or stock_df.empty:
+            return {}
+
+        end_date = self._resolve_historical_breadth_end_date(trade_date)
+        start_date = trade_date
+        stock_rows = [
+            {
+                "code": self._normalize_code(row.get("code")),
+                "name": str(row.get("name") or ""),
+            }
+            for row in stock_df.to_dict("records")
+        ]
+        stock_rows = [
+            row
+            for row in stock_rows
+            if row["code"] and row["code"][0] in {"0", "3", "4", "6", "8", "9"}
+        ]
+
+        window_stats: Dict[date, Dict[str, Any]] = {}
+        with ThreadPoolExecutor(max_workers=self.HISTORICAL_BREADTH_MAX_WORKERS) as executor:
+            futures = [
+                executor.submit(
+                    self._fetch_one_stock_history_stats,
+                    row["code"],
+                    row["name"],
+                    start_date,
+                    end_date,
+                )
+                for row in stock_rows
+            ]
+            for future in as_completed(futures):
+                for row_date, row_stats in future.result().items():
+                    target = window_stats.setdefault(
+                        row_date,
+                        {
+                            "limit_down_count": 0,
+                            "up_count_ex_st": 0,
+                            "down_count_ex_st": 0,
+                        },
+                    )
+                    target["limit_down_count"] += row_stats.get("limit_down_count", 0)
+                    target["up_count_ex_st"] += row_stats.get("up_count_ex_st", 0)
+                    target["down_count_ex_st"] += row_stats.get("down_count_ex_st", 0)
+
+        for row_date, row_stats in window_stats.items():
+            cached = dict(self._historical_market_stats_cache.get(row_date) or {})
+            cached.update(row_stats)
+            self._historical_market_stats_cache[row_date] = cached
+
+        return self._historical_market_stats_cache.get(trade_date, {})
+
+    def _fetch_one_stock_history_stats(
+        self,
+        stock_code: str,
+        stock_name: str,
+        start_date: date,
+        end_date: date,
+    ) -> Dict[date, Dict[str, int]]:
+        import requests
+
+        params = {
+            "fields1": "f1,f2,f3,f4,f5,f6",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+            "ut": "7eea3edcaed734bea9cbfc24409ed989",
+            "klt": "101",
+            "fqt": "0",
+            "secid": f"{self._eastmoney_market_code(stock_code)}.{stock_code}",
+            "beg": start_date.strftime("%Y%m%d"),
+            "end": end_date.strftime("%Y%m%d"),
+        }
+        try:
+            session = requests.Session()
+            session.trust_env = False
+            response = session.get(
+                self.EASTMONEY_STOCK_KLINE_API,
+                params=params,
+                headers={
+                    "User-Agent": settings.CRAWLER_USER_AGENT,
+                    "Referer": "https://quote.eastmoney.com/",
+                },
+                timeout=settings.CRAWLER_REQUEST_TIMEOUT,
+            )
+            response.raise_for_status()
+            klines = ((response.json().get("data") or {}).get("klines") or [])
+        except Exception:
+            return {}
+
+        stats: Dict[date, Dict[str, int]] = {}
+        is_st = self._is_st_name(stock_name)
+        for raw_line in klines:
+            parts = str(raw_line).split(",")
+            if len(parts) < 9:
+                continue
+            try:
+                row_date = datetime.strptime(parts[0], "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            change_pct = self._to_float(parts[8])
+            if change_pct is None:
+                continue
+            row_stats = stats.setdefault(
+                row_date,
+                {
+                    "limit_down_count": 0,
+                    "up_count_ex_st": 0,
+                    "down_count_ex_st": 0,
+                },
+            )
+            if self._is_limit_down(change_pct, stock_code, stock_name):
+                row_stats["limit_down_count"] += 1
+            if not is_st and change_pct > 0:
+                row_stats["up_count_ex_st"] += 1
+            if not is_st and change_pct < 0:
+                row_stats["down_count_ex_st"] += 1
+
+        return stats
+
+    def _resolve_historical_breadth_end_date(self, trade_date: date) -> date:
+        current_date = self.current_date_provider()
+        if current_date <= trade_date:
+            return trade_date
+        return min(
+            current_date,
+            trade_date + timedelta(days=self.HISTORICAL_BREADTH_WINDOW_DAYS),
+        )
 
     def _fetch_live_market_stats_sync(self) -> Dict[str, Any]:
         import akshare as ak
@@ -258,6 +446,36 @@ class MarketReviewSourceService:
             "up_count_ex_st": int(((changes > 0) & non_st_mask).sum()),
             "down_count_ex_st": int(((changes < 0) & non_st_mask).sum()),
         }
+
+    def _merge_market_stats(self, primary: Dict[str, Any], fallback: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "limit_down_count": int(
+                primary.get("limit_down_count")
+                or fallback.get("limit_down_count", 0)
+                or 0
+            ),
+            "market_turnover": float(
+                primary.get("market_turnover")
+                or fallback.get("market_turnover", 0.0)
+                or 0.0
+            ),
+            "up_count_ex_st": int(
+                primary.get("up_count_ex_st")
+                or fallback.get("up_count_ex_st", 0)
+                or 0
+            ),
+            "down_count_ex_st": int(
+                primary.get("down_count_ex_st")
+                or fallback.get("down_count_ex_st", 0)
+                or 0
+            ),
+        }
+
+    def _historical_breadth_present(self, stats: Dict[str, Any]) -> bool:
+        return any(
+            stats.get(field) not in (None, 0, 0.0)
+            for field in ("limit_down_count", "up_count_ex_st", "down_count_ex_st")
+        )
 
     def _build_stock_meta(
         self,
@@ -670,6 +888,9 @@ class MarketReviewSourceService:
         if code.startswith(("sh", "sz", "bj")):
             code = code[2:]
         return code.zfill(6) if code.isdigit() else ""
+
+    def _eastmoney_market_code(self, stock_code: str) -> int:
+        return 1 if stock_code.startswith("6") else 0
 
     def _is_st_name(self, stock_name: Any) -> bool:
         name = str(stock_name or "")

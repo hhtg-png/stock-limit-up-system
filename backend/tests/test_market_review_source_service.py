@@ -1,6 +1,7 @@
 import unittest
 from datetime import date, datetime
 
+import pandas as pd
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -164,6 +165,57 @@ class MarketReviewSourceServiceTests(unittest.IsolatedAsyncioTestCase):
             ).scalars().all()
 
         self.assertEqual(stock_codes, ["600001", "600002"])
+
+    async def test_historical_market_stats_are_loaded_when_daily_statistics_are_missing(self):
+        called = {}
+
+        class HistoricalStatsService(MarketReviewSourceService):
+            def _fetch_historical_market_stats_sync(self, trade_date):
+                called["trade_date"] = trade_date
+                return {
+                    "limit_down_count": 20,
+                    "market_turnover": 26419.0,
+                    "up_count_ex_st": 1994,
+                    "down_count_ex_st": 3085,
+                }
+
+        service = HistoricalStatsService(
+            session_factory=self.session_factory,
+            current_date_provider=lambda: date(2026, 4, 29),
+        )
+
+        stats = await service._fetch_market_stats(date(2026, 4, 24))
+
+        self.assertEqual(
+            stats,
+            {
+                "limit_down_count": 20,
+                "market_turnover": 26419.0,
+                "up_count_ex_st": 1994,
+                "down_count_ex_st": 3085,
+            },
+        )
+        self.assertEqual(called["trade_date"], date(2026, 4, 24))
+
+    def test_extract_exchange_market_turnover_normalizes_sse_and_szse_units(self):
+        service = MarketReviewSourceService(
+            session_factory=self.session_factory,
+            current_date_provider=lambda: date(2026, 4, 29),
+        )
+        sse_df = pd.DataFrame(
+            [
+                {"单日情况": "成交金额", "股票": 11274.75},
+            ]
+        )
+        szse_df = pd.DataFrame(
+            [
+                {"证券类别": "股票", "成交金额": 1465264000000.0},
+            ]
+        )
+
+        turnover = service._extract_exchange_market_turnover(sse_df, szse_df)
+
+        self.assertAlmostEqual(turnover, 25927.39)
 
     async def test_collect_for_date_returns_placeholder_when_all_sources_are_empty(self):
         async def empty_fetcher(_trade_date):
