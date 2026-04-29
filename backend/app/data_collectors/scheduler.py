@@ -10,6 +10,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from loguru import logger
 
 from app.config import settings
+from app.services.market_review_pipeline_service import market_review_pipeline_service
 from app.utils.time_utils import is_trading_time, get_market_status
 
 
@@ -71,6 +72,30 @@ class DataScheduler:
             id="clear_cache",
             name="每日缓存清理"
         )
+
+        if settings.MARKET_REVIEW_ENABLED:
+            self.scheduler.add_job(
+                self._build_market_review,
+                CronTrigger(
+                    hour=settings.MARKET_REVIEW_BUILD_HOUR,
+                    minute=settings.MARKET_REVIEW_BUILD_MINUTE,
+                ),
+                id="market_review_build",
+                name="市场复盘构建",
+                max_instances=1,
+            )
+
+            if settings.MARKET_REVIEW_REPAIR_ENABLED:
+                self.scheduler.add_job(
+                    self._repair_market_review,
+                    CronTrigger(
+                        hour=settings.MARKET_REVIEW_REPAIR_HOUR,
+                        minute=settings.MARKET_REVIEW_REPAIR_MINUTE,
+                    ),
+                    id="market_review_repair",
+                    name="市场复盘修复",
+                    max_instances=1,
+                )
         
         self.scheduler.start()
         self._is_running = True
@@ -360,6 +385,22 @@ class DataScheduler:
         
         except Exception as e:
             logger.error(f"Clear cache error: {e}")
+
+    async def _build_market_review(self):
+        """构建当日市场复盘数据"""
+        try:
+            await market_review_pipeline_service.run_for_date(date.today(), calc_version=1)
+            logger.info("Market review build completed")
+        except Exception as e:
+            logger.error(f"Market review build error: {e}")
+
+    async def _repair_market_review(self):
+        """修复当日市场复盘数据"""
+        try:
+            await market_review_pipeline_service.run_for_date(date.today(), calc_version=2)
+            logger.info("Market review repair completed")
+        except Exception as e:
+            logger.error(f"Market review repair error: {e}")
 
 
 # 全局调度器实例
