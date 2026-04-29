@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date
 from typing import Any, Dict, Iterable, Optional
 
+from sqlalchemy import delete
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -72,13 +73,12 @@ class MarketReviewPipelineService:
         metric_row = dict(payload.get("metric_row") or {})
         stock_rows = [dict(row) for row in payload.get("stock_rows") or []]
         event_rows = [dict(row) for row in payload.get("event_rows") or []]
+        trade_date = self._resolve_trade_date(payload, metric_row, stock_rows, event_rows)
 
         if metric_row:
             await self._upsert_metric_row(db, metric_row)
-        if stock_rows:
-            await self._upsert_stock_rows(db, stock_rows)
-        if event_rows:
-            await self._upsert_event_rows(db, event_rows)
+        if trade_date is not None:
+            await self._replace_trade_date_rows(db, trade_date, stock_rows, event_rows)
 
         return {
             "metric_rows": 1 if metric_row else 0,
@@ -147,6 +147,47 @@ class MarketReviewPipelineService:
                     set_=update_values,
                 )
             )
+
+    async def _replace_trade_date_rows(
+        self,
+        db: AsyncSession,
+        trade_date: date,
+        stock_rows: Iterable[Dict[str, Any]],
+        event_rows: Iterable[Dict[str, Any]],
+    ) -> None:
+        await db.execute(
+            delete(MarketReviewStockDaily).where(MarketReviewStockDaily.trade_date == trade_date)
+        )
+        await db.execute(
+            delete(MarketReviewLimitUpEvent).where(MarketReviewLimitUpEvent.trade_date == trade_date)
+        )
+        if stock_rows:
+            await self._upsert_stock_rows(db, stock_rows)
+        if event_rows:
+            await self._upsert_event_rows(db, event_rows)
+
+    def _resolve_trade_date(
+        self,
+        payload: Dict[str, Any],
+        metric_row: Dict[str, Any],
+        stock_rows: Iterable[Dict[str, Any]],
+        event_rows: Iterable[Dict[str, Any]],
+    ) -> Optional[date]:
+        candidates = [
+            payload.get("trade_date"),
+            metric_row.get("trade_date"),
+        ]
+        first_stock_row = next(iter(stock_rows), None)
+        first_event_row = next(iter(event_rows), None)
+        if first_stock_row is not None:
+            candidates.append(first_stock_row.get("trade_date"))
+        if first_event_row is not None:
+            candidates.append(first_event_row.get("trade_date"))
+
+        for candidate in candidates:
+            if isinstance(candidate, date):
+                return candidate
+        return None
 
     def _filter_model_columns(self, model, row: Dict[str, Any]) -> Dict[str, Any]:
         allowed_columns = set(model.__table__.columns.keys())

@@ -14,6 +14,10 @@ from app.services.market_review_pipeline_service import market_review_pipeline_s
 from app.utils.time_utils import CN_TZ, get_market_status, is_trading_time, today_cn
 
 
+class TradingCalendarLookupError(RuntimeError):
+    """Raised when the China trading calendar cannot be loaded reliably."""
+
+
 def _normalize_trade_calendar_date(raw_value) -> Optional[date]:
     if isinstance(raw_value, date):
         return raw_value
@@ -33,12 +37,14 @@ def _get_cn_trading_dates(start_date: date, end_date: date) -> List[date]:
 
         calendar_df = ak.tool_trade_date_hist_sina()
     except Exception as exc:
-        logger.warning(f"Unable to resolve China trading calendar, skipping market review work: {exc}")
-        return []
+        raise TradingCalendarLookupError(
+            f"Unable to resolve China trading calendar for market review work: {exc}"
+        ) from exc
 
     if "trade_date" not in calendar_df:
-        logger.warning("China trading calendar missing trade_date column, skipping market review work")
-        return []
+        raise TradingCalendarLookupError(
+            "China trading calendar missing trade_date column for market review work"
+        )
 
     trading_dates: List[date] = []
     for raw_value in calendar_df["trade_date"].tolist():
@@ -444,6 +450,7 @@ class DataScheduler:
             logger.info("Market review build completed")
         except Exception as e:
             logger.error(f"Market review build error: {e}")
+            raise
 
     async def _repair_market_review(self):
         """修复当日市场复盘数据"""
@@ -456,6 +463,7 @@ class DataScheduler:
             logger.info("Market review repair completed")
         except Exception as e:
             logger.error(f"Market review repair error: {e}")
+            raise
 
 
 # 全局调度器实例

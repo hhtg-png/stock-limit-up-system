@@ -16,6 +16,10 @@ if str(BACKEND_DIR) not in sys.path:
 from app.services.market_review_pipeline_service import market_review_pipeline_service
 
 
+class TradingCalendarLookupError(RuntimeError):
+    """Raised when the China trading calendar cannot be loaded reliably."""
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Backfill market review data for a date range.")
     parser.add_argument("--start", required=True, help="Start date in YYYY-MM-DD format.")
@@ -52,12 +56,14 @@ def _get_cn_trading_dates(start_date: date, end_date: date):
 
         calendar_df = ak.tool_trade_date_hist_sina()
     except Exception as exc:
-        logger.warning(f"Unable to resolve China trading calendar for market review backfill: {exc}")
-        return []
+        raise TradingCalendarLookupError(
+            f"Unable to resolve China trading calendar for market review backfill: {exc}"
+        ) from exc
 
     if "trade_date" not in calendar_df:
-        logger.warning("China trading calendar missing trade_date column for market review backfill")
-        return []
+        raise TradingCalendarLookupError(
+            "China trading calendar missing trade_date column for market review backfill"
+        )
 
     trading_dates = []
     for raw_value in calendar_df["trade_date"].tolist():

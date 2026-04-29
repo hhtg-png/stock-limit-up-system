@@ -1,3 +1,4 @@
+import copy
 import unittest
 from datetime import date, time
 
@@ -37,16 +38,27 @@ class MarketReviewPipelineServiceTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with self.session_factory() as session:
-            session.add(
-                Stock(
-                    id=1,
-                    stock_code="600001",
-                    stock_name="Alpha",
-                    market="SH",
-                    is_st=0,
-                    is_kc=0,
-                    is_cy=0,
-                )
+            session.add_all(
+                [
+                    Stock(
+                        id=1,
+                        stock_code="600001",
+                        stock_name="Alpha",
+                        market="SH",
+                        is_st=0,
+                        is_kc=0,
+                        is_cy=0,
+                    ),
+                    Stock(
+                        id=2,
+                        stock_code="600002",
+                        stock_name="Beta",
+                        market="SH",
+                        is_st=0,
+                        is_kc=0,
+                        is_cy=0,
+                    ),
+                ]
             )
             await session.commit()
 
@@ -260,6 +272,76 @@ class MarketReviewPipelineServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(stock_row.amount, 321000.0)
         self.assertAlmostEqual(stock_row.turnover_rate, 18.88)
         self.assertEqual(event_row.payload_json, {"note": "updated without commit"})
+
+    async def test_persist_payload_replaces_existing_trade_date_snapshot(self):
+        service = MarketReviewPipelineService(session_factory=self.session_factory)
+        first_normalized = self._normalized_input()
+        second_stock = copy.deepcopy(first_normalized["stock_rows"][0])
+        second_stock.update(
+            {
+                "stock_id": 2,
+                "stock_code": "600002",
+                "stock_name": "Beta",
+                "limit_up_reason": "Robotics",
+            }
+        )
+        second_event = copy.deepcopy(first_normalized["event_rows"][0])
+        second_event.update(
+            {
+                "stock_id": 2,
+                "stock_code": "600002",
+                "stock_name": "Beta",
+                "payload_json": {"note": "beta"},
+            }
+        )
+        first_normalized["stock_rows"].append(second_stock)
+        first_normalized["event_rows"].append(second_event)
+
+        second_normalized = self._normalized_input()
+        second_normalized["stock_rows"][0]["stock_name"] = "Alpha Rebuilt"
+        second_normalized["event_rows"] = []
+
+        first_payload = await service.build_payload_for_date(
+            date(2026, 4, 28),
+            normalized=first_normalized,
+        )
+        second_payload = await service.build_payload_for_date(
+            date(2026, 4, 28),
+            normalized=second_normalized,
+        )
+
+        async with self.session_factory() as session:
+            await service.persist_payload(session, first_payload)
+            await service.persist_payload(session, second_payload)
+            await session.commit()
+
+        async with self.session_factory() as session:
+            metric = (
+                await session.execute(
+                    select(MarketReviewDailyMetric).where(
+                        MarketReviewDailyMetric.trade_date == date(2026, 4, 28)
+                    )
+                )
+            ).scalar_one()
+            stock_rows = (
+                await session.execute(
+                    select(MarketReviewStockDaily).where(
+                        MarketReviewStockDaily.trade_date == date(2026, 4, 28)
+                    )
+                )
+            ).scalars().all()
+            event_rows = (
+                await session.execute(
+                    select(MarketReviewLimitUpEvent).where(
+                        MarketReviewLimitUpEvent.trade_date == date(2026, 4, 28)
+                    )
+                )
+            ).scalars().all()
+
+        self.assertEqual(metric.limit_up_count, 1)
+        self.assertEqual([row.stock_code for row in stock_rows], ["600001"])
+        self.assertEqual(stock_rows[0].stock_name, "Alpha Rebuilt")
+        self.assertEqual(event_rows, [])
 
 
 if __name__ == "__main__":
