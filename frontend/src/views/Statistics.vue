@@ -29,7 +29,7 @@
           <div class="card-header">
             <div>
               <h3>连板高度</h3>
-              <p>龙头高度、二板家数与创业板涨停梯度。</p>
+              <p>龙头高度、次高板高度与创业板高度。</p>
             </div>
           </div>
           <div ref="boardHeightChartRef" class="chart-container"></div>
@@ -261,6 +261,7 @@ let yesterdayChangeChart: echarts.ECharts | null = null
 let limitTrendChart: echarts.ECharts | null = null
 let breadthChart: echarts.ECharts | null = null
 let amountChart: echarts.ECharts | null = null
+let fetchSequence = 0
 
 const detailStocks = computed(() => detailResponse.value?.stocks ?? [])
 const ladderLevels = computed(() => ladderResponse.value?.ladders ?? [])
@@ -453,7 +454,7 @@ function updateCharts() {
           itemStyle: { color: '#f5222d' }
         },
         {
-          name: '二板家数',
+          name: '次高板高度',
           type: 'line',
           smooth: true,
           symbol: 'circle',
@@ -461,7 +462,7 @@ function updateCharts() {
           itemStyle: { color: '#fa8c16' }
         },
         {
-          name: '创业板涨停',
+          name: '创业板高度',
           type: 'line',
           smooth: true,
           symbol: 'circle',
@@ -703,29 +704,60 @@ function disposeCharts() {
 
 async function fetchData() {
   const { startDate, endDate } = getDateRange()
-  activeStartDate.value = startDate
-  activeEndDate.value = endDate
+  const currentSequence = ++fetchSequence
   loading.value = true
 
-  try {
-    const [dailyResponse, detail, ladder] = await Promise.all([
-      getMarketReviewDaily({
-        start_date: startDate,
-        end_date: endDate
-      }),
-      getMarketReviewDetail(endDate),
-      getMarketReviewLadder(endDate)
-    ])
+  const [dailyResult, detailResult, ladderResult] = await Promise.allSettled([
+    getMarketReviewDaily({
+      start_date: startDate,
+      end_date: endDate
+    }),
+    getMarketReviewDetail(endDate),
+    getMarketReviewLadder(endDate)
+  ])
 
-    dailySeries.value = dailyResponse.data.series
-    dailyRows.value = dailyResponse.data.rows
-    detailResponse.value = detail
-    ladderResponse.value = ladder
-    updateCharts()
-  } catch (error) {
-    console.error('Fetch market review error:', error)
+  if (currentSequence !== fetchSequence) {
+    return
+  }
+
+  activeStartDate.value = startDate
+  activeEndDate.value = endDate
+
+  let hasError = false
+
+  if (dailyResult.status === 'fulfilled') {
+    dailySeries.value = dailyResult.value.data.series
+    dailyRows.value = dailyResult.value.data.rows
+  } else {
+    console.error('Fetch market review daily error:', dailyResult.reason)
+    dailySeries.value = []
+    dailyRows.value = []
+    hasError = true
+  }
+
+  if (detailResult.status === 'fulfilled') {
+    detailResponse.value = detailResult.value
+  } else {
+    console.error('Fetch market review detail error:', detailResult.reason)
+    detailResponse.value = null
+    hasError = true
+  }
+
+  if (ladderResult.status === 'fulfilled') {
+    ladderResponse.value = ladderResult.value
+  } else {
+    console.error('Fetch market review ladder error:', ladderResult.reason)
+    ladderResponse.value = null
+    hasError = true
+  }
+
+  updateCharts()
+
+  if (hasError) {
     ElMessage.error('获取市场复盘数据失败')
-  } finally {
+  }
+
+  if (currentSequence === fetchSequence) {
     loading.value = false
   }
 }
