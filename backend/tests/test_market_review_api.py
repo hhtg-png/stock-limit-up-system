@@ -1,6 +1,9 @@
 import asyncio
+import importlib.util
+import sys
 import unittest
 from datetime import date, time
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -8,13 +11,27 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
 import app.models  # noqa: F401
-from app.api.v1.review import router as review_router
 from app.database import Base, get_db
 from app.models.market_review import MarketReviewDailyMetric, MarketReviewStockDaily
 from app.models.stock import Stock
 
 
+def _load_review_router():
+    review_module_path = Path(__file__).resolve().parents[1] / "app" / "api" / "v1" / "review.py"
+    spec = importlib.util.spec_from_file_location("isolated_market_review_router", review_module_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module.router
+
+
+review_router = _load_review_router()
+
+
 class MarketReviewApiTests(unittest.TestCase):
+    def test_review_router_import_does_not_execute_api_v1_package(self):
+        self.assertNotIn("app.api.v1", sys.modules)
+
     def setUp(self):
         self.engine = create_async_engine(
             "sqlite+aiosqlite://",
