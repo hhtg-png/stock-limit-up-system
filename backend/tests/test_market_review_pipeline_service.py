@@ -108,8 +108,14 @@ class MarketReviewPipelineServiceTests(unittest.IsolatedAsyncioTestCase):
         payload = await service.build_payload_for_date(date(2026, 4, 28), normalized=normalized)
 
         self.assertEqual(payload["trade_date"], date(2026, 4, 28))
-        self.assertIs(payload["stock_rows"], normalized["stock_rows"])
-        self.assertIs(payload["event_rows"], normalized["event_rows"])
+        self.assertIsNot(payload["stock_rows"], normalized["stock_rows"])
+        self.assertIsNot(payload["event_rows"], normalized["event_rows"])
+        self.assertIsNot(payload["stock_rows"][0], normalized["stock_rows"][0])
+        self.assertIsNot(payload["event_rows"][0], normalized["event_rows"][0])
+        self.assertEqual(payload["stock_rows"][0]["trade_date"], date(2026, 4, 28))
+        self.assertEqual(payload["event_rows"][0]["trade_date"], date(2026, 4, 28))
+        self.assertNotIn("trade_date", normalized["stock_rows"][0])
+        self.assertNotIn("trade_date", normalized["event_rows"][0])
         self.assertEqual(payload["metric_row"]["trade_date"], date(2026, 4, 28))
         self.assertEqual(payload["metric_row"]["limit_up_count"], 1)
         self.assertEqual(payload["metric_row"]["limit_down_count"], 3)
@@ -129,6 +135,20 @@ class MarketReviewPipelineServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(source_service.called_with, date(2026, 4, 28))
         self.assertEqual(payload["metric_row"]["source_status"], "stubbed")
+
+    async def test_build_payload_for_date_reusing_normalized_input_does_not_leak_first_trade_date(self):
+        normalized = self._normalized_input()
+        service = MarketReviewPipelineService()
+
+        first_payload = await service.build_payload_for_date(date(2026, 4, 28), normalized=normalized)
+        second_payload = await service.build_payload_for_date(date(2026, 4, 29), normalized=normalized)
+
+        self.assertEqual(first_payload["stock_rows"][0]["trade_date"], date(2026, 4, 28))
+        self.assertEqual(first_payload["event_rows"][0]["trade_date"], date(2026, 4, 28))
+        self.assertEqual(second_payload["stock_rows"][0]["trade_date"], date(2026, 4, 29))
+        self.assertEqual(second_payload["event_rows"][0]["trade_date"], date(2026, 4, 29))
+        self.assertNotIn("trade_date", normalized["stock_rows"][0])
+        self.assertNotIn("trade_date", normalized["event_rows"][0])
 
     async def test_persist_payload_upserts_metric_stock_and_event_rows(self):
         service = MarketReviewPipelineService(session_factory=self.session_factory)
@@ -158,6 +178,7 @@ class MarketReviewPipelineServiceTests(unittest.IsolatedAsyncioTestCase):
         async with self.session_factory() as session:
             await service.persist_payload(session, first_payload)
             await service.persist_payload(session, second_payload)
+            await session.commit()
 
         async with self.session_factory() as session:
             metric_rows = (await session.execute(select(MarketReviewDailyMetric))).scalars().all()
@@ -190,6 +211,55 @@ class MarketReviewPipelineServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event_row.event_type, "seal")
         self.assertEqual(event_row.event_seq, 1)
         self.assertEqual(event_row.payload_json, {"note": "updated"})
+
+    async def test_persist_payload_upserts_heterogeneous_rows_and_leaves_commit_to_caller(self):
+        service = MarketReviewPipelineService(session_factory=self.session_factory)
+        first_payload = await service.build_payload_for_date(
+            date(2026, 4, 28),
+            normalized=self._normalized_input(),
+        )
+
+        updated_normalized = self._normalized_input()
+        updated_normalized["stock_rows"][0].pop("today_opened_close")
+        updated_normalized["stock_rows"][0]["today_broken"] = True
+        updated_normalized["stock_rows"][0]["amount"] = 321000.0
+        updated_normalized["stock_rows"][0]["turnover_rate"] = 18.88
+        updated_normalized["event_rows"][0]["payload_json"] = {"note": "updated without commit"}
+        second_payload = await service.build_payload_for_date(
+            date(2026, 4, 28),
+            normalized=updated_normalized,
+        )
+
+        async with self.session_factory() as session:
+            await service.persist_payload(session, first_payload)
+            self.assertTrue(session.in_transaction())
+            await service.persist_payload(session, second_payload)
+            self.assertTrue(session.in_transaction())
+            await session.commit()
+
+        async with self.session_factory() as session:
+            stock_row = (
+                await session.execute(
+                    select(MarketReviewStockDaily).where(
+                        MarketReviewStockDaily.trade_date == date(2026, 4, 28),
+                        MarketReviewStockDaily.stock_code == "600001",
+                    )
+                )
+            ).scalar_one()
+            event_row = (
+                await session.execute(
+                    select(MarketReviewLimitUpEvent).where(
+                        MarketReviewLimitUpEvent.trade_date == date(2026, 4, 28),
+                        MarketReviewLimitUpEvent.stock_code == "600001",
+                    )
+                )
+            ).scalar_one()
+
+        self.assertFalse(stock_row.today_opened_close)
+        self.assertTrue(stock_row.today_broken)
+        self.assertAlmostEqual(stock_row.amount, 321000.0)
+        self.assertAlmostEqual(stock_row.turnover_rate, 18.88)
+        self.assertEqual(event_row.payload_json, {"note": "updated without commit"})
 
 
 if __name__ == "__main__":

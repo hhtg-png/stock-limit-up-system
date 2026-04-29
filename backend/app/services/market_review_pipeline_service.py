@@ -41,13 +41,14 @@ class MarketReviewPipelineService:
         normalized: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         normalized_data = normalized or await self.source_service.collect_for_date(trade_date)
-        stock_rows = normalized_data.get("stock_rows") or []
-        event_rows = normalized_data.get("event_rows") or []
-
-        for row in stock_rows:
-            row.setdefault("trade_date", trade_date)
-        for row in event_rows:
-            row.setdefault("trade_date", trade_date)
+        stock_rows = [
+            {**row, "trade_date": trade_date}
+            for row in (normalized_data.get("stock_rows") or [])
+        ]
+        event_rows = [
+            {**row, "trade_date": trade_date}
+            for row in (normalized_data.get("event_rows") or [])
+        ]
 
         metric_row = self.metrics_service.aggregate_daily_metrics(
             trade_date=trade_date,
@@ -79,7 +80,6 @@ class MarketReviewPipelineService:
         if event_rows:
             await self._upsert_event_rows(db, event_rows)
 
-        await db.commit()
         return {
             "metric_rows": 1 if metric_row else 0,
             "stock_rows": len(stock_rows),
@@ -97,6 +97,7 @@ class MarketReviewPipelineService:
 
         async with self.session_factory() as session:
             await self.persist_payload(session, payload)
+            await session.commit()
 
         return payload
 
@@ -116,40 +117,36 @@ class MarketReviewPipelineService:
         )
 
     async def _upsert_stock_rows(self, db: AsyncSession, stock_rows: Iterable[Dict[str, Any]]) -> None:
-        values = [
-            self._filter_model_columns(MarketReviewStockDaily, row)
-            for row in stock_rows
-        ]
-        stmt = sqlite_insert(MarketReviewStockDaily).values(values)
-        update_values = {
-            key: stmt.excluded[key]
-            for key in values[0]
-            if key not in {"id", "created_at", "trade_date", "stock_code"}
-        }
-        await db.execute(
-            stmt.on_conflict_do_update(
-                index_elements=["trade_date", "stock_code"],
-                set_=update_values,
+        for row in stock_rows:
+            values = self._filter_model_columns(MarketReviewStockDaily, row)
+            stmt = sqlite_insert(MarketReviewStockDaily).values(**values)
+            update_values = {
+                key: stmt.excluded[key]
+                for key in values
+                if key not in {"id", "created_at", "trade_date", "stock_code"}
+            }
+            await db.execute(
+                stmt.on_conflict_do_update(
+                    index_elements=["trade_date", "stock_code"],
+                    set_=update_values,
+                )
             )
-        )
 
     async def _upsert_event_rows(self, db: AsyncSession, event_rows: Iterable[Dict[str, Any]]) -> None:
-        values = [
-            self._filter_model_columns(MarketReviewLimitUpEvent, row)
-            for row in event_rows
-        ]
-        stmt = sqlite_insert(MarketReviewLimitUpEvent).values(values)
-        update_values = {
-            key: stmt.excluded[key]
-            for key in values[0]
-            if key not in {"id", "created_at", "trade_date", "stock_code", "event_type", "event_seq"}
-        }
-        await db.execute(
-            stmt.on_conflict_do_update(
-                index_elements=["trade_date", "stock_code", "event_type", "event_seq"],
-                set_=update_values,
+        for row in event_rows:
+            values = self._filter_model_columns(MarketReviewLimitUpEvent, row)
+            stmt = sqlite_insert(MarketReviewLimitUpEvent).values(**values)
+            update_values = {
+                key: stmt.excluded[key]
+                for key in values
+                if key not in {"id", "created_at", "trade_date", "stock_code", "event_type", "event_seq"}
+            }
+            await db.execute(
+                stmt.on_conflict_do_update(
+                    index_elements=["trade_date", "stock_code", "event_type", "event_seq"],
+                    set_=update_values,
+                )
             )
-        )
 
     def _filter_model_columns(self, model, row: Dict[str, Any]) -> Dict[str, Any]:
         allowed_columns = set(model.__table__.columns.keys())
