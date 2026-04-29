@@ -217,6 +217,40 @@ class MarketReviewSourceServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertAlmostEqual(turnover, 25927.39)
 
+    def test_parse_tencent_stock_history_stats_counts_moves_from_previous_close(self):
+        service = MarketReviewSourceService(
+            session_factory=self.session_factory,
+            current_date_provider=lambda: date(2026, 4, 29),
+        )
+        rows = [
+            ["2026-04-23", "9.80", "10.00", "10.10", "9.70", "1000"],
+            ["2026-04-24", "10.00", "11.00", "11.00", "9.90", "2000"],
+            ["2026-04-27", "11.00", "9.90", "11.10", "9.80", "3000"],
+        ]
+
+        stats = service._parse_tencent_stock_history_stats(
+            stock_code="600001",
+            stock_name="Alpha",
+            rows=rows,
+            count_start_date=date(2026, 4, 24),
+        )
+
+        self.assertEqual(
+            stats,
+            {
+                date(2026, 4, 24): {
+                    "limit_down_count": 0,
+                    "up_count_ex_st": 1,
+                    "down_count_ex_st": 0,
+                },
+                date(2026, 4, 27): {
+                    "limit_down_count": 1,
+                    "up_count_ex_st": 0,
+                    "down_count_ex_st": 1,
+                },
+            },
+        )
+
     async def test_collect_for_date_returns_placeholder_when_all_sources_are_empty(self):
         async def empty_fetcher(_trade_date):
             return []

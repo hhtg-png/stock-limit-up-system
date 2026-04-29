@@ -30,7 +30,7 @@ class MarketReviewSourceService:
     """Collects authoritative market-review inputs from existing market sources."""
 
     YESTERDAY_POOL_API = "https://push2ex.eastmoney.com/getYesterdayZTPool"
-    EASTMONEY_STOCK_KLINE_API = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+    TENCENT_STOCK_KLINE_API = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
     HISTORICAL_BREADTH_WINDOW_DAYS = 60
     HISTORICAL_BREADTH_MAX_WORKERS = 16
 
@@ -304,7 +304,7 @@ class MarketReviewSourceService:
         stock_rows = [
             row
             for row in stock_rows
-            if row["code"] and row["code"][0] in {"0", "3", "4", "6", "8", "9"}
+            if row["code"] and row["code"].startswith(("0", "3", "6"))
         ]
 
         window_stats: Dict[date, Dict[str, Any]] = {}
@@ -347,47 +347,66 @@ class MarketReviewSourceService:
         start_date: date,
         end_date: date,
     ) -> Dict[date, Dict[str, int]]:
-        import requests
-
         params = {
-            "fields1": "f1,f2,f3,f4,f5,f6",
-            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
-            "ut": "7eea3edcaed734bea9cbfc24409ed989",
-            "klt": "101",
-            "fqt": "0",
-            "secid": f"{self._eastmoney_market_code(stock_code)}.{stock_code}",
-            "beg": start_date.strftime("%Y%m%d"),
-            "end": end_date.strftime("%Y%m%d"),
+            "param": (
+                f"{self._tencent_symbol(stock_code)},day,"
+                f"{(start_date - timedelta(days=10)).strftime('%Y-%m-%d')},"
+                f"{end_date.strftime('%Y-%m-%d')},320,qfq"
+            )
         }
         try:
-            session = requests.Session()
-            session.trust_env = False
-            response = session.get(
-                self.EASTMONEY_STOCK_KLINE_API,
+            import requests
+
+            response = requests.get(
+                self.TENCENT_STOCK_KLINE_API,
                 params=params,
                 headers={
                     "User-Agent": settings.CRAWLER_USER_AGENT,
-                    "Referer": "https://quote.eastmoney.com/",
+                    "Referer": "https://gu.qq.com/",
                 },
                 timeout=settings.CRAWLER_REQUEST_TIMEOUT,
             )
             response.raise_for_status()
-            klines = ((response.json().get("data") or {}).get("klines") or [])
+            symbol = self._tencent_symbol(stock_code)
+            stock_data = (response.json().get("data") or {}).get(symbol) or {}
+            klines = stock_data.get("qfqday") or stock_data.get("day") or []
         except Exception:
             return {}
 
+        return self._parse_tencent_stock_history_stats(
+            stock_code=stock_code,
+            stock_name=stock_name,
+            rows=klines,
+            count_start_date=start_date,
+        )
+
+    def _parse_tencent_stock_history_stats(
+        self,
+        stock_code: str,
+        stock_name: str,
+        rows: Iterable[Any],
+        count_start_date: date,
+    ) -> Dict[date, Dict[str, int]]:
         stats: Dict[date, Dict[str, int]] = {}
         is_st = self._is_st_name(stock_name)
-        for raw_line in klines:
-            parts = str(raw_line).split(",")
-            if len(parts) < 9:
+        previous_close: Optional[float] = None
+        for raw_row in rows:
+            parts = list(raw_row) if isinstance(raw_row, (list, tuple)) else str(raw_row).split(",")
+            if len(parts) < 3:
                 continue
             try:
                 row_date = datetime.strptime(parts[0], "%Y-%m-%d").date()
             except ValueError:
                 continue
-            change_pct = self._to_float(parts[8])
-            if change_pct is None:
+            close_price = self._to_float(parts[2])
+            if close_price is None or close_price <= 0:
+                continue
+            if previous_close in (None, 0):
+                previous_close = close_price
+                continue
+            change_pct = (close_price - previous_close) / previous_close * 100
+            previous_close = close_price
+            if row_date < count_start_date:
                 continue
             row_stats = stats.setdefault(
                 row_date,
@@ -889,8 +908,9 @@ class MarketReviewSourceService:
             code = code[2:]
         return code.zfill(6) if code.isdigit() else ""
 
-    def _eastmoney_market_code(self, stock_code: str) -> int:
-        return 1 if stock_code.startswith("6") else 0
+    def _tencent_symbol(self, stock_code: str) -> str:
+        prefix = "sh" if stock_code.startswith("6") else "sz"
+        return f"{prefix}{stock_code}"
 
     def _is_st_name(self, stock_name: Any) -> bool:
         name = str(stock_name or "")
