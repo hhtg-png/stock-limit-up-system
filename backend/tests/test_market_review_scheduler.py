@@ -51,6 +51,7 @@ pytz_module.timezone = lambda _: timezone.utc
 sys.modules.setdefault("pytz", pytz_module)
 
 from app.data_collectors.scheduler import DataScheduler
+from app.utils.time_utils import CN_TZ
 
 
 class FakeScheduler:
@@ -95,9 +96,12 @@ class MarketReviewSchedulerTests(unittest.IsolatedAsyncioTestCase):
 
             scheduler.start()
 
-        job_ids = {job["id"] for job in scheduler.scheduler.jobs}
+        jobs_by_id = {job["id"]: job for job in scheduler.scheduler.jobs}
+        job_ids = set(jobs_by_id)
         self.assertIn("market_review_build", job_ids)
         self.assertIn("market_review_repair", job_ids)
+        self.assertIs(jobs_by_id["market_review_build"]["trigger"].kwargs["timezone"], CN_TZ)
+        self.assertIs(jobs_by_id["market_review_repair"]["trigger"].kwargs["timezone"], CN_TZ)
 
     def test_start_skips_market_review_jobs_when_disabled(self):
         scheduler = self._create_scheduler()
@@ -139,27 +143,65 @@ class MarketReviewSchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("market_review_build", job_ids)
         self.assertNotIn("market_review_repair", job_ids)
 
-    async def test_build_market_review_runs_pipeline_with_calc_version_one(self):
+    async def test_build_market_review_skips_pipeline_on_non_trading_day(self):
         scheduler = self._create_scheduler()
 
         with patch(
+            "app.data_collectors.scheduler._resolve_cn_trade_date_for_market_review",
+            return_value=None,
+            create=True,
+        ), patch(
             "app.data_collectors.scheduler.market_review_pipeline_service.run_for_date",
             AsyncMock(),
         ) as run_for_date:
             await scheduler._build_market_review()
 
-        run_for_date.assert_awaited_once_with(date.today(), calc_version=1)
+        run_for_date.assert_not_awaited()
 
-    async def test_repair_market_review_runs_pipeline_with_calc_version_two(self):
+    async def test_build_market_review_runs_pipeline_with_calc_version_one(self):
         scheduler = self._create_scheduler()
 
         with patch(
+            "app.data_collectors.scheduler._resolve_cn_trade_date_for_market_review",
+            return_value=date(2026, 4, 27),
+            create=True,
+        ), patch(
+            "app.data_collectors.scheduler.market_review_pipeline_service.run_for_date",
+            AsyncMock(),
+        ) as run_for_date:
+            await scheduler._build_market_review()
+
+        run_for_date.assert_awaited_once_with(date(2026, 4, 27), calc_version=1)
+
+    async def test_repair_market_review_skips_pipeline_on_non_trading_day(self):
+        scheduler = self._create_scheduler()
+
+        with patch(
+            "app.data_collectors.scheduler._resolve_cn_trade_date_for_market_review",
+            return_value=None,
+            create=True,
+        ), patch(
             "app.data_collectors.scheduler.market_review_pipeline_service.run_for_date",
             AsyncMock(),
         ) as run_for_date:
             await scheduler._repair_market_review()
 
-        run_for_date.assert_awaited_once_with(date.today(), calc_version=2)
+        run_for_date.assert_not_awaited()
+
+    async def test_repair_market_review_runs_pipeline_with_calc_version_two(self):
+        scheduler = self._create_scheduler()
+
+        with patch(
+            "app.data_collectors.scheduler._resolve_cn_trade_date_for_market_review",
+            return_value=date(2026, 4, 28),
+            create=True,
+        ), patch(
+            "app.data_collectors.scheduler.market_review_pipeline_service.run_for_date",
+            AsyncMock(),
+        ) as run_for_date:
+            await scheduler._repair_market_review()
+
+        run_for_date.assert_awaited_once_with(date(2026, 4, 28), calc_version=2)
 
 
 if __name__ == "__main__":

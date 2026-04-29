@@ -3,7 +3,7 @@
 """
 import asyncio
 from datetime import datetime, time, date
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
@@ -11,7 +11,52 @@ from loguru import logger
 
 from app.config import settings
 from app.services.market_review_pipeline_service import market_review_pipeline_service
-from app.utils.time_utils import is_trading_time, get_market_status
+from app.utils.time_utils import CN_TZ, get_market_status, is_trading_time, today_cn
+
+
+def _normalize_trade_calendar_date(raw_value) -> Optional[date]:
+    if isinstance(raw_value, date):
+        return raw_value
+    if hasattr(raw_value, "date"):
+        return raw_value.date()
+    if isinstance(raw_value, str):
+        return datetime.strptime(raw_value, "%Y-%m-%d").date()
+    return None
+
+
+def _get_cn_trading_dates(start_date: date, end_date: date) -> List[date]:
+    if end_date < start_date:
+        return []
+
+    try:
+        import akshare as ak
+
+        calendar_df = ak.tool_trade_date_hist_sina()
+    except Exception as exc:
+        logger.warning(f"Unable to resolve China trading calendar, skipping market review work: {exc}")
+        return []
+
+    if "trade_date" not in calendar_df:
+        logger.warning("China trading calendar missing trade_date column, skipping market review work")
+        return []
+
+    trading_dates: List[date] = []
+    for raw_value in calendar_df["trade_date"].tolist():
+        trade_date = _normalize_trade_calendar_date(raw_value)
+        if trade_date is None:
+            continue
+        if start_date <= trade_date <= end_date:
+            trading_dates.append(trade_date)
+
+    return trading_dates
+
+
+def _resolve_cn_trade_date_for_market_review(current_date: Optional[date] = None) -> Optional[date]:
+    resolved_date = current_date or today_cn()
+    trading_dates = _get_cn_trading_dates(resolved_date, resolved_date)
+    if not trading_dates:
+        return None
+    return resolved_date
 
 
 class DataScheduler:
@@ -79,6 +124,7 @@ class DataScheduler:
                 CronTrigger(
                     hour=settings.MARKET_REVIEW_BUILD_HOUR,
                     minute=settings.MARKET_REVIEW_BUILD_MINUTE,
+                    timezone=CN_TZ,
                 ),
                 id="market_review_build",
                 name="市场复盘构建",
@@ -91,6 +137,7 @@ class DataScheduler:
                     CronTrigger(
                         hour=settings.MARKET_REVIEW_REPAIR_HOUR,
                         minute=settings.MARKET_REVIEW_REPAIR_MINUTE,
+                        timezone=CN_TZ,
                     ),
                     id="market_review_repair",
                     name="市场复盘修复",
@@ -389,7 +436,11 @@ class DataScheduler:
     async def _build_market_review(self):
         """构建当日市场复盘数据"""
         try:
-            await market_review_pipeline_service.run_for_date(date.today(), calc_version=1)
+            trade_date = _resolve_cn_trade_date_for_market_review()
+            if trade_date is None:
+                logger.info("Skipping market review build because current China date is not a trading day")
+                return
+            await market_review_pipeline_service.run_for_date(trade_date, calc_version=1)
             logger.info("Market review build completed")
         except Exception as e:
             logger.error(f"Market review build error: {e}")
@@ -397,7 +448,11 @@ class DataScheduler:
     async def _repair_market_review(self):
         """修复当日市场复盘数据"""
         try:
-            await market_review_pipeline_service.run_for_date(date.today(), calc_version=2)
+            trade_date = _resolve_cn_trade_date_for_market_review()
+            if trade_date is None:
+                logger.info("Skipping market review repair because current China date is not a trading day")
+                return
+            await market_review_pipeline_service.run_for_date(trade_date, calc_version=2)
             logger.info("Market review repair completed")
         except Exception as e:
             logger.error(f"Market review repair error: {e}")
