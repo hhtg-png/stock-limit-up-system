@@ -28,12 +28,16 @@ def _load_review_router():
 class MarketReviewApiTests(unittest.TestCase):
     def test_review_router_import_does_not_execute_api_v1_package(self):
         before_modules = set(sys.modules)
-        self.assertNotIn("app.api.v1", before_modules)
 
         _load_review_router()
 
-        after_modules = set(sys.modules)
-        self.assertNotIn("app.api.v1", after_modules - before_modules)
+        introduced_modules = set(sys.modules) - before_modules
+        self.assertFalse(
+            any(
+                module_name == "app.api.v1" or module_name.startswith("app.api.v1.")
+                for module_name in introduced_modules
+            )
+        )
 
     def setUp(self):
         self.engine = create_async_engine(
