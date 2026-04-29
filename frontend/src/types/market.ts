@@ -111,3 +111,60 @@ export interface YesterdayContinuousResponse {
   is_fallback: boolean
   data: YesterdayContinuousLadder[]
 }
+
+// 市场复盘相关类型
+export interface MarketReviewDailyRow {
+  trade_date: string
+  limit_up_count: number
+  limit_down_count: number
+  continuous_count: number
+  max_board_height: number
+  second_board_height: number
+  gem_board_height: number
+  first_to_second_rate: number
+  continuous_promotion_rate: number
+  seal_rate: number
+  yesterday_limit_up_avg_change: number
+  yesterday_continuous_avg_change: number
+  market_turnover: number
+  up_count_ex_st: number
+  down_count_ex_st: number
+  limit_up_amount: number
+  broken_amount: number
+}
+
+export interface MarketReviewDailyResponse {
+  data: {
+    series: string[]
+    rows: MarketReviewDailyRow[]
+  }
+}
+
+export interface MarketReviewDetailStock {
+  stock_code: string
+  stock_name: string
+  today_continuous_days: number
+  today_sealed_close: boolean
+  today_opened_close: boolean
+  change_pct: number | null
+  amount: number
+  limit_up_reason: string | null
+}
+
+export interface MarketReviewDetailResponse {
+  trade_date: string
+  is_fallback: boolean
+  stocks: MarketReviewDetailStock[]
+}
+
+export interface MarketReviewLadderLevel {
+  continuous_days: number
+  count: number
+  stocks: MarketReviewDetailStock[]
+}
+
+export interface MarketReviewLadderResponse {
+  trade_date: string
+  is_fallback: boolean
+  ladders: MarketReviewLadderLevel[]
+}
