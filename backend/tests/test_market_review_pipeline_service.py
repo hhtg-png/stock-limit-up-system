@@ -170,7 +170,15 @@ class MarketReviewPipelineServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("trade_date", normalized["event_rows"][0])
 
     async def test_build_payload_for_date_marks_default_placeholder_source_as_non_authoritative(self):
-        service = MarketReviewPipelineService()
+        service = MarketReviewPipelineService(
+            source_service=StubSourceService(
+                {
+                    "source_status": "placeholder",
+                    "stock_rows": [],
+                    "event_rows": [],
+                }
+            )
+        )
 
         payload = await service.build_payload_for_date(date(2026, 4, 28))
 
@@ -485,8 +493,19 @@ class MarketReviewPipelineServiceTests(unittest.IsolatedAsyncioTestCase):
             normalized=self._normalized_input(),
         )
 
+        placeholder_service = MarketReviewPipelineService(
+            session_factory=self.session_factory,
+            source_service=StubSourceService(
+                {
+                    "source_status": "placeholder",
+                    "stock_rows": [],
+                    "event_rows": [],
+                }
+            ),
+        )
+
         with self.assertRaisesRegex(RuntimeError, "authoritative|placeholder|incomplete"):
-            await service.run_for_date(date(2026, 4, 28), calc_version=2)
+            await placeholder_service.run_for_date(date(2026, 4, 28), calc_version=2)
 
         async with self.session_factory() as session:
             metric = (
