@@ -20,12 +20,12 @@ class MarketReviewMetricsService:
         sealed_rows = [row for row in touched_rows if row.get("today_sealed_close")]
         opened_rows = [row for row in touched_rows if row.get("today_opened_close")]
 
-        ladder_days = sorted(
-            [
+        board_heights = sorted(
+            {
                 self._to_int(row.get("today_continuous_days"))
                 for row in touched_rows
-                if self._to_int(row.get("today_continuous_days")) > 1
-            ],
+                if self._to_int(row.get("today_continuous_days")) > 0
+            },
             reverse=True,
         )
 
@@ -74,8 +74,8 @@ class MarketReviewMetricsService:
             "continuous_count": len(
                 [row for row in touched_rows if self._to_int(row.get("today_continuous_days")) >= 2]
             ),
-            "max_board_height": ladder_days[0] if ladder_days else 0,
-            "second_board_height": ladder_days[1] if len(ladder_days) > 1 else 0,
+            "max_board_height": board_heights[0] if board_heights else 0,
+            "second_board_height": board_heights[1] if len(board_heights) > 1 else 0,
             "gem_board_height": max(gem_days) if gem_days else 0,
             "first_to_second_rate": round(len(promoted_first_board) * 100 / len(yesterday_first_board), 2)
             if yesterday_first_board

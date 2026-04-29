@@ -106,6 +106,94 @@ class MarketReviewMetricsServiceTests(unittest.TestCase):
         self.assertEqual(metric["limit_up_amount"], 0.0)
         self.assertEqual(metric["broken_amount"], 0.0)
 
+    def test_aggregate_daily_metrics_treats_first_board_only_as_height_one(self):
+        rows = [
+            {
+                "stock_code": "600010",
+                "board_type": "main",
+                "is_st": False,
+                "yesterday_limit_up": False,
+                "yesterday_continuous_days": 0,
+                "today_touched_limit_up": True,
+                "today_sealed_close": True,
+                "today_opened_close": False,
+                "today_broken": False,
+                "today_continuous_days": 1,
+                "change_pct": 9.95,
+                "amount": 50000.0,
+            }
+        ]
+
+        metric = self.service.aggregate_daily_metrics(
+            trade_date=date(2026, 4, 27),
+            stock_rows=rows,
+            limit_down_count=0,
+            market_turnover=0,
+            up_count_ex_st=0,
+            down_count_ex_st=0,
+        )
+
+        self.assertEqual(metric["max_board_height"], 1)
+        self.assertEqual(metric["second_board_height"], 0)
+
+    def test_aggregate_daily_metrics_uses_second_distinct_board_height(self):
+        rows = [
+            {
+                "stock_code": "600011",
+                "board_type": "main",
+                "is_st": False,
+                "yesterday_limit_up": True,
+                "yesterday_continuous_days": 2,
+                "today_touched_limit_up": True,
+                "today_sealed_close": True,
+                "today_opened_close": False,
+                "today_broken": False,
+                "today_continuous_days": 3,
+                "change_pct": 10.0,
+                "amount": 10000.0,
+            },
+            {
+                "stock_code": "600012",
+                "board_type": "main",
+                "is_st": False,
+                "yesterday_limit_up": True,
+                "yesterday_continuous_days": 1,
+                "today_touched_limit_up": True,
+                "today_sealed_close": True,
+                "today_opened_close": False,
+                "today_broken": False,
+                "today_continuous_days": 3,
+                "change_pct": 10.0,
+                "amount": 20000.0,
+            },
+            {
+                "stock_code": "600013",
+                "board_type": "main",
+                "is_st": False,
+                "yesterday_limit_up": True,
+                "yesterday_continuous_days": 0,
+                "today_touched_limit_up": True,
+                "today_sealed_close": True,
+                "today_opened_close": False,
+                "today_broken": False,
+                "today_continuous_days": 2,
+                "change_pct": 10.0,
+                "amount": 30000.0,
+            },
+        ]
+
+        metric = self.service.aggregate_daily_metrics(
+            trade_date=date(2026, 4, 27),
+            stock_rows=rows,
+            limit_down_count=0,
+            market_turnover=0,
+            up_count_ex_st=0,
+            down_count_ex_st=0,
+        )
+
+        self.assertEqual(metric["max_board_height"], 3)
+        self.assertEqual(metric["second_board_height"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()
