@@ -114,6 +114,11 @@ class MarketReviewPipelineServiceTests(unittest.IsolatedAsyncioTestCase):
             "source_status": "stubbed",
         }
 
+    def _normalized_input_without_authority(self):
+        normalized = self._normalized_input()
+        normalized.pop("is_authoritative")
+        return normalized
+
     async def test_build_payload_for_date_uses_supplied_normalized_input(self):
         normalized = self._normalized_input()
         service = MarketReviewPipelineService()
@@ -171,6 +176,17 @@ class MarketReviewPipelineServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(payload["is_authoritative"])
         self.assertEqual(payload["source_status"], "placeholder")
+
+    async def test_build_payload_for_date_marks_caller_supplied_payload_without_authority_as_non_authoritative(self):
+        service = MarketReviewPipelineService()
+
+        payload = await service.build_payload_for_date(
+            date(2026, 4, 28),
+            normalized=self._normalized_input_without_authority(),
+        )
+
+        self.assertFalse(payload["is_authoritative"])
+        self.assertEqual(payload["source_status"], "stubbed")
 
     async def test_persist_payload_upserts_metric_stock_and_event_rows(self):
         service = MarketReviewPipelineService(session_factory=self.session_factory)
@@ -411,6 +427,53 @@ class MarketReviewPipelineServiceTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(RuntimeError, "authoritative|placeholder|incomplete"):
             await service.run_for_date(date(2026, 4, 28), calc_version=2)
+
+        async with self.session_factory() as session:
+            metric = (
+                await session.execute(
+                    select(MarketReviewDailyMetric).where(
+                        MarketReviewDailyMetric.trade_date == date(2026, 4, 28)
+                    )
+                )
+            ).scalar_one()
+            stock_rows = (
+                await session.execute(
+                    select(MarketReviewStockDaily).where(
+                        MarketReviewStockDaily.trade_date == date(2026, 4, 28)
+                    )
+                )
+            ).scalars().all()
+            event_rows = (
+                await session.execute(
+                    select(MarketReviewLimitUpEvent).where(
+                        MarketReviewLimitUpEvent.trade_date == date(2026, 4, 28)
+                    )
+                )
+            ).scalars().all()
+
+        self.assertEqual(metric.calc_version, 1)
+        self.assertEqual(metric.source_status, "stubbed")
+        self.assertEqual([row.stock_code for row in stock_rows], ["600001"])
+        self.assertEqual([row.stock_code for row in event_rows], ["600001"])
+
+    async def test_run_for_date_with_caller_payload_missing_authority_raises_and_preserves_existing_rows(self):
+        service = MarketReviewPipelineService(session_factory=self.session_factory)
+        await service.run_for_date(
+            date(2026, 4, 28),
+            calc_version=1,
+            normalized=self._normalized_input(),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "authoritative|placeholder|incomplete"):
+            await service.run_for_date(
+                date(2026, 4, 28),
+                calc_version=2,
+                normalized={
+                    "source_status": "placeholder",
+                    "stock_rows": [],
+                    "event_rows": [],
+                },
+            )
 
         async with self.session_factory() as session:
             metric = (

@@ -42,10 +42,7 @@ class MarketReviewPipelineService:
         normalized: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         normalized_data = normalized or await self.source_service.collect_for_date(trade_date)
-        is_authoritative = self._resolve_authoritative_flag(
-            normalized_data,
-            default_when_unspecified=normalized is not None,
-        )
+        is_authoritative = self._resolve_authoritative_flag(normalized_data)
         stock_rows = [
             {**row, "trade_date": trade_date}
             for row in (normalized_data.get("stock_rows") or [])
@@ -183,11 +180,10 @@ class MarketReviewPipelineService:
     def _resolve_authoritative_flag(
         self,
         normalized_data: Dict[str, Any],
-        default_when_unspecified: bool,
     ) -> bool:
         if "is_authoritative" in normalized_data:
             return bool(normalized_data["is_authoritative"])
-        return default_when_unspecified
+        return False
 
     def _ensure_authoritative_payload(self, payload: Dict[str, Any]) -> None:
         if payload.get("is_authoritative"):
