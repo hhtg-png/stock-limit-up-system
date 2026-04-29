@@ -67,6 +67,7 @@ class MarketReviewPipelineServiceTests(unittest.IsolatedAsyncioTestCase):
 
     def _normalized_input(self):
         return {
+            "is_authoritative": True,
             "stock_rows": [
                 {
                     "stock_id": 1,
@@ -137,6 +138,7 @@ class MarketReviewPipelineServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["metric_row"]["up_count_ex_st"], 3000)
         self.assertEqual(payload["metric_row"]["down_count_ex_st"], 1200)
         self.assertEqual(payload["metric_row"]["source_status"], "stubbed")
+        self.assertTrue(payload["is_authoritative"])
 
     async def test_run_for_date_collects_from_source_service_when_normalized_not_supplied(self):
         normalized = self._normalized_input()
@@ -161,6 +163,14 @@ class MarketReviewPipelineServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second_payload["event_rows"][0]["trade_date"], date(2026, 4, 29))
         self.assertNotIn("trade_date", normalized["stock_rows"][0])
         self.assertNotIn("trade_date", normalized["event_rows"][0])
+
+    async def test_build_payload_for_date_marks_default_placeholder_source_as_non_authoritative(self):
+        service = MarketReviewPipelineService()
+
+        payload = await service.build_payload_for_date(date(2026, 4, 28))
+
+        self.assertFalse(payload["is_authoritative"])
+        self.assertEqual(payload["source_status"], "placeholder")
 
     async def test_persist_payload_upserts_metric_stock_and_event_rows(self):
         service = MarketReviewPipelineService(session_factory=self.session_factory)
@@ -342,6 +352,93 @@ class MarketReviewPipelineServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([row.stock_code for row in stock_rows], ["600001"])
         self.assertEqual(stock_rows[0].stock_name, "Alpha Rebuilt")
         self.assertEqual(event_rows, [])
+
+    async def test_persist_payload_canonicalizes_row_trade_dates_to_authoritative_trade_date(self):
+        service = MarketReviewPipelineService(session_factory=self.session_factory)
+        payload = await service.build_payload_for_date(
+            date(2026, 4, 28),
+            normalized=self._normalized_input(),
+        )
+        payload["stock_rows"][0]["trade_date"] = date(2026, 4, 29)
+        payload["event_rows"][0]["trade_date"] = date(2026, 4, 30)
+
+        async with self.session_factory() as session:
+            await service.persist_payload(session, payload)
+            await session.commit()
+
+        async with self.session_factory() as session:
+            stock_rows_on_authoritative_date = (
+                await session.execute(
+                    select(MarketReviewStockDaily).where(
+                        MarketReviewStockDaily.trade_date == date(2026, 4, 28)
+                    )
+                )
+            ).scalars().all()
+            stock_rows_on_drift_date = (
+                await session.execute(
+                    select(MarketReviewStockDaily).where(
+                        MarketReviewStockDaily.trade_date == date(2026, 4, 29)
+                    )
+                )
+            ).scalars().all()
+            event_rows_on_authoritative_date = (
+                await session.execute(
+                    select(MarketReviewLimitUpEvent).where(
+                        MarketReviewLimitUpEvent.trade_date == date(2026, 4, 28)
+                    )
+                )
+            ).scalars().all()
+            event_rows_on_drift_date = (
+                await session.execute(
+                    select(MarketReviewLimitUpEvent).where(
+                        MarketReviewLimitUpEvent.trade_date == date(2026, 4, 30)
+                    )
+                )
+            ).scalars().all()
+
+        self.assertEqual([row.stock_code for row in stock_rows_on_authoritative_date], ["600001"])
+        self.assertEqual(stock_rows_on_drift_date, [])
+        self.assertEqual([row.stock_code for row in event_rows_on_authoritative_date], ["600001"])
+        self.assertEqual(event_rows_on_drift_date, [])
+
+    async def test_run_for_date_with_placeholder_source_raises_and_preserves_existing_rows(self):
+        service = MarketReviewPipelineService(session_factory=self.session_factory)
+        await service.run_for_date(
+            date(2026, 4, 28),
+            calc_version=1,
+            normalized=self._normalized_input(),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "authoritative|placeholder|incomplete"):
+            await service.run_for_date(date(2026, 4, 28), calc_version=2)
+
+        async with self.session_factory() as session:
+            metric = (
+                await session.execute(
+                    select(MarketReviewDailyMetric).where(
+                        MarketReviewDailyMetric.trade_date == date(2026, 4, 28)
+                    )
+                )
+            ).scalar_one()
+            stock_rows = (
+                await session.execute(
+                    select(MarketReviewStockDaily).where(
+                        MarketReviewStockDaily.trade_date == date(2026, 4, 28)
+                    )
+                )
+            ).scalars().all()
+            event_rows = (
+                await session.execute(
+                    select(MarketReviewLimitUpEvent).where(
+                        MarketReviewLimitUpEvent.trade_date == date(2026, 4, 28)
+                    )
+                )
+            ).scalars().all()
+
+        self.assertEqual(metric.calc_version, 1)
+        self.assertEqual(metric.source_status, "stubbed")
+        self.assertEqual([row.stock_code for row in stock_rows], ["600001"])
+        self.assertEqual([row.stock_code for row in event_rows], ["600001"])
 
 
 if __name__ == "__main__":

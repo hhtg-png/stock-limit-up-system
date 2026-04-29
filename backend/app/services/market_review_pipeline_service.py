@@ -42,6 +42,10 @@ class MarketReviewPipelineService:
         normalized: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         normalized_data = normalized or await self.source_service.collect_for_date(trade_date)
+        is_authoritative = self._resolve_authoritative_flag(
+            normalized_data,
+            default_when_unspecified=normalized is not None,
+        )
         stock_rows = [
             {**row, "trade_date": trade_date}
             for row in (normalized_data.get("stock_rows") or [])
@@ -59,10 +63,12 @@ class MarketReviewPipelineService:
             up_count_ex_st=normalized_data.get("up_count_ex_st", 0),
             down_count_ex_st=normalized_data.get("down_count_ex_st", 0),
         )
+        metric_row["trade_date"] = trade_date
         metric_row["source_status"] = normalized_data.get("source_status", "unknown")
 
         return {
             "trade_date": trade_date,
+            "is_authoritative": is_authoritative,
             "metric_row": metric_row,
             "stock_rows": stock_rows,
             "event_rows": event_rows,
@@ -70,15 +76,22 @@ class MarketReviewPipelineService:
         }
 
     async def persist_payload(self, db: AsyncSession, payload: Dict[str, Any]) -> Dict[str, int]:
+        self._ensure_authoritative_payload(payload)
         metric_row = dict(payload.get("metric_row") or {})
-        stock_rows = [dict(row) for row in payload.get("stock_rows") or []]
-        event_rows = [dict(row) for row in payload.get("event_rows") or []]
-        trade_date = self._resolve_trade_date(payload, metric_row, stock_rows, event_rows)
+        trade_date = self._resolve_trade_date(payload, metric_row)
+        metric_row["trade_date"] = trade_date
+        stock_rows = self._canonicalize_trade_date(
+            payload.get("stock_rows") or [],
+            trade_date=trade_date,
+        )
+        event_rows = self._canonicalize_trade_date(
+            payload.get("event_rows") or [],
+            trade_date=trade_date,
+        )
 
         if metric_row:
             await self._upsert_metric_row(db, metric_row)
-        if trade_date is not None:
-            await self._replace_trade_date_rows(db, trade_date, stock_rows, event_rows)
+        await self._replace_trade_date_rows(db, trade_date, stock_rows, event_rows)
 
         return {
             "metric_rows": 1 if metric_row else 0,
@@ -93,6 +106,7 @@ class MarketReviewPipelineService:
         normalized: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         payload = await self.build_payload_for_date(trade_date, normalized=normalized)
+        self._ensure_authoritative_payload(payload)
         payload["metric_row"]["calc_version"] = calc_version
 
         async with self.session_factory() as session:
@@ -166,28 +180,47 @@ class MarketReviewPipelineService:
         if event_rows:
             await self._upsert_event_rows(db, event_rows)
 
+    def _resolve_authoritative_flag(
+        self,
+        normalized_data: Dict[str, Any],
+        default_when_unspecified: bool,
+    ) -> bool:
+        if "is_authoritative" in normalized_data:
+            return bool(normalized_data["is_authoritative"])
+        return default_when_unspecified
+
+    def _ensure_authoritative_payload(self, payload: Dict[str, Any]) -> None:
+        if payload.get("is_authoritative"):
+            return
+        trade_date = payload.get("trade_date")
+        source_status = payload.get("source_status") or (payload.get("metric_row") or {}).get("source_status")
+        raise RuntimeError(
+            f"Market review payload for {trade_date} is not authoritative; "
+            f"refusing to persist source_status={source_status!r}"
+        )
+
     def _resolve_trade_date(
         self,
         payload: Dict[str, Any],
         metric_row: Dict[str, Any],
-        stock_rows: Iterable[Dict[str, Any]],
-        event_rows: Iterable[Dict[str, Any]],
-    ) -> Optional[date]:
-        candidates = [
-            payload.get("trade_date"),
-            metric_row.get("trade_date"),
-        ]
-        first_stock_row = next(iter(stock_rows), None)
-        first_event_row = next(iter(event_rows), None)
-        if first_stock_row is not None:
-            candidates.append(first_stock_row.get("trade_date"))
-        if first_event_row is not None:
-            candidates.append(first_event_row.get("trade_date"))
-
-        for candidate in candidates:
+    ) -> date:
+        for candidate in (payload.get("trade_date"), metric_row.get("trade_date")):
             if isinstance(candidate, date):
                 return candidate
-        return None
+        raise RuntimeError("Authoritative market review payload is missing trade_date")
+
+    def _canonicalize_trade_date(
+        self,
+        rows: Iterable[Dict[str, Any]],
+        trade_date: date,
+    ) -> list[Dict[str, Any]]:
+        return [
+            {
+                **dict(row),
+                "trade_date": trade_date,
+            }
+            for row in rows
+        ]
 
     def _filter_model_columns(self, model, row: Dict[str, Any]) -> Dict[str, Any]:
         allowed_columns = set(model.__table__.columns.keys())

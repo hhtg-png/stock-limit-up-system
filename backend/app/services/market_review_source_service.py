@@ -10,6 +10,7 @@ class MarketReviewSourceService:
     async def collect_for_date(self, trade_date: date) -> Dict[str, Any]:
         return {
             "trade_date": trade_date,
+            "is_authoritative": False,
             "stock_rows": [],
             "event_rows": [],
             "limit_down_count": 0,
