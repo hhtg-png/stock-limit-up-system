@@ -503,6 +503,56 @@ class MarketReviewPipelineServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([row.stock_code for row in stock_rows], ["600001"])
         self.assertEqual([row.stock_code for row in event_rows], ["600001"])
 
+    async def test_run_for_date_with_truthy_non_boolean_authority_raises_and_preserves_existing_rows(self):
+        service = MarketReviewPipelineService(session_factory=self.session_factory)
+        await service.run_for_date(
+            date(2026, 4, 28),
+            calc_version=1,
+            normalized=self._normalized_input(),
+        )
+
+        for malformed_authority in ("false", "0", 1):
+            with self.subTest(malformed_authority=malformed_authority):
+                with self.assertRaisesRegex(RuntimeError, "authoritative|placeholder|incomplete"):
+                    await service.run_for_date(
+                        date(2026, 4, 28),
+                        calc_version=2,
+                        normalized={
+                            "is_authoritative": malformed_authority,
+                            "source_status": "placeholder",
+                            "stock_rows": [],
+                            "event_rows": [],
+                        },
+                    )
+
+        async with self.session_factory() as session:
+            metric = (
+                await session.execute(
+                    select(MarketReviewDailyMetric).where(
+                        MarketReviewDailyMetric.trade_date == date(2026, 4, 28)
+                    )
+                )
+            ).scalar_one()
+            stock_rows = (
+                await session.execute(
+                    select(MarketReviewStockDaily).where(
+                        MarketReviewStockDaily.trade_date == date(2026, 4, 28)
+                    )
+                )
+            ).scalars().all()
+            event_rows = (
+                await session.execute(
+                    select(MarketReviewLimitUpEvent).where(
+                        MarketReviewLimitUpEvent.trade_date == date(2026, 4, 28)
+                    )
+                )
+            ).scalars().all()
+
+        self.assertEqual(metric.calc_version, 1)
+        self.assertEqual(metric.source_status, "stubbed")
+        self.assertEqual([row.stock_code for row in stock_rows], ["600001"])
+        self.assertEqual([row.stock_code for row in event_rows], ["600001"])
+
 
 if __name__ == "__main__":
     unittest.main()

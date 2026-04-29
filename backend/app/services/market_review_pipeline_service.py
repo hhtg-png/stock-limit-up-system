@@ -182,7 +182,7 @@ class MarketReviewPipelineService:
         normalized_data: Dict[str, Any],
     ) -> bool:
         if "is_authoritative" in normalized_data:
-            return bool(normalized_data["is_authoritative"])
+            return normalized_data["is_authoritative"] is True
         return False
 
     def _ensure_authoritative_payload(self, payload: Dict[str, Any]) -> None:
