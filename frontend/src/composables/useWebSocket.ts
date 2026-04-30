@@ -1,4 +1,4 @@
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, onUnmounted } from 'vue'
 import { useAlertStore } from '@/stores/alert'
 import { useLimitUpStore } from '@/stores/limit-up'
 import { useSpeech } from '@/composables/useSpeech'
@@ -98,14 +98,14 @@ export function useWebSocket() {
         break
 
       case 'limit_up_snapshot':
-        limitUpStore.setSnapshot(
+        limitUpStore.setRealtimeSnapshot(
           message.data.trade_date || '',
           message.data.items || []
         )
         break
 
       case 'limit_up_delta':
-        limitUpStore.applyDelta(
+        limitUpStore.applyRealtimeDelta(
           message.data.upsert || [],
           message.data.remove || [],
           message.data.trade_date || ''

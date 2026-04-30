@@ -80,7 +80,7 @@ export const useAlertStore = defineStore('alert', () => {
   }
 
   // 播放声音
-  function playSound(type: string) {
+  function playSound(_type: string) {
     // 使用Web Audio API或Audio元素播放提示音
     try {
       const audio = new Audio('/sounds/alert.mp3')
