@@ -303,11 +303,31 @@ const strongestReason = computed(() => {
 function getDateRange() {
   const days = Number.parseInt(timeRange.value, 10)
   const endDate = dayjs().format('YYYY-MM-DD')
+
+  if (timeRange.value === '90') {
+    const startDate = dayjs().subtract(3, 'month').format('YYYY-MM-DD')
+    return {
+      startDate,
+      endDate,
+      query: {
+        start_date: startDate,
+        end_date: endDate
+      }
+    }
+  }
+
   const startDate = dayjs()
     .subtract(Math.max(days - 1, 0), 'day')
     .format('YYYY-MM-DD')
 
-  return { startDate, endDate }
+  return {
+    startDate,
+    endDate,
+    query: {
+      days,
+      end_date: endDate
+    }
+  }
 }
 
 function formatDateLabel(value: string) {
@@ -704,7 +724,7 @@ function disposeCharts() {
 }
 
 async function fetchData() {
-  const { startDate, endDate } = getDateRange()
+  const { startDate, endDate, query } = getDateRange()
   const currentSequence = ++fetchSequence
   loading.value = true
 
@@ -712,10 +732,7 @@ async function fetchData() {
   let hasError = false
 
   try {
-    const dailyResult = await getMarketReviewDaily({
-      start_date: startDate,
-      end_date: endDate
-    })
+    const dailyResult = await getMarketReviewDaily(query)
 
     if (currentSequence !== fetchSequence) {
       return

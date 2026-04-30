@@ -74,6 +74,7 @@ async def _resolve_daily_metric_range(
 async def get_market_review_daily(
     start_date: date | None = Query(None, description="开始日期"),
     end_date: date | None = Query(None, description="结束日期"),
+    days: int | None = Query(None, ge=1, le=250, description="最近N个复盘交易日"),
     db: AsyncSession = Depends(get_db),
 ):
     """获取市场复盘日级指标列表。"""
@@ -82,8 +83,32 @@ async def get_market_review_daily(
         start_date,
         end_date,
     )
-    query = select(MarketReviewDailyMetric)
 
+    if days is not None:
+        query = select(MarketReviewDailyMetric)
+        if resolved_end_date:
+            query = query.where(MarketReviewDailyMetric.trade_date <= resolved_end_date)
+        result = await db.execute(
+            query.order_by(MarketReviewDailyMetric.trade_date.desc()).limit(days)
+        )
+        rows = [
+            MarketReviewDailyMetricRow.model_validate(row)
+            for row in reversed(result.scalars().all())
+        ]
+        return MarketReviewDailyResponse(
+            data=MarketReviewDailyData(
+                series=[row.trade_date for row in rows],
+                rows=rows,
+            ),
+            requested_start_date=start_date,
+            requested_end_date=end_date,
+            start_date=rows[0].trade_date if rows else resolved_start_date,
+            end_date=rows[-1].trade_date if rows else resolved_end_date,
+            latest_trade_date=latest_trade_date,
+            is_fallback=is_fallback,
+        )
+
+    query = select(MarketReviewDailyMetric)
     if resolved_start_date:
         query = query.where(MarketReviewDailyMetric.trade_date >= resolved_start_date)
     if resolved_end_date:

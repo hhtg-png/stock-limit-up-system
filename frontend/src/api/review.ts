@@ -13,6 +13,7 @@ const api = axios.create({
 export async function getMarketReviewDaily(params?: {
   start_date?: string
   end_date?: string
+  days?: number
 }): Promise<MarketReviewDailyResponse> {
   const { data } = await api.get('/statistics/review/daily', { params })
   return data
