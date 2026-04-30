@@ -228,6 +228,7 @@ import { ElMessage } from 'element-plus'
 import * as echarts from 'echarts'
 import dayjs from 'dayjs'
 import { getMarketReviewDaily, getMarketReviewDetail, getMarketReviewLadder } from '@/api'
+import { buildReviewRange } from '@/utils/reviewRange'
 import type {
   MarketReviewDailyRow,
   MarketReviewDetailResponse,
@@ -240,7 +241,7 @@ const router = useRouter()
 
 const timeRange = ref('30')
 const loading = ref(false)
-const activeStartDate = ref(dayjs().subtract(29, 'day').format('YYYY-MM-DD'))
+const activeStartDate = ref(dayjs().format('YYYY-MM-DD'))
 const activeEndDate = ref(dayjs().format('YYYY-MM-DD'))
 
 const dailySeries = ref<string[]>([])
@@ -301,33 +302,7 @@ const strongestReason = computed(() => {
 })
 
 function getDateRange() {
-  const days = Number.parseInt(timeRange.value, 10)
-  const endDate = dayjs().format('YYYY-MM-DD')
-
-  if (timeRange.value === '90') {
-    const startDate = dayjs().subtract(3, 'month').format('YYYY-MM-DD')
-    return {
-      startDate,
-      endDate,
-      query: {
-        start_date: startDate,
-        end_date: endDate
-      }
-    }
-  }
-
-  const startDate = dayjs()
-    .subtract(Math.max(days - 1, 0), 'day')
-    .format('YYYY-MM-DD')
-
-  return {
-    startDate,
-    endDate,
-    query: {
-      days,
-      end_date: endDate
-    }
-  }
+  return buildReviewRange(timeRange.value, dayjs().format('YYYY-MM-DD'))
 }
 
 function formatDateLabel(value: string) {
