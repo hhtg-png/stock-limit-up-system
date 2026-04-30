@@ -99,7 +99,7 @@ import dayjs from 'dayjs'
 
 const route = useRoute()
 const alertStore = useAlertStore()
-const { connect, isConnected } = useWebSocket()
+const { connect } = useWebSocket()
 
 const isCollapsed = ref(false)
 const showAlertPanel = ref(false)

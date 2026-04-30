@@ -17,6 +17,7 @@
 import { ref, watch, onMounted, onUnmounted } from 'vue'
 import * as echarts from 'echarts'
 import { getSectorStats, getContinuousLadder } from '@/api/statistics'
+import type { ContinuousLadder, SectorStats } from '@/types/market'
 
 const viewType = ref('sector')
 const heatmapRef = ref<HTMLElement>()
@@ -25,15 +26,15 @@ let chart: echarts.ECharts | null = null
 
 async function fetchData() {
   if (viewType.value === 'sector') {
-    const data = await getSectorStats()
-    updateSectorHeatmap(data)
+    const response = await getSectorStats()
+    updateSectorHeatmap(response.data)
   } else {
-    const data = await getContinuousLadder()
-    updateContinuousHeatmap(data)
+    const response = await getContinuousLadder()
+    updateContinuousHeatmap(response.data)
   }
 }
 
-function updateSectorHeatmap(data: any[]) {
+function updateSectorHeatmap(data: SectorStats[]) {
   if (!chart) return
   
   // 转换为treemap数据格式
@@ -84,7 +85,7 @@ function updateSectorHeatmap(data: any[]) {
   })
 }
 
-function updateContinuousHeatmap(data: any[]) {
+function updateContinuousHeatmap(data: ContinuousLadder[]) {
   if (!chart) return
   
   // 转换为treemap数据格式
@@ -94,7 +95,7 @@ function updateContinuousHeatmap(data: any[]) {
     itemStyle: {
       color: getColorByDays(ladder.continuous_days)
     },
-    children: ladder.stocks?.map((stock: any) => ({
+    children: ladder.stocks?.map(stock => ({
       name: stock.stock_name,
       value: 1
     })) || []

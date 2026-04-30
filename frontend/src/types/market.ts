@@ -138,6 +138,12 @@ export interface MarketReviewDailyResponse {
     series: string[]
     rows: MarketReviewDailyRow[]
   }
+  requested_start_date?: string | null
+  requested_end_date?: string | null
+  start_date?: string | null
+  end_date?: string | null
+  latest_trade_date?: string | null
+  is_fallback?: boolean
 }
 
 export interface MarketReviewDetailStock {

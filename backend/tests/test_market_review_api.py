@@ -206,6 +206,10 @@ class MarketReviewApiTests(unittest.TestCase):
         self.assertEqual([row["trade_date"] for row in rows], ["2026-04-27", "2026-04-28"])
         self.assertEqual(rows[0]["limit_up_count"], 5)
         self.assertEqual(rows[1]["max_board_height"], 4)
+        self.assertEqual(payload["start_date"], "2026-04-27")
+        self.assertEqual(payload["end_date"], "2026-04-28")
+        self.assertEqual(payload["latest_trade_date"], "2026-04-28")
+        self.assertFalse(payload["is_fallback"])
 
         for field in (
             "trade_date",
@@ -227,6 +231,38 @@ class MarketReviewApiTests(unittest.TestCase):
             "broken_amount",
         ):
             self.assertIn(field, rows[0])
+
+    def test_daily_endpoint_resolves_future_end_date_to_latest_available_metric(self):
+        response = self.client.get(
+            "/api/v1/statistics/review/daily",
+            params={"start_date": "2026-04-27", "end_date": "2026-05-02"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["data"]["series"], ["2026-04-27", "2026-04-28"])
+        self.assertEqual(payload["start_date"], "2026-04-27")
+        self.assertEqual(payload["end_date"], "2026-04-28")
+        self.assertEqual(payload["requested_start_date"], "2026-04-27")
+        self.assertEqual(payload["requested_end_date"], "2026-05-02")
+        self.assertEqual(payload["latest_trade_date"], "2026-04-28")
+        self.assertTrue(payload["is_fallback"])
+
+    def test_daily_endpoint_falls_back_to_latest_single_row_when_range_is_after_latest_metric(self):
+        response = self.client.get(
+            "/api/v1/statistics/review/daily",
+            params={"start_date": "2026-05-02", "end_date": "2026-05-02"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["data"]["series"], ["2026-04-28"])
+        self.assertEqual(payload["start_date"], "2026-04-28")
+        self.assertEqual(payload["end_date"], "2026-04-28")
+        self.assertEqual(payload["requested_start_date"], "2026-05-02")
+        self.assertEqual(payload["requested_end_date"], "2026-05-02")
+        self.assertEqual(payload["latest_trade_date"], "2026-04-28")
+        self.assertTrue(payload["is_fallback"])
 
     def test_detail_endpoint_sorts_by_continuous_days_then_amount_desc(self):
         response = self.client.get(

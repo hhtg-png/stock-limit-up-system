@@ -41,6 +41,12 @@ class MarketReviewDailyResponse(BaseModel):
     """市场复盘日级指标响应"""
 
     data: MarketReviewDailyData
+    requested_start_date: date | None = None
+    requested_end_date: date | None = None
+    start_date: date | None = None
+    end_date: date | None = None
+    latest_trade_date: date | None = None
+    is_fallback: bool = Field(False, description="是否回退到最近可用复盘日")
 
 
 class MarketReviewStockItem(BaseModel):

@@ -245,6 +245,7 @@ const activeEndDate = ref(dayjs().format('YYYY-MM-DD'))
 
 const dailySeries = ref<string[]>([])
 const dailyRows = ref<MarketReviewDailyRow[]>([])
+const dailyHasFallback = ref(false)
 const detailResponse = ref<MarketReviewDetailResponse | null>(null)
 const ladderResponse = ref<MarketReviewLadderResponse | null>(null)
 
@@ -269,7 +270,7 @@ const resolvedTradeDate = computed(
   () => detailResponse.value?.trade_date || ladderResponse.value?.trade_date || activeEndDate.value
 )
 const hasFallback = computed(
-  () => Boolean(detailResponse.value?.is_fallback || ladderResponse.value?.is_fallback)
+  () => Boolean(dailyHasFallback.value || detailResponse.value?.is_fallback || ladderResponse.value?.is_fallback)
 )
 const sealedCloseCount = computed(
   () => detailStocks.value.filter(stock => stock.today_sealed_close).length
@@ -707,32 +708,43 @@ async function fetchData() {
   const currentSequence = ++fetchSequence
   loading.value = true
 
-  const [dailyResult, detailResult, ladderResult] = await Promise.allSettled([
-    getMarketReviewDaily({
+  let detailDate = endDate
+  let hasError = false
+
+  try {
+    const dailyResult = await getMarketReviewDaily({
       start_date: startDate,
       end_date: endDate
-    }),
-    getMarketReviewDetail(endDate),
-    getMarketReviewLadder(endDate)
+    })
+
+    if (currentSequence !== fetchSequence) {
+      return
+    }
+
+    dailySeries.value = dailyResult.data.series
+    dailyRows.value = dailyResult.data.rows
+    dailyHasFallback.value = Boolean(dailyResult.is_fallback)
+    const lastSeriesDate = dailyResult.data.series[dailyResult.data.series.length - 1]
+    activeStartDate.value = dailyResult.start_date || startDate
+    activeEndDate.value = dailyResult.end_date || lastSeriesDate || endDate
+    detailDate = activeEndDate.value
+  } catch (e) {
+    console.error('Fetch market review daily error:', e)
+    dailySeries.value = []
+    dailyRows.value = []
+    dailyHasFallback.value = false
+    activeStartDate.value = startDate
+    activeEndDate.value = endDate
+    hasError = true
+  }
+
+  const [detailResult, ladderResult] = await Promise.allSettled([
+    getMarketReviewDetail(detailDate),
+    getMarketReviewLadder(detailDate)
   ])
 
   if (currentSequence !== fetchSequence) {
     return
-  }
-
-  activeStartDate.value = startDate
-  activeEndDate.value = endDate
-
-  let hasError = false
-
-  if (dailyResult.status === 'fulfilled') {
-    dailySeries.value = dailyResult.value.data.series
-    dailyRows.value = dailyResult.value.data.rows
-  } else {
-    console.error('Fetch market review daily error:', dailyResult.reason)
-    dailySeries.value = []
-    dailyRows.value = []
-    hasError = true
   }
 
   if (detailResult.status === 'fulfilled') {

@@ -5,7 +5,7 @@
       <div class="basic-info">
         <h2>{{ stockInfo.stock_name }} <span class="code">{{ stockCode }}</span></h2>
         <div class="tags">
-          <el-tag v-if="stockInfo.continuous_limit_up_days > 1" type="info" size="small">
+          <el-tag v-if="(stockInfo.continuous_limit_up_days || 0) > 1" type="info" size="small">
             {{ stockInfo.continuous_limit_up_days }}连板
           </el-tag>
           <el-tag :type="stockInfo.is_final_sealed ? 'info' : 'warning'" size="small">
@@ -35,7 +35,7 @@
           <span class="highlight-value">{{ stockInfo.final_seal_time || '-' }}</span>
         </el-descriptions-item>
         <el-descriptions-item label="连板天数">
-          <el-tag v-if="stockInfo.continuous_limit_up_days > 1" type="danger" size="small">
+          <el-tag v-if="(stockInfo.continuous_limit_up_days || 0) > 1" type="danger" size="small">
             {{ stockInfo.continuous_limit_up_days }}板
           </el-tag>
           <span v-else>首板</span>
