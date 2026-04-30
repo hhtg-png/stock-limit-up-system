@@ -10,7 +10,7 @@
         <el-radio-group v-model="timeRange" size="small">
           <el-radio-button label="7">近7天</el-radio-button>
           <el-radio-button label="30">近30天</el-radio-button>
-          <el-radio-button label="90">近3月</el-radio-button>
+          <el-radio-button label="3m">近3月</el-radio-button>
         </el-radio-group>
       </div>
 

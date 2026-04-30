@@ -9,9 +9,17 @@ export interface ReviewRange {
   query: ReviewRangeQuery
 }
 
+const QUICK_RANGE_TRADING_DAYS: Record<string, number> = {
+  '7': 7,
+  '30': 30,
+  '3m': 60
+}
+
 export function buildReviewRange(timeRange: string, currentDate: string): ReviewRange {
   const parsedDays = Number.parseInt(timeRange, 10)
-  const days = Number.isFinite(parsedDays) && parsedDays > 0 ? parsedDays : 30
+  const days = QUICK_RANGE_TRADING_DAYS[timeRange] ?? (
+    Number.isFinite(parsedDays) && parsedDays > 0 ? parsedDays : 30
+  )
 
   return {
     startDate: currentDate,

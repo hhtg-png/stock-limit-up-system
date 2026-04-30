@@ -8,7 +8,7 @@ test('builds trading-session query for every quick review range', () => {
   for (const [range, days] of [
     ['7', 7],
     ['30', 30],
-    ['90', 90]
+    ['3m', 60]
   ]) {
     const result = buildReviewRange(range, today)
 
