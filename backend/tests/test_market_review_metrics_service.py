@@ -106,6 +106,70 @@ class MarketReviewMetricsServiceTests(unittest.TestCase):
         self.assertEqual(metric["limit_up_amount"], 0.0)
         self.assertEqual(metric["broken_amount"], 0.0)
 
+    def test_aggregate_daily_metrics_ignores_missing_feedback_change_pct(self):
+        rows = [
+            {
+                "stock_code": "600010",
+                "board_type": "main",
+                "yesterday_limit_up": True,
+                "yesterday_continuous_days": 1,
+                "today_touched_limit_up": False,
+                "today_sealed_close": False,
+                "today_opened_close": False,
+                "today_continuous_days": 0,
+                "change_pct": None,
+                "amount": 10000.0,
+            },
+            {
+                "stock_code": "600011",
+                "board_type": "main",
+                "yesterday_limit_up": True,
+                "yesterday_continuous_days": 1,
+                "today_touched_limit_up": False,
+                "today_sealed_close": False,
+                "today_opened_close": False,
+                "today_continuous_days": 0,
+                "change_pct": 10.0,
+                "amount": 10000.0,
+            },
+            {
+                "stock_code": "600012",
+                "board_type": "main",
+                "yesterday_limit_up": True,
+                "yesterday_continuous_days": 2,
+                "today_touched_limit_up": False,
+                "today_sealed_close": False,
+                "today_opened_close": False,
+                "today_continuous_days": 0,
+                "change_pct": 4.0,
+                "amount": 10000.0,
+            },
+            {
+                "stock_code": "600013",
+                "board_type": "main",
+                "yesterday_limit_up": True,
+                "yesterday_continuous_days": 2,
+                "today_touched_limit_up": False,
+                "today_sealed_close": False,
+                "today_opened_close": False,
+                "today_continuous_days": 0,
+                "change_pct": None,
+                "amount": 10000.0,
+            },
+        ]
+
+        metric = self.service.aggregate_daily_metrics(
+            trade_date=date(2026, 4, 28),
+            stock_rows=rows,
+            limit_down_count=0,
+            market_turnover=0,
+            up_count_ex_st=0,
+            down_count_ex_st=0,
+        )
+
+        self.assertAlmostEqual(metric["yesterday_limit_up_avg_change"], 7.0)
+        self.assertAlmostEqual(metric["yesterday_continuous_avg_change"], 4.0)
+
     def test_aggregate_daily_metrics_treats_first_board_only_as_height_one(self):
         rows = [
             {

@@ -316,6 +316,51 @@ class MarketReviewSourceServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["stock_rows"], [])
         self.assertEqual(payload["event_rows"], [])
 
+    async def test_collect_for_date_drops_yesterday_pool_sentinel_change_pct(self):
+        async def empty_today_fetcher(_trade_date):
+            return []
+
+        async def yesterday_pool_fetcher(_trade_date):
+            return [
+                {
+                    "c": "603272",
+                    "n": "联翔股份",
+                    "ylbc": 2,
+                    "zdp": -100.0,
+                    "p": 0,
+                    "amount": 0,
+                    "ltsz": 0.0,
+                }
+            ]
+
+        async def empty_quotes(_codes):
+            return {}
+
+        async def market_stats_fetcher(_trade_date):
+            return {
+                "limit_down_count": 0,
+                "market_turnover": 1000.0,
+                "up_count_ex_st": 100,
+                "down_count_ex_st": 100,
+            }
+
+        service = MarketReviewSourceService(
+            session_factory=self.session_factory,
+            today_limit_up_fetcher=empty_today_fetcher,
+            yesterday_pool_fetcher=yesterday_pool_fetcher,
+            quote_fetcher=empty_quotes,
+            market_stats_fetcher=market_stats_fetcher,
+            current_date_provider=lambda: date(2026, 4, 29),
+        )
+
+        payload = await service.collect_for_date(date(2026, 4, 28))
+
+        self.assertTrue(payload["is_authoritative"])
+        self.assertEqual(len(payload["stock_rows"]), 1)
+        row = payload["stock_rows"][0]
+        self.assertEqual(row["stock_code"], "603272")
+        self.assertIsNone(row["change_pct"])
+
     async def test_bj_limit_helpers_use_thirty_percent_board_rules(self):
         service = MarketReviewSourceService(
             session_factory=self.session_factory,

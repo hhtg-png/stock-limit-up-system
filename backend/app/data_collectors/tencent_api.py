@@ -5,6 +5,8 @@ import httpx
 from typing import Dict, List, Optional
 from loguru import logger
 
+from app.utils.market_data_sanitizer import normalize_change_pct
+
 
 class TencentStockAPI:
     """腾讯股票实时行情API"""
@@ -108,6 +110,12 @@ class TencentStockAPI:
                             result[name] = 0
                     else:
                         result[name] = value
+
+            result["change_pct"] = normalize_change_pct(
+                result.get("change_pct"),
+                price=result.get("price"),
+                amount=result.get("amount"),
+            )
             
             return result
         except Exception as e:

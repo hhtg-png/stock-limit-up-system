@@ -17,6 +17,7 @@ from app.models.market_data import DailyStatistics
 from app.models.stock import Stock
 from app.services.realtime_limit_up_service import realtime_limit_up_service
 from app.crawlers.eastmoney_crawler import em_crawler
+from app.utils.market_data_sanitizer import normalize_change_pct
 NormalizedFetcher = Callable[[date], Awaitable[Dict[str, Any]]]
 ListFetcher = Callable[[date], Awaitable[list[Dict[str, Any]]]]
 QuoteFetcher = Callable[[list[str]], Awaitable[Dict[str, Dict[str, Any]]]]
@@ -782,17 +783,24 @@ class MarketReviewSourceService:
         close_price: Optional[float],
         pre_close: Optional[float],
     ) -> Optional[float]:
-        for value in (
-            quote.get("change_pct"),
-            today_item.get("change_pct"),
-            yesterday_item.get("zdp"),
+        for value, price, amount in (
+            (quote.get("change_pct"), quote.get("price"), quote.get("amount")),
+            (
+                today_item.get("change_pct"),
+                today_item.get("current_price") or today_item.get("limit_up_price"),
+                today_item.get("amount"),
+            ),
+            (yesterday_item.get("zdp"), yesterday_item.get("p"), yesterday_item.get("amount")),
         ):
-            resolved = self._to_float(value)
+            resolved = normalize_change_pct(value, price=price, amount=amount)
             if resolved is not None:
-                return round(resolved, 2)
+                return resolved
 
         if close_price is not None and pre_close not in (None, 0):
-            return round((close_price - pre_close) / pre_close * 100, 2)
+            return normalize_change_pct(
+                (close_price - pre_close) / pre_close * 100,
+                price=close_price,
+            )
         return None
 
     def _resolve_amount(self, today_item: Dict[str, Any], quote: Dict[str, Any]) -> float:

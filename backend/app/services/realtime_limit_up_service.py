@@ -25,6 +25,7 @@ from app.crawlers.eastmoney_crawler import em_crawler
 from app.crawlers.tonghuashun_crawler import ths_crawler
 from app.data_collectors.tencent_api import tencent_api
 from app.services.tradable_market_value_service import tradable_market_value_service
+from app.utils.market_data_sanitizer import normalize_change_pct
 
 
 class RealtimeLimitUpService:
@@ -277,16 +278,28 @@ class RealtimeLimitUpService:
         stock_code = merged.get("stock_code", "")
 
         if quote:
-            current_price = quote.get("price", 0) or merged.get("limit_up_price", 0)
+            try:
+                quote_price = float(quote.get("price") or 0)
+            except (TypeError, ValueError):
+                quote_price = 0.0
+            current_price = quote_price if quote_price > 0 else merged.get("limit_up_price", 0)
             amount = quote.get("amount", 0) or merged.get("amount", 0)
             turnover_rate = quote.get("turnover_rate", 0) or merged.get("turnover_rate", 0)
-            change_pct = quote.get("change_pct")
+            change_pct = normalize_change_pct(
+                quote.get("change_pct"),
+                price=quote_price,
+                amount=quote.get("amount"),
+            )
             bid1_volume = quote.get("bid1_volume", 0)
         else:
             current_price = merged.get("limit_up_price", 0)
             amount = merged.get("amount", 0)
             turnover_rate = merged.get("turnover_rate", 0)
-            change_pct = None
+            change_pct = normalize_change_pct(
+                merged.get("change_pct"),
+                price=merged.get("current_price") or merged.get("limit_up_price"),
+                amount=merged.get("amount"),
+            )
             bid1_volume = 0
 
         is_sealed = bool(merged.get("is_final_sealed", True))

@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import date
 from typing import Dict, List
 
+from app.utils.market_data_sanitizer import normalize_change_pct
+
 
 class MarketReviewMetricsService:
     """Pure aggregation service for end-of-day market review metrics."""
@@ -57,14 +59,18 @@ class MarketReviewMetricsService:
             return round(sum(values) / len(values), 2) if values else 0.0
 
         yesterday_limit_up_changes = [
-            float(row.get("change_pct") or 0)
+            change_pct
             for row in stock_rows
             if row.get("yesterday_limit_up")
+            for change_pct in [self._normalized_change_pct(row)]
+            if change_pct is not None
         ]
         yesterday_continuous_changes = [
-            float(row.get("change_pct") or 0)
+            change_pct
             for row in stock_rows
             if self._to_int(row.get("yesterday_continuous_days")) >= 2
+            for change_pct in [self._normalized_change_pct(row)]
+            if change_pct is not None
         ]
 
         return {
@@ -100,6 +106,13 @@ class MarketReviewMetricsService:
             return int(value)
         except (TypeError, ValueError):
             return 0
+
+    def _normalized_change_pct(self, row: Dict) -> float | None:
+        return normalize_change_pct(
+            row.get("change_pct"),
+            price=row.get("close_price") or row.get("current_price"),
+            amount=row.get("amount"),
+        )
 
 
 market_review_metrics_service = MarketReviewMetricsService()

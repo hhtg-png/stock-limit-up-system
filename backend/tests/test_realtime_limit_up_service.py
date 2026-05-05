@@ -155,6 +155,50 @@ class RealtimeLimitUpServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNone(data[0]["tradable_market_value"])
 
+    async def test_get_realtime_limit_up_list_drops_quote_sentinel_change_pct(self):
+        service = RealtimeLimitUpService()
+        service.get_fast_limit_up_pool = AsyncMock(
+            return_value=[
+                {
+                    "stock_code": "603272",
+                    "stock_name": "联翔股份",
+                    "continuous_limit_up_days": 2,
+                    "open_count": 0,
+                    "is_final_sealed": True,
+                    "limit_up_price": 26.73,
+                    "turnover_rate": 0,
+                    "amount": 0,
+                }
+            ]
+        )
+        service._fetch_ths_reason_map = AsyncMock(return_value={})
+
+        quotes = {
+            "603272": {
+                "code": "603272",
+                "price": 0,
+                "amount": 0,
+                "turnover_rate": 0,
+                "change_pct": -100.0,
+                "bid1_volume": 0,
+            }
+        }
+
+        with patch(
+            "app.services.realtime_limit_up_service.tencent_api.get_quotes_batch",
+            AsyncMock(return_value=quotes),
+        ), patch.object(
+            realtime_limit_up_module,
+            "tradable_market_value_service",
+            AsyncMock(),
+            create=True,
+        ) as tradable_market_value_service:
+            tradable_market_value_service.get_float_share_map = AsyncMock(return_value={})
+            data = await service.get_realtime_limit_up_list(date(2026, 4, 28))
+
+        self.assertEqual(data[0]["current_price"], 26.73)
+        self.assertIsNone(data[0]["change_pct"])
+
 
 if __name__ == "__main__":
     unittest.main()
