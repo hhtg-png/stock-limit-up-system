@@ -9,6 +9,9 @@ test('board height chart displays stock labels from daily rows', () => {
   assert.match(source, /second_board_label/, 'second board labels should be used in the chart')
   assert.match(source, /gem_board_label/, 'GEM board labels should be used in the chart')
   assert.match(source, /function getBoardLabelFormatter/, 'chart point labels should have a formatter')
+  assert.match(source, /function shouldShowBoardHeightLabel/, 'labels should be filtered to avoid crowding')
+  assert.match(source, /function formatBoardHeightTooltip/, 'full labels should remain available in tooltip')
+  assert.match(source, /tooltip:\s*\{\s*trigger: 'axis',\s*formatter: formatBoardHeightTooltip/s)
   assert.match(source, /label:\s*getBoardHeightLabelOption\('max_board_label'\)/)
   assert.match(source, /label:\s*getBoardHeightLabelOption\('second_board_label'\)/)
   assert.match(source, /label:\s*getBoardHeightLabelOption\('gem_board_label', 'bottom'\)/)
@@ -23,4 +26,11 @@ test('yesterday feedback chart uses straight line series', () => {
   assert.match(optionSource, /name: '昨日连板平均涨幅'[\s\S]*?type: 'line'/)
   assert.doesNotMatch(optionSource, /smooth: true/, 'yesterday feedback lines should not be smoothed')
   assert.doesNotMatch(optionSource, /type: 'bar'/, 'yesterday feedback chart should not use bars')
+})
+
+test('ladder groups show seal rate and average change', () => {
+  assert.match(source, /封板率\s*\{\{\s*getLadderSealRate\(ladder\)\s*\}\}/)
+  assert.match(source, /均涨\s*\{\{\s*getLadderAverageChange\(ladder\)\s*\}\}/)
+  assert.match(source, /function getLadderSealRate\(ladder: MarketReviewLadderLevel\)/)
+  assert.match(source, /function getLadderAverageChange\(ladder: MarketReviewLadderLevel\)/)
 })
