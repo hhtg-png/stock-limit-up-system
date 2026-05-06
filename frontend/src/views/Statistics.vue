@@ -32,7 +32,7 @@
               <p>龙头高度、次高板高度与创业板高度。</p>
             </div>
           </div>
-          <div ref="boardHeightChartRef" class="chart-container board-height-chart"></div>
+          <div ref="boardHeightChartRef" class="chart-container review-main-chart"></div>
         </div>
       </el-col>
       <el-col :xs="24" :lg="12">
@@ -43,7 +43,7 @@
               <p>首板进二板、连板晋级与封板率联动观察。</p>
             </div>
           </div>
-          <div ref="promotionRateChartRef" class="chart-container"></div>
+          <div ref="promotionRateChartRef" class="chart-container review-main-chart"></div>
         </div>
       </el-col>
     </el-row>
@@ -497,10 +497,10 @@ const boardHeightFieldMap: Record<BoardLabelField, BoardHeightField> = {
 
 function compactBoardLabel(label: string) {
   const lines = label.split('\n').filter(Boolean)
-  if (lines.length <= 1) {
-    return lines[0] || ''
+  if (lines.length <= 3) {
+    return lines.join('\n')
   }
-  return `${lines[0]} 等${lines.length}只`
+  return `${lines.slice(0, 3).join('\n')}\n等${lines.length}只`
 }
 
 function getBoardHeight(row: MarketReviewDailyRow | undefined, field: BoardLabelField) {
@@ -558,11 +558,8 @@ function getBoardHeightLabelOption(
     fontSize: 11,
     lineHeight: 14,
     distance: 6,
-    width: 100,
-    overflow: 'truncate',
-    backgroundColor: 'rgba(255, 255, 255, 0.86)',
-    borderRadius: 4,
-    padding: [2, 4]
+    width: 118,
+    overflow: 'break'
   }
 }
 
@@ -1138,7 +1135,7 @@ onUnmounted(() => {
   height: 320px;
 }
 
-.board-height-chart {
+.review-main-chart {
   height: 380px;
 }
 
@@ -1346,7 +1343,7 @@ onUnmounted(() => {
     height: 280px;
   }
 
-  .board-height-chart {
+  .review-main-chart {
     height: 340px;
   }
 

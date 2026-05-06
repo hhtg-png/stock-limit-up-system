@@ -18,13 +18,19 @@ test('board height chart displays stock labels from daily rows', () => {
 })
 
 test('board height labels keep more data with layout controls', () => {
-  assert.match(source, /class="chart-container board-height-chart"/, 'board chart should have more vertical space')
+  assert.match(source, /ref="boardHeightChartRef" class="chart-container review-main-chart"/)
+  assert.match(source, /ref="promotionRateChartRef" class="chart-container review-main-chart"/)
   assert.match(source, /function isBoardHeightLabelPoint/, 'changed height points should be eligible for labels')
   assert.match(source, /currentHeight !== prevHeight \|\| currentHeight !== nextHeight/)
   assert.match(source, /labelLayout:\s*\{\s*hideOverlap: true/s)
   assert.match(source, /getBoardHeightLabelOption\('max_board_label', 'top', \[0, -6\]\)/)
   assert.match(source, /getBoardHeightLabelOption\('second_board_label', 'bottom', \[0, 16\]\)/)
-  assert.match(source, /return `\$\{lines\[0\]\} 等\$\{lines\.length\}只`/)
+  assert.match(source, /if \(lines\.length <= 3\) \{[\s\S]*return lines\.join\('\\n'\)/)
+  assert.match(source, /return `\$\{lines\.slice\(0, 3\)\.join\('\\n'\)\}\\n等\$\{lines\.length\}只`/)
+  assert.match(source, /\.review-main-chart\s*\{[\s\S]*height: 380px/)
+  const boardLabelOption = source.match(/function getBoardHeightLabelOption[\s\S]*?function getPercentPointLabelOption/)
+  assert.ok(boardLabelOption, 'board label option should exist')
+  assert.doesNotMatch(boardLabelOption[0], /backgroundColor|borderRadius|padding/, 'board stock labels should not use a white tag background')
 })
 
 test('yesterday feedback chart uses straight line series', () => {
