@@ -357,11 +357,11 @@ function formatAmount(value: number) {
   return value.toFixed(0)
 }
 
-function toYiAmount(value: number | null | undefined) {
+function toYiFromWanAmount(value: number | null | undefined) {
   if (value == null) {
     return 0
   }
-  return Number((value / 100000000).toFixed(2))
+  return Number((value / 10000).toFixed(2))
 }
 
 function formatYiAmount(value: number | string | null | undefined) {
@@ -897,7 +897,7 @@ function updateCharts() {
         {
           name: '涨停成交额',
           type: 'bar',
-          data: dailyRows.value.map(row => toYiAmount(row.limit_up_amount)),
+          data: dailyRows.value.map(row => toYiFromWanAmount(row.limit_up_amount)),
           itemStyle: { color: '#f5222d' },
           label: getYiAmountLabelOption(),
           barMaxWidth: 26
@@ -905,7 +905,7 @@ function updateCharts() {
         {
           name: '炸板成交额',
           type: 'bar',
-          data: dailyRows.value.map(row => toYiAmount(row.broken_amount)),
+          data: dailyRows.value.map(row => toYiFromWanAmount(row.broken_amount)),
           itemStyle: { color: '#faad14' },
           label: getYiAmountLabelOption(),
           barMaxWidth: 26

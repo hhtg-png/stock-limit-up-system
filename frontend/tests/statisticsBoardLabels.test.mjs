@@ -70,12 +70,13 @@ test('limit and broken amount chart uses hundred-million unit', () => {
   assert.ok(match, 'amount chart option should exist')
   const optionSource = match[0]
 
-  assert.match(source, /function toYiAmount/)
+  assert.match(source, /function toYiFromWanAmount/)
+  assert.match(source, /return Number\(\(value \/ 10000\)\.toFixed\(2\)\)/)
   assert.match(source, /function formatYiAmount/)
   assert.match(optionSource, /name:\s*'亿元'/)
   assert.match(optionSource, /formatter:\s*\(value: number\) => formatYiAmount\(value\)/)
-  assert.match(optionSource, /data:\s*dailyRows\.value\.map\(row => toYiAmount\(row\.limit_up_amount\)\)/)
-  assert.match(optionSource, /data:\s*dailyRows\.value\.map\(row => toYiAmount\(row\.broken_amount\)\)/)
+  assert.match(optionSource, /data:\s*dailyRows\.value\.map\(row => toYiFromWanAmount\(row\.limit_up_amount\)\)/)
+  assert.match(optionSource, /data:\s*dailyRows\.value\.map\(row => toYiFromWanAmount\(row\.broken_amount\)\)/)
   assert.match(optionSource, /valueFormatter:\s*\(value: unknown\) => formatYiAmount\(Number\(value\)\)/)
 })
 
