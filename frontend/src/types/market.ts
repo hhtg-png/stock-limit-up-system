@@ -177,3 +177,10 @@ export interface MarketReviewLadderResponse {
   is_fallback: boolean
   ladders: MarketReviewLadderLevel[]
 }
+
+export interface MarketReviewIntradayResponse extends MarketReviewDailyResponse {
+  is_intraday: true
+  snapshot_time: string
+  detail: MarketReviewDetailResponse
+  ladder: MarketReviewLadderResponse
+}

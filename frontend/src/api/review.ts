@@ -2,6 +2,7 @@ import axios from 'axios'
 import type {
   MarketReviewDailyResponse,
   MarketReviewDetailResponse,
+  MarketReviewIntradayResponse,
   MarketReviewLadderResponse
 } from '@/types/market'
 
@@ -29,6 +30,13 @@ export async function getMarketReviewDetail(tradeDate: string): Promise<MarketRe
 export async function getMarketReviewLadder(tradeDate: string): Promise<MarketReviewLadderResponse> {
   const { data } = await api.get('/statistics/review/ladder', {
     params: { trade_date: tradeDate }
+  })
+  return data
+}
+
+export async function getMarketReviewIntraday(tradeDate?: string): Promise<MarketReviewIntradayResponse> {
+  const { data } = await api.get('/statistics/review/intraday', {
+    params: tradeDate ? { trade_date: tradeDate } : undefined
   })
   return data
 }

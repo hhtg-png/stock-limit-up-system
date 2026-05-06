@@ -1,7 +1,8 @@
 """
 市场复盘API
 """
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
+from typing import Any
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import desc, select
@@ -14,12 +15,21 @@ from app.schemas.market_review import (
     MarketReviewDailyMetricRow,
     MarketReviewDailyResponse,
     MarketReviewDetailResponse,
+    MarketReviewIntradayResponse,
     MarketReviewLadderItem,
     MarketReviewLadderResponse,
     MarketReviewStockItem,
 )
+from app.services.market_review_metrics_service import market_review_metrics_service
 
 router = APIRouter()
+CN_TZ = timezone(timedelta(hours=8))
+
+
+async def _collect_intraday_source(trade_date: date) -> dict[str, Any]:
+    from app.services.market_review_source_service import market_review_source_service
+
+    return await market_review_source_service.collect(trade_date)
 
 
 async def _resolve_review_trade_date(
@@ -71,7 +81,7 @@ async def _resolve_daily_metric_range(
 
 
 def _format_board_height_label(
-    stock_rows: list[MarketReviewStockDaily],
+    stock_rows: list[MarketReviewStockDaily | dict[str, Any]],
     height: int,
     board_types: set[str] | None = None,
 ) -> str | None:
@@ -79,12 +89,143 @@ def _format_board_height_label(
         return None
 
     names = [
-        f"{row.stock_name}{height}"
+        f"{_get_stock_value(row, 'stock_name')}{height}"
         for row in stock_rows
-        if row.today_continuous_days == height
-        and (board_types is None or row.board_type in board_types)
+        if _get_stock_int(row, "today_continuous_days") == height
+        and (board_types is None or _get_stock_value(row, "board_type") in board_types)
     ]
     return "\n".join(names) if names else None
+
+
+def _get_stock_value(row: MarketReviewStockDaily | dict[str, Any], key: str, default: Any = None) -> Any:
+    if isinstance(row, dict):
+        return row.get(key, default)
+    return getattr(row, key, default)
+
+
+def _get_stock_int(row: MarketReviewStockDaily | dict[str, Any], key: str) -> int:
+    try:
+        return int(_get_stock_value(row, key, 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _get_stock_float(row: MarketReviewStockDaily | dict[str, Any], key: str) -> float | None:
+    value = _get_stock_value(row, key)
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _build_stock_item_from_source(row: dict[str, Any]) -> MarketReviewStockItem:
+    change_pct = _get_stock_float(row, "change_pct")
+    return MarketReviewStockItem(
+        stock_code=str(row.get("stock_code") or ""),
+        stock_name=str(row.get("stock_name") or row.get("stock_code") or ""),
+        today_continuous_days=_get_stock_int(row, "today_continuous_days"),
+        today_sealed_close=bool(row.get("today_sealed_close")),
+        today_opened_close=bool(row.get("today_opened_close") or row.get("today_broken")),
+        change_pct=change_pct,
+        amount=float(row.get("amount") or 0.0),
+        limit_up_reason=row.get("limit_up_reason") or None,
+    )
+
+
+def _build_intraday_detail(trade_date: date, stock_rows: list[dict[str, Any]]) -> MarketReviewDetailResponse:
+    stocks = [_build_stock_item_from_source(row) for row in stock_rows if row.get("stock_code")]
+    stocks.sort(
+        key=lambda stock: (
+            -stock.today_continuous_days,
+            -stock.amount,
+            stock.stock_code,
+        )
+    )
+    return MarketReviewDetailResponse(
+        trade_date=trade_date,
+        is_fallback=False,
+        stocks=stocks,
+    )
+
+
+def _build_intraday_ladder(trade_date: date, stock_rows: list[dict[str, Any]]) -> MarketReviewLadderResponse:
+    stocks = [
+        _build_stock_item_from_source(row)
+        for row in stock_rows
+        if row.get("today_touched_limit_up") and _get_stock_int(row, "today_continuous_days") >= 2
+    ]
+    stocks.sort(
+        key=lambda stock: (
+            -stock.today_continuous_days,
+            not stock.today_sealed_close,
+            stock.stock_code,
+        )
+    )
+
+    ladders: list[MarketReviewLadderItem] = []
+    current_ladder: MarketReviewLadderItem | None = None
+    for stock in stocks:
+        if current_ladder is None or current_ladder.continuous_days != stock.today_continuous_days:
+            current_ladder = MarketReviewLadderItem(
+                continuous_days=stock.today_continuous_days,
+                count=0,
+                stocks=[],
+            )
+            ladders.append(current_ladder)
+
+        current_ladder.stocks.append(stock)
+        current_ladder.count = len(current_ladder.stocks)
+
+    return MarketReviewLadderResponse(
+        trade_date=trade_date,
+        is_fallback=False,
+        ladders=ladders,
+    )
+
+
+async def _build_intraday_snapshot(trade_date: date) -> MarketReviewIntradayResponse:
+    normalized_data = await _collect_intraday_source(trade_date)
+    stock_rows = normalized_data.get("stock_rows") or []
+    metric = market_review_metrics_service.aggregate_daily_metrics(
+        trade_date,
+        stock_rows,
+        int(normalized_data.get("limit_down_count") or 0),
+        float(normalized_data.get("market_turnover") or 0.0),
+        int(normalized_data.get("up_count_ex_st") or 0),
+        int(normalized_data.get("down_count_ex_st") or 0),
+    )
+    metric_row = MarketReviewDailyMetricRow.model_validate(metric)
+    labels = {
+        "max_board_label": _format_board_height_label(stock_rows, metric_row.max_board_height),
+        "second_board_label": _format_board_height_label(stock_rows, metric_row.second_board_height),
+        "gem_board_label": _format_board_height_label(
+            stock_rows,
+            metric_row.gem_board_height,
+            {"gem", "star"},
+        ),
+    }
+    metric_row = metric_row.model_copy(update=labels)
+
+    detail = _build_intraday_detail(metric_row.trade_date, stock_rows)
+    ladder = _build_intraday_ladder(metric_row.trade_date, stock_rows)
+
+    return MarketReviewIntradayResponse(
+        data=MarketReviewDailyData(
+            series=[metric_row.trade_date],
+            rows=[metric_row],
+        ),
+        requested_start_date=trade_date,
+        requested_end_date=trade_date,
+        start_date=metric_row.trade_date,
+        end_date=metric_row.trade_date,
+        latest_trade_date=metric_row.trade_date,
+        is_fallback=False,
+        snapshot_time=datetime.now(CN_TZ),
+        detail=detail,
+        ladder=ladder,
+    )
 
 
 async def _attach_board_height_labels(
@@ -130,6 +271,15 @@ async def _attach_board_height_labels(
         rows.append(MarketReviewDailyMetricRow.model_validate(metric_row).model_copy(update=labels))
 
     return rows
+
+
+@router.get("/intraday", response_model=MarketReviewIntradayResponse, summary="获取盘中复盘快照")
+async def get_market_review_intraday(
+    trade_date: date | None = Query(None, description="交易日期，默认今天"),
+):
+    """获取盘中实时复盘快照。"""
+    target_date = trade_date or datetime.now(CN_TZ).date()
+    return await _build_intraday_snapshot(target_date)
 
 
 @router.get("/daily", response_model=MarketReviewDailyResponse, summary="获取复盘日级指标")

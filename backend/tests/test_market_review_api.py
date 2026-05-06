@@ -4,6 +4,7 @@ import sys
 import unittest
 from datetime import date, time
 from pathlib import Path
+from unittest.mock import AsyncMock, Mock
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -16,13 +17,17 @@ from app.models.market_review import MarketReviewDailyMetric, MarketReviewStockD
 from app.models.stock import Stock
 
 
-def _load_review_router():
+def _load_review_module():
     review_module_path = Path(__file__).resolve().parents[1] / "app" / "api" / "v1" / "review.py"
     spec = importlib.util.spec_from_file_location("isolated_market_review_router", review_module_path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
-    return module.router
+    return module
+
+
+def _load_review_router():
+    return _load_review_module().router
 
 
 class MarketReviewApiTests(unittest.TestCase):
@@ -52,10 +57,10 @@ class MarketReviewApiTests(unittest.TestCase):
         )
         asyncio.run(self._create_schema())
         asyncio.run(self._seed_data())
-        review_router = _load_review_router()
+        self.review_module = _load_review_module()
 
         self.app = FastAPI()
-        self.app.include_router(review_router, prefix="/api/v1/statistics/review")
+        self.app.include_router(self.review_module.router, prefix="/api/v1/statistics/review")
 
         async def override_get_db():
             async with self.session_factory() as session:
@@ -372,6 +377,97 @@ class MarketReviewApiTests(unittest.TestCase):
         self.assertEqual(payload["trade_date"], "2026-04-28")
         self.assertEqual(payload["is_fallback"], True)
         self.assertEqual(payload["ladders"][0]["stocks"][0]["stock_code"], "600001")
+
+    def test_intraday_endpoint_returns_live_metric_detail_and_ladder_snapshot(self):
+        collect_mock = AsyncMock(
+            return_value={
+                "stock_rows": [
+                    {
+                        "stock_code": "600010",
+                        "stock_name": "LiveAlpha",
+                        "board_type": "main",
+                        "today_touched_limit_up": True,
+                        "today_sealed_close": True,
+                        "today_opened_close": False,
+                        "today_continuous_days": 3,
+                        "change_pct": 10.01,
+                        "amount": 120000.0,
+                        "limit_up_reason": "AI",
+                    },
+                    {
+                        "stock_code": "600011",
+                        "stock_name": "LiveBeta",
+                        "board_type": "main",
+                        "today_touched_limit_up": True,
+                        "today_sealed_close": False,
+                        "today_opened_close": True,
+                        "today_continuous_days": 3,
+                        "change_pct": 7.2,
+                        "amount": 220000.0,
+                        "limit_up_reason": "AI",
+                    },
+                    {
+                        "stock_code": "600012",
+                        "stock_name": "LiveGamma",
+                        "board_type": "gem",
+                        "today_touched_limit_up": True,
+                        "today_sealed_close": True,
+                        "today_opened_close": False,
+                        "today_continuous_days": 2,
+                        "change_pct": 20.0,
+                        "amount": 180000.0,
+                        "limit_up_reason": "Chip",
+                    },
+                ],
+                "limit_down_count": 2,
+                "market_turnover": 9800.0,
+                "up_count_ex_st": 2600,
+                "down_count_ex_st": 1200,
+            }
+        )
+        aggregate_mock = Mock(
+            return_value={
+                "trade_date": date(2026, 5, 6),
+                "limit_up_count": 3,
+                "limit_down_count": 2,
+                "continuous_count": 3,
+                "max_board_height": 3,
+                "second_board_height": 2,
+                "gem_board_height": 2,
+                "first_to_second_rate": 42.0,
+                "continuous_promotion_rate": 55.0,
+                "seal_rate": 66.67,
+                "yesterday_limit_up_avg_change": 3.4,
+                "yesterday_continuous_avg_change": 5.6,
+                "market_turnover": 9800.0,
+                "up_count_ex_st": 2600,
+                "down_count_ex_st": 1200,
+                "limit_up_amount": 520000.0,
+                "broken_amount": 220000.0,
+            }
+        )
+
+        self.review_module._collect_intraday_source = collect_mock
+        if hasattr(self.review_module, "market_review_metrics_service"):
+            self.review_module.market_review_metrics_service.aggregate_daily_metrics = aggregate_mock
+
+        response = self.client.get(
+            "/api/v1/statistics/review/intraday",
+            params={"trade_date": "2026-05-06"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["is_intraday"])
+        self.assertIsNotNone(payload["snapshot_time"])
+        self.assertEqual(payload["data"]["series"], ["2026-05-06"])
+        row = payload["data"]["rows"][0]
+        self.assertEqual(row["max_board_label"], "LiveAlpha3\nLiveBeta3")
+        self.assertEqual(row["second_board_label"], "LiveGamma2")
+        self.assertEqual(row["gem_board_label"], "LiveGamma2")
+        self.assertEqual([stock["stock_code"] for stock in payload["detail"]["stocks"]], ["600011", "600010", "600012"])
+        self.assertEqual([ladder["continuous_days"] for ladder in payload["ladder"]["ladders"]], [3, 2])
+        self.assertEqual(payload["ladder"]["ladders"][0]["count"], 2)
 
 
 if __name__ == "__main__":

@@ -7,16 +7,30 @@
           <p>用复盘指标跟踪连板高度、晋级率、情绪与量能变化。</p>
         </div>
 
-        <el-radio-group v-model="timeRange" size="small">
-          <el-radio-button label="7">近7天</el-radio-button>
-          <el-radio-button label="30">近30天</el-radio-button>
-          <el-radio-button label="3m">近3月</el-radio-button>
-        </el-radio-group>
+        <div class="summary-controls">
+          <el-radio-group v-model="reviewMode" size="small">
+            <el-radio-button label="daily">收盘复盘</el-radio-button>
+            <el-radio-button label="intraday">盘中实时</el-radio-button>
+          </el-radio-group>
+
+          <el-radio-group v-if="reviewMode === 'daily'" v-model="timeRange" size="small">
+            <el-radio-button label="7">近7天</el-radio-button>
+            <el-radio-button label="30">近30天</el-radio-button>
+            <el-radio-button label="3m">近3月</el-radio-button>
+          </el-radio-group>
+        </div>
       </div>
 
       <div class="summary-meta">
-        <span>区间 {{ activeStartDate }} 至 {{ activeEndDate }}</span>
+        <span v-if="reviewMode === 'daily'">区间 {{ activeStartDate }} 至 {{ activeEndDate }}</span>
+        <span v-else>盘中快照 {{ activeEndDate }}</span>
         <span>明细日期 {{ resolvedTradeDate }}</span>
+        <span v-if="reviewMode === 'intraday' && intradaySnapshotTime">
+          更新时间 {{ formatSnapshotTime(intradaySnapshotTime) }}
+        </span>
+        <el-tag v-if="reviewMode === 'intraday'" type="success" size="small">
+          盘中快照
+        </el-tag>
         <el-tag v-if="hasFallback" type="warning" size="small">
           已回退到最近可用数据
         </el-tag>
@@ -240,7 +254,7 @@ import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import * as echarts from 'echarts'
 import dayjs from 'dayjs'
-import { getMarketReviewDaily, getMarketReviewDetail, getMarketReviewLadder } from '@/api'
+import { getMarketReviewDaily, getMarketReviewDetail, getMarketReviewIntraday, getMarketReviewLadder } from '@/api'
 import { buildReviewRange } from '@/utils/reviewRange'
 import type {
   MarketReviewDailyRow,
@@ -252,6 +266,7 @@ import type {
 
 const router = useRouter()
 
+const reviewMode = ref<'daily' | 'intraday'>('daily')
 const timeRange = ref('30')
 const loading = ref(false)
 const activeStartDate = ref(dayjs().format('YYYY-MM-DD'))
@@ -262,6 +277,7 @@ const dailyRows = ref<MarketReviewDailyRow[]>([])
 const dailyHasFallback = ref(false)
 const detailResponse = ref<MarketReviewDetailResponse | null>(null)
 const ladderResponse = ref<MarketReviewLadderResponse | null>(null)
+const intradaySnapshotTime = ref<string | null>(null)
 
 const boardHeightChartRef = ref<HTMLElement>()
 const promotionRateChartRef = ref<HTMLElement>()
@@ -277,6 +293,7 @@ let limitTrendChart: echarts.ECharts | null = null
 let breadthChart: echarts.ECharts | null = null
 let amountChart: echarts.ECharts | null = null
 let fetchSequence = 0
+let intradayRefreshTimer: number | null = null
 
 const detailStocks = computed(() => detailResponse.value?.stocks ?? [])
 const ladderLevels = computed(() => ladderResponse.value?.ladders ?? [])
@@ -320,6 +337,10 @@ function getDateRange() {
 
 function formatDateLabel(value: string) {
   return dayjs(value).format('MM-DD')
+}
+
+function formatSnapshotTime(value: string) {
+  return dayjs(value).format('HH:mm:ss')
 }
 
 function formatPercent(value: number | null | undefined) {
@@ -963,9 +984,58 @@ function disposeCharts() {
 }
 
 async function fetchData() {
-  const { startDate, endDate, query } = getDateRange()
   const currentSequence = ++fetchSequence
   loading.value = true
+  const today = dayjs().format('YYYY-MM-DD')
+
+  if (reviewMode.value === 'intraday') {
+    let hasError = false
+
+    try {
+      const dailyResult = await getMarketReviewIntraday(dayjs().format('YYYY-MM-DD'))
+
+      if (currentSequence !== fetchSequence) {
+        return
+      }
+
+      dailySeries.value = dailyResult.data.series
+      dailyRows.value = dailyResult.data.rows
+      dailyHasFallback.value = Boolean(dailyResult.is_fallback)
+      const snapshotDate = dailyResult.end_date || dailyResult.latest_trade_date || dailyResult.data.series[0] || today
+      activeStartDate.value = snapshotDate
+      activeEndDate.value = snapshotDate
+      intradaySnapshotTime.value = dailyResult.snapshot_time
+      detailResponse.value = dailyResult.detail
+      ladderResponse.value = dailyResult.ladder
+    } catch (e) {
+      console.error('Fetch market review intraday error:', e)
+      dailySeries.value = []
+      dailyRows.value = []
+      dailyHasFallback.value = false
+      detailResponse.value = null
+      ladderResponse.value = null
+      intradaySnapshotTime.value = null
+      activeStartDate.value = today
+      activeEndDate.value = today
+      hasError = true
+    }
+
+    if (currentSequence !== fetchSequence) {
+      return
+    }
+
+    updateCharts()
+
+    if (hasError) {
+      ElMessage.error('获取盘中复盘数据失败')
+    }
+
+    loading.value = false
+    return
+  }
+
+  const { startDate, endDate, query } = getDateRange()
+  intradaySnapshotTime.value = null
 
   let detailDate = endDate
   let hasError = false
@@ -1039,17 +1109,41 @@ function handleRowClick(row: MarketReviewDetailStock) {
 }
 
 watch(timeRange, () => {
+  if (reviewMode.value === 'daily') {
+    fetchData()
+  }
+})
+
+function clearIntradayRefreshTimer() {
+  if (intradayRefreshTimer != null) {
+    window.clearInterval(intradayRefreshTimer)
+    intradayRefreshTimer = null
+  }
+}
+
+function resetIntradayRefreshTimer() {
+  clearIntradayRefreshTimer()
+  if (reviewMode.value === 'intraday') {
+    intradayRefreshTimer = window.setInterval(fetchData, 60000)
+  }
+}
+
+watch(reviewMode, () => {
+  clearIntradayRefreshTimer()
   fetchData()
+  resetIntradayRefreshTimer()
 })
 
 onMounted(() => {
   initCharts()
   updateCharts()
   fetchData()
+  resetIntradayRefreshTimer()
   window.addEventListener('resize', resizeCharts)
 })
 
 onUnmounted(() => {
+  clearIntradayRefreshTimer()
   window.removeEventListener('resize', resizeCharts)
   disposeCharts()
 })
@@ -1104,6 +1198,14 @@ onUnmounted(() => {
   flex-wrap: wrap;
   color: #666;
   font-size: 13px;
+}
+
+.summary-controls {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 .chart-card,

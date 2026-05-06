@@ -1,7 +1,7 @@
 """
 市场复盘接口响应模型
 """
-from datetime import date
+from datetime import date, datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -89,3 +89,12 @@ class MarketReviewLadderResponse(BaseModel):
     trade_date: date
     is_fallback: bool = Field(False, description="是否回退到历史数据")
     ladders: list[MarketReviewLadderItem] = Field(default_factory=list)
+
+
+class MarketReviewIntradayResponse(MarketReviewDailyResponse):
+    """市场复盘盘中快照响应"""
+
+    is_intraday: bool = Field(True, description="是否为盘中实时快照")
+    snapshot_time: datetime
+    detail: MarketReviewDetailResponse
+    ladder: MarketReviewLadderResponse
