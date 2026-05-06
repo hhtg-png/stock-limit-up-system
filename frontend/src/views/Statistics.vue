@@ -115,12 +115,6 @@
                   {{ ladder.continuous_days }}连板
                 </span>
                 <span class="count">{{ ladder.count }}只</span>
-                <span class="ladder-stat">封板 {{ getSealedCount(ladder) }}</span>
-                <span class="ladder-stat ladder-stat-warning">炸板 {{ getOpenedCount(ladder) }}</span>
-                <span class="ladder-stat ladder-stat-rate">封板率 {{ getLadderSealRate(ladder) }}</span>
-                <span class="ladder-stat ladder-stat-average" :class="getChangeClass(getLadderAverageChangeValue(ladder))">
-                  均涨 {{ getLadderAverageChange(ladder) }}
-                </span>
               </div>
 
               <div class="stock-chip-list">
@@ -237,7 +231,6 @@ import type {
   MarketReviewDailyRow,
   MarketReviewDetailResponse,
   MarketReviewDetailStock,
-  MarketReviewLadderLevel,
   MarketReviewLadderResponse
 } from '@/types/market'
 
@@ -358,37 +351,6 @@ function getStockStatusLabel(stock: MarketReviewDetailStock) {
   return '观察'
 }
 
-function getSealedCount(ladder: MarketReviewLadderLevel) {
-  return ladder.stocks.filter(stock => stock.today_sealed_close).length
-}
-
-function getOpenedCount(ladder: MarketReviewLadderLevel) {
-  return ladder.stocks.filter(stock => stock.today_opened_close).length
-}
-
-function getLadderSealRate(ladder: MarketReviewLadderLevel) {
-  const total = ladder.count || ladder.stocks.length
-  if (!total) {
-    return '0.00%'
-  }
-  return `${((getSealedCount(ladder) / total) * 100).toFixed(2)}%`
-}
-
-function getLadderAverageChangeValue(ladder: MarketReviewLadderLevel) {
-  const changes = ladder.stocks
-    .map(stock => stock.change_pct)
-    .filter((value): value is number => value != null)
-
-  if (!changes.length) {
-    return null
-  }
-  return changes.reduce((sum, value) => sum + value, 0) / changes.length
-}
-
-function getLadderAverageChange(ladder: MarketReviewLadderLevel) {
-  return formatPercent(getLadderAverageChangeValue(ladder))
-}
-
 function createEmptyOption(): echarts.EChartsOption {
   return {
     graphic: {
@@ -448,6 +410,7 @@ function getBaseGridOption(boundaryGap = false): Pick<echarts.EChartsOption, 'gr
 type BoardLabelField = 'max_board_label' | 'second_board_label' | 'gem_board_label'
 type BoardHeightField = 'max_board_height' | 'second_board_height' | 'gem_board_height'
 
+const boardLabelFields: BoardLabelField[] = ['max_board_label', 'second_board_label', 'gem_board_label']
 const boardHeightFieldMap: Record<BoardLabelField, BoardHeightField> = {
   max_board_label: 'max_board_height',
   second_board_label: 'second_board_height',
@@ -456,10 +419,51 @@ const boardHeightFieldMap: Record<BoardLabelField, BoardHeightField> = {
 
 function compactBoardLabel(label: string) {
   const lines = label.split('\n').filter(Boolean)
-  if (lines.length <= 2) {
-    return lines.join('\n')
+  if (lines.length <= 1) {
+    return lines[0] || ''
   }
-  return `${lines.slice(0, 2).join('\n')}\n等${lines.length}只`
+  return `${lines[0]} 等${lines.length}只`
+}
+
+function getBoardHeight(row: MarketReviewDailyRow | undefined, field: BoardLabelField) {
+  return Number(row?.[boardHeightFieldMap[field]] || 0)
+}
+
+function isDominantBoardHeightLabel(rowIndex: number, field: BoardLabelField) {
+  const row = dailyRows.value[rowIndex]
+  if (!row) {
+    return false
+  }
+
+  const currentHeight = getBoardHeight(row, field)
+  const currentOrder = boardLabelFields.indexOf(field)
+
+  return boardLabelFields.every((candidate, candidateOrder) => {
+    if (candidate === field || !row[candidate]) {
+      return true
+    }
+
+    const candidateHeight = getBoardHeight(row, candidate)
+    return currentHeight > candidateHeight || (currentHeight === candidateHeight && currentOrder < candidateOrder)
+  })
+}
+
+function isSparseBoardHeightLabelPoint(rowIndex: number, field: BoardLabelField) {
+  const row = dailyRows.value[rowIndex]
+  const currentHeight = getBoardHeight(row, field)
+  if (currentHeight < 2) {
+    return false
+  }
+
+  const prevHeight = getBoardHeight(dailyRows.value[rowIndex - 1], field)
+  const nextHeight = getBoardHeight(dailyRows.value[rowIndex + 1], field)
+  const isLastPoint = rowIndex === dailyRows.value.length - 1
+  const isStrictPeak = currentHeight > prevHeight && currentHeight > nextHeight
+
+  if (isLastPoint) {
+    return field === 'max_board_label' && currentHeight >= 3
+  }
+  return isStrictPeak && currentHeight >= (field === 'max_board_label' ? 4 : 3)
 }
 
 function shouldShowBoardHeightLabel(rowIndex: number, field: BoardLabelField) {
@@ -467,27 +471,10 @@ function shouldShowBoardHeightLabel(rowIndex: number, field: BoardLabelField) {
   if (!row?.[field]) {
     return false
   }
-
-  const heightField = boardHeightFieldMap[field]
-  const currentHeight = Number(row[heightField] || 0)
-  if (currentHeight < 2) {
+  if (!isDominantBoardHeightLabel(rowIndex, field)) {
     return false
   }
-
-  const prevHeight = Number(dailyRows.value[rowIndex - 1]?.[heightField] || 0)
-  const nextHeight = Number(dailyRows.value[rowIndex + 1]?.[heightField] || 0)
-  const isLastPoint = rowIndex === dailyRows.value.length - 1
-  const isLocalPeak = currentHeight >= prevHeight && currentHeight >= nextHeight && (
-    currentHeight > prevHeight || currentHeight > nextHeight
-  )
-
-  if (isLastPoint) {
-    return field !== 'gem_board_label' || currentHeight >= 2
-  }
-  if (field === 'max_board_label') {
-    return isLocalPeak || currentHeight >= 5
-  }
-  return isLocalPeak && currentHeight >= 3
+  return isSparseBoardHeightLabelPoint(rowIndex, field)
 }
 
 function getBoardLabelFormatter(field: BoardLabelField) {
@@ -508,7 +495,9 @@ function getBoardHeightLabelOption(field: BoardLabelField, position: 'top' | 'bo
     color: '#262626',
     fontSize: 12,
     lineHeight: 16,
-    distance: 8
+    distance: 8,
+    width: 110,
+    overflow: 'truncate'
   }
 }
 
@@ -571,6 +560,9 @@ function updateCharts() {
           symbol: 'circle',
           data: dailyRows.value.map(row => row.max_board_height),
           itemStyle: { color: '#f5222d' },
+          labelLayout: {
+            hideOverlap: true
+          },
           label: getBoardHeightLabelOption('max_board_label')
         },
         {
@@ -580,6 +572,9 @@ function updateCharts() {
           symbol: 'circle',
           data: dailyRows.value.map(row => row.second_board_height),
           itemStyle: { color: '#fa8c16' },
+          labelLayout: {
+            hideOverlap: true
+          },
           label: getBoardHeightLabelOption('second_board_label')
         },
         {
@@ -589,6 +584,9 @@ function updateCharts() {
           symbol: 'circle',
           data: dailyRows.value.map(row => row.gem_board_height),
           itemStyle: { color: '#1677ff' },
+          labelLayout: {
+            hideOverlap: true
+          },
           label: getBoardHeightLabelOption('gem_board_label', 'bottom')
         }
       ]
@@ -1071,31 +1069,6 @@ onUnmounted(() => {
   color: #595959;
   font-size: 13px;
   font-weight: 500;
-}
-
-.ladder-stat {
-  color: #f5222d;
-  font-size: 12px;
-}
-
-.ladder-stat-warning {
-  color: #fa8c16;
-}
-
-.ladder-stat-rate {
-  color: #1677ff;
-}
-
-.ladder-stat-average.positive {
-  color: #f5222d;
-}
-
-.ladder-stat-average.negative {
-  color: #52c41a;
-}
-
-.ladder-stat-average.neutral {
-  color: #8c8c8c;
 }
 
 .stock-chip-list {
