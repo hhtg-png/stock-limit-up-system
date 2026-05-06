@@ -38,6 +38,41 @@ test('yesterday feedback chart uses straight line series', () => {
   assert.doesNotMatch(optionSource, /type: 'bar'/, 'yesterday feedback chart should not use bars')
 })
 
+test('promotion and yesterday feedback charts show direct percent readings', () => {
+  const promotionMatch = source.match(/promotionRateChart\?\.setOption\([\s\S]*?yesterdayChangeChart\?\.setOption/)
+  assert.ok(promotionMatch, 'promotion rate chart option should exist')
+  const promotionSource = promotionMatch[0]
+
+  assert.match(source, /function getPercentPointLabelOption/)
+  assert.match(source, /function formatPercentAxisLabel/)
+  assert.match(promotionSource, /min:\s*0/)
+  assert.match(promotionSource, /max:\s*100/)
+  assert.match(promotionSource, /label:\s*getPercentPointLabelOption\('top'\)/)
+  assert.match(promotionSource, /labelLayout:\s*\{\s*hideOverlap: true/s)
+
+  const yesterdayMatch = source.match(/yesterdayChangeChart\?\.setOption\([\s\S]*?limitTrendChart\?\.setOption/)
+  assert.ok(yesterdayMatch, 'yesterday feedback chart option should exist')
+  const yesterdaySource = yesterdayMatch[0]
+
+  assert.match(yesterdaySource, /label:\s*getPercentPointLabelOption\('top', true\)/)
+  assert.match(yesterdaySource, /label:\s*getPercentPointLabelOption\('bottom', true\)/)
+  assert.match(yesterdaySource, /markLine:\s*\{[\s\S]*yAxis:\s*0/s)
+})
+
+test('limit and broken amount chart uses hundred-million unit', () => {
+  const match = source.match(/amountChart\?\.setOption\([\s\S]*?\n  \)\n\}/)
+  assert.ok(match, 'amount chart option should exist')
+  const optionSource = match[0]
+
+  assert.match(source, /function toYiAmount/)
+  assert.match(source, /function formatYiAmount/)
+  assert.match(optionSource, /name:\s*'亿元'/)
+  assert.match(optionSource, /formatter:\s*\(value: number\) => formatYiAmount\(value\)/)
+  assert.match(optionSource, /data:\s*dailyRows\.value\.map\(row => toYiAmount\(row\.limit_up_amount\)\)/)
+  assert.match(optionSource, /data:\s*dailyRows\.value\.map\(row => toYiAmount\(row\.broken_amount\)\)/)
+  assert.match(optionSource, /valueFormatter:\s*\(value: unknown\) => formatYiAmount\(Number\(value\)\)/)
+})
+
 test('ladder groups show stats in a separate compact metrics row', () => {
   const match = source.match(/<div class="ladder-metrics">[\s\S]*?<\/div>/)
   assert.ok(match, 'ladder metrics row should exist')

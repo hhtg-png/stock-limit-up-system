@@ -330,6 +330,23 @@ function formatPercent(value: number | null | undefined) {
   return `${sign}${value.toFixed(2)}%`
 }
 
+function formatPercentAxisLabel(value: number | string | null | undefined) {
+  const numericValue = Number(value)
+  if (!Number.isFinite(numericValue)) {
+    return '-'
+  }
+  return `${numericValue.toFixed(0)}%`
+}
+
+function formatPercentPointLabel(value: number | string | null | undefined, signed = false) {
+  const numericValue = Number(value)
+  if (!Number.isFinite(numericValue)) {
+    return '-'
+  }
+  const sign = signed && numericValue > 0 ? '+' : ''
+  return `${sign}${numericValue.toFixed(1)}%`
+}
+
 function formatAmount(value: number) {
   if (Math.abs(value) >= 100000000) {
     return `${(value / 100000000).toFixed(2)}亿`
@@ -338,6 +355,21 @@ function formatAmount(value: number) {
     return `${(value / 10000).toFixed(2)}万`
   }
   return value.toFixed(0)
+}
+
+function toYiAmount(value: number | null | undefined) {
+  if (value == null) {
+    return 0
+  }
+  return Number((value / 100000000).toFixed(2))
+}
+
+function formatYiAmount(value: number | string | null | undefined) {
+  const numericValue = Number(value)
+  if (!Number.isFinite(numericValue)) {
+    return '-'
+  }
+  return `${numericValue.toFixed(2)}亿`
 }
 
 function getChangeClass(value: number | null | undefined) {
@@ -534,6 +566,32 @@ function getBoardHeightLabelOption(
   }
 }
 
+function getPercentPointLabelOption(position: 'top' | 'bottom' = 'top', signed = false) {
+  return {
+    show: true,
+    position,
+    formatter: (params: { value?: number | string }) => formatPercentPointLabel(params.value, signed),
+    color: '#262626',
+    fontSize: 11,
+    lineHeight: 14,
+    distance: 6,
+    backgroundColor: 'rgba(255, 255, 255, 0.86)',
+    borderRadius: 4,
+    padding: [2, 4]
+  }
+}
+
+function getYiAmountLabelOption() {
+  return {
+    show: true,
+    position: 'top',
+    formatter: (params: { value?: number | string }) => formatYiAmount(Number(params.value)),
+    color: '#595959',
+    fontSize: 11,
+    distance: 4
+  }
+}
+
 function formatBoardHeightTooltip(params: unknown) {
   const items = Array.isArray(params) ? params : [params]
   const dataIndex = Number((items[0] as { dataIndex?: number } | undefined)?.dataIndex ?? -1)
@@ -638,8 +696,10 @@ function updateCharts() {
       ...getBaseGridOption(),
       yAxis: {
         type: 'value',
+        min: 0,
+        max: 100,
         axisLabel: {
-          formatter: '{value}%'
+          formatter: (value: number) => formatPercentAxisLabel(value)
         }
       },
       series: [
@@ -649,6 +709,10 @@ function updateCharts() {
           smooth: true,
           data: dailyRows.value.map(row => row.first_to_second_rate),
           itemStyle: { color: '#f5222d' },
+          labelLayout: {
+            hideOverlap: true
+          },
+          label: getPercentPointLabelOption('top'),
           areaStyle: {
             color: 'rgba(245, 34, 45, 0.08)'
           }
@@ -659,6 +723,10 @@ function updateCharts() {
           smooth: true,
           data: dailyRows.value.map(row => row.continuous_promotion_rate),
           itemStyle: { color: '#722ed1' },
+          labelLayout: {
+            hideOverlap: true
+          },
+          label: getPercentPointLabelOption('bottom'),
           areaStyle: {
             color: 'rgba(114, 46, 209, 0.08)'
           }
@@ -668,7 +736,11 @@ function updateCharts() {
           type: 'line',
           smooth: true,
           data: dailyRows.value.map(row => row.seal_rate),
-          itemStyle: { color: '#13c2c2' }
+          itemStyle: { color: '#13c2c2' },
+          labelLayout: {
+            hideOverlap: true
+          },
+          label: getPercentPointLabelOption('top')
         }
       ]
     },
@@ -681,7 +753,7 @@ function updateCharts() {
       yAxis: {
         type: 'value',
         axisLabel: {
-          formatter: '{value}%'
+          formatter: (value: number) => formatPercentAxisLabel(value)
         }
       },
       series: [
@@ -691,7 +763,26 @@ function updateCharts() {
           smooth: false,
           symbol: 'circle',
           data: dailyRows.value.map(row => row.yesterday_limit_up_avg_change),
-          itemStyle: { color: '#ff7875' }
+          itemStyle: { color: '#ff7875' },
+          labelLayout: {
+            hideOverlap: true
+          },
+          label: getPercentPointLabelOption('top', true),
+          markLine: {
+            symbol: 'none',
+            silent: true,
+            label: {
+              formatter: '0%',
+              color: '#8c8c8c'
+            },
+            lineStyle: {
+              color: '#8c8c8c',
+              type: 'dashed'
+            },
+            data: [
+              { yAxis: 0 }
+            ]
+          }
         },
         {
           name: '昨日连板平均涨幅',
@@ -699,7 +790,11 @@ function updateCharts() {
           smooth: false,
           symbol: 'circle',
           data: dailyRows.value.map(row => row.yesterday_continuous_avg_change),
-          itemStyle: { color: '#52c41a' }
+          itemStyle: { color: '#52c41a' },
+          labelLayout: {
+            hideOverlap: true
+          },
+          label: getPercentPointLabelOption('bottom', true)
         }
       ]
     },
@@ -790,25 +885,32 @@ function updateCharts() {
   amountChart?.setOption(
     {
       ...getBaseGridOption(true),
+      tooltip: {
+        trigger: 'axis',
+        valueFormatter: (value: unknown) => formatYiAmount(Number(value))
+      },
       yAxis: {
         type: 'value',
+        name: '亿元',
         axisLabel: {
-          formatter: (value: number) => formatAmount(value)
+          formatter: (value: number) => formatYiAmount(value)
         }
       },
       series: [
         {
           name: '涨停成交额',
           type: 'bar',
-          data: dailyRows.value.map(row => row.limit_up_amount),
+          data: dailyRows.value.map(row => toYiAmount(row.limit_up_amount)),
           itemStyle: { color: '#f5222d' },
+          label: getYiAmountLabelOption(),
           barMaxWidth: 26
         },
         {
           name: '炸板成交额',
           type: 'bar',
-          data: dailyRows.value.map(row => row.broken_amount),
+          data: dailyRows.value.map(row => toYiAmount(row.broken_amount)),
           itemStyle: { color: '#faad14' },
+          label: getYiAmountLabelOption(),
           barMaxWidth: 26
         }
       ]
