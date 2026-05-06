@@ -32,7 +32,7 @@
               <p>龙头高度、次高板高度与创业板高度。</p>
             </div>
           </div>
-          <div ref="boardHeightChartRef" class="chart-container"></div>
+          <div ref="boardHeightChartRef" class="chart-container board-height-chart"></div>
         </div>
       </el-col>
       <el-col :xs="24" :lg="12">
@@ -115,6 +115,21 @@
                   {{ ladder.continuous_days }}连板
                 </span>
                 <span class="count">{{ ladder.count }}只</span>
+              </div>
+
+              <div class="ladder-metrics">
+                <span class="metric-pill metric-sealed">
+                  封板 <strong>{{ getSealedCount(ladder) }}</strong>
+                </span>
+                <span class="metric-pill metric-opened">
+                  炸板 <strong>{{ getOpenedCount(ladder) }}</strong>
+                </span>
+                <span class="metric-pill metric-rate">
+                  封板率 <strong>{{ getLadderSealRate(ladder) }}</strong>
+                </span>
+                <span class="metric-pill metric-average" :class="getChangeClass(getLadderAverageChangeValue(ladder))">
+                  均涨 <strong>{{ getLadderAverageChange(ladder) }}</strong>
+                </span>
               </div>
 
               <div class="stock-chip-list">
@@ -231,6 +246,7 @@ import type {
   MarketReviewDailyRow,
   MarketReviewDetailResponse,
   MarketReviewDetailStock,
+  MarketReviewLadderLevel,
   MarketReviewLadderResponse
 } from '@/types/market'
 
@@ -351,6 +367,37 @@ function getStockStatusLabel(stock: MarketReviewDetailStock) {
   return '观察'
 }
 
+function getSealedCount(ladder: MarketReviewLadderLevel) {
+  return ladder.stocks.filter(stock => stock.today_sealed_close).length
+}
+
+function getOpenedCount(ladder: MarketReviewLadderLevel) {
+  return ladder.stocks.filter(stock => stock.today_opened_close).length
+}
+
+function getLadderSealRate(ladder: MarketReviewLadderLevel) {
+  const total = ladder.count || ladder.stocks.length
+  if (!total) {
+    return '0.00%'
+  }
+  return `${((getSealedCount(ladder) / total) * 100).toFixed(2)}%`
+}
+
+function getLadderAverageChangeValue(ladder: MarketReviewLadderLevel) {
+  const changes = ladder.stocks
+    .map(stock => stock.change_pct)
+    .filter((value): value is number => value != null)
+
+  if (!changes.length) {
+    return null
+  }
+  return changes.reduce((sum, value) => sum + value, 0) / changes.length
+}
+
+function getLadderAverageChange(ladder: MarketReviewLadderLevel) {
+  return formatPercent(getLadderAverageChangeValue(ladder))
+}
+
 function createEmptyOption(): echarts.EChartsOption {
   return {
     graphic: {
@@ -410,7 +457,6 @@ function getBaseGridOption(boundaryGap = false): Pick<echarts.EChartsOption, 'gr
 type BoardLabelField = 'max_board_label' | 'second_board_label' | 'gem_board_label'
 type BoardHeightField = 'max_board_height' | 'second_board_height' | 'gem_board_height'
 
-const boardLabelFields: BoardLabelField[] = ['max_board_label', 'second_board_label', 'gem_board_label']
 const boardHeightFieldMap: Record<BoardLabelField, BoardHeightField> = {
   max_board_label: 'max_board_height',
   second_board_label: 'second_board_height',
@@ -429,26 +475,7 @@ function getBoardHeight(row: MarketReviewDailyRow | undefined, field: BoardLabel
   return Number(row?.[boardHeightFieldMap[field]] || 0)
 }
 
-function isDominantBoardHeightLabel(rowIndex: number, field: BoardLabelField) {
-  const row = dailyRows.value[rowIndex]
-  if (!row) {
-    return false
-  }
-
-  const currentHeight = getBoardHeight(row, field)
-  const currentOrder = boardLabelFields.indexOf(field)
-
-  return boardLabelFields.every((candidate, candidateOrder) => {
-    if (candidate === field || !row[candidate]) {
-      return true
-    }
-
-    const candidateHeight = getBoardHeight(row, candidate)
-    return currentHeight > candidateHeight || (currentHeight === candidateHeight && currentOrder < candidateOrder)
-  })
-}
-
-function isSparseBoardHeightLabelPoint(rowIndex: number, field: BoardLabelField) {
+function isBoardHeightLabelPoint(rowIndex: number, field: BoardLabelField) {
   const row = dailyRows.value[rowIndex]
   const currentHeight = getBoardHeight(row, field)
   if (currentHeight < 2) {
@@ -457,13 +484,14 @@ function isSparseBoardHeightLabelPoint(rowIndex: number, field: BoardLabelField)
 
   const prevHeight = getBoardHeight(dailyRows.value[rowIndex - 1], field)
   const nextHeight = getBoardHeight(dailyRows.value[rowIndex + 1], field)
+  const isFirstPoint = rowIndex === 0
   const isLastPoint = rowIndex === dailyRows.value.length - 1
-  const isStrictPeak = currentHeight > prevHeight && currentHeight > nextHeight
+  const isLocalPeak = currentHeight >= prevHeight && currentHeight >= nextHeight && (
+    currentHeight > prevHeight || currentHeight > nextHeight
+  )
+  const isChangedPoint = currentHeight !== prevHeight || currentHeight !== nextHeight
 
-  if (isLastPoint) {
-    return field === 'max_board_label' && currentHeight >= 3
-  }
-  return isStrictPeak && currentHeight >= (field === 'max_board_label' ? 4 : 3)
+  return isFirstPoint || isLastPoint || isLocalPeak || isChangedPoint
 }
 
 function shouldShowBoardHeightLabel(rowIndex: number, field: BoardLabelField) {
@@ -471,10 +499,7 @@ function shouldShowBoardHeightLabel(rowIndex: number, field: BoardLabelField) {
   if (!row?.[field]) {
     return false
   }
-  if (!isDominantBoardHeightLabel(rowIndex, field)) {
-    return false
-  }
-  return isSparseBoardHeightLabelPoint(rowIndex, field)
+  return isBoardHeightLabelPoint(rowIndex, field)
 }
 
 function getBoardLabelFormatter(field: BoardLabelField) {
@@ -487,17 +512,25 @@ function getBoardLabelFormatter(field: BoardLabelField) {
   }
 }
 
-function getBoardHeightLabelOption(field: BoardLabelField, position: 'top' | 'bottom' = 'top') {
+function getBoardHeightLabelOption(
+  field: BoardLabelField,
+  position: 'top' | 'bottom' = 'top',
+  offset: [number, number] = [0, 0]
+) {
   return {
     show: true,
     position,
+    offset,
     formatter: getBoardLabelFormatter(field),
     color: '#262626',
-    fontSize: 12,
-    lineHeight: 16,
-    distance: 8,
-    width: 110,
-    overflow: 'truncate'
+    fontSize: 11,
+    lineHeight: 14,
+    distance: 6,
+    width: 100,
+    overflow: 'truncate',
+    backgroundColor: 'rgba(255, 255, 255, 0.86)',
+    borderRadius: 4,
+    padding: [2, 4]
   }
 }
 
@@ -544,6 +577,12 @@ function updateCharts() {
   boardHeightChart?.setOption(
     {
       ...getBaseGridOption(),
+      grid: {
+        left: 56,
+        right: 28,
+        top: 80,
+        bottom: 46
+      },
       tooltip: {
         trigger: 'axis',
         formatter: formatBoardHeightTooltip
@@ -563,7 +602,7 @@ function updateCharts() {
           labelLayout: {
             hideOverlap: true
           },
-          label: getBoardHeightLabelOption('max_board_label')
+          label: getBoardHeightLabelOption('max_board_label', 'top', [0, -6])
         },
         {
           name: '次高板高度',
@@ -575,7 +614,7 @@ function updateCharts() {
           labelLayout: {
             hideOverlap: true
           },
-          label: getBoardHeightLabelOption('second_board_label')
+          label: getBoardHeightLabelOption('second_board_label', 'bottom', [0, 16])
         },
         {
           name: '创业板高度',
@@ -587,7 +626,7 @@ function updateCharts() {
           labelLayout: {
             hideOverlap: true
           },
-          label: getBoardHeightLabelOption('gem_board_label', 'bottom')
+          label: getBoardHeightLabelOption('gem_board_label', 'bottom', [0, 28])
         }
       ]
     },
@@ -997,6 +1036,10 @@ onUnmounted(() => {
   height: 320px;
 }
 
+.board-height-chart {
+  height: 380px;
+}
+
 .detail-summary {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -1069,6 +1112,57 @@ onUnmounted(() => {
   color: #595959;
   font-size: 13px;
   font-weight: 500;
+}
+
+.ladder-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.metric-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  min-width: 0;
+  border-radius: 6px;
+  background: #fff;
+  padding: 5px 6px;
+  color: #595959;
+  font-size: 11px;
+  line-height: 1.2;
+  white-space: nowrap;
+
+  strong {
+    color: inherit;
+    font-weight: 600;
+  }
+
+  &.metric-sealed {
+    color: #f5222d;
+  }
+
+  &.metric-opened {
+    color: #fa8c16;
+  }
+
+  &.metric-rate {
+    color: #1677ff;
+  }
+}
+
+.metric-average.positive {
+  color: #f5222d;
+}
+
+.metric-average.negative {
+  color: #52c41a;
+}
+
+.metric-average.neutral {
+  color: #8c8c8c;
 }
 
 .stock-chip-list {
@@ -1148,6 +1242,14 @@ onUnmounted(() => {
 
   .chart-container {
     height: 280px;
+  }
+
+  .board-height-chart {
+    height: 340px;
+  }
+
+  .ladder-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .detail-summary {

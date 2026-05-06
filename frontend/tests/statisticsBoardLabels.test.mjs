@@ -12,16 +12,18 @@ test('board height chart displays stock labels from daily rows', () => {
   assert.match(source, /function shouldShowBoardHeightLabel/, 'labels should be filtered to avoid crowding')
   assert.match(source, /function formatBoardHeightTooltip/, 'full labels should remain available in tooltip')
   assert.match(source, /tooltip:\s*\{\s*trigger: 'axis',\s*formatter: formatBoardHeightTooltip/s)
-  assert.match(source, /label:\s*getBoardHeightLabelOption\('max_board_label'\)/)
-  assert.match(source, /label:\s*getBoardHeightLabelOption\('second_board_label'\)/)
-  assert.match(source, /label:\s*getBoardHeightLabelOption\('gem_board_label', 'bottom'\)/)
+  assert.match(source, /label:\s*getBoardHeightLabelOption\('max_board_label', 'top', \[0, -6\]\)/)
+  assert.match(source, /label:\s*getBoardHeightLabelOption\('second_board_label', 'bottom', \[0, 16\]\)/)
+  assert.match(source, /label:\s*getBoardHeightLabelOption\('gem_board_label', 'bottom', \[0, 28\]\)/)
 })
 
-test('board height labels cap crowded points', () => {
-  assert.match(source, /function isDominantBoardHeightLabel/, 'only one board label should be eligible per date')
-  assert.match(source, /function isSparseBoardHeightLabelPoint/, 'non-peak labels should be suppressed')
-  assert.match(source, /!isDominantBoardHeightLabel\(rowIndex, field\)/)
+test('board height labels keep more data with layout controls', () => {
+  assert.match(source, /class="chart-container board-height-chart"/, 'board chart should have more vertical space')
+  assert.match(source, /function isBoardHeightLabelPoint/, 'changed height points should be eligible for labels')
+  assert.match(source, /currentHeight !== prevHeight \|\| currentHeight !== nextHeight/)
   assert.match(source, /labelLayout:\s*\{\s*hideOverlap: true/s)
+  assert.match(source, /getBoardHeightLabelOption\('max_board_label', 'top', \[0, -6\]\)/)
+  assert.match(source, /getBoardHeightLabelOption\('second_board_label', 'bottom', \[0, 16\]\)/)
   assert.match(source, /return `\$\{lines\[0\]\} 等\$\{lines\.length\}只`/)
 })
 
@@ -36,16 +38,16 @@ test('yesterday feedback chart uses straight line series', () => {
   assert.doesNotMatch(optionSource, /type: 'bar'/, 'yesterday feedback chart should not use bars')
 })
 
-test('ladder groups avoid redundant sealed-only stats', () => {
-  const match = source.match(/<div class="ladder-header">[\s\S]*?<\/div>/)
-  assert.ok(match, 'ladder header should exist')
-  const headerSource = match[0]
+test('ladder groups show stats in a separate compact metrics row', () => {
+  const match = source.match(/<div class="ladder-metrics">[\s\S]*?<\/div>/)
+  assert.ok(match, 'ladder metrics row should exist')
+  const metricsSource = match[0]
 
-  assert.match(headerSource, /\{\{\s*ladder\.count\s*\}\}只/)
-  assert.doesNotMatch(headerSource, /封板|炸板|封板率|均涨/)
-  assert.doesNotMatch(headerSource, /getSealedCount|getOpenedCount|getLadderSealRate|getLadderAverageChange/)
-  assert.doesNotMatch(source, /function getSealedCount/)
-  assert.doesNotMatch(source, /function getOpenedCount/)
-  assert.doesNotMatch(source, /function getLadderSealRate/)
-  assert.doesNotMatch(source, /function getLadderAverageChange/)
+  assert.match(metricsSource, /封板[\s\S]*getSealedCount\(ladder\)/)
+  assert.match(metricsSource, /炸板[\s\S]*getOpenedCount\(ladder\)/)
+  assert.match(metricsSource, /封板率[\s\S]*getLadderSealRate\(ladder\)/)
+  assert.match(metricsSource, /均涨[\s\S]*getLadderAverageChange\(ladder\)/)
+  assert.match(source, /function getLadderSealRate\(ladder: MarketReviewLadderLevel\)/)
+  assert.match(source, /function getLadderAverageChange\(ladder: MarketReviewLadderLevel\)/)
+  assert.match(source, /\.ladder-metrics\s*\{[\s\S]*grid-template-columns: repeat\(4, minmax\(0, 1fr\)\)/)
 })
