@@ -95,6 +95,10 @@ export function useWebSocket() {
           content: `首次涨停 ${message.data.time}${message.data.reason ? ` - ${message.data.reason}` : ''}`,
           time: message.timestamp
         })
+        if (message.data.stock_name) {
+          const { announceStock } = useSpeech()
+          announceStock(message.data.stock_name, message.data.reason)
+        }
         break
 
       case 'limit_up_snapshot':

@@ -1,5 +1,6 @@
 import { ref } from 'vue'
 import { useConfigStore } from '@/stores/config'
+import { useAlertStore } from '@/stores/alert'
 
 // 语音播报配置 - 从config store获取设置
 const speechRate = ref(1.2) // 语速
@@ -9,7 +10,8 @@ const speechVolume = ref(0.8) // 音量
 function getSpeechEnabled(): boolean {
   try {
     const configStore = useConfigStore()
-    return configStore.config.alert_limit_up_enabled
+    const alertStore = useAlertStore()
+    return alertStore.enabled && configStore.config.alert_limit_up_enabled
   } catch {
     return false
   }
