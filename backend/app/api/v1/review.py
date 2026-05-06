@@ -29,7 +29,7 @@ CN_TZ = timezone(timedelta(hours=8))
 async def _collect_intraday_source(trade_date: date) -> dict[str, Any]:
     from app.services.market_review_source_service import market_review_source_service
 
-    return await market_review_source_service.collect(trade_date)
+    return await market_review_source_service.collect_for_date(trade_date)
 
 
 async def _resolve_review_trade_date(

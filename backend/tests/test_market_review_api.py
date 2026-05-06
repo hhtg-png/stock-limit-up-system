@@ -4,6 +4,7 @@ import sys
 import unittest
 from datetime import date, time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 from fastapi import FastAPI
@@ -468,6 +469,24 @@ class MarketReviewApiTests(unittest.TestCase):
         self.assertEqual([stock["stock_code"] for stock in payload["detail"]["stocks"]], ["600011", "600010", "600012"])
         self.assertEqual([ladder["continuous_days"] for ladder in payload["ladder"]["ladders"]], [3, 2])
         self.assertEqual(payload["ladder"]["ladders"][0]["count"], 2)
+
+    def test_intraday_source_wrapper_uses_market_review_source_service_collect_for_date(self):
+        service = SimpleNamespace(
+            collect_for_date=AsyncMock(return_value={"stock_rows": []})
+        )
+        module_name = "app.services.market_review_source_service"
+        original_module = sys.modules.get(module_name)
+        sys.modules[module_name] = SimpleNamespace(market_review_source_service=service)
+        try:
+            result = asyncio.run(self.review_module._collect_intraday_source(date(2026, 5, 6)))
+        finally:
+            if original_module is None:
+                sys.modules.pop(module_name, None)
+            else:
+                sys.modules[module_name] = original_module
+
+        self.assertEqual(result, {"stock_rows": []})
+        service.collect_for_date.assert_awaited_once_with(date(2026, 5, 6))
 
 
 if __name__ == "__main__":
