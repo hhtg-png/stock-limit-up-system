@@ -449,6 +449,7 @@ class MarketReviewApiTests(unittest.TestCase):
         )
 
         self.review_module._collect_intraday_source = collect_mock
+        self.review_module._should_collect_live_intraday = Mock(return_value=True)
         if hasattr(self.review_module, "market_review_metrics_service"):
             self.review_module.market_review_metrics_service.aggregate_daily_metrics = aggregate_mock
 
@@ -469,6 +470,26 @@ class MarketReviewApiTests(unittest.TestCase):
         self.assertEqual([stock["stock_code"] for stock in payload["detail"]["stocks"]], ["600011", "600010", "600012"])
         self.assertEqual([ladder["continuous_days"] for ladder in payload["ladder"]["ladders"]], [3, 2])
         self.assertEqual(payload["ladder"]["ladders"][0]["count"], 2)
+
+    def test_intraday_endpoint_uses_stored_review_snapshot_when_available(self):
+        self.review_module._collect_intraday_source = AsyncMock(
+            side_effect=AssertionError("stored intraday snapshot should not collect live source")
+        )
+
+        response = self.client.get(
+            "/api/v1/statistics/review/intraday",
+            params={"trade_date": "2026-04-28"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["is_intraday"])
+        self.assertFalse(payload["is_fallback"])
+        self.assertEqual(payload["data"]["series"], ["2026-04-28"])
+        self.assertEqual(payload["data"]["rows"][0]["max_board_label"], "Alpha4\nBeta4")
+        self.assertEqual(payload["detail"]["stocks"][0]["stock_code"], "600002")
+        self.assertEqual(payload["ladder"]["ladders"][0]["continuous_days"], 4)
+        self.review_module._collect_intraday_source.assert_not_awaited()
 
     def test_intraday_source_wrapper_uses_market_review_source_service_collect_for_date(self):
         service = SimpleNamespace(

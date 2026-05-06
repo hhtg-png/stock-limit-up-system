@@ -1,7 +1,7 @@
 """
 市场复盘API
 """
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query
@@ -185,6 +185,11 @@ def _build_intraday_ladder(trade_date: date, stock_rows: list[dict[str, Any]]) -
     )
 
 
+def _should_collect_live_intraday(trade_date: date) -> bool:
+    now = datetime.now(CN_TZ)
+    return trade_date == now.date() and time(9, 15) <= now.time() <= time(15, 30)
+
+
 async def _build_intraday_snapshot(trade_date: date) -> MarketReviewIntradayResponse:
     normalized_data = await _collect_intraday_source(trade_date)
     stock_rows = normalized_data.get("stock_rows") or []
@@ -222,6 +227,118 @@ async def _build_intraday_snapshot(trade_date: date) -> MarketReviewIntradayResp
         end_date=metric_row.trade_date,
         latest_trade_date=metric_row.trade_date,
         is_fallback=False,
+        snapshot_time=datetime.now(CN_TZ),
+        detail=detail,
+        ladder=ladder,
+    )
+
+
+async def _build_detail_response_from_db(
+    db: AsyncSession,
+    resolved_date: date,
+    is_fallback: bool,
+) -> MarketReviewDetailResponse:
+    result = await db.execute(
+        select(MarketReviewStockDaily)
+        .where(MarketReviewStockDaily.trade_date == resolved_date)
+        .order_by(
+            MarketReviewStockDaily.today_continuous_days.desc(),
+            MarketReviewStockDaily.amount.desc(),
+        )
+    )
+    stocks = [MarketReviewStockItem.model_validate(row) for row in result.scalars().all()]
+
+    return MarketReviewDetailResponse(
+        trade_date=resolved_date,
+        is_fallback=is_fallback,
+        stocks=stocks,
+    )
+
+
+async def _build_ladder_response_from_db(
+    db: AsyncSession,
+    resolved_date: date,
+    is_fallback: bool,
+) -> MarketReviewLadderResponse:
+    result = await db.execute(
+        select(MarketReviewStockDaily)
+        .where(
+            MarketReviewStockDaily.trade_date == resolved_date,
+            MarketReviewStockDaily.today_touched_limit_up.is_(True),
+            MarketReviewStockDaily.today_continuous_days >= 2,
+        )
+        .order_by(
+            MarketReviewStockDaily.today_continuous_days.desc(),
+            MarketReviewStockDaily.today_sealed_close.desc(),
+            MarketReviewStockDaily.first_limit_time.asc(),
+            MarketReviewStockDaily.stock_code.asc(),
+        )
+    )
+
+    ladders: list[MarketReviewLadderItem] = []
+    current_ladder: MarketReviewLadderItem | None = None
+
+    for row in result.scalars().all():
+        stock = MarketReviewStockItem.model_validate(row)
+        if current_ladder is None or current_ladder.continuous_days != stock.today_continuous_days:
+            current_ladder = MarketReviewLadderItem(
+                continuous_days=stock.today_continuous_days,
+                count=0,
+                stocks=[],
+            )
+            ladders.append(current_ladder)
+
+        current_ladder.stocks.append(stock)
+        current_ladder.count = len(current_ladder.stocks)
+
+    return MarketReviewLadderResponse(
+        trade_date=resolved_date,
+        is_fallback=is_fallback,
+        ladders=ladders,
+    )
+
+
+async def _build_stored_intraday_snapshot(
+    db: AsyncSession,
+    requested_date: date,
+) -> MarketReviewIntradayResponse | None:
+    result = await db.execute(
+        select(MarketReviewDailyMetric)
+        .where(MarketReviewDailyMetric.trade_date == requested_date)
+        .limit(1)
+    )
+    metric_row = result.scalar_one_or_none()
+    is_fallback = False
+
+    if metric_row is None:
+        result = await db.execute(
+            select(MarketReviewDailyMetric)
+            .where(MarketReviewDailyMetric.trade_date <= requested_date)
+            .order_by(desc(MarketReviewDailyMetric.trade_date))
+            .limit(1)
+        )
+        metric_row = result.scalar_one_or_none()
+        is_fallback = metric_row is not None
+
+    if metric_row is None:
+        return None
+
+    rows = await _attach_board_height_labels(db, [metric_row])
+    daily_row = rows[0] if rows else MarketReviewDailyMetricRow.model_validate(metric_row)
+    detail = await _build_detail_response_from_db(db, daily_row.trade_date, is_fallback)
+    ladder = await _build_ladder_response_from_db(db, daily_row.trade_date, is_fallback)
+
+    return MarketReviewIntradayResponse(
+        data=MarketReviewDailyData(
+            series=[daily_row.trade_date],
+            rows=[daily_row],
+        ),
+        requested_start_date=requested_date,
+        requested_end_date=requested_date,
+        start_date=daily_row.trade_date,
+        end_date=daily_row.trade_date,
+        latest_trade_date=daily_row.trade_date,
+        is_fallback=is_fallback,
         snapshot_time=datetime.now(CN_TZ),
         detail=detail,
         ladder=ladder,
@@ -276,9 +393,24 @@ async def _attach_board_height_labels(
 @router.get("/intraday", response_model=MarketReviewIntradayResponse, summary="获取盘中复盘快照")
 async def get_market_review_intraday(
     trade_date: date | None = Query(None, description="交易日期，默认今天"),
+    db: AsyncSession = Depends(get_db),
 ):
     """获取盘中实时复盘快照。"""
     target_date = trade_date or datetime.now(CN_TZ).date()
+
+    if _should_collect_live_intraday(target_date):
+        try:
+            return await _build_intraday_snapshot(target_date)
+        except Exception:
+            stored_snapshot = await _build_stored_intraday_snapshot(db, target_date)
+            if stored_snapshot is not None:
+                return stored_snapshot
+            raise
+
+    stored_snapshot = await _build_stored_intraday_snapshot(db, target_date)
+    if stored_snapshot is not None:
+        return stored_snapshot
+
     return await _build_intraday_snapshot(target_date)
 
 
@@ -347,21 +479,7 @@ async def get_market_review_detail(
 ):
     """获取指定交易日的市场复盘个股明细。"""
     resolved_date, is_fallback = await _resolve_review_trade_date(db, trade_date)
-    result = await db.execute(
-        select(MarketReviewStockDaily)
-        .where(MarketReviewStockDaily.trade_date == resolved_date)
-        .order_by(
-            MarketReviewStockDaily.today_continuous_days.desc(),
-            MarketReviewStockDaily.amount.desc(),
-        )
-    )
-    stocks = [MarketReviewStockItem.model_validate(row) for row in result.scalars().all()]
-
-    return MarketReviewDetailResponse(
-        trade_date=resolved_date,
-        is_fallback=is_fallback,
-        stocks=stocks,
-    )
+    return await _build_detail_response_from_db(db, resolved_date, is_fallback)
 
 
 @router.get("/ladder", response_model=MarketReviewLadderResponse, summary="获取复盘连板梯队")
@@ -371,39 +489,4 @@ async def get_market_review_ladder(
 ):
     """获取指定交易日的市场复盘连板梯队。"""
     resolved_date, is_fallback = await _resolve_review_trade_date(db, trade_date)
-    result = await db.execute(
-        select(MarketReviewStockDaily)
-        .where(
-            MarketReviewStockDaily.trade_date == resolved_date,
-            MarketReviewStockDaily.today_touched_limit_up.is_(True),
-            MarketReviewStockDaily.today_continuous_days >= 2,
-        )
-        .order_by(
-            MarketReviewStockDaily.today_continuous_days.desc(),
-            MarketReviewStockDaily.today_sealed_close.desc(),
-            MarketReviewStockDaily.first_limit_time.asc(),
-            MarketReviewStockDaily.stock_code.asc(),
-        )
-    )
-
-    ladders: list[MarketReviewLadderItem] = []
-    current_ladder: MarketReviewLadderItem | None = None
-
-    for row in result.scalars().all():
-        stock = MarketReviewStockItem.model_validate(row)
-        if current_ladder is None or current_ladder.continuous_days != stock.today_continuous_days:
-            current_ladder = MarketReviewLadderItem(
-                continuous_days=stock.today_continuous_days,
-                count=0,
-                stocks=[],
-            )
-            ladders.append(current_ladder)
-
-        current_ladder.stocks.append(stock)
-        current_ladder.count = len(current_ladder.stocks)
-
-    return MarketReviewLadderResponse(
-        trade_date=resolved_date,
-        is_fallback=is_fallback,
-        ladders=ladders,
-    )
+    return await _build_ladder_response_from_db(db, resolved_date, is_fallback)
