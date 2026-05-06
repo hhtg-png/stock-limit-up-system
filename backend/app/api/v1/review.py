@@ -70,6 +70,68 @@ async def _resolve_daily_metric_range(
     return resolved_start_date, resolved_end_date, latest_trade_date, is_fallback
 
 
+def _format_board_height_label(
+    stock_rows: list[MarketReviewStockDaily],
+    height: int,
+    board_types: set[str] | None = None,
+) -> str | None:
+    if height <= 0:
+        return None
+
+    names = [
+        f"{row.stock_name}{height}"
+        for row in stock_rows
+        if row.today_continuous_days == height
+        and (board_types is None or row.board_type in board_types)
+    ]
+    return "\n".join(names) if names else None
+
+
+async def _attach_board_height_labels(
+    db: AsyncSession,
+    metric_rows: list[MarketReviewDailyMetric],
+) -> list[MarketReviewDailyMetricRow]:
+    if not metric_rows:
+        return []
+
+    trade_dates = [row.trade_date for row in metric_rows]
+    result = await db.execute(
+        select(MarketReviewStockDaily)
+        .where(
+            MarketReviewStockDaily.trade_date.in_(trade_dates),
+            MarketReviewStockDaily.today_touched_limit_up.is_(True),
+            MarketReviewStockDaily.today_continuous_days > 0,
+        )
+        .order_by(
+            MarketReviewStockDaily.trade_date.asc(),
+            MarketReviewStockDaily.today_continuous_days.desc(),
+            MarketReviewStockDaily.today_sealed_close.desc(),
+            MarketReviewStockDaily.first_limit_time.asc(),
+            MarketReviewStockDaily.stock_code.asc(),
+        )
+    )
+
+    stocks_by_date: dict[date, list[MarketReviewStockDaily]] = {}
+    for stock_row in result.scalars().all():
+        stocks_by_date.setdefault(stock_row.trade_date, []).append(stock_row)
+
+    rows: list[MarketReviewDailyMetricRow] = []
+    for metric_row in metric_rows:
+        stock_rows = stocks_by_date.get(metric_row.trade_date, [])
+        labels = {
+            "max_board_label": _format_board_height_label(stock_rows, metric_row.max_board_height),
+            "second_board_label": _format_board_height_label(stock_rows, metric_row.second_board_height),
+            "gem_board_label": _format_board_height_label(
+                stock_rows,
+                metric_row.gem_board_height,
+                {"gem", "star"},
+            ),
+        }
+        rows.append(MarketReviewDailyMetricRow.model_validate(metric_row).model_copy(update=labels))
+
+    return rows
+
+
 @router.get("/daily", response_model=MarketReviewDailyResponse, summary="获取复盘日级指标")
 async def get_market_review_daily(
     start_date: date | None = Query(None, description="开始日期"),
@@ -91,10 +153,7 @@ async def get_market_review_daily(
         result = await db.execute(
             query.order_by(MarketReviewDailyMetric.trade_date.desc()).limit(days)
         )
-        rows = [
-            MarketReviewDailyMetricRow.model_validate(row)
-            for row in reversed(result.scalars().all())
-        ]
+        rows = await _attach_board_height_labels(db, list(reversed(result.scalars().all())))
         return MarketReviewDailyResponse(
             data=MarketReviewDailyData(
                 series=[row.trade_date for row in rows],
@@ -115,7 +174,7 @@ async def get_market_review_daily(
         query = query.where(MarketReviewDailyMetric.trade_date <= resolved_end_date)
 
     result = await db.execute(query.order_by(MarketReviewDailyMetric.trade_date.asc()))
-    rows = [MarketReviewDailyMetricRow.model_validate(row) for row in result.scalars().all()]
+    rows = await _attach_board_height_labels(db, list(result.scalars().all()))
 
     return MarketReviewDailyResponse(
         data=MarketReviewDailyData(

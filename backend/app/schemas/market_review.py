@@ -18,6 +18,9 @@ class MarketReviewDailyMetricRow(BaseModel):
     max_board_height: int
     second_board_height: int
     gem_board_height: int
+    max_board_label: str | None = None
+    second_board_label: str | None = None
+    gem_board_label: str | None = None
     first_to_second_rate: float
     continuous_promotion_rate: float
     seal_rate: float

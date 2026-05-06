@@ -121,6 +121,9 @@ export interface MarketReviewDailyRow {
   max_board_height: number
   second_board_height: number
   gem_board_height: number
+  max_board_label?: string | null
+  second_board_label?: string | null
+  gem_board_label?: string | null
   first_to_second_rate: number
   continuous_promotion_rate: number
   seal_rate: number

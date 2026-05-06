@@ -398,7 +398,7 @@ function getBaseGridOption(boundaryGap = false): Pick<echarts.EChartsOption, 'gr
     grid: {
       left: 56,
       right: 24,
-      top: 48,
+      top: 64,
       bottom: 40
     },
     xAxis: {
@@ -415,6 +415,27 @@ function getBaseGridOption(boundaryGap = false): Pick<echarts.EChartsOption, 'gr
         }
       }
     }
+  }
+}
+
+type BoardLabelField = 'max_board_label' | 'second_board_label' | 'gem_board_label'
+
+function getBoardLabelFormatter(field: BoardLabelField) {
+  return (params: { dataIndex?: number }) => {
+    const row = params.dataIndex == null ? null : dailyRows.value[params.dataIndex]
+    return row?.[field] || ''
+  }
+}
+
+function getBoardHeightLabelOption(field: BoardLabelField, position: 'top' | 'bottom' = 'top') {
+  return {
+    show: true,
+    position,
+    formatter: getBoardLabelFormatter(field),
+    color: '#262626',
+    fontSize: 12,
+    lineHeight: 16,
+    distance: 8
   }
 }
 
@@ -447,7 +468,8 @@ function updateCharts() {
           smooth: true,
           symbol: 'circle',
           data: dailyRows.value.map(row => row.max_board_height),
-          itemStyle: { color: '#f5222d' }
+          itemStyle: { color: '#f5222d' },
+          label: getBoardHeightLabelOption('max_board_label')
         },
         {
           name: '次高板高度',
@@ -455,7 +477,8 @@ function updateCharts() {
           smooth: true,
           symbol: 'circle',
           data: dailyRows.value.map(row => row.second_board_height),
-          itemStyle: { color: '#fa8c16' }
+          itemStyle: { color: '#fa8c16' },
+          label: getBoardHeightLabelOption('second_board_label')
         },
         {
           name: '创业板高度',
@@ -463,7 +486,8 @@ function updateCharts() {
           smooth: true,
           symbol: 'circle',
           data: dailyRows.value.map(row => row.gem_board_height),
-          itemStyle: { color: '#1677ff' }
+          itemStyle: { color: '#1677ff' },
+          label: getBoardHeightLabelOption('gem_board_label', 'bottom')
         }
       ]
     },

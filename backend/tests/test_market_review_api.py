@@ -153,7 +153,20 @@ class MarketReviewApiTests(unittest.TestCase):
                     self._stock_row(3, "600003", "Gamma", 3, True, False, True, 6.5, 400000.0, "Chip", time(9, 45)),
                     self._stock_row(4, "600004", "Delta", 2, False, False, True, 4.2, 50000.0, "EV", time(10, 5)),
                     self._stock_row(5, "600005", "Epsilon", 1, True, True, False, 2.5, 600000.0, "Retail", time(9, 40)),
-                    self._stock_row(6, "600006", "Zeta", 2, True, True, False, 5.0, 250000.0, "Finance", time(9, 35)),
+                    self._stock_row(
+                        6,
+                        "600006",
+                        "Zeta",
+                        2,
+                        True,
+                        True,
+                        False,
+                        5.0,
+                        250000.0,
+                        "Finance",
+                        time(9, 35),
+                        board_type="gem",
+                    ),
                 ]
             )
             await session.commit()
@@ -171,13 +184,14 @@ class MarketReviewApiTests(unittest.TestCase):
         amount,
         limit_up_reason,
         first_limit_time,
+        board_type="main",
     ):
         return MarketReviewStockDaily(
             trade_date=date(2026, 4, 28),
             stock_id=stock_id,
             stock_code=stock_code,
             stock_name=stock_name,
-            board_type="main",
+            board_type=board_type,
             is_st=False,
             yesterday_limit_up=today_continuous_days > 1,
             yesterday_continuous_days=max(today_continuous_days - 1, 0),
@@ -231,6 +245,18 @@ class MarketReviewApiTests(unittest.TestCase):
             "broken_amount",
         ):
             self.assertIn(field, rows[0])
+
+    def test_daily_endpoint_includes_board_height_stock_labels(self):
+        response = self.client.get(
+            "/api/v1/statistics/review/daily",
+            params={"start_date": "2026-04-28", "end_date": "2026-04-28"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        row = response.json()["data"]["rows"][0]
+        self.assertEqual(row["max_board_label"], "Alpha4\nBeta4")
+        self.assertEqual(row["second_board_label"], "Gamma3")
+        self.assertEqual(row["gem_board_label"], "Zeta2")
 
     def test_daily_endpoint_resolves_future_end_date_to_latest_available_metric(self):
         response = self.client.get(
