@@ -548,15 +548,17 @@ function updateCharts() {
       series: [
         {
           name: '昨日涨停平均涨幅',
-          type: 'bar',
+          type: 'line',
+          smooth: false,
+          symbol: 'circle',
           data: dailyRows.value.map(row => row.yesterday_limit_up_avg_change),
-          itemStyle: { color: '#ff7875' },
-          barMaxWidth: 28
+          itemStyle: { color: '#ff7875' }
         },
         {
           name: '昨日连板平均涨幅',
           type: 'line',
-          smooth: true,
+          smooth: false,
+          symbol: 'circle',
           data: dailyRows.value.map(row => row.yesterday_continuous_avg_change),
           itemStyle: { color: '#52c41a' }
         }

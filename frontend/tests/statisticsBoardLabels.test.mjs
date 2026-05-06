@@ -13,3 +13,14 @@ test('board height chart displays stock labels from daily rows', () => {
   assert.match(source, /label:\s*getBoardHeightLabelOption\('second_board_label'\)/)
   assert.match(source, /label:\s*getBoardHeightLabelOption\('gem_board_label', 'bottom'\)/)
 })
+
+test('yesterday feedback chart uses straight line series', () => {
+  const match = source.match(/yesterdayChangeChart\?\.setOption\([\s\S]*?limitTrendChart\?\.setOption/)
+  assert.ok(match, 'yesterday feedback chart option should exist')
+  const optionSource = match[0]
+
+  assert.match(optionSource, /name: '昨日涨停平均涨幅'[\s\S]*?type: 'line'/)
+  assert.match(optionSource, /name: '昨日连板平均涨幅'[\s\S]*?type: 'line'/)
+  assert.doesNotMatch(optionSource, /smooth: true/, 'yesterday feedback lines should not be smoothed')
+  assert.doesNotMatch(optionSource, /type: 'bar'/, 'yesterday feedback chart should not use bars')
+})
