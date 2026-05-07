@@ -10,22 +10,32 @@ test('market review API exposes intraday snapshot with detail and ladder payload
   assert.match(apiSource, /getMarketReviewIntraday/, 'intraday API function should be exported')
   assert.match(apiSource, /\/statistics\/review\/intraday/, 'intraday API should call the backend intraday endpoint')
   assert.match(typeSource, /interface MarketReviewIntradayResponse/, 'intraday response type should be explicit')
+  assert.match(typeSource, /is_live:\s*boolean/, 'intraday response should tell whether the snapshot is live market data')
   assert.match(typeSource, /detail:\s*MarketReviewDetailResponse/, 'intraday response should carry live detail data')
   assert.match(typeSource, /ladder:\s*MarketReviewLadderResponse/, 'intraday response should carry live ladder data')
 })
 
-test('statistics view has a distinct intraday mode that refreshes live report data', () => {
-  assert.match(statisticsSource, /const reviewMode = ref<'daily' \| 'intraday'>\('daily'\)/)
-  assert.match(statisticsSource, /label="intraday"[\s\S]*?盘中实时/)
-  assert.match(statisticsSource, /getMarketReviewIntraday\(dayjs\(\)\.format\('YYYY-MM-DD'\)\)/)
-  assert.match(statisticsSource, /detailResponse\.value = dailyResult\.detail/)
-  assert.match(statisticsSource, /ladderResponse\.value = dailyResult\.ladder/)
-  assert.match(statisticsSource, /window\.setInterval\(fetchData, 60000\)/, 'intraday mode should refresh every minute')
-  assert.match(statisticsSource, /clearIntradayRefreshTimer\(\)/, 'timer should be cleared when mode changes or view unmounts')
+test('statistics view automatically merges live intraday data into the selected daily range', () => {
+  assert.doesNotMatch(statisticsSource, /reviewMode/, 'manual close-review/intraday mode state should be removed')
+  assert.doesNotMatch(statisticsSource, /label="intraday"/, 'manual intraday button should not be rendered')
+  assert.doesNotMatch(statisticsSource, /label="daily"/, 'manual daily button should not be rendered')
+  assert.match(statisticsSource, /<el-radio-group v-model="timeRange" size="small">/, 'range picker should always be available')
+  assert.match(statisticsSource, /getMarketReviewDaily\(query\)/, 'daily history should be fetched for the selected range')
+  assert.match(statisticsSource, /getMarketReviewIntraday\(today\)/, 'today intraday snapshot should be checked automatically')
+  assert.match(
+    statisticsSource,
+    /if \(intradayResult\.is_live && intradayResult\.data\.rows\.length\)/,
+    'live intraday data should only be merged during live market time'
+  )
+  assert.match(statisticsSource, /mergeIntradayDailyRows/, 'today intraday row should be merged into historical rows')
+  assert.match(statisticsSource, /detailResponse\.value = intradayResult\.detail/)
+  assert.match(statisticsSource, /ladderResponse\.value = intradayResult\.ladder/)
 })
 
-test('daily range controls remain scoped to close-review mode', () => {
-  assert.match(statisticsSource, /v-if="reviewMode === 'daily'"/, 'range picker should only control daily close-review mode')
-  assert.match(statisticsSource, /盘中快照/, 'summary should identify intraday snapshot data')
-  assert.match(statisticsSource, /更新时间/, 'summary should display intraday update time')
+test('statistics view refreshes automatically without hiding historical comparison data', () => {
+  assert.match(statisticsSource, /window\.setInterval\(fetchData, 60000\)/, 'report should re-check market status every minute')
+  assert.match(statisticsSource, /clearReviewRefreshTimer\(\)/, 'timer should be cleared when view unmounts')
+  assert.doesNotMatch(statisticsSource, /v-if="reviewMode === 'daily'"/, 'range picker should not be scoped to a removed mode')
+  assert.match(statisticsSource, /盘中实时/, 'summary should identify live intraday data')
+  assert.match(statisticsSource, /实时更新/, 'summary should display live snapshot update time')
 })

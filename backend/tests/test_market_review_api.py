@@ -2,7 +2,7 @@ import asyncio
 import importlib.util
 import sys
 import unittest
-from datetime import date, time
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -421,6 +421,35 @@ class MarketReviewApiTests(unittest.TestCase):
         self.assertEqual(payload["is_fallback"], True)
         self.assertEqual(payload["ladders"][0]["stocks"][0]["stock_code"], "600001")
 
+    def test_live_intraday_detection_uses_trading_calendar_and_closes_at_market_end(self):
+        class MarketOpenDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return datetime(2026, 5, 6, 14, 59, tzinfo=timezone(timedelta(hours=8)))
+
+        class MarketClosedDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return datetime(2026, 5, 6, 15, 1, tzinfo=timezone(timedelta(hours=8)))
+
+        original_datetime = self.review_module.datetime
+        try:
+            self.review_module._TRADING_DAY_CACHE.clear()
+            self.review_module._load_cn_trading_dates = Mock(return_value={date(2026, 5, 6)})
+            self.review_module.datetime = MarketOpenDatetime
+            self.assertTrue(self.review_module._should_collect_live_intraday(date(2026, 5, 6)))
+
+            self.review_module.datetime = MarketClosedDatetime
+            self.assertFalse(self.review_module._should_collect_live_intraday(date(2026, 5, 6)))
+
+            self.review_module._TRADING_DAY_CACHE.clear()
+            self.review_module._load_cn_trading_dates = Mock(return_value=set())
+            self.review_module.datetime = MarketOpenDatetime
+            self.assertFalse(self.review_module._should_collect_live_intraday(date(2026, 5, 6)))
+        finally:
+            self.review_module.datetime = original_datetime
+            self.review_module._TRADING_DAY_CACHE.clear()
+
     def test_intraday_endpoint_returns_live_metric_detail_and_ladder_snapshot(self):
         collect_mock = AsyncMock(
             return_value={
@@ -523,6 +552,7 @@ class MarketReviewApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         self.assertTrue(payload["is_intraday"])
+        self.assertTrue(payload["is_live"])
         self.assertIsNotNone(payload["snapshot_time"])
         self.assertEqual(payload["data"]["series"], ["2026-05-06"])
         row = payload["data"]["rows"][0]
@@ -549,6 +579,7 @@ class MarketReviewApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         self.assertTrue(payload["is_intraday"])
+        self.assertFalse(payload["is_live"])
         self.assertFalse(payload["is_fallback"])
         self.assertEqual(payload["data"]["series"], ["2026-04-28"])
         self.assertEqual(payload["data"]["rows"][0]["max_board_label"], "Alpha4\nBeta4")

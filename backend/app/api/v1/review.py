@@ -24,6 +24,7 @@ from app.services.market_review_metrics_service import market_review_metrics_ser
 
 router = APIRouter()
 CN_TZ = timezone(timedelta(hours=8))
+_TRADING_DAY_CACHE: dict[date, bool] = {}
 
 
 async def _collect_intraday_source(trade_date: date) -> dict[str, Any]:
@@ -253,12 +254,52 @@ def _build_intraday_ladder(trade_date: date, stock_rows: list[dict[str, Any]]) -
     return _build_ladder_response_from_rows(trade_date, False, stock_rows)
 
 
+def _normalize_cn_trade_calendar_date(raw_value: Any) -> date | None:
+    if isinstance(raw_value, datetime):
+        return raw_value.date()
+    if isinstance(raw_value, date):
+        return raw_value
+    if isinstance(raw_value, str):
+        return datetime.strptime(raw_value, "%Y-%m-%d").date()
+    if hasattr(raw_value, "date"):
+        return raw_value.date()
+    return None
+
+
+def _load_cn_trading_dates(start_date: date, end_date: date) -> set[date]:
+    import akshare as ak
+
+    calendar_df = ak.tool_trade_date_hist_sina()
+    if "trade_date" not in calendar_df:
+        return set()
+
+    trading_dates: set[date] = set()
+    for raw_value in calendar_df["trade_date"].tolist():
+        trade_date = _normalize_cn_trade_calendar_date(raw_value)
+        if trade_date is not None and start_date <= trade_date <= end_date:
+            trading_dates.add(trade_date)
+    return trading_dates
+
+
+def _is_cn_trading_day(trade_date: date) -> bool:
+    if trade_date.weekday() >= 5:
+        return False
+    if trade_date not in _TRADING_DAY_CACHE:
+        try:
+            _TRADING_DAY_CACHE[trade_date] = trade_date in _load_cn_trading_dates(trade_date, trade_date)
+        except Exception:
+            _TRADING_DAY_CACHE[trade_date] = True
+    return _TRADING_DAY_CACHE[trade_date]
+
+
 def _should_collect_live_intraday(trade_date: date) -> bool:
     now = datetime.now(CN_TZ)
-    return trade_date == now.date() and time(9, 15) <= now.time() <= time(15, 30)
+    if trade_date != now.date() or not _is_cn_trading_day(trade_date):
+        return False
+    return time(9, 15) <= now.time() <= time(15, 0)
 
 
-async def _build_intraday_snapshot(trade_date: date) -> MarketReviewIntradayResponse:
+async def _build_intraday_snapshot(trade_date: date, is_live: bool = True) -> MarketReviewIntradayResponse:
     normalized_data = await _collect_intraday_source(trade_date)
     stock_rows = normalized_data.get("stock_rows") or []
     metric = market_review_metrics_service.aggregate_daily_metrics(
@@ -295,6 +336,7 @@ async def _build_intraday_snapshot(trade_date: date) -> MarketReviewIntradayResp
         end_date=metric_row.trade_date,
         latest_trade_date=metric_row.trade_date,
         is_fallback=False,
+        is_live=is_live,
         snapshot_time=datetime.now(CN_TZ),
         detail=detail,
         ladder=ladder,
@@ -387,6 +429,7 @@ async def _build_stored_intraday_snapshot(
         end_date=daily_row.trade_date,
         latest_trade_date=daily_row.trade_date,
         is_fallback=is_fallback,
+        is_live=False,
         snapshot_time=datetime.now(CN_TZ),
         detail=detail,
         ladder=ladder,
@@ -448,7 +491,7 @@ async def get_market_review_intraday(
 
     if _should_collect_live_intraday(target_date):
         try:
-            return await _build_intraday_snapshot(target_date)
+            return await _build_intraday_snapshot(target_date, is_live=True)
         except Exception:
             stored_snapshot = await _build_stored_intraday_snapshot(db, target_date)
             if stored_snapshot is not None:
@@ -459,7 +502,7 @@ async def get_market_review_intraday(
     if stored_snapshot is not None:
         return stored_snapshot
 
-    return await _build_intraday_snapshot(target_date)
+    return await _build_intraday_snapshot(target_date, is_live=False)
 
 
 @router.get("/daily", response_model=MarketReviewDailyResponse, summary="获取复盘日级指标")

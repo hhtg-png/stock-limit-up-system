@@ -8,12 +8,7 @@
         </div>
 
         <div class="summary-controls">
-          <el-radio-group v-model="reviewMode" size="small">
-            <el-radio-button label="daily">收盘复盘</el-radio-button>
-            <el-radio-button label="intraday">盘中实时</el-radio-button>
-          </el-radio-group>
-
-          <el-radio-group v-if="reviewMode === 'daily'" v-model="timeRange" size="small">
+          <el-radio-group v-model="timeRange" size="small">
             <el-radio-button label="7">近7天</el-radio-button>
             <el-radio-button label="30">近30天</el-radio-button>
             <el-radio-button label="3m">近3月</el-radio-button>
@@ -22,14 +17,16 @@
       </div>
 
       <div class="summary-meta">
-        <span v-if="reviewMode === 'daily'">区间 {{ activeStartDate }} 至 {{ activeEndDate }}</span>
-        <span v-else>盘中快照 {{ activeEndDate }}</span>
+        <span>区间 {{ activeStartDate }} 至 {{ activeEndDate }}</span>
         <span>明细日期 {{ resolvedTradeDate }}</span>
-        <span v-if="reviewMode === 'intraday' && intradaySnapshotTime">
-          更新时间 {{ formatSnapshotTime(intradaySnapshotTime) }}
+        <span v-if="isLiveIntraday && intradaySnapshotTime">
+          实时更新 {{ formatSnapshotTime(intradaySnapshotTime) }}
         </span>
-        <el-tag v-if="reviewMode === 'intraday'" type="success" size="small">
-          盘中快照
+        <el-tag v-if="isLiveIntraday" type="success" size="small">
+          盘中实时
+        </el-tag>
+        <el-tag v-else type="info" size="small">
+          收盘复盘
         </el-tag>
         <el-tag v-if="hasFallback" type="warning" size="small">
           已回退到最近可用数据
@@ -266,7 +263,6 @@ import type {
 
 const router = useRouter()
 
-const reviewMode = ref<'daily' | 'intraday'>('daily')
 const timeRange = ref('30')
 const loading = ref(false)
 const activeStartDate = ref(dayjs().format('YYYY-MM-DD'))
@@ -277,6 +273,7 @@ const dailyRows = ref<MarketReviewDailyRow[]>([])
 const dailyHasFallback = ref(false)
 const detailResponse = ref<MarketReviewDetailResponse | null>(null)
 const ladderResponse = ref<MarketReviewLadderResponse | null>(null)
+const isLiveIntraday = ref(false)
 const intradaySnapshotTime = ref<string | null>(null)
 
 const boardHeightChartRef = ref<HTMLElement>()
@@ -293,7 +290,7 @@ let limitTrendChart: echarts.ECharts | null = null
 let breadthChart: echarts.ECharts | null = null
 let amountChart: echarts.ECharts | null = null
 let fetchSequence = 0
-let intradayRefreshTimer: number | null = null
+let reviewRefreshTimer: number | null = null
 
 const detailStocks = computed(() => detailResponse.value?.stocks ?? [])
 const ladderLevels = computed(() => ladderResponse.value?.ladders ?? [])
@@ -333,6 +330,28 @@ const strongestReason = computed(() => {
 
 function getDateRange() {
   return buildReviewRange(timeRange.value, dayjs().format('YYYY-MM-DD'))
+}
+
+function mergeIntradayDailyRows(
+  series: string[],
+  rows: MarketReviewDailyRow[],
+  intradayRow: MarketReviewDailyRow
+) {
+  const nextSeries = [...series]
+  const nextRows = [...rows]
+  const rowIndex = nextRows.findIndex(row => row.trade_date === intradayRow.trade_date)
+
+  if (rowIndex >= 0) {
+    nextRows[rowIndex] = intradayRow
+  } else {
+    nextSeries.push(intradayRow.trade_date)
+    nextRows.push(intradayRow)
+  }
+
+  return {
+    series: nextSeries,
+    rows: nextRows
+  }
 }
 
 function formatDateLabel(value: string) {
@@ -983,58 +1002,13 @@ async function fetchData() {
   const currentSequence = ++fetchSequence
   loading.value = true
   const today = dayjs().format('YYYY-MM-DD')
-
-  if (reviewMode.value === 'intraday') {
-    let hasError = false
-
-    try {
-      const dailyResult = await getMarketReviewIntraday(dayjs().format('YYYY-MM-DD'))
-
-      if (currentSequence !== fetchSequence) {
-        return
-      }
-
-      dailySeries.value = dailyResult.data.series
-      dailyRows.value = dailyResult.data.rows
-      dailyHasFallback.value = Boolean(dailyResult.is_fallback)
-      const snapshotDate = dailyResult.end_date || dailyResult.latest_trade_date || dailyResult.data.series[0] || today
-      activeStartDate.value = snapshotDate
-      activeEndDate.value = snapshotDate
-      intradaySnapshotTime.value = dailyResult.snapshot_time
-      detailResponse.value = dailyResult.detail
-      ladderResponse.value = dailyResult.ladder
-    } catch (e) {
-      console.error('Fetch market review intraday error:', e)
-      dailySeries.value = []
-      dailyRows.value = []
-      dailyHasFallback.value = false
-      detailResponse.value = null
-      ladderResponse.value = null
-      intradaySnapshotTime.value = null
-      activeStartDate.value = today
-      activeEndDate.value = today
-      hasError = true
-    }
-
-    if (currentSequence !== fetchSequence) {
-      return
-    }
-
-    updateCharts()
-
-    if (hasError) {
-      ElMessage.error('获取盘中复盘数据失败')
-    }
-
-    loading.value = false
-    return
-  }
-
   const { startDate, endDate, query } = getDateRange()
+  isLiveIntraday.value = false
   intradaySnapshotTime.value = null
 
   let detailDate = endDate
   let hasError = false
+  let hasLiveIntradayDetail = false
 
   try {
     const dailyResult = await getMarketReviewDaily(query)
@@ -1060,29 +1034,56 @@ async function fetchData() {
     hasError = true
   }
 
-  const [detailResult, ladderResult] = await Promise.allSettled([
-    getMarketReviewDetail(detailDate),
-    getMarketReviewLadder(detailDate)
-  ])
+  try {
+    const intradayResult = await getMarketReviewIntraday(today)
 
-  if (currentSequence !== fetchSequence) {
-    return
+    if (currentSequence !== fetchSequence) {
+      return
+    }
+
+    if (intradayResult.is_live && intradayResult.data.rows.length) {
+      const intradayRow = intradayResult.data.rows[0]
+      const mergedDaily = mergeIntradayDailyRows(dailySeries.value, dailyRows.value, intradayRow)
+      dailySeries.value = mergedDaily.series
+      dailyRows.value = mergedDaily.rows
+      dailyHasFallback.value = Boolean(dailyHasFallback.value || intradayResult.is_fallback)
+      activeEndDate.value = intradayRow.trade_date
+      detailDate = intradayRow.trade_date
+      isLiveIntraday.value = true
+      intradaySnapshotTime.value = intradayResult.snapshot_time
+      detailResponse.value = intradayResult.detail
+      ladderResponse.value = intradayResult.ladder
+      hasLiveIntradayDetail = true
+    }
+  } catch (e) {
+    console.warn('Fetch market review intraday status error:', e)
   }
 
-  if (detailResult.status === 'fulfilled') {
-    detailResponse.value = detailResult.value
-  } else {
-    console.error('Fetch market review detail error:', detailResult.reason)
-    detailResponse.value = null
-    hasError = true
-  }
+  if (!hasLiveIntradayDetail) {
+    const [detailResult, ladderResult] = await Promise.allSettled([
+      getMarketReviewDetail(detailDate),
+      getMarketReviewLadder(detailDate)
+    ])
 
-  if (ladderResult.status === 'fulfilled') {
-    ladderResponse.value = ladderResult.value
-  } else {
-    console.error('Fetch market review ladder error:', ladderResult.reason)
-    ladderResponse.value = null
-    hasError = true
+    if (currentSequence !== fetchSequence) {
+      return
+    }
+
+    if (detailResult.status === 'fulfilled') {
+      detailResponse.value = detailResult.value
+    } else {
+      console.error('Fetch market review detail error:', detailResult.reason)
+      detailResponse.value = null
+      hasError = true
+    }
+
+    if (ladderResult.status === 'fulfilled') {
+      ladderResponse.value = ladderResult.value
+    } else {
+      console.error('Fetch market review ladder error:', ladderResult.reason)
+      ladderResponse.value = null
+      hasError = true
+    }
   }
 
   updateCharts()
@@ -1104,42 +1105,30 @@ function handleRowClick(row: MarketReviewDetailStock) {
   goToDetail(row.stock_code)
 }
 
-watch(timeRange, () => {
-  if (reviewMode.value === 'daily') {
-    fetchData()
-  }
-})
+watch(timeRange, fetchData)
 
-function clearIntradayRefreshTimer() {
-  if (intradayRefreshTimer != null) {
-    window.clearInterval(intradayRefreshTimer)
-    intradayRefreshTimer = null
+function clearReviewRefreshTimer() {
+  if (reviewRefreshTimer != null) {
+    window.clearInterval(reviewRefreshTimer)
+    reviewRefreshTimer = null
   }
 }
 
-function resetIntradayRefreshTimer() {
-  clearIntradayRefreshTimer()
-  if (reviewMode.value === 'intraday') {
-    intradayRefreshTimer = window.setInterval(fetchData, 60000)
-  }
+function resetReviewRefreshTimer() {
+  clearReviewRefreshTimer()
+  reviewRefreshTimer = window.setInterval(fetchData, 60000)
 }
-
-watch(reviewMode, () => {
-  clearIntradayRefreshTimer()
-  fetchData()
-  resetIntradayRefreshTimer()
-})
 
 onMounted(() => {
   initCharts()
   updateCharts()
   fetchData()
-  resetIntradayRefreshTimer()
+  resetReviewRefreshTimer()
   window.addEventListener('resize', resizeCharts)
 })
 
 onUnmounted(() => {
-  clearIntradayRefreshTimer()
+  clearReviewRefreshTimer()
   window.removeEventListener('resize', resizeCharts)
   disposeCharts()
 })
