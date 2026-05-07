@@ -169,6 +169,11 @@ export interface MarketReviewDetailResponse {
 export interface MarketReviewLadderLevel {
   continuous_days: number
   count: number
+  cohort_count: number
+  cohort_sealed_count: number
+  cohort_opened_count: number
+  cohort_seal_rate: number
+  cohort_avg_change: number | null
   stocks: MarketReviewDetailStock[]
 }
 

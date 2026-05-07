@@ -93,3 +93,12 @@ test('ladder groups show stats in a separate compact metrics row', () => {
   assert.match(source, /function getLadderAverageChange\(ladder: MarketReviewLadderLevel\)/)
   assert.match(source, /\.ladder-metrics\s*\{[\s\S]*grid-template-columns: repeat\(4, minmax\(0, 1fr\)\)/)
 })
+
+test('ladder seal rate and average change use same-cohort metrics from backend', () => {
+  const typeSource = readFileSync('src/types/market.ts', 'utf8')
+  assert.match(typeSource, /cohort_count:\s*number/)
+  assert.match(typeSource, /cohort_seal_rate:\s*number/)
+  assert.match(typeSource, /cohort_avg_change:\s*number \| null/)
+  assert.match(source, /return formatRate\(ladder\.cohort_seal_rate\)/)
+  assert.match(source, /return ladder\.cohort_avg_change/)
+})

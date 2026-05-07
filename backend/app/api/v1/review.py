@@ -134,6 +134,12 @@ def _build_stock_item_from_source(row: dict[str, Any]) -> MarketReviewStockItem:
     )
 
 
+def _build_stock_item(row: MarketReviewStockDaily | dict[str, Any]) -> MarketReviewStockItem:
+    if isinstance(row, dict):
+        return _build_stock_item_from_source(row)
+    return MarketReviewStockItem.model_validate(row)
+
+
 def _build_intraday_detail(trade_date: date, stock_rows: list[dict[str, Any]]) -> MarketReviewDetailResponse:
     stocks = [_build_stock_item_from_source(row) for row in stock_rows if row.get("stock_code")]
     stocks.sort(
@@ -150,23 +156,79 @@ def _build_intraday_detail(trade_date: date, stock_rows: list[dict[str, Any]]) -
     )
 
 
-def _build_intraday_ladder(trade_date: date, stock_rows: list[dict[str, Any]]) -> MarketReviewLadderResponse:
-    stocks = [
-        _build_stock_item_from_source(row)
-        for row in stock_rows
-        if row.get("today_touched_limit_up") and _get_stock_int(row, "today_continuous_days") >= 2
-    ]
-    stocks.sort(
-        key=lambda stock: (
-            -stock.today_continuous_days,
-            not stock.today_sealed_close,
-            stock.stock_code,
+def _is_ladder_display_row(row: MarketReviewStockDaily | dict[str, Any]) -> bool:
+    return bool(_get_stock_value(row, "today_touched_limit_up")) and _get_stock_int(row, "today_continuous_days") >= 2
+
+
+def _is_same_ladder_cohort_row(row: MarketReviewStockDaily | dict[str, Any], continuous_days: int) -> bool:
+    if continuous_days <= 1:
+        return False
+
+    previous_days = continuous_days - 1
+    yesterday_days = _get_stock_int(row, "yesterday_continuous_days")
+    if previous_days == 1 and bool(_get_stock_value(row, "yesterday_limit_up")) and yesterday_days in (0, 1):
+        return True
+    if yesterday_days == previous_days:
+        return True
+
+    return (
+        _is_ladder_display_row(row)
+        and _get_stock_int(row, "today_continuous_days") == continuous_days
+        and yesterday_days == 0
+    )
+
+
+def _apply_ladder_cohort_metrics(
+    ladders: list[MarketReviewLadderItem],
+    stock_rows: list[MarketReviewStockDaily | dict[str, Any]],
+) -> None:
+    for ladder in ladders:
+        cohort_rows = [
+            row
+            for row in stock_rows
+            if _is_same_ladder_cohort_row(row, ladder.continuous_days)
+        ]
+        if not cohort_rows:
+            cohort_rows = ladder.stocks
+
+        changes = [
+            change
+            for change in (_get_stock_float(row, "change_pct") for row in cohort_rows)
+            if change is not None
+        ]
+        cohort_count = len(cohort_rows)
+        cohort_sealed_count = sum(1 for row in cohort_rows if bool(_get_stock_value(row, "today_sealed_close")))
+        cohort_opened_count = sum(
+            1
+            for row in cohort_rows
+            if bool(_get_stock_value(row, "today_opened_close") or _get_stock_value(row, "today_broken"))
+        )
+
+        ladder.cohort_count = cohort_count
+        ladder.cohort_sealed_count = cohort_sealed_count
+        ladder.cohort_opened_count = cohort_opened_count
+        ladder.cohort_seal_rate = round(cohort_sealed_count * 100 / cohort_count, 2) if cohort_count else 0.0
+        ladder.cohort_avg_change = round(sum(changes) / len(changes), 2) if changes else None
+
+
+def _build_ladder_response_from_rows(
+    trade_date: date,
+    is_fallback: bool,
+    stock_rows: list[MarketReviewStockDaily | dict[str, Any]],
+) -> MarketReviewLadderResponse:
+    ladder_rows = [row for row in stock_rows if _is_ladder_display_row(row)]
+    ladder_rows.sort(
+        key=lambda row: (
+            -_get_stock_int(row, "today_continuous_days"),
+            not bool(_get_stock_value(row, "today_sealed_close")),
+            str(_get_stock_value(row, "stock_code", "")),
         )
     )
 
     ladders: list[MarketReviewLadderItem] = []
     current_ladder: MarketReviewLadderItem | None = None
-    for stock in stocks:
+    for row in ladder_rows:
+        stock = _build_stock_item(row)
         if current_ladder is None or current_ladder.continuous_days != stock.today_continuous_days:
             current_ladder = MarketReviewLadderItem(
                 continuous_days=stock.today_continuous_days,
@@ -178,11 +240,17 @@ def _build_intraday_ladder(trade_date: date, stock_rows: list[dict[str, Any]]) -
         current_ladder.stocks.append(stock)
         current_ladder.count = len(current_ladder.stocks)
 
+    _apply_ladder_cohort_metrics(ladders, stock_rows)
+
     return MarketReviewLadderResponse(
         trade_date=trade_date,
-        is_fallback=False,
+        is_fallback=is_fallback,
         ladders=ladders,
     )
+
+
+def _build_intraday_ladder(trade_date: date, stock_rows: list[dict[str, Any]]) -> MarketReviewLadderResponse:
+    return _build_ladder_response_from_rows(trade_date, False, stock_rows)
 
 
 def _should_collect_live_intraday(trade_date: date) -> bool:
@@ -262,11 +330,7 @@ async def _build_ladder_response_from_db(
 ) -> MarketReviewLadderResponse:
     result = await db.execute(
         select(MarketReviewStockDaily)
-        .where(
-            MarketReviewStockDaily.trade_date == resolved_date,
-            MarketReviewStockDaily.today_touched_limit_up.is_(True),
-            MarketReviewStockDaily.today_continuous_days >= 2,
-        )
+        .where(MarketReviewStockDaily.trade_date == resolved_date)
         .order_by(
             MarketReviewStockDaily.today_continuous_days.desc(),
             MarketReviewStockDaily.today_sealed_close.desc(),
@@ -275,26 +339,10 @@ async def _build_ladder_response_from_db(
         )
     )
 
-    ladders: list[MarketReviewLadderItem] = []
-    current_ladder: MarketReviewLadderItem | None = None
-
-    for row in result.scalars().all():
-        stock = MarketReviewStockItem.model_validate(row)
-        if current_ladder is None or current_ladder.continuous_days != stock.today_continuous_days:
-            current_ladder = MarketReviewLadderItem(
-                continuous_days=stock.today_continuous_days,
-                count=0,
-                stocks=[],
-            )
-            ladders.append(current_ladder)
-
-        current_ladder.stocks.append(stock)
-        current_ladder.count = len(current_ladder.stocks)
-
-    return MarketReviewLadderResponse(
+    return _build_ladder_response_from_rows(
         trade_date=resolved_date,
         is_fallback=is_fallback,
-        ladders=ladders,
+        stock_rows=list(result.scalars().all()),
     )
 
 

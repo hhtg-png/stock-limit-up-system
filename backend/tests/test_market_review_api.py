@@ -367,6 +367,48 @@ class MarketReviewApiTests(unittest.TestCase):
         self.assertNotIn("600004", ladder_stock_codes)
         self.assertNotIn("600005", ladder_stock_codes)
 
+    def test_ladder_endpoint_metrics_include_unpromoted_same_cohort(self):
+        async def add_unpromoted_stock():
+            async with self.session_factory() as session:
+                session.add(
+                    MarketReviewStockDaily(
+                        trade_date=date(2026, 4, 28),
+                        stock_id=7,
+                        stock_code="600007",
+                        stock_name="Eta",
+                        board_type="main",
+                        is_st=False,
+                        yesterday_limit_up=True,
+                        yesterday_continuous_days=3,
+                        today_touched_limit_up=False,
+                        today_sealed_close=False,
+                        today_opened_close=False,
+                        today_broken=False,
+                        today_continuous_days=0,
+                        change_pct=-2.0,
+                        amount=100000.0,
+                        limit_up_reason="AI",
+                    )
+                )
+                await session.commit()
+
+        asyncio.run(add_unpromoted_stock())
+
+        response = self.client.get(
+            "/api/v1/statistics/review/ladder",
+            params={"trade_date": "2026-04-28"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        ladder = response.json()["ladders"][0]
+        self.assertEqual(ladder["continuous_days"], 4)
+        self.assertEqual(ladder["count"], 2)
+        self.assertEqual(ladder["cohort_count"], 3)
+        self.assertEqual(ladder["cohort_sealed_count"], 1)
+        self.assertEqual(ladder["cohort_opened_count"], 1)
+        self.assertAlmostEqual(ladder["cohort_seal_rate"], 33.33)
+        self.assertAlmostEqual(ladder["cohort_avg_change"], 4.63)
+
     def test_ladder_endpoint_falls_back_to_latest_available_review_date(self):
         response = self.client.get(
             "/api/v1/statistics/review/ladder",
@@ -390,6 +432,8 @@ class MarketReviewApiTests(unittest.TestCase):
                         "today_touched_limit_up": True,
                         "today_sealed_close": True,
                         "today_opened_close": False,
+                        "yesterday_limit_up": True,
+                        "yesterday_continuous_days": 2,
                         "today_continuous_days": 3,
                         "change_pct": 10.01,
                         "amount": 120000.0,
@@ -402,6 +446,8 @@ class MarketReviewApiTests(unittest.TestCase):
                         "today_touched_limit_up": True,
                         "today_sealed_close": False,
                         "today_opened_close": True,
+                        "yesterday_limit_up": True,
+                        "yesterday_continuous_days": 2,
                         "today_continuous_days": 3,
                         "change_pct": 7.2,
                         "amount": 220000.0,
@@ -414,10 +460,26 @@ class MarketReviewApiTests(unittest.TestCase):
                         "today_touched_limit_up": True,
                         "today_sealed_close": True,
                         "today_opened_close": False,
+                        "yesterday_limit_up": True,
+                        "yesterday_continuous_days": 1,
                         "today_continuous_days": 2,
                         "change_pct": 20.0,
                         "amount": 180000.0,
                         "limit_up_reason": "Chip",
+                    },
+                    {
+                        "stock_code": "600013",
+                        "stock_name": "LiveEta",
+                        "board_type": "main",
+                        "today_touched_limit_up": False,
+                        "today_sealed_close": False,
+                        "today_opened_close": False,
+                        "yesterday_limit_up": True,
+                        "yesterday_continuous_days": 2,
+                        "today_continuous_days": 0,
+                        "change_pct": -1.0,
+                        "amount": 90000.0,
+                        "limit_up_reason": "AI",
                     },
                 ],
                 "limit_down_count": 2,
@@ -467,9 +529,12 @@ class MarketReviewApiTests(unittest.TestCase):
         self.assertEqual(row["max_board_label"], "LiveAlpha3\nLiveBeta3")
         self.assertEqual(row["second_board_label"], "LiveGamma2")
         self.assertEqual(row["gem_board_label"], "LiveGamma2")
-        self.assertEqual([stock["stock_code"] for stock in payload["detail"]["stocks"]], ["600011", "600010", "600012"])
+        self.assertEqual([stock["stock_code"] for stock in payload["detail"]["stocks"]], ["600011", "600010", "600012", "600013"])
         self.assertEqual([ladder["continuous_days"] for ladder in payload["ladder"]["ladders"]], [3, 2])
         self.assertEqual(payload["ladder"]["ladders"][0]["count"], 2)
+        self.assertEqual(payload["ladder"]["ladders"][0]["cohort_count"], 3)
+        self.assertAlmostEqual(payload["ladder"]["ladders"][0]["cohort_seal_rate"], 33.33)
+        self.assertAlmostEqual(payload["ladder"]["ladders"][0]["cohort_avg_change"], 5.4)
 
     def test_intraday_endpoint_uses_stored_review_snapshot_when_available(self):
         self.review_module._collect_intraday_source = AsyncMock(

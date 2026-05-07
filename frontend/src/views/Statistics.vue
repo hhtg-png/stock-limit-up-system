@@ -351,6 +351,13 @@ function formatPercent(value: number | null | undefined) {
   return `${sign}${value.toFixed(2)}%`
 }
 
+function formatRate(value: number | null | undefined) {
+  if (value == null) {
+    return '-'
+  }
+  return `${value.toFixed(2)}%`
+}
+
 function formatPercentAxisLabel(value: number | string | null | undefined) {
   const numericValue = Number(value)
   if (!Number.isFinite(numericValue)) {
@@ -429,22 +436,11 @@ function getOpenedCount(ladder: MarketReviewLadderLevel) {
 }
 
 function getLadderSealRate(ladder: MarketReviewLadderLevel) {
-  const total = ladder.count || ladder.stocks.length
-  if (!total) {
-    return '0.00%'
-  }
-  return `${((getSealedCount(ladder) / total) * 100).toFixed(2)}%`
+  return formatRate(ladder.cohort_seal_rate)
 }
 
 function getLadderAverageChangeValue(ladder: MarketReviewLadderLevel) {
-  const changes = ladder.stocks
-    .map(stock => stock.change_pct)
-    .filter((value): value is number => value != null)
-
-  if (!changes.length) {
-    return null
-  }
-  return changes.reduce((sum, value) => sum + value, 0) / changes.length
+  return ladder.cohort_avg_change
 }
 
 function getLadderAverageChange(ladder: MarketReviewLadderLevel) {
