@@ -10,6 +10,7 @@ from sqlalchemy.pool import StaticPool
 from app.api.v1.daily_analysis import router as daily_analysis_router
 from app.database import Base, get_db
 from app.models.limit_up import LimitUpRecord
+from app.models.market_review import MarketReviewStockDaily
 from app.models.stock import Stock
 
 
@@ -57,7 +58,23 @@ class DailyAnalysisApiTests(unittest.TestCase):
                 is_cy=1,
                 is_kc=0,
             )
-            session.add_all([leader, trend_20cm])
+            popular_limit_down = Stock(
+                stock_code="002900",
+                stock_name="人气跌停",
+                market="SZ",
+                industry="人工智能",
+                is_cy=0,
+                is_kc=0,
+            )
+            popular_slump = Stock(
+                stock_code="002901",
+                stock_name="人气大跌",
+                market="SZ",
+                industry="人工智能",
+                is_cy=0,
+                is_kc=0,
+            )
+            session.add_all([leader, trend_20cm, popular_limit_down, popular_slump])
             await session.flush()
 
             session.add_all(
@@ -111,6 +128,86 @@ class DailyAnalysisApiTests(unittest.TestCase):
                         amount=30000,
                         turnover_rate=15,
                     ),
+                    LimitUpRecord(
+                        stock_id=popular_limit_down.id,
+                        trade_date=date(2026, 4, 23),
+                        first_limit_up_time=datetime(2026, 4, 23, 9, 40, 0),
+                        final_seal_time=datetime(2026, 4, 23, 9, 40, 0),
+                        reason_category="人工智能",
+                        limit_up_reason="人形机器人",
+                        continuous_limit_up_days=3,
+                        open_count=0,
+                        is_final_sealed=True,
+                        open_price=9.1,
+                        close_price=10,
+                        limit_up_price=10,
+                        amount=90000,
+                        turnover_rate=8,
+                    ),
+                    LimitUpRecord(
+                        stock_id=popular_slump.id,
+                        trade_date=date(2026, 4, 23),
+                        first_limit_up_time=datetime(2026, 4, 23, 9, 42, 0),
+                        final_seal_time=datetime(2026, 4, 23, 9, 42, 0),
+                        reason_category="人工智能",
+                        limit_up_reason="人形机器人",
+                        continuous_limit_up_days=3,
+                        open_count=0,
+                        is_final_sealed=True,
+                        open_price=9.1,
+                        close_price=10,
+                        limit_up_price=10,
+                        amount=85000,
+                        turnover_rate=7,
+                    ),
+                ]
+            )
+            session.add_all(
+                [
+                    MarketReviewStockDaily(
+                        stock_id=popular_limit_down.id,
+                        trade_date=date(2026, 4, 24),
+                        stock_code="002900",
+                        stock_name="人气跌停",
+                        board_type="main",
+                        is_st=False,
+                        yesterday_limit_up=True,
+                        yesterday_continuous_days=3,
+                        today_touched_limit_up=False,
+                        today_sealed_close=False,
+                        today_opened_close=False,
+                        today_broken=False,
+                        today_continuous_days=0,
+                        close_price=9.05,
+                        pre_close=10.0,
+                        change_pct=-9.5,
+                        amount=70000,
+                        turnover_rate=11,
+                        limit_up_reason=None,
+                        data_quality_flag="ok",
+                    ),
+                    MarketReviewStockDaily(
+                        stock_id=popular_slump.id,
+                        trade_date=date(2026, 4, 24),
+                        stock_code="002901",
+                        stock_name="人气大跌",
+                        board_type="main",
+                        is_st=False,
+                        yesterday_limit_up=True,
+                        yesterday_continuous_days=3,
+                        today_touched_limit_up=False,
+                        today_sealed_close=False,
+                        today_opened_close=False,
+                        today_broken=False,
+                        today_continuous_days=0,
+                        close_price=9.3,
+                        pre_close=10.0,
+                        change_pct=-7.0,
+                        amount=65000,
+                        turnover_rate=10,
+                        limit_up_reason=None,
+                        data_quality_flag="ok",
+                    ),
                 ]
             )
             await session.commit()
@@ -126,6 +223,12 @@ class DailyAnalysisApiTests(unittest.TestCase):
         self.assertEqual({row["trade_date"] for row in rows}, {"2026-04-23", "2026-04-24"})
         latest = next(row for row in rows if row["trade_date"] == "2026-04-24")
         self.assertEqual(latest["columns"]["连板唯一性"]["items"][0]["time"], "09:25:02")
+        negative_codes = {
+            item["stock_code"]
+            for item in latest["columns"]["负反馈"]["items"]
+        }
+        self.assertIn("002900", negative_codes)
+        self.assertNotIn("002901", negative_codes)
 
         patched = self.client.patch(
             "/statistics/daily-analysis/2026-04-24/overrides",

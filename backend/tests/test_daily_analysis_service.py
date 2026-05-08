@@ -83,7 +83,7 @@ class DailyAnalysisRuleEngineTests(unittest.TestCase):
             fact("300606", trade_day, stock_name="二十长影", sealed=False, open_count=2, is_20cm=True, close_price=10.8, high_price=12.4, pre_close=10.0),
             fact("002707", trade_day, stock_name="一字套利", open_price=11.0, close_price=11.0, high_price=11.0, low_price=11.0, pre_close=10.0, first_time="09:25:02", final_time="09:25:02"),
             fact("002808", date(2026, 4, 23), stock_name="昨日核心", continuous_days=3, first_time="09:30:00", amount=120000),
-            fact("002808", trade_day, stock_name="昨日核心", sealed=False, open_count=6, close_price=8.9, high_price=10.0, pre_close=9.8),
+            fact("002808", trade_day, stock_name="昨日核心", sealed=False, open_count=0, close_price=8.85, high_price=9.1, pre_close=9.8),
         ]
 
         result = DailyAnalysisRuleEngine().build_daily_result(trade_day, facts)
@@ -351,6 +351,34 @@ class DailyAnalysisRuleEngineTests(unittest.TestCase):
         self.assertIn("2只", sector_by_label["Token工厂"]["tags"])
         self.assertIn("机器人甲(301001)", sector_by_label["人形机器人"]["content"])
         self.assertIn("算力乙(301004)", sector_by_label["Token工厂"]["content"])
+
+    def test_negative_feedback_requires_popular_stock_limit_down(self):
+        trade_day = date(2026, 4, 24)
+        yesterday = date(2026, 4, 23)
+        facts = [
+            fact("001001", yesterday, stock_name="人气跌停", continuous_days=3, close_price=10.0, high_price=10.0, pre_close=9.1),
+            fact("001001", trade_day, stock_name="人气跌停", sealed=False, open_count=0, close_price=9.05, high_price=9.2, pre_close=10.0),
+            fact("001002", yesterday, stock_name="人气大跌", continuous_days=3, close_price=10.0, high_price=10.0, pre_close=9.1),
+            fact("001002", trade_day, stock_name="人气大跌", sealed=False, open_count=0, close_price=9.3, high_price=9.7, pre_close=10.0),
+            fact("001003", yesterday, stock_name="人气炸板", continuous_days=3, close_price=10.0, high_price=10.0, pre_close=9.1),
+            fact("001003", trade_day, stock_name="人气炸板", sealed=False, open_count=5, close_price=10.2, high_price=11.0, pre_close=10.0),
+            fact("001004", yesterday, stock_name="普通跌停", sealed=False, first_time="14:50:00", final_time=None, open_count=3, close_price=10.0, high_price=10.0, pre_close=9.5, amount=100, turnover_rate=1),
+            fact("001004", trade_day, stock_name="普通跌停", sealed=False, open_count=0, close_price=9.05, high_price=9.2, pre_close=10.0),
+            fact("300888", yesterday, stock_name="二十人气", is_20cm=True, close_price=12.0, high_price=12.0, pre_close=10.0, amount=90000),
+            fact("300888", trade_day, stock_name="二十人气", is_20cm=True, sealed=False, open_count=0, close_price=9.65, high_price=10.5, pre_close=12.0),
+        ]
+
+        result = DailyAnalysisRuleEngine().build_daily_result(trade_day, facts)
+        negative_by_code = {
+            item["stock_code"]: item
+            for item in result["负反馈"]["items"]
+        }
+
+        self.assertEqual(negative_by_code["001001"]["tags"], ["跌停"])
+        self.assertEqual(negative_by_code["300888"]["tags"], ["跌停"])
+        self.assertNotIn("001002", negative_by_code)
+        self.assertNotIn("001003", negative_by_code)
+        self.assertNotIn("001004", negative_by_code)
 
     def test_20cm_column_uses_only_unique_height_long_shadow_or_recent_limit_new_high(self):
         trade_dates = [

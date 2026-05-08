@@ -10,7 +10,7 @@ from sqlalchemy import distinct, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.limit_up import LimitUpRecord
-from app.models.market_review import DailyAnalysisRecord
+from app.models.market_review import DailyAnalysisRecord, MarketReviewStockDaily
 from app.models.stock import Stock
 
 
@@ -76,10 +76,16 @@ class DailyAnalysisRuleEngine:
         self,
         trade_date: date,
         facts: Iterable[DailyAnalysisStockFact],
+        negative_feedback_facts: Optional[Iterable[DailyAnalysisStockFact]] = None,
     ) -> Dict[str, Dict[str, Any]]:
         all_facts = sorted(facts, key=lambda fact: (fact.trade_date, fact.stock_code))
         history = self._group_history(all_facts)
         today_facts = [fact for fact in all_facts if fact.trade_date == trade_date]
+        negative_today_facts = (
+            [fact for fact in negative_feedback_facts if fact.trade_date == trade_date]
+            if negative_feedback_facts is not None
+            else today_facts
+        )
         trade_dates = sorted({fact.trade_date for fact in all_facts})
         previous_trade_date = self._previous_trade_date(trade_date, trade_dates)
 
@@ -92,7 +98,7 @@ class DailyAnalysisRuleEngine:
         result["20cm"] = self._cell(self._build_20cm_items(trade_date, today_facts, history, trade_dates))
         result["一字套利"] = self._cell(self._build_one_word_arbitrage_items(today_facts))
         result["板块"] = self._cell(self._build_sector_items(today_facts))
-        result["负反馈"] = self._cell(self._build_negative_feedback_items(trade_date, today_facts, history))
+        result["负反馈"] = self._cell(self._build_negative_feedback_items(trade_date, negative_today_facts, history))
         return result
 
     def _group_history(
@@ -316,7 +322,13 @@ class DailyAnalysisRuleEngine:
         items = []
         for fact in today_facts:
             if self._is_negative_feedback(fact, history.get(fact.stock_code, [])):
-                items.append(self._stock_item(fact, tags=["负反馈"], score=self._recognition_score(fact)))
+                items.append(
+                    self._stock_item(
+                        fact,
+                        tags=["跌停"],
+                        score=self._negative_feedback_score(fact, history.get(fact.stock_code, [])),
+                    )
+                )
         return self._sort_items(items)
 
     def _is_rebound(
@@ -530,13 +542,35 @@ class DailyAnalysisRuleEngine:
         if not previous:
             return False
         yesterday = previous[-1]
-        was_core = yesterday.continuous_days >= 2 or self._recognition_score(yesterday) >= 25
-        weak_today = (
-            (not today.is_final_sealed and today.open_count > 0)
-            or (today.change_pct is not None and today.change_pct <= -5)
-            or (today.close_price is not None and today.pre_close is not None and today.close_price <= today.pre_close * 0.95)
-        )
-        return was_core and weak_today
+        return self._is_popular_stock(yesterday) and self._is_limit_down(today)
+
+    def _is_popular_stock(self, fact: DailyAnalysisStockFact) -> bool:
+        return fact.continuous_days >= 2 or self._recognition_score(fact) >= 25
+
+    def _is_limit_down(self, fact: DailyAnalysisStockFact) -> bool:
+        if fact.change_pct is not None:
+            return fact.change_pct <= self._limit_down_change_threshold(fact)
+        if fact.close_price is None or not fact.pre_close:
+            return False
+        ratio = abs(self._limit_down_change_threshold(fact)) / 100
+        return fact.close_price <= fact.pre_close * (1 - ratio) * 1.001
+
+    def _limit_down_change_threshold(self, fact: DailyAnalysisStockFact) -> float:
+        if "ST" in fact.stock_name.upper():
+            return -4.8
+        if fact.stock_code.startswith(("8", "920")):
+            return -29.5
+        if fact.is_20cm or fact.stock_code.startswith(("300", "301", "688")):
+            return -19.5
+        return -9.5
+
+    def _negative_feedback_score(self, today: DailyAnalysisStockFact, history: List[DailyAnalysisStockFact]) -> float:
+        previous_scores = [
+            self._recognition_score(fact)
+            for fact in history
+            if fact.trade_date < today.trade_date
+        ]
+        return max(previous_scores or [self._recognition_score(today)])
 
     def _recognition_score(self, fact: DailyAnalysisStockFact) -> float:
         score = fact.continuous_days * 12
@@ -663,7 +697,12 @@ class DailyAnalysisService:
         calc_version: Optional[int] = None,
     ) -> DailyAnalysisRecord:
         facts = await self.collect_candidate_facts(db, trade_date)
-        auto_result = self.rule_engine.build_daily_result(trade_date, facts)
+        negative_feedback_facts = await self.collect_negative_feedback_facts(db, trade_date)
+        auto_result = self.rule_engine.build_daily_result(
+            trade_date,
+            facts,
+            negative_feedback_facts=negative_feedback_facts or None,
+        )
         record = await self._get_record(db, trade_date)
         now = datetime.now()
 
@@ -709,6 +748,21 @@ class DailyAnalysisService:
         result = await db.execute(query)
         rows = result.all()
         return [self._to_fact(record, stock) for record, stock in rows]
+
+    async def collect_negative_feedback_facts(
+        self,
+        db: AsyncSession,
+        trade_date: date,
+    ) -> List[DailyAnalysisStockFact]:
+        query = (
+            select(MarketReviewStockDaily, Stock)
+            .join(Stock, MarketReviewStockDaily.stock_id == Stock.id)
+            .where(MarketReviewStockDaily.trade_date == trade_date)
+            .order_by(MarketReviewStockDaily.stock_code)
+        )
+        result = await db.execute(query)
+        rows = result.all()
+        return [self._to_fact_from_review_stock(row, stock) for row, stock in rows]
 
     def serialize_record(self, record: DailyAnalysisRecord) -> Dict[str, Any]:
         auto_result = self._normalize_auto_result(record.auto_result or {})
@@ -808,6 +862,40 @@ class DailyAnalysisService:
             amount=float(record.amount or 0),
             turnover_rate=self._to_float(record.turnover_rate),
         )
+
+    def _to_fact_from_review_stock(self, row: MarketReviewStockDaily, stock: Stock) -> DailyAnalysisStockFact:
+        is_20cm = bool(
+            stock.is_cy
+            or stock.is_kc
+            or row.board_type in {"gem", "star"}
+            or row.stock_code.startswith(("300", "301", "688"))
+        )
+        return DailyAnalysisStockFact(
+            trade_date=row.trade_date,
+            stock_code=row.stock_code,
+            stock_name=row.stock_name,
+            reason_category=stock.industry or "其他",
+            limit_up_reason=row.limit_up_reason or stock.industry or "",
+            continuous_days=int(row.today_continuous_days or 0),
+            open_count=int(row.open_count or 0),
+            is_final_sealed=bool(row.today_sealed_close),
+            is_20cm=is_20cm,
+            first_limit_time=self._combine_date_time(row.trade_date, row.first_limit_time),
+            final_seal_time=self._combine_date_time(row.trade_date, row.final_seal_time),
+            open_price=None,
+            close_price=self._to_float(row.close_price),
+            high_price=self._to_float(row.close_price),
+            low_price=self._to_float(row.close_price),
+            pre_close=self._to_float(row.pre_close),
+            change_pct=self._to_float(row.change_pct),
+            amount=float(row.amount or 0),
+            turnover_rate=self._to_float(row.turnover_rate),
+        )
+
+    def _combine_date_time(self, trade_date: date, value: Optional[time]) -> Optional[datetime]:
+        if value is None:
+            return None
+        return datetime.combine(trade_date, value)
 
     def _estimate_pre_close(
         self,
