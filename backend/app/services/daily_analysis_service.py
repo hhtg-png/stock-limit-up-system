@@ -62,11 +62,12 @@ class DailyAnalysisRuleEngine:
         all_facts = sorted(facts, key=lambda fact: (fact.trade_date, fact.stock_code))
         history = self._group_history(all_facts)
         today_facts = [fact for fact in all_facts if fact.trade_date == trade_date]
+        previous_trade_date = self._previous_trade_date(trade_date, all_facts)
 
         result = {column: self._cell([]) for column in SIGNAL_COLUMNS}
         result["连板唯一性"] = self._cell(self._build_unique_board_items(today_facts))
         result["反包+趋势+弹钢琴"] = self._cell(self._build_combined_pattern_items(trade_date, today_facts, history))
-        result["炸板反包"] = self._cell(self._build_broken_rebound_items(trade_date, today_facts, history))
+        result["炸板反包"] = self._cell(self._build_broken_rebound_items(trade_date, today_facts, history, previous_trade_date))
         result["辨识度"] = self._cell(self._build_recognition_items(today_facts))
         result["二波"] = self._cell(self._build_second_wave_items(trade_date, today_facts, history))
         result["20cm"] = self._cell(self._build_20cm_items(trade_date, today_facts, history))
@@ -86,6 +87,14 @@ class DailyAnalysisRuleEngine:
             values.sort(key=lambda fact: fact.trade_date)
         return grouped
 
+    def _previous_trade_date(
+        self,
+        trade_date: date,
+        facts: Iterable[DailyAnalysisStockFact],
+    ) -> Optional[date]:
+        trade_dates = sorted({fact.trade_date for fact in facts if fact.trade_date < trade_date})
+        return trade_dates[-1] if trade_dates else None
+
     def _build_unique_board_items(self, today_facts: List[DailyAnalysisStockFact]) -> List[Dict[str, Any]]:
         if not today_facts:
             return []
@@ -103,28 +112,36 @@ class DailyAnalysisRuleEngine:
     ) -> List[Dict[str, Any]]:
         items = []
         for fact in today_facts:
-            tags = []
             stock_history = history.get(fact.stock_code, [])
-            if self._is_rebound(fact, stock_history):
-                tags.append("反包")
-            if self._is_trend(fact, stock_history):
-                tags.append("趋势")
-            if self._is_piano(fact, stock_history):
-                tags.append("弹钢琴")
-            if tags:
-                items.append(self._stock_item(fact, tags=tags, score=self._recognition_score(fact)))
+            tag = self._combined_pattern_tag(fact, stock_history)
+            if tag:
+                items.append(self._stock_item(fact, tags=[tag], score=self._recognition_score(fact)))
         return self._sort_items(items)
+
+    def _combined_pattern_tag(
+        self,
+        fact: DailyAnalysisStockFact,
+        stock_history: List[DailyAnalysisStockFact],
+    ) -> Optional[str]:
+        if self._is_piano(fact, stock_history):
+            return "弹钢琴"
+        if self._is_rebound(fact, stock_history):
+            return "反包"
+        if self._is_trend(fact, stock_history):
+            return "趋势"
+        return None
 
     def _build_broken_rebound_items(
         self,
         trade_date: date,
         today_facts: List[DailyAnalysisStockFact],
         history: Dict[str, List[DailyAnalysisStockFact]],
+        previous_trade_date: Optional[date],
     ) -> List[Dict[str, Any]]:
         items = [
             self._stock_item(fact, tags=["炸板反包"], score=self._recognition_score(fact))
             for fact in today_facts
-            if self._is_broken_rebound(fact, history.get(fact.stock_code, []))
+            if self._is_broken_rebound(fact, history.get(fact.stock_code, []), previous_trade_date)
         ]
         return self._sort_items(items)
 
@@ -220,10 +237,15 @@ class DailyAnalysisRuleEngine:
 
     def _is_rebound(self, today: DailyAnalysisStockFact, history: List[DailyAnalysisStockFact]) -> bool:
         previous = [fact for fact in history if fact.trade_date < today.trade_date]
-        if not previous or today.close_price is None:
+        if not previous or today.close_price is None or not today.is_final_sealed:
+            return False
+        if max(today.continuous_days, 1) != 1:
             return False
 
         recent = previous[-3:]
+        prior_success = [fact for fact in previous if fact.is_final_sealed]
+        if not prior_success:
+            return False
         prior_high = max((fact.high_price or fact.close_price or 0) for fact in recent)
         had_disagreement = any((not fact.is_final_sealed) or fact.open_count > 0 for fact in recent)
         return had_disagreement and prior_high > 0 and today.close_price >= prior_high * 0.995
@@ -240,16 +262,32 @@ class DailyAnalysisRuleEngine:
         recent = [fact for fact in history if fact.trade_date <= today.trade_date]
         if len(recent) < 3:
             return False
-        had_disagreement = any((not fact.is_final_sealed) or fact.open_count > 0 for fact in recent[:-1])
+        previous = recent[:-1]
+        prior_success_count = sum(1 for fact in previous if fact.is_final_sealed)
+        if prior_success_count < 2:
+            return False
+        had_disagreement = any((not fact.is_final_sealed) or fact.open_count > 0 for fact in previous)
         strong_today = today.is_final_sealed or (today.change_pct is not None and today.change_pct >= 6)
         return had_disagreement and strong_today
 
-    def _is_broken_rebound(self, today: DailyAnalysisStockFact, history: List[DailyAnalysisStockFact]) -> bool:
+    def _is_broken_rebound(
+        self,
+        today: DailyAnalysisStockFact,
+        history: List[DailyAnalysisStockFact],
+        previous_trade_date: Optional[date],
+    ) -> bool:
         previous = [fact for fact in history if fact.trade_date < today.trade_date]
-        if not previous:
+        if not previous or previous_trade_date is None:
             return False
-        recent = previous[-3:]
-        broken = [fact for fact in recent if (not fact.is_final_sealed) or fact.open_count > 0]
+        if max(today.continuous_days, 1) != 1:
+            return False
+        if any(fact.is_final_sealed for fact in previous):
+            return False
+        broken = [
+            fact
+            for fact in previous
+            if fact.trade_date == previous_trade_date and ((not fact.is_final_sealed) or fact.open_count > 0)
+        ]
         if not broken:
             return False
         broken_high = max((fact.high_price or fact.close_price or 0) for fact in broken)
