@@ -334,6 +334,10 @@ class DailyAnalysisRuleEngine:
         previous = [fact for fact in history if fact.trade_date < today.trade_date]
         if not previous or today.close_price is None:
             return False
+
+        if self._is_ongoing_second_wave(today, previous, trade_dates):
+            return True
+
         major_wave_facts = [
             fact
             for fact in previous
@@ -355,6 +359,44 @@ class DailyAnalysisRuleEngine:
         prior_high = max((fact.high_price or fact.close_price or 0) for fact in previous)
         strong_today = today.is_final_sealed or today.close_price >= prior_high * 0.995
         return strong_today and today.close_price >= prior_high * 0.995
+
+    def _is_ongoing_second_wave(
+        self,
+        today: DailyAnalysisStockFact,
+        previous: List[DailyAnalysisStockFact],
+        trade_dates: List[date],
+    ) -> bool:
+        if not today.is_final_sealed or today.continuous_days < 4:
+            return False
+
+        successes = [
+            fact
+            for fact in [*previous, today]
+            if fact.is_final_sealed
+        ]
+        if len(successes) < 3:
+            return False
+
+        current_wave_start_index = 0
+        for index in range(1, len(successes)):
+            gap = self._trade_gap_days(successes[index - 1].trade_date, successes[index].trade_date, trade_dates)
+            if gap >= 2:
+                current_wave_start_index = index
+
+        if current_wave_start_index == 0:
+            return False
+
+        current_wave = successes[current_wave_start_index:]
+        previous_wave = successes[:current_wave_start_index]
+        if not previous_wave:
+            return False
+
+        break_days = self._trade_gap_days(previous_wave[-1].trade_date, current_wave[0].trade_date, trade_dates)
+        if break_days < 2 or break_days > 8:
+            return False
+
+        current_wave_height = max(fact.continuous_days for fact in current_wave)
+        return current_wave_height >= 4
 
     def _has_long_upper_shadow(self, fact: DailyAnalysisStockFact) -> bool:
         if not fact.high_price or not fact.close_price or not fact.pre_close:
