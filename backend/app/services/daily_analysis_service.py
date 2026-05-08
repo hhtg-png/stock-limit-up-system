@@ -189,20 +189,25 @@ class DailyAnalysisRuleEngine:
         trade_dates: List[date],
     ) -> List[Dict[str, Any]]:
         items = []
+        twenty_cm_height_counts = Counter(
+            max(fact.continuous_days, 1)
+            for fact in today_facts
+            if fact.is_20cm and fact.is_final_sealed and max(fact.continuous_days, 1) >= 2
+        )
         for fact in today_facts:
             if not fact.is_20cm:
                 continue
             stock_history = history.get(fact.stock_code, [])
             tags = []
-            if fact.continuous_days >= 2:
-                tags.append("连板")
+            height = max(fact.continuous_days, 1)
+            if fact.is_final_sealed and height >= 2 and twenty_cm_height_counts.get(height) == 1:
+                tags.extend(["唯一高度", f"{height}板"])
             if self._has_long_upper_shadow(fact):
                 tags.append("长上影")
-            if self._is_trend(fact, stock_history):
-                tags.append("趋势")
-            if self._is_rebound(fact, stock_history, trade_dates):
-                tags.append("反包")
-            items.append(self._stock_item(fact, tags=tags or ["20cm"], score=self._recognition_score(fact)))
+            if self._is_recent_20cm_limit_new_high(fact, stock_history, trade_dates):
+                tags.append("5日涨停新高")
+            if tags:
+                items.append(self._stock_item(fact, tags=tags, score=self._recognition_score(fact)))
         return self._sort_items(items)
 
     def _build_one_word_arbitrage_items(self, today_facts: List[DailyAnalysisStockFact]) -> List[Dict[str, Any]]:
@@ -409,6 +414,31 @@ class DailyAnalysisRuleEngine:
         high_gain_pct = (fact.high_price - fact.pre_close) / fact.pre_close * 100
         upper_shadow_pct = (fact.high_price - fact.close_price) / fact.pre_close * 100
         return high_gain_pct >= 12 and upper_shadow_pct >= 5 and fact.close_price <= fact.high_price * 0.94
+
+    def _is_recent_20cm_limit_new_high(
+        self,
+        today: DailyAnalysisStockFact,
+        history: List[DailyAnalysisStockFact],
+        trade_dates: List[date],
+    ) -> bool:
+        if not today.is_20cm or not today.is_final_sealed or today.close_price is None:
+            return False
+
+        previous_dates = [value for value in trade_dates if value < today.trade_date]
+        recent_dates = set(previous_dates[-5:])
+        if not recent_dates:
+            return False
+
+        recent_previous = [
+            fact
+            for fact in history
+            if fact.trade_date in recent_dates and fact.trade_date < today.trade_date
+        ]
+        if not any(fact.is_final_sealed for fact in recent_previous):
+            return False
+
+        prior_high = max((fact.high_price or fact.close_price or 0) for fact in recent_previous)
+        return prior_high > 0 and today.close_price > prior_high
 
     def _is_one_word_arbitrage(self, fact: DailyAnalysisStockFact) -> bool:
         clock = self._clock(fact.first_limit_time)
