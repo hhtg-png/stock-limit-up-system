@@ -378,10 +378,13 @@ class DailyAnalysisRuleEngine:
             return False
 
         current_wave_start_index = 0
+        current_wave_started_by_height_reset = False
         for index in range(1, len(successes)):
             gap = self._trade_gap_days(successes[index - 1].trade_date, successes[index].trade_date, trade_dates)
-            if gap >= 2:
+            height_reset = successes[index].continuous_days < successes[index - 1].continuous_days
+            if gap >= 2 or height_reset:
                 current_wave_start_index = index
+                current_wave_started_by_height_reset = height_reset
 
         if current_wave_start_index == 0:
             return False
@@ -392,7 +395,9 @@ class DailyAnalysisRuleEngine:
             return False
 
         break_days = self._trade_gap_days(previous_wave[-1].trade_date, current_wave[0].trade_date, trade_dates)
-        if break_days < 2 or break_days > 8:
+        if break_days > 8:
+            return False
+        if break_days < 2 and not current_wave_started_by_height_reset:
             return False
 
         current_wave_height = max(fact.continuous_days for fact in current_wave)

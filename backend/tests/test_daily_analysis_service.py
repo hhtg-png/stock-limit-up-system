@@ -286,6 +286,49 @@ class DailyAnalysisRuleEngineTests(unittest.TestCase):
         self.assertIn("002081", second_wave_codes)
         self.assertNotIn("333333", second_wave_codes)
 
+    def test_ongoing_second_wave_uses_board_height_reset_when_candidate_dates_are_sparse(self):
+        trade_dates = [
+            date(2026, 4, 21),
+            date(2026, 4, 22),
+            date(2026, 4, 23),
+            date(2026, 4, 24),
+            date(2026, 4, 29),
+            date(2026, 4, 30),
+            date(2026, 5, 5),
+            date(2026, 5, 6),
+            date(2026, 5, 7),
+        ]
+        trade_day = trade_dates[-1]
+        facts = [
+            *[
+                fact(
+                    f"9200{index:02d}",
+                    trade_date,
+                    stock_name=f"稀疏日期占位{index}",
+                    close_price=10 + index,
+                    high_price=10 + index,
+                    pre_close=9 + index,
+                )
+                for index, trade_date in enumerate(trade_dates)
+            ],
+            fact("002081", trade_dates[0], stock_name="金螳螂", continuous_days=1, close_price=4.49, high_price=4.49, pre_close=4.08),
+            fact("002081", trade_dates[1], stock_name="金螳螂", continuous_days=2, close_price=4.94, high_price=4.94, pre_close=4.49),
+            fact("002081", trade_dates[2], stock_name="金螳螂", continuous_days=3, close_price=5.43, high_price=5.43, pre_close=4.94),
+            fact("002081", trade_dates[4], stock_name="金螳螂", continuous_days=2, close_price=5.36, high_price=5.36, pre_close=4.87),
+            fact("002081", trade_dates[5], stock_name="金螳螂", continuous_days=3, close_price=5.90, high_price=5.90, pre_close=5.36),
+            fact("002081", trade_dates[6], stock_name="金螳螂", continuous_days=3, close_price=5.90, high_price=5.90, pre_close=5.36),
+            fact("002081", trade_dates[7], stock_name="金螳螂", continuous_days=4, close_price=6.49, high_price=6.49, pre_close=5.90),
+            fact("002081", trade_day, stock_name="金螳螂", continuous_days=5, close_price=7.14, high_price=7.14, pre_close=6.49),
+        ]
+
+        result = DailyAnalysisRuleEngine().build_daily_result(trade_day, facts)
+        second_wave_codes = {
+            item["stock_code"]
+            for item in result["二波"]["items"]
+        }
+
+        self.assertIn("002081", second_wave_codes)
+
 
 if __name__ == "__main__":
     unittest.main()
