@@ -259,6 +259,8 @@ class DailyAnalysisRuleEngine:
         return rising_steps >= 3 and closes[-1] > closes[0] * 1.08
 
     def _is_piano(self, today: DailyAnalysisStockFact, history: List[DailyAnalysisStockFact]) -> bool:
+        if max(today.continuous_days, 1) != 1:
+            return False
         recent = [fact for fact in history if fact.trade_date <= today.trade_date]
         if len(recent) < 3:
             return False

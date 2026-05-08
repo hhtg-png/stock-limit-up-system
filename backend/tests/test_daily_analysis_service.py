@@ -152,6 +152,9 @@ class DailyAnalysisRuleEngineTests(unittest.TestCase):
             fact("004444", earlier, stock_name="老票炸板", close_price=5.5, high_price=5.5, pre_close=5.0),
             fact("004444", yesterday, stock_name="老票炸板", sealed=False, open_count=5, close_price=5.1, high_price=5.7, pre_close=5.4),
             fact("004444", trade_day, stock_name="老票炸板", close_price=5.8, high_price=5.8, pre_close=5.1),
+            fact("005555", earlier, stock_name="连板弹琴", close_price=11.0, high_price=11.0, pre_close=10.0),
+            fact("005555", yesterday, stock_name="连板弹琴", open_count=2, close_price=12.0, high_price=12.0, pre_close=11.0),
+            fact("005555", trade_day, stock_name="连板弹琴", continuous_days=2, close_price=13.2, high_price=13.2, pre_close=12.0),
         ]
 
         result = DailyAnalysisRuleEngine().build_daily_result(trade_day, facts)
@@ -170,6 +173,7 @@ class DailyAnalysisRuleEngineTests(unittest.TestCase):
         self.assertNotIn("002223", broken_codes)
         self.assertNotIn("003333", broken_codes)
         self.assertNotIn("004444", broken_codes)
+        self.assertNotIn("005555", combined_by_code)
 
 
 if __name__ == "__main__":
