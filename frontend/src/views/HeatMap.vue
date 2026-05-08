@@ -25,11 +25,11 @@ let chart: echarts.ECharts | null = null
 
 async function fetchData() {
   if (viewType.value === 'sector') {
-    const data = await getSectorStats()
-    updateSectorHeatmap(data)
+    const response = await getSectorStats()
+    updateSectorHeatmap(response.data)
   } else {
-    const data = await getContinuousLadder()
-    updateContinuousHeatmap(data)
+    const response = await getContinuousLadder()
+    updateContinuousHeatmap(response.data)
   }
 }
 

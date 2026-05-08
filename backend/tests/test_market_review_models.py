@@ -9,6 +9,7 @@ class MarketReviewModelTests(unittest.TestCase):
         self.assertIn("market_review_daily_metric", Base.metadata.tables)
         self.assertIn("market_review_stock_daily", Base.metadata.tables)
         self.assertIn("market_review_limitup_event", Base.metadata.tables)
+        self.assertIn("daily_analysis_records", Base.metadata.tables)
 
 
 if __name__ == "__main__":

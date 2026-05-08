@@ -1,4 +1,4 @@
-import { ref, computed } from 'vue'
+import { ref } from 'vue'
 import { useConfigStore } from '@/stores/config'
 
 // 语音播报配置 - 从config store获取设置

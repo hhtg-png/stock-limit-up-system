@@ -83,7 +83,7 @@ async function fetchData() {
     updateTrendChart(dailyStats)
     updatePieChart(dailyStats[0])
     updateBreakChart(dailyStats)
-    updateSectorChart(sectorStats)
+    updateSectorChart(sectorStats.data)
   } catch (e) {
     console.error('Fetch stats error:', e)
   }

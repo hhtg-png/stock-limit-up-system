@@ -63,6 +63,15 @@ class DataScheduler:
             id="daily_stats",
             name="每日统计计算"
         )
+
+        # 收盘后每日分析月表（默认复用市场复盘任务时间）
+        self.scheduler.add_job(
+            self._calculate_daily_analysis,
+            CronTrigger(hour=settings.MARKET_REVIEW_BUILD_HOUR, minute=settings.MARKET_REVIEW_BUILD_MINUTE),
+            id="daily_analysis",
+            name="每日分析月表生成",
+            max_instances=1
+        )
         
         # 每日缓存清理（每天16:00）
         self.scheduler.add_job(
@@ -346,6 +355,20 @@ class DataScheduler:
         
         except Exception as e:
             logger.error(f"Calculate daily stats error: {e}")
+
+    async def _calculate_daily_analysis(self):
+        """生成每日分析月表数据"""
+        try:
+            from app.database import async_session_maker
+            from app.services.daily_analysis_service import daily_analysis_service
+
+            today = date.today()
+            async with async_session_maker() as db:
+                await daily_analysis_service.build_for_date(db, today)
+
+            logger.info(f"Daily analysis calculated: {today}")
+        except Exception as e:
+            logger.error(f"Calculate daily analysis error: {e}")
     
     async def _clear_daily_cache(self):
         """清理每日缓存"""

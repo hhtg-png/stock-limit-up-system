@@ -28,6 +28,12 @@ const router = createRouter({
       meta: { title: '统计分析' }
     },
     {
+      path: '/daily-analysis',
+      name: 'DailyAnalysis',
+      component: () => import('@/views/DailyAnalysis.vue'),
+      meta: { title: '每日分析' }
+    },
+    {
       path: '/continuous',
       name: 'ContinuousBoard',
       component: () => import('@/views/ContinuousBoard.vue'),
@@ -43,7 +49,7 @@ const router = createRouter({
   ]
 })
 
-router.beforeEach((to, from, next) => {
+router.beforeEach((to, _from, next) => {
   document.title = `${to.meta.title || '股票涨停分析系统'}`
   next()
 })
