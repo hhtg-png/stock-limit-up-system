@@ -138,7 +138,7 @@ class DailyAnalysisRuleEngine:
             return "弹钢琴"
         if self._is_rebound(fact, stock_history, trade_dates):
             return "反包"
-        if self._is_trend(fact, stock_history):
+        if self._is_trend(fact, stock_history, trade_dates):
             return "趋势"
         return None
 
@@ -285,7 +285,16 @@ class DailyAnalysisRuleEngine:
         prior_high = max((fact.high_price or fact.close_price or 0) for fact in between_facts)
         return prior_high > 0 and today.close_price >= prior_high * 0.995
 
-    def _is_trend(self, today: DailyAnalysisStockFact, history: List[DailyAnalysisStockFact]) -> bool:
+    def _is_trend(
+        self,
+        today: DailyAnalysisStockFact,
+        history: List[DailyAnalysisStockFact],
+        trade_dates: Optional[List[date]] = None,
+    ) -> bool:
+        if max(today.continuous_days, 1) >= 2:
+            return False
+        if trade_dates is not None and self._is_second_wave(today, history, trade_dates):
+            return False
         recent = [fact for fact in history if fact.trade_date <= today.trade_date and fact.close_price is not None][-4:]
         if len(recent) < 4:
             return False

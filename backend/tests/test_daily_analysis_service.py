@@ -235,6 +235,64 @@ class DailyAnalysisRuleEngineTests(unittest.TestCase):
         self.assertNotIn("202224", second_wave_codes)
         self.assertNotIn("202225", second_wave_codes)
 
+    def test_trend_excludes_continuous_boards_and_second_wave(self):
+        trade_dates = [
+            date(2026, 4, 10),
+            date(2026, 4, 13),
+            date(2026, 4, 14),
+            date(2026, 4, 15),
+            date(2026, 4, 16),
+            date(2026, 4, 17),
+            date(2026, 4, 20),
+            date(2026, 4, 21),
+            date(2026, 4, 22),
+            date(2026, 4, 23),
+            date(2026, 4, 24),
+        ]
+        trade_day = trade_dates[-1]
+        facts = [
+            *[
+                fact(
+                    f"9400{index:02d}",
+                    trade_date,
+                    stock_name=f"趋势日期占位{index}",
+                    continuous_days=1,
+                    close_price=10 + index,
+                    high_price=10 + index,
+                    pre_close=9 + index,
+                )
+                for index, trade_date in enumerate(trade_dates)
+            ],
+            fact("301111", trade_dates[-4], stock_name="普通趋势", sealed=False, close_price=10.0, high_price=10.2, pre_close=9.8),
+            fact("301111", trade_dates[-3], stock_name="普通趋势", sealed=False, close_price=10.7, high_price=10.9, pre_close=10.0),
+            fact("301111", trade_dates[-2], stock_name="普通趋势", sealed=False, close_price=11.4, high_price=11.6, pre_close=10.7),
+            fact("301111", trade_day, stock_name="普通趋势", sealed=False, close_price=12.2, high_price=12.4, pre_close=11.4),
+            fact("302222", trade_dates[-4], stock_name="连板趋势", sealed=False, close_price=9.5, high_price=9.7, pre_close=9.2),
+            fact("302222", trade_dates[-3], stock_name="连板趋势", close_price=10.0, high_price=10.0, pre_close=9.1),
+            fact("302222", trade_dates[-2], stock_name="连板趋势", continuous_days=2, close_price=11.0, high_price=11.0, pre_close=10.0),
+            fact("302222", trade_day, stock_name="连板趋势", continuous_days=3, close_price=12.1, high_price=12.1, pre_close=11.0),
+            fact("303333", trade_dates[3], stock_name="二波趋势", continuous_days=4, close_price=15.0, high_price=15.0, pre_close=13.6),
+            fact("303333", trade_dates[-4], stock_name="二波趋势", sealed=False, close_price=13.8, high_price=14.2, pre_close=13.5),
+            fact("303333", trade_dates[-3], stock_name="二波趋势", sealed=False, close_price=14.2, high_price=14.6, pre_close=13.8),
+            fact("303333", trade_dates[-2], stock_name="二波趋势", sealed=False, close_price=14.8, high_price=15.0, pre_close=14.2),
+            fact("303333", trade_day, stock_name="二波趋势", close_price=15.1, high_price=15.1, pre_close=13.7),
+        ]
+
+        result = DailyAnalysisRuleEngine().build_daily_result(trade_day, facts)
+        combined_by_code = {
+            item["stock_code"]: item
+            for item in result["反包+趋势+弹钢琴"]["items"]
+        }
+        second_wave_codes = {
+            item["stock_code"]
+            for item in result["二波"]["items"]
+        }
+
+        self.assertEqual(combined_by_code["301111"]["tags"], ["趋势"])
+        self.assertNotIn("302222", combined_by_code)
+        self.assertNotIn("303333", combined_by_code)
+        self.assertIn("303333", second_wave_codes)
+
     def test_20cm_column_uses_only_unique_height_long_shadow_or_recent_limit_new_high(self):
         trade_dates = [
             date(2026, 4, 14),
