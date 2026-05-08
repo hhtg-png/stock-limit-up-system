@@ -202,9 +202,9 @@ class DailyAnalysisRuleEngine:
             height = max(fact.continuous_days, 1)
             if fact.is_final_sealed and height >= 2 and twenty_cm_height_counts.get(height) == 1:
                 tags.extend(["唯一高度", f"{height}板"])
-            if self._has_long_upper_shadow(fact):
+            elif self._has_long_upper_shadow(fact):
                 tags.append("长上影")
-            if self._is_recent_20cm_limit_new_high(fact, stock_history, trade_dates):
+            elif self._is_recent_20cm_limit_new_high(fact, stock_history, trade_dates):
                 tags.append("5日涨停新高")
             if tags:
                 items.append(self._stock_item(fact, tags=tags, score=self._recognition_score(fact)))

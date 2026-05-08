@@ -260,6 +260,7 @@ class DailyAnalysisRuleEngineTests(unittest.TestCase):
             ],
             fact("300001", trade_day, stock_name="重复二板甲", continuous_days=2, is_20cm=True, close_price=14.4, high_price=14.4, pre_close=12.0),
             fact("300002", trade_day, stock_name="重复二板乙", continuous_days=2, is_20cm=True, close_price=15.6, high_price=15.6, pre_close=13.0),
+            fact("300003", trade_dates[-2], stock_name="唯一三板", is_20cm=True, close_price=15.0, high_price=15.0, pre_close=12.5),
             fact("300003", trade_day, stock_name="唯一三板", continuous_days=3, is_20cm=True, close_price=18.0, high_price=18.0, pre_close=15.0),
             fact("300004", trade_day, stock_name="今日长影", sealed=False, open_count=2, is_20cm=True, close_price=10.8, high_price=12.4, pre_close=10.0),
             fact("300005", trade_dates[-3], stock_name="五日涨停新高", is_20cm=True, close_price=12.0, high_price=12.0, pre_close=10.0),
