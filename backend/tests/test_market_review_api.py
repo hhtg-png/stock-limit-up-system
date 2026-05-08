@@ -541,13 +541,19 @@ class MarketReviewApiTests(unittest.TestCase):
 
         self.review_module._collect_intraday_source = collect_mock
         self.review_module._should_collect_live_intraday = Mock(return_value=True)
+        original_aggregate = None
         if hasattr(self.review_module, "market_review_metrics_service"):
+            original_aggregate = self.review_module.market_review_metrics_service.aggregate_daily_metrics
             self.review_module.market_review_metrics_service.aggregate_daily_metrics = aggregate_mock
 
-        response = self.client.get(
-            "/api/v1/statistics/review/intraday",
-            params={"trade_date": "2026-05-06"},
-        )
+        try:
+            response = self.client.get(
+                "/api/v1/statistics/review/intraday",
+                params={"trade_date": "2026-05-06"},
+            )
+        finally:
+            if original_aggregate is not None:
+                self.review_module.market_review_metrics_service.aggregate_daily_metrics = original_aggregate
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()
