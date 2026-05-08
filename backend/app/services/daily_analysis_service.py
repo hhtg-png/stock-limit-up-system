@@ -62,15 +62,16 @@ class DailyAnalysisRuleEngine:
         all_facts = sorted(facts, key=lambda fact: (fact.trade_date, fact.stock_code))
         history = self._group_history(all_facts)
         today_facts = [fact for fact in all_facts if fact.trade_date == trade_date]
-        previous_trade_date = self._previous_trade_date(trade_date, all_facts)
+        trade_dates = sorted({fact.trade_date for fact in all_facts})
+        previous_trade_date = self._previous_trade_date(trade_date, trade_dates)
 
         result = {column: self._cell([]) for column in SIGNAL_COLUMNS}
         result["连板唯一性"] = self._cell(self._build_unique_board_items(today_facts))
-        result["反包+趋势+弹钢琴"] = self._cell(self._build_combined_pattern_items(trade_date, today_facts, history))
+        result["反包+趋势+弹钢琴"] = self._cell(self._build_combined_pattern_items(trade_date, today_facts, history, trade_dates))
         result["炸板反包"] = self._cell(self._build_broken_rebound_items(trade_date, today_facts, history, previous_trade_date))
         result["辨识度"] = self._cell(self._build_recognition_items(today_facts))
-        result["二波"] = self._cell(self._build_second_wave_items(trade_date, today_facts, history))
-        result["20cm"] = self._cell(self._build_20cm_items(trade_date, today_facts, history))
+        result["二波"] = self._cell(self._build_second_wave_items(trade_date, today_facts, history, trade_dates))
+        result["20cm"] = self._cell(self._build_20cm_items(trade_date, today_facts, history, trade_dates))
         result["一字套利"] = self._cell(self._build_one_word_arbitrage_items(today_facts))
         result["板块"] = self._cell(self._build_sector_items(today_facts))
         result["负反馈"] = self._cell(self._build_negative_feedback_items(trade_date, today_facts, history))
@@ -90,10 +91,18 @@ class DailyAnalysisRuleEngine:
     def _previous_trade_date(
         self,
         trade_date: date,
-        facts: Iterable[DailyAnalysisStockFact],
+        trade_dates: Iterable[date],
     ) -> Optional[date]:
-        trade_dates = sorted({fact.trade_date for fact in facts if fact.trade_date < trade_date})
-        return trade_dates[-1] if trade_dates else None
+        previous_dates = [value for value in trade_dates if value < trade_date]
+        return previous_dates[-1] if previous_dates else None
+
+    def _trade_gap_days(
+        self,
+        start_date: date,
+        end_date: date,
+        trade_dates: Iterable[date],
+    ) -> int:
+        return sum(1 for value in trade_dates if start_date < value < end_date)
 
     def _build_unique_board_items(self, today_facts: List[DailyAnalysisStockFact]) -> List[Dict[str, Any]]:
         if not today_facts:
@@ -109,11 +118,12 @@ class DailyAnalysisRuleEngine:
         trade_date: date,
         today_facts: List[DailyAnalysisStockFact],
         history: Dict[str, List[DailyAnalysisStockFact]],
+        trade_dates: List[date],
     ) -> List[Dict[str, Any]]:
         items = []
         for fact in today_facts:
             stock_history = history.get(fact.stock_code, [])
-            tag = self._combined_pattern_tag(fact, stock_history)
+            tag = self._combined_pattern_tag(fact, stock_history, trade_dates)
             if tag:
                 items.append(self._stock_item(fact, tags=[tag], score=self._recognition_score(fact)))
         return self._sort_items(items)
@@ -122,10 +132,11 @@ class DailyAnalysisRuleEngine:
         self,
         fact: DailyAnalysisStockFact,
         stock_history: List[DailyAnalysisStockFact],
+        trade_dates: List[date],
     ) -> Optional[str]:
         if self._is_piano(fact, stock_history):
             return "弹钢琴"
-        if self._is_rebound(fact, stock_history):
+        if self._is_rebound(fact, stock_history, trade_dates):
             return "反包"
         if self._is_trend(fact, stock_history):
             return "趋势"
@@ -161,11 +172,12 @@ class DailyAnalysisRuleEngine:
         trade_date: date,
         today_facts: List[DailyAnalysisStockFact],
         history: Dict[str, List[DailyAnalysisStockFact]],
+        trade_dates: List[date],
     ) -> List[Dict[str, Any]]:
         items = [
             self._stock_item(fact, tags=["二波"], score=self._recognition_score(fact))
             for fact in today_facts
-            if self._is_second_wave(fact, history.get(fact.stock_code, []))
+            if self._is_second_wave(fact, history.get(fact.stock_code, []), trade_dates)
         ]
         return self._sort_items(items)
 
@@ -174,6 +186,7 @@ class DailyAnalysisRuleEngine:
         trade_date: date,
         today_facts: List[DailyAnalysisStockFact],
         history: Dict[str, List[DailyAnalysisStockFact]],
+        trade_dates: List[date],
     ) -> List[Dict[str, Any]]:
         items = []
         for fact in today_facts:
@@ -187,7 +200,7 @@ class DailyAnalysisRuleEngine:
                 tags.append("长上影")
             if self._is_trend(fact, stock_history):
                 tags.append("趋势")
-            if self._is_rebound(fact, stock_history):
+            if self._is_rebound(fact, stock_history, trade_dates):
                 tags.append("反包")
             items.append(self._stock_item(fact, tags=tags or ["20cm"], score=self._recognition_score(fact)))
         return self._sort_items(items)
@@ -235,20 +248,37 @@ class DailyAnalysisRuleEngine:
                 items.append(self._stock_item(fact, tags=["负反馈"], score=self._recognition_score(fact)))
         return self._sort_items(items)
 
-    def _is_rebound(self, today: DailyAnalysisStockFact, history: List[DailyAnalysisStockFact]) -> bool:
+    def _is_rebound(
+        self,
+        today: DailyAnalysisStockFact,
+        history: List[DailyAnalysisStockFact],
+        trade_dates: List[date],
+    ) -> bool:
         previous = [fact for fact in history if fact.trade_date < today.trade_date]
         if not previous or today.close_price is None or not today.is_final_sealed:
             return False
         if max(today.continuous_days, 1) != 1:
             return False
 
-        recent = previous[-3:]
         prior_success = [fact for fact in previous if fact.is_final_sealed]
         if not prior_success:
             return False
-        prior_high = max((fact.high_price or fact.close_price or 0) for fact in recent)
-        had_disagreement = any((not fact.is_final_sealed) or fact.open_count > 0 for fact in recent)
-        return had_disagreement and prior_high > 0 and today.close_price >= prior_high * 0.995
+
+        last_success = prior_success[-1]
+        break_days = self._trade_gap_days(last_success.trade_date, today.trade_date, trade_dates)
+        if break_days != 1:
+            return False
+
+        between_facts = [
+            fact
+            for fact in previous
+            if last_success.trade_date <= fact.trade_date < today.trade_date
+        ]
+        if any(fact.trade_date > last_success.trade_date and fact.is_final_sealed for fact in between_facts):
+            return False
+
+        prior_high = max((fact.high_price or fact.close_price or 0) for fact in between_facts)
+        return prior_high > 0 and today.close_price >= prior_high * 0.995
 
     def _is_trend(self, today: DailyAnalysisStockFact, history: List[DailyAnalysisStockFact]) -> bool:
         recent = [fact for fact in history if fact.trade_date <= today.trade_date and fact.close_price is not None][-4:]
@@ -295,18 +325,36 @@ class DailyAnalysisRuleEngine:
         broken_high = max((fact.high_price or fact.close_price or 0) for fact in broken)
         return today.is_final_sealed and today.close_price is not None and today.close_price >= broken_high * 0.995
 
-    def _is_second_wave(self, today: DailyAnalysisStockFact, history: List[DailyAnalysisStockFact]) -> bool:
+    def _is_second_wave(
+        self,
+        today: DailyAnalysisStockFact,
+        history: List[DailyAnalysisStockFact],
+        trade_dates: List[date],
+    ) -> bool:
         previous = [fact for fact in history if fact.trade_date < today.trade_date]
-        if len(previous) < 2 or today.close_price is None:
+        if not previous or today.close_price is None:
             return False
-        had_first_wave = any(fact.continuous_days >= 2 for fact in previous) or len(previous) >= 2
-        prior_high = max((fact.high_price or fact.close_price or 0) for fact in previous)
-        had_pullback = any(
-            (not fact.is_final_sealed)
-            or ((fact.close_price or 0) < (fact.high_price or fact.close_price or 0) * 0.98)
+        major_wave_facts = [
+            fact
             for fact in previous
-        )
-        return had_first_wave and had_pullback and today.close_price >= prior_high * 0.995
+            if fact.is_final_sealed and fact.continuous_days >= 4
+        ]
+        if not major_wave_facts:
+            return False
+
+        first_wave_high = major_wave_facts[-1]
+        break_days = self._trade_gap_days(first_wave_high.trade_date, today.trade_date, trade_dates)
+        if break_days < 2 or break_days > 8:
+            return False
+        if any(
+            fact.trade_date > first_wave_high.trade_date and fact.is_final_sealed
+            for fact in previous
+        ):
+            return False
+
+        prior_high = max((fact.high_price or fact.close_price or 0) for fact in previous)
+        strong_today = today.is_final_sealed or today.close_price >= prior_high * 0.995
+        return strong_today and today.close_price >= prior_high * 0.995
 
     def _has_long_upper_shadow(self, fact: DailyAnalysisStockFact) -> bool:
         if not fact.high_price or not fact.close_price or not fact.pre_close:

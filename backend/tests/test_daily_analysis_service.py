@@ -63,8 +63,8 @@ class DailyAnalysisRuleEngineTests(unittest.TestCase):
         trade_day = date(2026, 4, 24)
         facts = [
             fact("000001", trade_day, stock_name="唯一高标", continuous_days=4, first_time="09:31:00", amount=90000),
-            fact("300101", date(2026, 4, 21), stock_name="反包二十", close_price=11.0, high_price=11.0, pre_close=10.0, is_20cm=True),
-            fact("300101", date(2026, 4, 22), stock_name="反包二十", sealed=False, open_count=4, close_price=10.2, high_price=12.0, pre_close=11.0, is_20cm=True),
+            fact("300101", date(2026, 4, 22), stock_name="反包二十", close_price=11.0, high_price=11.0, pre_close=10.0, is_20cm=True),
+            fact("300101", date(2026, 4, 23), stock_name="反包二十", sealed=False, open_count=4, close_price=10.2, high_price=12.0, pre_close=11.0, is_20cm=True),
             fact("300101", trade_day, stock_name="反包二十", close_price=13.0, high_price=14.0, pre_close=10.8, is_20cm=True),
             fact("300202", date(2026, 4, 21), stock_name="趋势二十", close_price=10.0, high_price=10.4, pre_close=9.8, is_20cm=True),
             fact("300202", date(2026, 4, 22), stock_name="趋势二十", close_price=10.8, high_price=11.0, pre_close=10.0, is_20cm=True),
@@ -76,7 +76,7 @@ class DailyAnalysisRuleEngineTests(unittest.TestCase):
             fact("002303", trade_day, stock_name="弹琴票", sealed=True, close_price=9.4, high_price=9.4, pre_close=8.6),
             fact("002404", date(2026, 4, 23), stock_name="炸板反包", sealed=False, open_count=5, close_price=6.5, high_price=7.3, pre_close=6.8),
             fact("002404", trade_day, stock_name="炸板反包", sealed=True, close_price=7.5, high_price=7.5, pre_close=6.5),
-            fact("002505", date(2026, 4, 15), stock_name="二波票", continuous_days=2, close_price=5.5, high_price=5.5, pre_close=5.0),
+            fact("002505", date(2026, 4, 15), stock_name="二波票", continuous_days=4, close_price=5.5, high_price=5.5, pre_close=5.0),
             fact("002505", date(2026, 4, 19), stock_name="二波票", sealed=False, open_count=1, close_price=5.0, high_price=5.4, pre_close=5.2),
             fact("002505", trade_day, stock_name="二波票", sealed=True, close_price=6.0, high_price=6.0, pre_close=5.4),
             fact("300606", trade_day, stock_name="二十长影", sealed=False, open_count=2, is_20cm=True, close_price=10.8, high_price=12.4, pre_close=10.0),
@@ -174,6 +174,66 @@ class DailyAnalysisRuleEngineTests(unittest.TestCase):
         self.assertNotIn("003333", broken_codes)
         self.assertNotIn("004444", broken_codes)
         self.assertNotIn("005555", combined_by_code)
+
+    def test_rebound_and_second_wave_use_distinct_break_windows(self):
+        trade_dates = [
+            date(2026, 4, 10),
+            date(2026, 4, 13),
+            date(2026, 4, 14),
+            date(2026, 4, 15),
+            date(2026, 4, 16),
+            date(2026, 4, 17),
+            date(2026, 4, 20),
+            date(2026, 4, 21),
+            date(2026, 4, 22),
+            date(2026, 4, 23),
+            date(2026, 4, 24),
+        ]
+        trade_day = trade_dates[-1]
+        facts = [
+            *[
+                fact(
+                    f"9000{index:02d}",
+                    trade_date,
+                    stock_name=f"日期占位{index}",
+                    continuous_days=1,
+                    close_price=10 + index,
+                    high_price=10 + index,
+                    pre_close=9 + index,
+                )
+                for index, trade_date in enumerate(trade_dates)
+            ],
+            fact("101111", trade_dates[-3], stock_name="一日反包", close_price=11.0, high_price=11.0, pre_close=10.0),
+            fact("101111", trade_day, stock_name="一日反包", close_price=11.2, high_price=11.2, pre_close=10.1),
+            fact("101112", trade_dates[-4], stock_name="两日不反包", close_price=9.9, high_price=10.0, pre_close=9.0),
+            fact("101112", trade_day, stock_name="两日不反包", close_price=10.2, high_price=10.2, pre_close=9.4),
+            fact("202222", trade_dates[4], stock_name="四板二波", continuous_days=4, close_price=20.0, high_price=20.0, pre_close=18.2),
+            fact("202222", trade_day, stock_name="四板二波", close_price=20.2, high_price=20.2, pre_close=18.4),
+            fact("202223", trade_dates[4], stock_name="三板不二波", continuous_days=3, close_price=15.0, high_price=15.0, pre_close=13.6),
+            fact("202223", trade_day, stock_name="三板不二波", close_price=15.2, high_price=15.2, pre_close=13.8),
+            fact("202224", trade_dates[-3], stock_name="一日不二波", continuous_days=4, close_price=12.0, high_price=12.0, pre_close=10.9),
+            fact("202224", trade_day, stock_name="一日不二波", close_price=12.2, high_price=12.2, pre_close=11.1),
+            fact("202225", trade_dates[0], stock_name="太久不二波", continuous_days=4, close_price=8.0, high_price=8.0, pre_close=7.3),
+            fact("202225", trade_day, stock_name="太久不二波", close_price=8.2, high_price=8.2, pre_close=7.5),
+        ]
+
+        result = DailyAnalysisRuleEngine().build_daily_result(trade_day, facts)
+        combined_by_code = {
+            item["stock_code"]: item
+            for item in result["反包+趋势+弹钢琴"]["items"]
+        }
+        second_wave_codes = {
+            item["stock_code"]
+            for item in result["二波"]["items"]
+        }
+
+        self.assertIn("101111", combined_by_code)
+        self.assertEqual(combined_by_code["101111"]["tags"], ["反包"])
+        self.assertNotIn("101112", combined_by_code)
+        self.assertIn("202222", second_wave_codes)
+        self.assertNotIn("202223", second_wave_codes)
+        self.assertNotIn("202224", second_wave_codes)
+        self.assertNotIn("202225", second_wave_codes)
 
 
 if __name__ == "__main__":
