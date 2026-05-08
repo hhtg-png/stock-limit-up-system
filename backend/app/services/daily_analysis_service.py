@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, time
+import re
 from typing import Any, Dict, Iterable, List, Optional
 
 from sqlalchemy import distinct, select
@@ -53,6 +54,23 @@ class DailyAnalysisStockFact:
 
 class DailyAnalysisRuleEngine:
     """Build daily review signal cells from recent limit-up candidate facts."""
+
+    LOW_SIGNAL_SECTOR_THEMES = {
+        "央企",
+        "央企背景",
+        "国企",
+        "国资",
+        "地方国资",
+        "业绩",
+        "业绩增长",
+        "业绩大增",
+        "一季报增长",
+        "Q1业绩大增",
+        "订单放量",
+        "现金分红",
+        "摘帽",
+        "减亏",
+    }
 
     def build_daily_result(
         self,
@@ -221,8 +239,8 @@ class DailyAnalysisRuleEngine:
     def _build_sector_items(self, today_facts: List[DailyAnalysisStockFact]) -> List[Dict[str, Any]]:
         grouped: Dict[str, List[DailyAnalysisStockFact]] = defaultdict(list)
         for fact in today_facts:
-            sector = fact.reason_category or "其他"
-            grouped[sector].append(fact)
+            for sector in self._sector_themes(fact):
+                grouped[sector].append(fact)
 
         items = []
         for sector, stocks in grouped.items():
@@ -239,7 +257,55 @@ class DailyAnalysisRuleEngine:
                 }
             )
         items.sort(key=lambda item: (-item["score"], item["label"]))
-        return items[:5]
+        return items[:8]
+
+    def _sector_themes(self, fact: DailyAnalysisStockFact) -> List[str]:
+        themes = []
+        for raw_theme in re.split(r"[+＋/／、,，;；|｜]", fact.limit_up_reason or ""):
+            theme = self._normalize_sector_theme(raw_theme)
+            if not theme or theme in themes:
+                continue
+            if theme in self.LOW_SIGNAL_SECTOR_THEMES:
+                continue
+            themes.append(theme)
+            if len(themes) >= 2:
+                break
+
+        if themes:
+            return themes
+        return [fact.reason_category or "其他"]
+
+    def _normalize_sector_theme(self, raw_theme: str) -> str:
+        theme = re.sub(r"\s+", "", raw_theme or "")
+        theme = theme.strip("：:（）()[]【】")
+        if not theme:
+            return ""
+        theme = re.sub(r"概念$", "", theme)
+        theme = re.sub(r"(板块|方向|业务)$", "", theme)
+        theme = theme.replace("AI算力", "算力")
+        if "人形机器人" in theme:
+            return "人形机器人"
+        if "光模块" in theme:
+            return "光模块"
+        if "Token工厂" in theme or "token工厂" in theme:
+            return "Token工厂"
+        if "算力租赁" in theme:
+            return "算力租赁"
+        if "数据中心" in theme:
+            return "数据中心"
+        if "固态电池" in theme:
+            return "固态电池"
+        if "储能" in theme:
+            return "储能"
+        if "液冷" in theme:
+            return "液冷"
+        if "商业航天" in theme:
+            return "商业航天"
+        if "房地产" in theme:
+            return "房地产"
+        if len(theme) > 12:
+            return ""
+        return theme
 
     def _build_negative_feedback_items(
         self,

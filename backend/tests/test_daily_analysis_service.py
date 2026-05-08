@@ -14,6 +14,7 @@ def fact(
     *,
     stock_name: str | None = None,
     reason_category: str = "人工智能",
+    limit_up_reason: str | None = None,
     continuous_days: int = 1,
     open_count: int = 0,
     sealed: bool = True,
@@ -40,7 +41,7 @@ def fact(
         stock_code=stock_code,
         stock_name=stock_name or f"股票{stock_code[-2:]}",
         reason_category=reason_category,
-        limit_up_reason=reason_category,
+        limit_up_reason=limit_up_reason if limit_up_reason is not None else reason_category,
         continuous_days=continuous_days,
         open_count=open_count,
         is_final_sealed=sealed,
@@ -292,6 +293,64 @@ class DailyAnalysisRuleEngineTests(unittest.TestCase):
         self.assertNotIn("302222", combined_by_code)
         self.assertNotIn("303333", combined_by_code)
         self.assertIn("303333", second_wave_codes)
+
+    def test_sector_items_use_source_themes_before_broad_reason_category(self):
+        trade_day = date(2026, 4, 24)
+        facts = [
+            fact(
+                "301001",
+                trade_day,
+                stock_name="机器人甲",
+                reason_category="人工智能",
+                limit_up_reason="人形机器人+RV减速器+XT减速器",
+                continuous_days=2,
+            ),
+            fact(
+                "301002",
+                trade_day,
+                stock_name="机器人乙",
+                reason_category="人工智能",
+                limit_up_reason="人形机器人+丝杠+商业航天",
+            ),
+            fact(
+                "301003",
+                trade_day,
+                stock_name="算力甲",
+                reason_category="人工智能",
+                limit_up_reason="算力租赁+Token工厂+通信网络管维",
+            ),
+            fact(
+                "301004",
+                trade_day,
+                stock_name="算力乙",
+                reason_category="人工智能",
+                limit_up_reason="Token工厂+AI政务+华为合作",
+                is_20cm=True,
+            ),
+            fact(
+                "301005",
+                trade_day,
+                stock_name="兜底票",
+                reason_category="医药医疗",
+                limit_up_reason="",
+            ),
+        ]
+
+        result = DailyAnalysisRuleEngine().build_daily_result(trade_day, facts)
+        sector_by_label = {
+            item["label"]: item
+            for item in result["板块"]["items"]
+        }
+
+        self.assertIn("人形机器人", sector_by_label)
+        self.assertIn("Token工厂", sector_by_label)
+        self.assertIn("算力租赁", sector_by_label)
+        self.assertIn("医药医疗", sector_by_label)
+        self.assertNotIn("人工智能", sector_by_label)
+        self.assertIn("2只", sector_by_label["人形机器人"]["tags"])
+        self.assertIn("2只", sector_by_label["Token工厂"]["tags"])
+        self.assertIn("机器人甲(301001)", sector_by_label["人形机器人"]["content"])
+        self.assertIn("算力乙(301004)", sector_by_label["Token工厂"]["content"])
 
     def test_20cm_column_uses_only_unique_height_long_shadow_or_recent_limit_new_high(self):
         trade_dates = [
