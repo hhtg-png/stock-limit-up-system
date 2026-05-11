@@ -998,13 +998,25 @@ function disposeCharts() {
   amountChart = null
 }
 
-async function fetchData() {
+type FetchDataOptions = {
+  silent?: boolean
+}
+
+async function fetchData(options: FetchDataOptions = {}) {
   const currentSequence = ++fetchSequence
-  loading.value = true
+  const shouldShowLoading = !options.silent
+
+  if (shouldShowLoading) {
+    loading.value = true
+  }
+
   const today = dayjs().format('YYYY-MM-DD')
   const { startDate, endDate, query } = getDateRange()
-  isLiveIntraday.value = false
-  intradaySnapshotTime.value = null
+
+  if (shouldShowLoading) {
+    isLiveIntraday.value = false
+    intradaySnapshotTime.value = null
+  }
 
   let detailDate = endDate
   let hasError = false
@@ -1026,6 +1038,9 @@ async function fetchData() {
     detailDate = activeEndDate.value
   } catch (e) {
     console.error('Fetch market review daily error:', e)
+    if (options.silent) {
+      return
+    }
     dailySeries.value = []
     dailyRows.value = []
     dailyHasFallback.value = false
@@ -1054,6 +1069,9 @@ async function fetchData() {
       detailResponse.value = intradayResult.detail
       ladderResponse.value = intradayResult.ladder
       hasLiveIntradayDetail = true
+    } else {
+      isLiveIntraday.value = false
+      intradaySnapshotTime.value = null
     }
   } catch (e) {
     console.warn('Fetch market review intraday status error:', e)
@@ -1073,26 +1091,30 @@ async function fetchData() {
       detailResponse.value = detailResult.value
     } else {
       console.error('Fetch market review detail error:', detailResult.reason)
-      detailResponse.value = null
-      hasError = true
+      if (!options.silent) {
+        detailResponse.value = null
+        hasError = true
+      }
     }
 
     if (ladderResult.status === 'fulfilled') {
       ladderResponse.value = ladderResult.value
     } else {
       console.error('Fetch market review ladder error:', ladderResult.reason)
-      ladderResponse.value = null
-      hasError = true
+      if (!options.silent) {
+        ladderResponse.value = null
+        hasError = true
+      }
     }
   }
 
   updateCharts()
 
-  if (hasError) {
+  if (hasError && shouldShowLoading) {
     ElMessage.error('获取市场复盘数据失败')
   }
 
-  if (currentSequence === fetchSequence) {
+  if (shouldShowLoading && currentSequence === fetchSequence) {
     loading.value = false
   }
 }
@@ -1105,7 +1127,7 @@ function handleRowClick(row: MarketReviewDetailStock) {
   goToDetail(row.stock_code)
 }
 
-watch(timeRange, fetchData)
+watch(timeRange, () => fetchData())
 
 function clearReviewRefreshTimer() {
   if (reviewRefreshTimer != null) {
@@ -1114,9 +1136,16 @@ function clearReviewRefreshTimer() {
   }
 }
 
+function refreshReviewSilently() {
+  if (loading.value) {
+    return
+  }
+  void fetchData({ silent: true })
+}
+
 function resetReviewRefreshTimer() {
   clearReviewRefreshTimer()
-  reviewRefreshTimer = window.setInterval(fetchData, 60000)
+  reviewRefreshTimer = window.setInterval(refreshReviewSilently, 60000)
 }
 
 onMounted(() => {

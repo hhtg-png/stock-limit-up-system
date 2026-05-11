@@ -33,7 +33,10 @@ test('statistics view automatically merges live intraday data into the selected 
 })
 
 test('statistics view refreshes automatically without hiding historical comparison data', () => {
-  assert.match(statisticsSource, /window\.setInterval\(fetchData, 60000\)/, 'report should re-check market status every minute')
+  assert.match(statisticsSource, /window\.setInterval\(refreshReviewSilently, 60000\)/, 'report should re-check market status every minute')
+  assert.match(statisticsSource, /fetchData\(\{ silent: true \}\)/, 'timer refresh should not show the full-page loading mask')
+  assert.match(statisticsSource, /const shouldShowLoading = !options\.silent/)
+  assert.match(statisticsSource, /if \(shouldShowLoading\) \{\s*loading\.value = true\s*\}/)
   assert.match(statisticsSource, /clearReviewRefreshTimer\(\)/, 'timer should be cleared when view unmounts')
   assert.doesNotMatch(statisticsSource, /v-if="reviewMode === 'daily'"/, 'range picker should not be scoped to a removed mode')
   assert.match(statisticsSource, /盘中实时/, 'summary should identify live intraday data')
