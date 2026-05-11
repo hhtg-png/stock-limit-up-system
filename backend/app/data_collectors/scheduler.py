@@ -445,10 +445,15 @@ class DataScheduler:
             from app.services.daily_analysis_service import daily_analysis_service
 
             today = date.today()
-            async with async_session_maker() as db:
-                await daily_analysis_service.build_for_date(db, today)
+            resolved_trade_date = _resolve_cn_trade_date_for_market_review(today)
+            if resolved_trade_date is None:
+                logger.info("Skipping daily analysis build because current China date is not a trading day")
+                return
 
-            logger.info(f"Daily analysis calculated: {today}")
+            async with async_session_maker() as db:
+                await daily_analysis_service.build_for_date(db, resolved_trade_date)
+
+            logger.info(f"Daily analysis calculated: {resolved_trade_date}")
         except Exception as e:
             logger.error(f"Calculate daily analysis error: {e}")
     

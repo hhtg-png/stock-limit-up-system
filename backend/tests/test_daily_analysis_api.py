@@ -1,6 +1,7 @@
 import asyncio
 import unittest
 from datetime import date, datetime
+from unittest.mock import patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -10,8 +11,9 @@ from sqlalchemy.pool import StaticPool
 from app.api.v1.daily_analysis import router as daily_analysis_router
 from app.database import Base, get_db
 from app.models.limit_up import LimitUpRecord
-from app.models.market_review import MarketReviewStockDaily
+from app.models.market_review import DailyAnalysisRecord, MarketReviewStockDaily
 from app.models.stock import Stock
+from app.services.daily_analysis_service import daily_analysis_service
 
 
 class DailyAnalysisApiTests(unittest.TestCase):
@@ -129,6 +131,22 @@ class DailyAnalysisApiTests(unittest.TestCase):
                         turnover_rate=15,
                     ),
                     LimitUpRecord(
+                        stock_id=trend_20cm.id,
+                        trade_date=date(2026, 4, 25),
+                        first_limit_up_time=datetime(2026, 4, 25, 10, 5, 0),
+                        final_seal_time=datetime(2026, 4, 25, 10, 5, 0),
+                        reason_category="人工智能",
+                        limit_up_reason="机器人",
+                        continuous_limit_up_days=1,
+                        open_count=0,
+                        is_final_sealed=True,
+                        open_price=24,
+                        close_price=28.8,
+                        limit_up_price=28.8,
+                        amount=30000,
+                        turnover_rate=15,
+                    ),
+                    LimitUpRecord(
                         stock_id=popular_limit_down.id,
                         trade_date=date(2026, 4, 23),
                         first_limit_up_time=datetime(2026, 4, 23, 9, 40, 0),
@@ -161,6 +179,17 @@ class DailyAnalysisApiTests(unittest.TestCase):
                         turnover_rate=7,
                     ),
                 ]
+            )
+            session.add(
+                DailyAnalysisRecord(
+                    trade_date=date(2026, 4, 25),
+                    month="2026-04",
+                    auto_result={},
+                    manual_overrides={},
+                    calc_version=1,
+                    data_status="ready",
+                    generated_at=datetime(2026, 4, 25, 16, 0, 0),
+                )
             )
             session.add_all(
                 [
@@ -213,35 +242,38 @@ class DailyAnalysisApiTests(unittest.TestCase):
             await session.commit()
 
     def test_backfill_query_override_and_rebuild_preserves_manual_override(self):
-        backfill = self.client.post("/statistics/daily-analysis/backfill", json={"month": "2026-04"})
-        self.assertEqual(backfill.status_code, 200)
-        self.assertEqual(backfill.json()["built_count"], 2)
+        trading_dates = {date(2026, 4, 23), date(2026, 4, 24)}
+        with patch.object(daily_analysis_service, "_load_cn_trading_date_set", return_value=trading_dates):
+            backfill = self.client.post("/statistics/daily-analysis/backfill", json={"month": "2026-04"})
+            self.assertEqual(backfill.status_code, 200)
+            self.assertEqual(backfill.json()["built_count"], 2)
+            self.assertEqual(backfill.json()["removed_non_trading_count"], 1)
 
-        month = self.client.get("/statistics/daily-analysis", params={"month": "2026-04"})
-        self.assertEqual(month.status_code, 200)
-        rows = month.json()["data"]
-        self.assertEqual({row["trade_date"] for row in rows}, {"2026-04-23", "2026-04-24"})
-        latest = next(row for row in rows if row["trade_date"] == "2026-04-24")
-        self.assertEqual(latest["columns"]["连板唯一性"]["items"][0]["time"], "09:25:02")
-        negative_codes = {
-            item["stock_code"]
-            for item in latest["columns"]["负反馈"]["items"]
-        }
-        self.assertIn("002900", negative_codes)
-        self.assertNotIn("002901", negative_codes)
+            month = self.client.get("/statistics/daily-analysis", params={"month": "2026-04"})
+            self.assertEqual(month.status_code, 200)
+            rows = month.json()["data"]
+            self.assertEqual({row["trade_date"] for row in rows}, {"2026-04-23", "2026-04-24"})
+            latest = next(row for row in rows if row["trade_date"] == "2026-04-24")
+            self.assertEqual(latest["columns"]["连板唯一性"]["items"][0]["time"], "09:25:02")
+            negative_codes = {
+                item["stock_code"]
+                for item in latest["columns"]["负反馈"]["items"]
+            }
+            self.assertIn("002900", negative_codes)
+            self.assertNotIn("002901", negative_codes)
 
-        patched = self.client.patch(
-            "/statistics/daily-analysis/2026-04-24/overrides",
-            json={"overrides": {"辨识度": "人工确认：唯一高标"}},
-        )
-        self.assertEqual(patched.status_code, 200)
-        self.assertEqual(patched.json()["columns"]["辨识度"]["content"], "人工确认：唯一高标")
-        self.assertTrue(patched.json()["columns"]["辨识度"]["is_manual"])
+            patched = self.client.patch(
+                "/statistics/daily-analysis/2026-04-24/overrides",
+                json={"overrides": {"辨识度": "人工确认：唯一高标"}},
+            )
+            self.assertEqual(patched.status_code, 200)
+            self.assertEqual(patched.json()["columns"]["辨识度"]["content"], "人工确认：唯一高标")
+            self.assertTrue(patched.json()["columns"]["辨识度"]["is_manual"])
 
-        rebuilt = self.client.post("/statistics/daily-analysis/2026-04-24/rebuild")
-        self.assertEqual(rebuilt.status_code, 200)
-        self.assertEqual(rebuilt.json()["columns"]["辨识度"]["content"], "人工确认：唯一高标")
-        self.assertTrue(rebuilt.json()["columns"]["辨识度"]["is_manual"])
+            rebuilt = self.client.post("/statistics/daily-analysis/2026-04-24/rebuild")
+            self.assertEqual(rebuilt.status_code, 200)
+            self.assertEqual(rebuilt.json()["columns"]["辨识度"]["content"], "人工确认：唯一高标")
+            self.assertTrue(rebuilt.json()["columns"]["辨识度"]["is_manual"])
 
 
 if __name__ == "__main__":

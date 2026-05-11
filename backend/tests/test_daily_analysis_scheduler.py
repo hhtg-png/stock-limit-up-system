@@ -1,6 +1,8 @@
+import asyncio
 import unittest
 import sys
 import types
+from unittest.mock import patch
 
 apscheduler_module = types.ModuleType("apscheduler")
 schedulers_module = types.ModuleType("apscheduler.schedulers")
@@ -72,6 +74,15 @@ class DailyAnalysisSchedulerTests(unittest.TestCase):
 
         job_ids = {job["id"] for job in scheduler.scheduler.jobs}
         self.assertIn("daily_analysis", job_ids)
+
+    def test_calculate_daily_analysis_skips_non_trading_day(self):
+        scheduler = DataScheduler()
+
+        with patch(
+            "app.data_collectors.scheduler._resolve_cn_trade_date_for_market_review",
+            return_value=None,
+        ):
+            asyncio.run(scheduler._calculate_daily_analysis())
 
 
 if __name__ == "__main__":

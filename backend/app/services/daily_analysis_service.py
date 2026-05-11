@@ -4,7 +4,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, time
 import re
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Set
 
 from sqlalchemy import distinct, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -645,6 +645,8 @@ class DailyAnalysisRuleEngine:
 class DailyAnalysisService:
     def __init__(self, rule_engine: Optional[DailyAnalysisRuleEngine] = None):
         self.rule_engine = rule_engine or DailyAnalysisRuleEngine()
+        self._cn_trading_calendar: Optional[Set[date]] = None
+        self._cn_trading_calendar_unavailable = False
 
     async def get_month(self, db: AsyncSession, month: str) -> Dict[str, Any]:
         records = await self._get_month_records(db, month)
@@ -659,11 +661,18 @@ class DailyAnalysisService:
 
     async def backfill(self, db: AsyncSession, month: Optional[str] = None) -> Dict[str, Any]:
         dates = await self._get_trade_dates(db, month)
+        removed = await self._delete_non_trading_records(db, month)
+        if removed:
+            await db.commit()
         built = []
         for trade_date in dates:
             await self.build_for_date(db, trade_date)
             built.append(trade_date.isoformat())
-        return {"built_count": len(built), "trade_dates": built}
+        return {
+            "built_count": len(built),
+            "trade_dates": built,
+            "removed_non_trading_count": removed,
+        }
 
     async def update_overrides(
         self,
@@ -806,7 +815,7 @@ class DailyAnalysisService:
             .limit(limit)
         )
         result = await db.execute(query)
-        return sorted([row[0] for row in result.all()])
+        return sorted(self._filter_trading_dates([row[0] for row in result.all()]))
 
     async def _get_trade_dates(self, db: AsyncSession, month: Optional[str]) -> List[date]:
         query = select(distinct(LimitUpRecord.trade_date)).where(LimitUpRecord.trade_date <= date.today())
@@ -815,7 +824,7 @@ class DailyAnalysisService:
             query = query.where(LimitUpRecord.trade_date >= start, LimitUpRecord.trade_date <= end)
         query = query.order_by(LimitUpRecord.trade_date)
         result = await db.execute(query)
-        return [row[0] for row in result.all()]
+        return self._filter_trading_dates([row[0] for row in result.all()])
 
     async def _get_month_records(self, db: AsyncSession, month: str) -> List[DailyAnalysisRecord]:
         query = (
@@ -824,7 +833,51 @@ class DailyAnalysisService:
             .order_by(DailyAnalysisRecord.trade_date.desc())
         )
         result = await db.execute(query)
-        return list(result.scalars().all())
+        records = list(result.scalars().all())
+        trading_dates = set(self._filter_trading_dates([record.trade_date for record in records]))
+        return [record for record in records if record.trade_date in trading_dates]
+
+    async def _delete_non_trading_records(self, db: AsyncSession, month: Optional[str]) -> int:
+        query = select(DailyAnalysisRecord).where(DailyAnalysisRecord.trade_date <= date.today())
+        if month:
+            start, end = self._month_bounds(month)
+            query = query.where(DailyAnalysisRecord.trade_date >= start, DailyAnalysisRecord.trade_date <= end)
+        result = await db.execute(query)
+        records = list(result.scalars().all())
+        trading_dates = set(self._filter_trading_dates([record.trade_date for record in records]))
+        removed = 0
+        for record in records:
+            if record.trade_date not in trading_dates:
+                await db.delete(record)
+                removed += 1
+        return removed
+
+    def _filter_trading_dates(self, dates: List[date]) -> List[date]:
+        ordered_dates = list(dict.fromkeys(dates))
+        if not ordered_dates:
+            return []
+
+        trading_dates = self._load_cn_trading_date_set(min(ordered_dates), max(ordered_dates))
+        if trading_dates is None:
+            return [value for value in ordered_dates if value.weekday() < 5]
+        return [value for value in ordered_dates if value in trading_dates]
+
+    def _load_cn_trading_date_set(self, start: date, end: date) -> Optional[Set[date]]:
+        if self._cn_trading_calendar is not None:
+            return {value for value in self._cn_trading_calendar if start <= value <= end}
+        if self._cn_trading_calendar_unavailable:
+            return None
+
+        try:
+            from app.data_collectors.scheduler import _get_cn_trading_dates
+
+            calendar_end = max(end, date.today())
+            self._cn_trading_calendar = set(_get_cn_trading_dates(date(1990, 1, 1), calendar_end))
+        except Exception:
+            self._cn_trading_calendar_unavailable = True
+            return None
+
+        return {value for value in self._cn_trading_calendar if start <= value <= end}
 
     async def _get_record(self, db: AsyncSession, trade_date: date) -> Optional[DailyAnalysisRecord]:
         result = await db.execute(select(DailyAnalysisRecord).where(DailyAnalysisRecord.trade_date == trade_date))
