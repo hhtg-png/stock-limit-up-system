@@ -22,6 +22,10 @@
               <el-icon><PieChart /></el-icon>
               <span>报表分析</span>
             </el-menu-item>
+            <el-menu-item index="/daily-analysis">
+              <el-icon><Calendar /></el-icon>
+              <span>每日分析</span>
+            </el-menu-item>
             <el-menu-item index="/continuous">
               <el-icon><TrendCharts /></el-icon>
               <span>连板梯队</span>
@@ -88,7 +92,7 @@ import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRoute } from 'vue-router'
 import {
   DataBoard, PieChart, Setting,
-  Fold, Expand, Bell, TrendCharts
+  Fold, Expand, Bell, TrendCharts, Calendar
 } from '@element-plus/icons-vue'
 import zhCn from 'element-plus/dist/locale/zh-cn.mjs'
 import AlertPanel from '@/components/alert/AlertPanel.vue'

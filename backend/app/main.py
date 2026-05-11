@@ -31,7 +31,7 @@ async def lifespan(app: FastAPI):
     await event_bus.start()
     logger.info("EventBus started")
 
-    # 启动定时采集/盘后复盘任务
+    # 启动定时任务：盘中采集、盘后统计、市场复盘、每日分析
     data_scheduler.start()
     
     # 自动爬取最近交易日数据（后台任务）

@@ -38,6 +38,7 @@ class MarketReviewModelTests(unittest.TestCase):
         self.assertIn(("trade_date", "stock_code", "event_type", "event_seq"), limitup_event_uniques)
         self.assertNotIn(("trade_date", "stock_id"), stock_daily_uniques)
         self.assertNotIn(("trade_date", "stock_id", "event_type", "event_seq"), limitup_event_uniques)
+        self.assertIn("daily_analysis_records", Base.metadata.tables)
 
 
 if __name__ == "__main__":

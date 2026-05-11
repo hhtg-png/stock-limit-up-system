@@ -116,3 +116,23 @@ class MarketReviewLimitUpEvent(Base):
     payload_json = Column(JSON, default=dict, nullable=False, comment="事件载荷")
     created_at = Column(DateTime, default=datetime.now, nullable=False, comment="创建时间")
     stock = relationship("Stock")
+
+
+class DailyAnalysisRecord(Base):
+    """每日分析月表结果"""
+
+    __tablename__ = "daily_analysis_records"
+    __table_args__ = (
+        UniqueConstraint("trade_date", name="uq_daily_analysis_trade_date"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    trade_date = Column(Date, nullable=False, comment="交易日期")
+    month = Column(String(7), nullable=False, index=True, comment="月份 YYYY-MM")
+    auto_result = Column(JSON, default=dict, nullable=False, comment="自动分析结果")
+    manual_overrides = Column(JSON, default=dict, nullable=False, comment="人工覆盖内容")
+    calc_version = Column(Integer, default=1, nullable=False, comment="计算版本")
+    data_status = Column(String(20), default="ready", nullable=False, comment="数据状态")
+    generated_at = Column(DateTime, default=datetime.now, nullable=False, comment="生成时间")
+    created_at = Column(DateTime, default=datetime.now, nullable=False, comment="创建时间")
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, nullable=False, comment="更新时间")

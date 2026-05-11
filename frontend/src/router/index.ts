@@ -28,6 +28,12 @@ const router = createRouter({
       meta: { title: '统计分析' }
     },
     {
+      path: '/daily-analysis',
+      name: 'DailyAnalysis',
+      component: () => import('@/views/DailyAnalysis.vue'),
+      meta: { title: '每日分析' }
+    },
+    {
       path: '/continuous',
       name: 'ContinuousBoard',
       component: () => import('@/views/ContinuousBoard.vue'),
