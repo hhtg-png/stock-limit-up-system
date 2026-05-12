@@ -41,10 +41,10 @@
           <span v-else>首板</span>
         </el-descriptions-item>
         <el-descriptions-item label="涨停价">{{ stockInfo.limit_up_price?.toFixed(2) || '-' }}</el-descriptions-item>
-        <el-descriptions-item label="封单(万)">{{ stockInfo.seal_amount?.toFixed(0) || '-' }}</el-descriptions-item>
+        <el-descriptions-item label="封单">{{ formatAmount(stockInfo.seal_amount) }}</el-descriptions-item>
         <el-descriptions-item label="开板次数">{{ stockInfo.open_count ?? '-' }}</el-descriptions-item>
         <el-descriptions-item label="换手率">{{ formatTurnoverRate(stockInfo.turnover_rate) }}</el-descriptions-item>
-        <el-descriptions-item label="成交额(万)">{{ stockInfo.amount?.toFixed(0) || '-' }}</el-descriptions-item>
+        <el-descriptions-item label="成交额">{{ formatAmount(stockInfo.amount) }}</el-descriptions-item>
         <el-descriptions-item label="行业">{{ stockInfo.industry || '-' }}</el-descriptions-item>
         <el-descriptions-item label="涨停原因" :span="3">{{ stockInfo.limit_up_reason || '-' }}</el-descriptions-item>
       </el-descriptions>
@@ -254,7 +254,8 @@ function toggleLimitUpHighlight() {
 defineExpose({
   setPeriod,
   toggleOverlay,
-  toggleLimitUpHighlight
+  toggleLimitUpHighlight,
+  zoomChart
 })
 
 // 获取数据
@@ -287,117 +288,201 @@ function formatTurnoverRate(rate: number | undefined | null): string {
   return rate.toFixed(2) + '%'
 }
 
-// 初始化图表
-function initChart() {
-  if (!chartRef.value) return
-  
-  chart = echarts.init(chartRef.value)
-  chart.setOption({
-    grid: [
-      { left: 50, right: 20, top: 20, height: '60%' },
-      { left: 50, right: 20, top: '75%', height: '15%' }
-    ],
-    xAxis: [
-      { type: 'category', data: [], gridIndex: 0, axisLabel: { show: false } },
-      { type: 'category', data: [], gridIndex: 1 }
-    ],
-    yAxis: [
-      { type: 'value', gridIndex: 0, scale: true },
-      { type: 'value', gridIndex: 1, scale: true }
-    ],
-    series: [
-      {
-        type: 'line',
-        xAxisIndex: 0,
-        yAxisIndex: 0,
-        data: [],
-        smooth: true,
-        lineStyle: { color: '#f5222d' },
-        areaStyle: { color: 'rgba(245, 34, 45, 0.1)' }
-      },
-      {
-        type: 'bar',
-        xAxisIndex: 1,
-        yAxisIndex: 1,
-        data: [],
-        itemStyle: { color: '#1890ff' }
-      }
-    ],
-    tooltip: { trigger: 'axis' }
+function formatAmount(value?: number | null): string {
+  if (value == null || Number.isNaN(value)) return '-'
+  if (Math.abs(value) >= 100000000) return (value / 100000000).toFixed(2) + '亿'
+  if (Math.abs(value) >= 10000) return (value / 10000).toFixed(0) + '万'
+  return value.toFixed(0)
+}
+
+function getLimitUpColor(point: KlinePoint): string {
+  if (showLimitUpHighlight.value && point.is_limit_up) return '#8b000f'
+  return point.close >= point.open ? '#d82135' : '#1677ff'
+}
+
+function buildMaData(points: KlinePoint[], windowSize: number): (number | null)[] {
+  return points.map((_point, index) => {
+    if (index < windowSize - 1) return null
+    const slice = points.slice(index - windowSize + 1, index + 1)
+    const total = slice.reduce((sum, item) => sum + item.close, 0)
+    return Number((total / windowSize).toFixed(2))
   })
 }
 
-function buildMovingAverage(data: number[], dayCount: number) {
-  return data.map((_, index) => {
-    if (index < dayCount - 1) return null
-    const sum = data.slice(index - dayCount + 1, index + 1).reduce((total, value) => total + value, 0)
-    return Number((sum / dayCount).toFixed(2))
-  })
-}
-
-function updateChart() {
-  if (!chart) return
-
-  if (activePeriod.value === 'timeline') {
-    const times = intradayData.value.map((d: any) => d.time)
-    const prices = intradayData.value.map((d: any) => d.price)
-    const volumes = intradayData.value.map((d: any) => d.volume)
-
-    chart.setOption({
-      xAxis: [{ data: times }, { data: times }],
-      series: [
-        { name: '价格', type: 'line', data: prices },
-        { name: '成交量', type: 'bar', data: volumes }
-      ]
-    })
-    return
-  }
-
+function buildKlineOption() {
   const dates = klineData.value.map(item => item.date)
-  const closes = klineData.value.map(item => item.close)
-  const volumes = klineData.value.map(item => item.volume)
-  const series: echarts.SeriesOption[] = [
-    { name: '收盘价', type: 'line', xAxisIndex: 0, yAxisIndex: 0, data: closes, smooth: true },
-    { name: '成交量', type: 'bar', xAxisIndex: 1, yAxisIndex: 1, data: volumes }
+  const candleData = klineData.value.map(item => ({
+    value: [item.open, item.close, item.low, item.high],
+    itemStyle: {
+      color: getLimitUpColor(item),
+      color0: '#1677ff',
+      borderColor: getLimitUpColor(item),
+      borderColor0: '#1677ff'
+    }
+  }))
+
+  const series: any[] = [
+    {
+      name: stockInfo.value.stock_name || stockCode.value,
+      type: 'candlestick',
+      data: candleData,
+      xAxisIndex: 0,
+      yAxisIndex: 0
+    },
+    {
+      name: '成交量',
+      type: 'bar',
+      data: klineData.value.map(item => ({
+        value: item.volume,
+        itemStyle: { color: getLimitUpColor(item) }
+      })),
+      xAxisIndex: 1,
+      yAxisIndex: 2
+    }
   ]
 
   if (showMa.value) {
     series.push({
       name: 'MA5',
       type: 'line',
+      data: buildMaData(klineData.value, 5),
+      smooth: true,
+      symbol: 'none',
       xAxisIndex: 0,
       yAxisIndex: 0,
-      data: buildMovingAverage(closes, 5),
-      smooth: true
+      lineStyle: { width: 1.5, color: '#7c3aed' }
     })
   }
 
   if (showOverlay.value) {
-    compareSeries.value.forEach(item => {
+    compareSeries.value.forEach((overlay, index) => {
       series.push({
-        name: item.name || item.symbol,
+        name: overlay.name || overlay.symbol,
         type: 'line',
+        data: overlay.data.map(item => item.change_pct_from_start),
+        smooth: true,
+        symbol: 'none',
         xAxisIndex: 0,
-        yAxisIndex: 0,
-        data: item.data.map(point => point.change_pct_from_start),
-        smooth: true
+        yAxisIndex: 1,
+        lineStyle: {
+          width: 1.5,
+          color: ['#2563eb', '#f59e0b', '#059669'][index % 3]
+        }
       })
     })
   }
 
-  chart.setOption({
-    xAxis: [{ data: dates }, { data: dates }],
-    series,
-    visualMap: showLimitUpHighlight.value
-      ? {
-          show: false,
-          seriesIndex: 0,
-          pieces: klineData.value
-            .map((item, index) => item.is_limit_up ? { gt: index - 1, lte: index, color: '#f5222d' } : null)
-            .filter(Boolean)
-        }
-      : undefined
-  })
+  return {
+    animation: false,
+    tooltip: { trigger: 'axis', axisPointer: { type: 'cross' } },
+    legend: { top: 8, left: 12 },
+    grid: [
+      { left: 56, right: 58, top: 42, height: '58%' },
+      { left: 56, right: 58, top: '76%', height: '14%' }
+    ],
+    xAxis: [
+      { type: 'category', data: dates, scale: true, boundaryGap: true, axisLabel: { show: false } },
+      { type: 'category', data: dates, gridIndex: 1, scale: true, boundaryGap: true }
+    ],
+    yAxis: [
+      { scale: true, splitArea: { show: true } },
+      { scale: true, position: 'right', axisLabel: { formatter: '{value}%' }, splitLine: { show: false } },
+      { scale: true, gridIndex: 1, splitNumber: 2 }
+    ],
+    dataZoom: [
+      { type: 'inside', xAxisIndex: [0, 1], start: 55, end: 100 },
+      { type: 'slider', xAxisIndex: [0, 1], bottom: 8, height: 18, start: 55, end: 100 }
+    ],
+    series
+  }
+}
+
+function buildTimelineOption() {
+  const times = intradayData.value.map((item: any) => item.time)
+  return {
+    animation: false,
+    tooltip: { trigger: 'axis', axisPointer: { type: 'cross' } },
+    grid: [
+      { left: 56, right: 24, top: 32, height: '58%' },
+      { left: 56, right: 24, top: '76%', height: '14%' }
+    ],
+    xAxis: [
+      { type: 'category', data: times, axisLabel: { show: false } },
+      { type: 'category', data: times, gridIndex: 1 }
+    ],
+    yAxis: [
+      { scale: true },
+      { scale: true, gridIndex: 1, splitNumber: 2 }
+    ],
+    dataZoom: [
+      { type: 'inside', xAxisIndex: [0, 1], start: 0, end: 100 },
+      { type: 'slider', xAxisIndex: [0, 1], bottom: 8, height: 18, start: 0, end: 100 }
+    ],
+    series: [
+      {
+        name: '现价',
+        type: 'line',
+        data: intradayData.value.map((item: any) => item.price),
+        smooth: true,
+        symbol: 'none',
+        xAxisIndex: 0,
+        yAxisIndex: 0,
+        lineStyle: { color: '#d82135' },
+        areaStyle: { color: 'rgba(216, 33, 53, 0.08)' }
+      },
+      {
+        name: '成交量',
+        type: 'bar',
+        data: intradayData.value.map((item: any) => item.volume),
+        xAxisIndex: 1,
+        yAxisIndex: 1,
+        itemStyle: { color: '#64748b' }
+      }
+    ]
+  }
+}
+
+// 初始化图表
+function initChart() {
+  if (!chartRef.value) return
+  chart = echarts.init(chartRef.value)
+  updateChart()
+}
+
+function updateChart() {
+  if (!chart) return
+  const hasData = activePeriod.value === 'timeline'
+    ? intradayData.value.length > 0
+    : klineData.value.length > 0
+
+  if (!hasData) {
+    chart.clear()
+    chart.setOption({
+      title: {
+        text: '暂无图表数据',
+        left: 'center',
+        top: 'middle',
+        textStyle: { color: '#94a3b8', fontSize: 14, fontWeight: 500 }
+      }
+    })
+    return
+  }
+
+  chart.setOption(activePeriod.value === 'timeline' ? buildTimelineOption() : buildKlineOption(), true)
+}
+
+function resizeChart() {
+  chart?.resize()
+}
+
+function zoomChart(delta: number) {
+  if (!chart) return
+  const option: any = chart.getOption()
+  const zoom = option.dataZoom?.[0]
+  if (!zoom) return
+  const start = Math.max(0, Math.min(95, Number(zoom.start ?? 55) + delta))
+  const end = Math.max(start + 5, Math.min(100, Number(zoom.end ?? 100) - delta))
+  chart.dispatchAction({ type: 'dataZoom', start, end })
 }
 
 // 切换关注
@@ -440,6 +525,7 @@ onMounted(() => {
   nextTick(() => {
     initChart()
     fetchData()
+    window.addEventListener('resize', resizeChart)
   })
   
   // 定时刷新
@@ -450,11 +536,13 @@ onMounted(() => {
   
   onUnmounted(() => {
     clearInterval(timer)
+    window.removeEventListener('resize', resizeChart)
     chart?.dispose()
   })
 })
 
-watch(stockCode, () => {
+watch(stockCode, async () => {
+  await nextTick()
   fetchData()
 })
 </script>
