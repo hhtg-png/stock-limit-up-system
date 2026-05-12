@@ -143,16 +143,16 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
 import { useRoute } from 'vue-router'
 import { Star } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import * as echarts from 'echarts'
 import { getLimitUpDetail } from '@/api/limit-up'
-import { getOrderBook, getBigOrders, getTimeline } from '@/api/market'
+import { getOrderBook, getBigOrders, getTimeline, getKline, getCompareSeries } from '@/api/market'
 import { useConfigStore } from '@/stores/config'
 import type { LimitUpDetail, LimitUpStatusChange } from '@/types/limit-up'
-import type { OrderBook, BigOrder } from '@/types/market'
+import type { OrderBook, BigOrder, KlinePeriod, KlinePoint, CompareSeries } from '@/types/market'
 
 const route = useRoute()
 const configStore = useConfigStore()
@@ -167,6 +167,16 @@ const bigOrders = ref<BigOrder[]>([])
 
 const chartRef = ref<HTMLElement>()
 let chart: echarts.ECharts | null = null
+
+const activePeriod = ref<KlinePeriod>('day')
+const chartLoading = ref(false)
+const klineData = ref<KlinePoint[]>([])
+const intradayData = ref<any[]>([])
+const compareSeries = ref<CompareSeries[]>([])
+const overlaySymbols = ref<string[]>(['000001.SH'])
+const showLimitUpHighlight = ref(true)
+const showMa = ref(true)
+const showOverlay = ref(true)
 
 // 根据股票板块判断大单手数阈值（科创/创业板用20cm阈值）
 const bigOrderThreshold = computed(() => {
@@ -188,6 +198,65 @@ const isWatched = computed(() =>
   configStore.config.watch_list.includes(stockCode.value)
 )
 
+function isKlinePeriod(period: KlinePeriod): period is 'day' | 'week' | 'month' {
+  return period === 'day' || period === 'week' || period === 'month'
+}
+
+async function fetchChartData() {
+  if (!chart) return
+  chartLoading.value = true
+  try {
+    if (activePeriod.value === 'timeline') {
+      const data = await getTimeline(stockCode.value)
+      intradayData.value = data?.data || []
+      klineData.value = []
+      compareSeries.value = []
+    } else if (isKlinePeriod(activePeriod.value)) {
+      const [kline, compares] = await Promise.all([
+        getKline(stockCode.value, { period: activePeriod.value, limit: 250 }),
+        showOverlay.value
+          ? getCompareSeries({
+              symbols: overlaySymbols.value,
+              period: activePeriod.value,
+              limit: 250
+            }).catch(() => [])
+          : Promise.resolve([])
+      ])
+      klineData.value = kline.data || []
+      compareSeries.value = compares
+      intradayData.value = []
+    }
+    updateChart()
+  } catch (e) {
+    console.error('Fetch chart data error:', e)
+    ElMessage.warning('图表数据暂不可用')
+  } finally {
+    chartLoading.value = false
+  }
+}
+
+function setPeriod(period: KlinePeriod) {
+  if (activePeriod.value === period) return
+  activePeriod.value = period
+  fetchChartData()
+}
+
+function toggleOverlay() {
+  showOverlay.value = !showOverlay.value
+  fetchChartData()
+}
+
+function toggleLimitUpHighlight() {
+  showLimitUpHighlight.value = !showLimitUpHighlight.value
+  updateChart()
+}
+
+defineExpose({
+  setPeriod,
+  toggleOverlay,
+  toggleLimitUpHighlight
+})
+
 // 获取数据
 async function fetchData() {
   loading.value = true
@@ -203,35 +272,12 @@ async function fetchData() {
     orderBook.value = ob
     bigOrders.value = orders
 
-    // 获取分时数据并绑定图表
-    fetchTimeline()
+    await fetchChartData()
   } catch (e) {
     console.error('Fetch error:', e)
     ElMessage.error('获取数据失败')
   } finally {
     loading.value = false
-  }
-}
-
-// 获取分时数据
-async function fetchTimeline() {
-  try {
-    const data = await getTimeline(stockCode.value)
-    if (data?.data?.length && chart) {
-      const times = data.data.map((d: any) => d.time)
-      const prices = data.data.map((d: any) => d.price)
-      const volumes = data.data.map((d: any) => d.volume)
-      
-      chart.setOption({
-        xAxis: [{ data: times }, { data: times }],
-        series: [
-          { data: prices },
-          { data: volumes }
-        ]
-      })
-    }
-  } catch (e) {
-    console.error('Fetch timeline error:', e)
   }
 }
 
@@ -281,6 +327,79 @@ function initChart() {
   })
 }
 
+function buildMovingAverage(data: number[], dayCount: number) {
+  return data.map((_, index) => {
+    if (index < dayCount - 1) return null
+    const sum = data.slice(index - dayCount + 1, index + 1).reduce((total, value) => total + value, 0)
+    return Number((sum / dayCount).toFixed(2))
+  })
+}
+
+function updateChart() {
+  if (!chart) return
+
+  if (activePeriod.value === 'timeline') {
+    const times = intradayData.value.map((d: any) => d.time)
+    const prices = intradayData.value.map((d: any) => d.price)
+    const volumes = intradayData.value.map((d: any) => d.volume)
+
+    chart.setOption({
+      xAxis: [{ data: times }, { data: times }],
+      series: [
+        { name: '价格', type: 'line', data: prices },
+        { name: '成交量', type: 'bar', data: volumes }
+      ]
+    })
+    return
+  }
+
+  const dates = klineData.value.map(item => item.date)
+  const closes = klineData.value.map(item => item.close)
+  const volumes = klineData.value.map(item => item.volume)
+  const series: echarts.SeriesOption[] = [
+    { name: '收盘价', type: 'line', xAxisIndex: 0, yAxisIndex: 0, data: closes, smooth: true },
+    { name: '成交量', type: 'bar', xAxisIndex: 1, yAxisIndex: 1, data: volumes }
+  ]
+
+  if (showMa.value) {
+    series.push({
+      name: 'MA5',
+      type: 'line',
+      xAxisIndex: 0,
+      yAxisIndex: 0,
+      data: buildMovingAverage(closes, 5),
+      smooth: true
+    })
+  }
+
+  if (showOverlay.value) {
+    compareSeries.value.forEach(item => {
+      series.push({
+        name: item.name || item.symbol,
+        type: 'line',
+        xAxisIndex: 0,
+        yAxisIndex: 0,
+        data: item.data.map(point => point.change_pct_from_start),
+        smooth: true
+      })
+    })
+  }
+
+  chart.setOption({
+    xAxis: [{ data: dates }, { data: dates }],
+    series,
+    visualMap: showLimitUpHighlight.value
+      ? {
+          show: false,
+          seriesIndex: 0,
+          pieces: klineData.value
+            .map((item, index) => item.is_limit_up ? { gt: index - 1, lte: index, color: '#f5222d' } : null)
+            .filter(Boolean)
+        }
+      : undefined
+  })
+}
+
 // 切换关注
 function toggleWatch() {
   if (isWatched.value) {
@@ -318,8 +437,10 @@ function formatTime(time: string) {
 }
 
 onMounted(() => {
-  initChart()
-  fetchData()
+  nextTick(() => {
+    initChart()
+    fetchData()
+  })
   
   // 定时刷新
   const timer = setInterval(() => {
@@ -331,6 +452,10 @@ onMounted(() => {
     clearInterval(timer)
     chart?.dispose()
   })
+})
+
+watch(stockCode, () => {
+  fetchData()
 })
 </script>
 
