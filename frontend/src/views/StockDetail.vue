@@ -645,7 +645,9 @@ watch(stockCode, async () => {
 .chart-meta {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
+  row-gap: 6px;
   padding: 10px 14px 0;
   color: #64748b;
   font-size: 12px;
@@ -742,6 +744,10 @@ watch(stockCode, async () => {
   grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 10px;
   padding: 12px;
+
+  > .empty-hint {
+    grid-column: 1 / -1;
+  }
 }
 
 .timeline-event {
