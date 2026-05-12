@@ -44,7 +44,7 @@
               <el-button :type="activePeriod === 'month' ? 'primary' : 'default'" size="small" @click="setPeriod('month')">月K</el-button>
             </el-button-group>
             <el-button size="small" :type="showLimitUpHighlight ? 'danger' : 'default'" @click="toggleLimitUpHighlight">涨停变色</el-button>
-            <el-button size="small" :type="showOverlay ? 'primary' : 'default'" @click="toggleOverlay">叠加指数</el-button>
+            <el-button size="small" :type="showOverlay ? 'primary' : 'default'" @click="toggleOverlay">叠加标的</el-button>
             <el-button size="small" :icon="Plus" @click="zoomChart(8)" />
             <el-button size="small" :icon="Minus" @click="zoomChart(-8)" />
             <el-button size="small" :icon="Refresh" @click="fetchChartData" />
@@ -52,10 +52,53 @@
         </div>
         <div class="chart-meta">
           <span class="legend stock"></span>{{ stockInfo.stock_name || stockCode }}
-          <span v-if="showOverlay" class="legend index"></span><span v-if="showOverlay">叠加走势</span>
-          <span v-if="showMa" class="legend ma"></span><span v-if="showMa">MA5</span>
+          <button
+            v-for="ma in MA_CONFIGS"
+            :key="ma.name"
+            type="button"
+            class="ma-toggle"
+            :class="{ active: isMaActive(ma.name) }"
+            :style="{ '--ma-color': ma.color }"
+            @click="toggleMa(ma.name)"
+          >
+              <span class="legend ma" :style="{ background: ma.color }"></span><span>{{ ma.name }}</span>
+          </button>
         </div>
-        <div ref="chartRef" v-loading="chartLoading" class="chart-container"></div>
+        <div class="overlay-manager">
+          <div class="overlay-input">
+            <el-autocomplete
+              v-model="overlayInput"
+              size="small"
+              clearable
+              value-key="display"
+              :fetch-suggestions="searchOverlaySuggestions"
+              :trigger-on-focus="false"
+              :debounce="220"
+              :loading="overlaySearchLoading"
+              placeholder="代码 / 拼音 / 名称"
+              @select="selectOverlaySuggestion"
+              @keyup.enter="addOverlaySymbol"
+            />
+            <el-button size="small" @click="addOverlaySymbol">添加</el-button>
+          </div>
+          <div class="overlay-tags">
+            <el-tag
+              v-for="(symbol, index) in overlaySymbols"
+              :key="symbol"
+              size="small"
+              closable
+              :disable-transitions="true"
+              :style="{
+                '--overlay-color': getOverlayBaseColor(index),
+                '--overlay-limit-color': getOverlayLimitColor(index)
+              }"
+              @close="removeOverlaySymbol(symbol)"
+            >
+              {{ formatOverlayTag(symbol) }}
+            </el-tag>
+          </div>
+        </div>
+        <div ref="chartRef" v-loading="chartLoading" class="chart-container" :style="{ height: chartHeight }"></div>
       </div>
 
       <aside class="side-panels">
@@ -128,10 +171,10 @@ import { Minus, Plus, Refresh, Star } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import * as echarts from 'echarts'
 import { getLimitUpDetail } from '@/api/limit-up'
-import { getOrderBook, getBigOrders, getTimeline, getKline, getCompareSeries } from '@/api/market'
+import { getOrderBook, getBigOrders, getTimeline, getKline, getCompareSeries, searchStocks } from '@/api/market'
 import { useConfigStore } from '@/stores/config'
 import type { LimitUpDetail, LimitUpStatusChange } from '@/types/limit-up'
-import type { OrderBook, BigOrder, KlinePeriod, KlinePoint, CompareSeries } from '@/types/market'
+import type { OrderBook, BigOrder, KlinePeriod, KlinePoint, CompareSeries, ComparePoint, StockSearchItem } from '@/types/market'
 
 const route = useRoute()
 const configStore = useConfigStore()
@@ -152,11 +195,49 @@ const activePeriod = ref<KlinePeriod>('day')
 const chartLoading = ref(false)
 const klineData = ref<KlinePoint[]>([])
 const intradayData = ref<any[]>([])
+const overlayTimelineSeries = ref<TimelineOverlaySeries[]>([])
 const compareSeries = ref<CompareSeries[]>([])
 const overlaySymbols = ref<string[]>(['000001.SH'])
+const overlayLabels = ref<Record<string, string>>({ '000001.SH': '上证指数' })
+const overlayInput = ref('')
+const overlaySearchLoading = ref(false)
 const showLimitUpHighlight = ref(true)
-const showMa = ref(true)
 const showOverlay = ref(true)
+const MAX_PRICE_CHARTS = 6
+const MAX_OVERLAY_SYMBOLS = MAX_PRICE_CHARTS - 1
+const KLINE_UP_COLOR = '#ef232a'
+const KLINE_DOWN_COLOR = '#14a058'
+const KLINE_LIMIT_UP_COLOR = '#b00020'
+const OVERLAY_PALETTE = [
+  { base: '#2563eb', limit: '#1d4ed8' },
+  { base: '#f59e0b', limit: '#b45309' },
+  { base: '#059669', limit: '#047857' },
+  { base: '#7c3aed', limit: '#5b21b6' },
+  { base: '#0891b2', limit: '#0e7490' }
+]
+const MA_CONFIGS = [
+  { name: 'MA3', window: 3, color: '#f97316', width: 1.2 },
+  { name: 'MA5', window: 5, color: '#7c3aed', width: 1.2 },
+  { name: 'MA10', window: 10, color: '#0f766e', width: 1.2 },
+  { name: 'MA480', window: 480, color: '#111827', width: 1.8 }
+]
+const activeMaNames = ref(MA_CONFIGS.map(ma => ma.name))
+const MAIN_GRID_HEIGHT = 320
+const VOLUME_GRID_HEIGHT = 88
+const GRID_TOP = 36
+const GRID_GAP = 24
+const GRID_BOTTOM_SPACE = 54
+
+interface OverlaySuggestion extends StockSearchItem {
+  value: string
+  display: string
+}
+
+interface TimelineOverlaySeries {
+  symbol: string
+  name: string
+  data: any[]
+}
 
 // 根据股票板块判断大单手数阈值（科创/创业板用20cm阈值）
 const bigOrderThreshold = computed(() => {
@@ -173,6 +254,17 @@ const filteredBigOrders = computed(() => {
   return bigOrders.value.filter(order => order.trade_volume >= threshold)
 })
 
+const visibleOverlayChartCount = computed(() => {
+  if (!showOverlay.value) return 0
+  if (activePeriod.value === 'timeline') return Math.max(overlayTimelineSeries.value.length, overlaySymbols.value.length)
+  if (isKlinePeriod(activePeriod.value)) return Math.max(compareSeries.value.length, overlaySymbols.value.length)
+  return 0
+})
+
+const chartHeight = computed(() => {
+  return `${Math.max(620, getKlineChartHeightPx(visibleOverlayChartCount.value))}px`
+})
+
 // 是否已关注
 const isWatched = computed(() => 
   configStore.config.watch_list.includes(stockCode.value)
@@ -187,24 +279,43 @@ async function fetchChartData() {
   chartLoading.value = true
   try {
     if (activePeriod.value === 'timeline') {
-      const data = await getTimeline(stockCode.value)
+      const [data, overlays] = await Promise.all([
+        getTimeline(stockCode.value),
+        showOverlay.value && overlaySymbols.value.length > 0
+          ? Promise.all(overlaySymbols.value.map(symbol =>
+              getTimeline(symbol)
+                .then(result => ({
+                  symbol,
+                  name: overlayLabels.value[symbol] || symbol,
+                  data: result?.data || []
+                }))
+                .catch(() => ({
+                  symbol,
+                  name: overlayLabels.value[symbol] || symbol,
+                  data: []
+                }))
+            ))
+          : Promise.resolve([])
+      ])
       intradayData.value = data?.data || []
       klineData.value = []
       compareSeries.value = []
+      overlayTimelineSeries.value = overlays
     } else if (isKlinePeriod(activePeriod.value)) {
       const [kline, compares] = await Promise.all([
-        getKline(stockCode.value, { period: activePeriod.value, limit: 250 }),
-        showOverlay.value
+        getKline(stockCode.value, { period: activePeriod.value, limit: 600 }),
+        showOverlay.value && overlaySymbols.value.length > 0
           ? getCompareSeries({
               symbols: overlaySymbols.value,
               period: activePeriod.value,
-              limit: 250
+              limit: 600
             }).catch(() => [])
           : Promise.resolve([])
       ])
       klineData.value = kline.data || []
       compareSeries.value = compares
       intradayData.value = []
+      overlayTimelineSeries.value = []
     }
     updateChart()
   } catch (e) {
@@ -229,6 +340,149 @@ function toggleOverlay() {
 function toggleLimitUpHighlight() {
   showLimitUpHighlight.value = !showLimitUpHighlight.value
   updateChart()
+}
+
+function isMaActive(name: string): boolean {
+  return activeMaNames.value.includes(name)
+}
+
+function toggleMa(name: string) {
+  activeMaNames.value = isMaActive(name)
+    ? activeMaNames.value.filter(item => item !== name)
+    : [...activeMaNames.value, name]
+  updateChart()
+}
+
+function getVisibleMaConfigs() {
+  return MA_CONFIGS.filter(ma => activeMaNames.value.includes(ma.name))
+}
+
+function inferMarketFromCode(code: string): string {
+  if (code.startsWith('6')) return 'SH'
+  if (code.startsWith('4') || code.startsWith('8') || code.startsWith('920')) return 'BJ'
+  return 'SZ'
+}
+
+function normalizeDirectOverlaySymbol(value: string): string {
+  const raw = value.trim().toUpperCase().replace(/\s+/g, '')
+  const match = raw.match(/^(\d{6})(?:\.(SH|SZ|BJ|BSE))?$/)
+  if (!match) return ''
+
+  const market = match[2] ? match[2].replace('BSE', 'BJ') : inferMarketFromCode(match[1])
+  return `${match[1]}.${market}`
+}
+
+function rememberOverlayLabel(symbol: string, name?: string) {
+  if (!name || name === symbol) return
+  overlayLabels.value = { ...overlayLabels.value, [symbol]: name }
+}
+
+function formatOverlayTag(symbol: string): string {
+  const name = overlayLabels.value[symbol]
+  return name && name !== symbol ? `${name} ${symbol}` : symbol
+}
+
+function toOverlaySuggestion(item: StockSearchItem): OverlaySuggestion {
+  const pinyin = item.pinyin ? ` / ${item.pinyin}` : ''
+  return {
+    ...item,
+    value: item.symbol,
+    display: `${item.stock_name} ${item.symbol}${pinyin}`
+  }
+}
+
+async function searchOverlaySuggestions(queryString: string, cb: (items: OverlaySuggestion[]) => void) {
+  const query = queryString.trim()
+  if (!query) {
+    cb([])
+    return
+  }
+
+  overlaySearchLoading.value = true
+  try {
+    const results = await searchStocks(query, 8)
+    cb(results.map(toOverlaySuggestion))
+  } catch (e) {
+    cb([])
+  } finally {
+    overlaySearchLoading.value = false
+  }
+}
+
+function addResolvedOverlaySymbol(symbol: string, name?: string) {
+  if (!symbol) {
+    ElMessage.warning('请输入叠加代码、拼音或名称')
+    return
+  }
+  if (overlaySymbols.value.includes(symbol)) {
+    ElMessage.warning('该标的已在叠加列表')
+    return
+  }
+  if (overlaySymbols.value.length >= MAX_OVERLAY_SYMBOLS) {
+    ElMessage.warning(`最多显示${MAX_PRICE_CHARTS}个图（主图+${MAX_OVERLAY_SYMBOLS}个叠加）`)
+    return
+  }
+
+  rememberOverlayLabel(symbol, name)
+  overlaySymbols.value = [...overlaySymbols.value, symbol]
+  overlayInput.value = ''
+  showOverlay.value = true
+  refreshOverlayData()
+}
+
+function selectOverlaySuggestion(item: OverlaySuggestion) {
+  addResolvedOverlaySymbol(item.symbol, item.stock_name)
+}
+
+function getOverlayBaseColor(index: number): string {
+  return OVERLAY_PALETTE[index % OVERLAY_PALETTE.length].base
+}
+
+function getOverlayLimitColor(_index: number): string {
+  return KLINE_LIMIT_UP_COLOR
+}
+
+function refreshOverlayData() {
+  if (showOverlay.value && (isKlinePeriod(activePeriod.value) || activePeriod.value === 'timeline')) {
+    fetchChartData()
+    return
+  }
+  updateChart()
+}
+
+async function addOverlaySymbol() {
+  const query = overlayInput.value.trim()
+  if (!query) {
+    ElMessage.warning('请输入叠加代码、拼音或名称')
+    return
+  }
+
+  const directSymbol = normalizeDirectOverlaySymbol(query)
+  try {
+    const results = await searchStocks(query, 5)
+    const selected = directSymbol
+      ? results.find(item => item.symbol === directSymbol) ?? results[0]
+      : results[0]
+
+    if (selected) {
+      addResolvedOverlaySymbol(selected.symbol, selected.stock_name)
+      return
+    }
+  } catch (e) {
+    // Direct code input still works when the remote suggest endpoint is unavailable.
+  }
+
+  if (!directSymbol) {
+    ElMessage.warning('未找到匹配标的')
+    return
+  }
+
+  addResolvedOverlaySymbol(directSymbol, directSymbol)
+}
+
+function removeOverlaySymbol(symbol: string) {
+  overlaySymbols.value = overlaySymbols.value.filter(item => item !== symbol)
+  refreshOverlayData()
 }
 
 defineExpose({
@@ -290,11 +544,11 @@ function isHighlightedLimitUpPoint(point: KlinePoint): boolean {
 }
 
 function getLimitUpColor(point: KlinePoint): string {
-  if (showLimitUpHighlight.value && isHighlightedLimitUpPoint(point)) return '#8b000f'
-  return point.close >= point.open ? '#d82135' : '#1677ff'
+  if (showLimitUpHighlight.value && isHighlightedLimitUpPoint(point)) return KLINE_LIMIT_UP_COLOR
+  return point.close >= point.open ? KLINE_UP_COLOR : KLINE_DOWN_COLOR
 }
 
-function buildMaData(points: KlinePoint[], windowSize: number): (number | null)[] {
+function buildMaData<T extends { close: number }>(points: T[], windowSize: number): (number | null)[] {
   return points.map((_point, index) => {
     if (index < windowSize - 1) return null
     const slice = points.slice(index - windowSize + 1, index + 1)
@@ -303,15 +557,221 @@ function buildMaData(points: KlinePoint[], windowSize: number): (number | null)[
   })
 }
 
+function buildOverlayMaData(points: (ComparePoint | null)[], windowSize: number): (number | null)[] {
+  return points.map((_point, index) => {
+    if (index < windowSize - 1) return null
+    const slice = points.slice(index - windowSize + 1, index + 1)
+    if (slice.some(point => !point)) return null
+    const total = slice.reduce((sum, item) => sum + (item?.close ?? 0), 0)
+    return Number((total / windowSize).toFixed(2))
+  })
+}
+
+function getOverlayPointColor(point: ComparePoint | null, index: number): string {
+  if (showLimitUpHighlight.value && point?.is_limit_up) return getOverlayLimitColor(index)
+  if (!point) return getOverlayBaseColor(index)
+  return point.close >= point.open ? KLINE_UP_COLOR : KLINE_DOWN_COLOR
+}
+
+function withAlpha(hexColor: string, alpha: number): string {
+  const normalized = hexColor.replace('#', '')
+  const value = normalized.length === 3
+    ? normalized.split('').map(char => char + char).join('')
+    : normalized
+  const r = Number.parseInt(value.slice(0, 2), 16)
+  const g = Number.parseInt(value.slice(2, 4), 16)
+  const b = Number.parseInt(value.slice(4, 6), 16)
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`
+}
+
+function getKlineChartHeightPx(overlayCount: number): number {
+  const priceChartCount = overlayCount + 1
+  const columnCount = getChartGridColumnCount(priceChartCount)
+  const priceRowCount = Math.ceil(priceChartCount / columnCount)
+  return GRID_TOP
+    + (MAIN_GRID_HEIGHT * priceRowCount)
+    + (GRID_GAP * Math.max(priceRowCount - 1, 0))
+    + GRID_GAP
+    + VOLUME_GRID_HEIGHT
+    + GRID_BOTTOM_SPACE
+}
+
+function getChartGridColumnCount(priceChartCount: number): number {
+  return priceChartCount > 2 ? 2 : 1
+}
+
+function buildGridLayout(categories: string[], overlayCount: number) {
+  const totalHeight = getKlineChartHeightPx(overlayCount)
+  const priceChartCount = overlayCount + 1
+  const columnCount = getChartGridColumnCount(priceChartCount)
+  const priceRowCount = Math.ceil(priceChartCount / columnCount)
+  const grids: any[] = []
+  const xAxis: any[] = []
+  const yAxis: any[] = []
+
+  const addGrid = (
+    topPx: number,
+    heightPx: number,
+    axisLabel = false,
+    yOptions: Record<string, unknown> = {},
+    gridOptions: Record<string, unknown> = {}
+  ) => {
+    const gridIndex = grids.length
+    grids.push({
+      left: 58,
+      right: 72,
+      top: topPx,
+      height: heightPx,
+      ...gridOptions
+    })
+    xAxis.push({
+      type: 'category',
+      data: categories,
+      gridIndex,
+      scale: true,
+      boundaryGap: true,
+      axisPointer: {
+        show: true,
+        snap: true,
+        triggerTooltip: true,
+        lineStyle: { color: '#64748b', width: 1, type: 'dashed' },
+        label: { show: false }
+      },
+      axisLabel: { show: axisLabel }
+    })
+    yAxis.push({
+      scale: true,
+      gridIndex,
+      ...yOptions
+    })
+    return gridIndex
+  }
+
+  const addPriceGrid = (slotIndex: number, yOptions: Record<string, unknown> = {}) => {
+    const row = Math.floor(slotIndex / columnCount)
+    const column = slotIndex % columnCount
+    const top = GRID_TOP + row * (MAIN_GRID_HEIGHT + GRID_GAP)
+    const gridOptions = columnCount === 1
+      ? {}
+      : column === 0
+        ? { right: '54%' }
+        : { left: '54%', right: 72 }
+
+    return addGrid(top, MAIN_GRID_HEIGHT, false, {
+      splitArea: { show: true },
+      position: columnCount === 2 && column === 1 ? 'right' : 'left',
+      axisLabel: { formatter: '{value}' },
+      splitLine: { show: true, lineStyle: { color: '#edf1f7' } },
+      ...yOptions
+    }, gridOptions)
+  }
+
+  const mainGridIndex = addPriceGrid(0)
+
+  const overlayGridIndexes: number[] = []
+  for (let i = 0; i < overlayCount; i += 1) {
+    overlayGridIndexes.push(addPriceGrid(i + 1))
+  }
+
+  const nextTop = GRID_TOP + priceRowCount * MAIN_GRID_HEIGHT + Math.max(priceRowCount - 1, 0) * GRID_GAP + GRID_GAP
+  const volumeGridIndex = addGrid(nextTop, VOLUME_GRID_HEIGHT, true, {
+    splitNumber: 2
+  })
+
+  return {
+    totalHeight,
+    grids,
+    xAxis,
+    yAxis,
+    mainGridIndex,
+    overlayGridIndexes,
+    volumeGridIndex,
+    xAxisIndexes: xAxis.map((_axis, index) => index)
+  }
+}
+
+function buildOverlayCandleData(points: (ComparePoint | null)[], index: number) {
+  return points.map(point => {
+    if (!point) {
+      return {
+        value: ['-', '-', '-', '-'],
+        itemStyle: { opacity: 0 }
+      }
+    }
+    const color = getOverlayPointColor(point, index)
+    const isLimit = showLimitUpHighlight.value && point.is_limit_up
+    return {
+      value: [
+        point.open,
+        point.close,
+        point.low,
+        point.high
+      ],
+      itemStyle: {
+        color,
+        color0: KLINE_DOWN_COLOR,
+        borderColor: color,
+        borderColor0: KLINE_DOWN_COLOR,
+        borderWidth: isLimit ? 2 : 1,
+        opacity: 1
+      }
+    }
+  })
+}
+
+function tooltipLine(label: string, value: string, color: string): string {
+  return `<div style="display:flex;gap:8px;align-items:center;white-space:nowrap;">
+    <span style="width:8px;height:8px;border-radius:999px;background:${color};display:inline-block;"></span>
+    <span style="min-width:70px;color:#64748b;">${label}</span>
+    <strong style="color:#111827;">${value}</strong>
+  </div>`
+}
+
+function formatNumber(value?: number | null): string {
+  if (value == null || Number.isNaN(value)) return '-'
+  return value.toFixed(2)
+}
+
+function resolveTooltipDataIndex(params: any, categories: string[]): number {
+  const rows = Array.isArray(params) ? params : [params]
+  const rowWithIndex = rows.find(row => Number.isInteger(row?.dataIndex))
+  if (rowWithIndex) return rowWithIndex.dataIndex
+
+  const axisValue = rows.find(row => row?.axisValue != null)?.axisValue
+  const axisIndex = categories.findIndex(item => String(item) === String(axisValue))
+  return axisIndex >= 0 ? axisIndex : 0
+}
+
+function buildLinkedAxisPointerOption(xAxisIndexes: number[]) {
+  return {
+    snap: true,
+    triggerTooltip: true,
+    link: [{ xAxisIndex: xAxisIndexes }]
+  }
+}
+
 function buildKlineOption() {
   const dates = klineData.value.map(item => item.date)
+  const visibleMaConfigs = getVisibleMaConfigs()
+  const overlayCharts = showOverlay.value
+    ? compareSeries.value.map((overlay, index) => {
+        const pointByDate = new Map(overlay.data.map(point => [point.date, point]))
+        return {
+          overlay,
+          index,
+          name: overlayLabels.value[overlay.symbol] || overlay.name || overlay.symbol,
+          points: dates.map(date => pointByDate.get(date) ?? null)
+        }
+      })
+    : []
+  const layout = buildGridLayout(dates, overlayCharts.length)
   const candleData = klineData.value.map(item => ({
     value: [item.open, item.close, item.low, item.high],
     itemStyle: {
       color: getLimitUpColor(item),
-      color0: '#1677ff',
+      color0: KLINE_DOWN_COLOR,
       borderColor: getLimitUpColor(item),
-      borderColor0: '#1677ff'
+      borderColor0: KLINE_DOWN_COLOR
     }
   }))
 
@@ -320,12 +780,12 @@ function buildKlineOption() {
       name: stockInfo.value.stock_name || stockCode.value,
       type: 'candlestick',
       data: candleData,
-      xAxisIndex: 0,
-      yAxisIndex: 0,
+      xAxisIndex: layout.mainGridIndex,
+      yAxisIndex: layout.mainGridIndex,
       markPoint: {
         symbol: 'pin',
         symbolSize: 42,
-        itemStyle: { color: '#8b000f' },
+        itemStyle: { color: KLINE_LIMIT_UP_COLOR },
         label: { formatter: '涨停', color: '#fff', fontSize: 10 },
         data: klineData.value
           .map((item, index) => ({ item, index }))
@@ -344,63 +804,117 @@ function buildKlineOption() {
         value: item.volume,
         itemStyle: { color: getLimitUpColor(item) }
       })),
-      xAxisIndex: 1,
-      yAxisIndex: 2
+      xAxisIndex: layout.volumeGridIndex,
+      yAxisIndex: layout.volumeGridIndex
     }
   ]
 
-  if (showMa.value) {
-    series.push({
-      name: 'MA5',
-      type: 'line',
-      data: buildMaData(klineData.value, 5),
-      smooth: true,
-      symbol: 'none',
-      xAxisIndex: 0,
-      yAxisIndex: 0,
-      lineStyle: { width: 1.5, color: '#7c3aed' }
-    })
-  }
-
-  if (showOverlay.value) {
-    compareSeries.value.forEach((overlay, index) => {
-      const pointByDate = new Map(overlay.data.map(point => [point.date, point.change_pct_from_start]))
+  if (visibleMaConfigs.length > 0) {
+    visibleMaConfigs.forEach(ma => {
       series.push({
-        name: overlay.name || overlay.symbol,
+        name: ma.name,
         type: 'line',
-        data: dates.map(date => pointByDate.get(date) ?? null),
+        data: buildMaData(klineData.value, ma.window),
         smooth: true,
         symbol: 'none',
-        xAxisIndex: 0,
-        yAxisIndex: 1,
-        lineStyle: {
-          width: 1.5,
-          color: ['#2563eb', '#f59e0b', '#059669'][index % 3]
-        }
+        xAxisIndex: layout.mainGridIndex,
+        yAxisIndex: layout.mainGridIndex,
+        z: 20,
+        lineStyle: { width: ma.width, color: ma.color }
       })
     })
   }
 
+  overlayCharts.forEach(({ index, name: overlayName, points }) => {
+    const baseColor = getOverlayBaseColor(index)
+    const overlayGridIndex = layout.overlayGridIndexes[index]
+    layout.yAxis[overlayGridIndex].name = overlayName
+    layout.yAxis[overlayGridIndex].nameTextStyle = { color: baseColor, fontWeight: 600 }
+
+    series.push({
+      name: `${overlayName}K`,
+      type: 'candlestick',
+      data: buildOverlayCandleData(points, index),
+      xAxisIndex: overlayGridIndex,
+      yAxisIndex: overlayGridIndex,
+      barMaxWidth: 16,
+      z: 14 + index,
+      itemStyle: {
+        color: KLINE_UP_COLOR,
+        color0: KLINE_DOWN_COLOR,
+        borderColor: KLINE_UP_COLOR,
+        borderColor0: KLINE_DOWN_COLOR
+      },
+      markPoint: {
+        symbol: 'pin',
+        symbolSize: 42,
+        itemStyle: { color: KLINE_LIMIT_UP_COLOR },
+        label: { formatter: '涨停', color: '#fff', fontSize: 10 },
+        data: points
+          .map((point, dataIndex) => ({ point, dataIndex }))
+          .filter(({ point }) => showLimitUpHighlight.value && Boolean(point?.is_limit_up))
+          .map(({ point, dataIndex }) => ({
+            name: '涨停',
+            coord: [dataIndex, point!.high],
+            value: point!.close
+          }))
+      }
+    })
+
+    if (visibleMaConfigs.length > 0) {
+      visibleMaConfigs.forEach(ma => {
+        series.push({
+          name: `${overlayName}${ma.name}`,
+          type: 'line',
+          data: buildOverlayMaData(points, ma.window),
+          smooth: true,
+          symbol: 'none',
+          connectNulls: false,
+          xAxisIndex: overlayGridIndex,
+          yAxisIndex: overlayGridIndex,
+          z: 20 + index,
+          lineStyle: { width: ma.width, color: ma.color, opacity: 0.9 }
+        })
+      })
+    }
+  })
+
   return {
     animation: false,
-    tooltip: { trigger: 'axis', axisPointer: { type: 'cross' } },
+    tooltip: {
+      trigger: 'axis',
+      triggerOn: 'mousemove|click',
+      axisPointer: { type: 'cross', snap: true },
+      confine: true,
+      enterable: false,
+      transitionDuration: 0,
+      position: [8, 8],
+      formatter: (params: any) => {
+        const dataIndex = resolveTooltipDataIndex(params, dates)
+        const date = dates[dataIndex] || ''
+        const main = klineData.value[dataIndex]
+        const html = [`<div style="font-size:12px;line-height:1.7;"><strong style="color:#111827;">${date}</strong>`]
+        if (main) {
+          html.push(tooltipLine(stockInfo.value.stock_name || stockCode.value, `开 ${formatNumber(main.open)} 高 ${formatNumber(main.high)} 低 ${formatNumber(main.low)} 收 ${formatNumber(main.close)}`, getLimitUpColor(main)))
+        }
+        overlayCharts.forEach(({ name, points, index }) => {
+          const point = points[dataIndex]
+          if (!point) return
+          const suffix = showLimitUpHighlight.value && point.is_limit_up ? ' 涨停' : ''
+          html.push(tooltipLine(name, `开 ${formatNumber(point.open)} 高 ${formatNumber(point.high)} 低 ${formatNumber(point.low)} 收 ${formatNumber(point.close)}${suffix}`, getOverlayPointColor(point, index)))
+        })
+        html.push('</div>')
+        return html.join('')
+      }
+    },
+    axisPointer: buildLinkedAxisPointerOption(layout.xAxisIndexes),
     legend: { show: false },
-    grid: [
-      { left: 56, right: 58, top: 42, height: '58%' },
-      { left: 56, right: 58, top: '76%', height: '14%' }
-    ],
-    xAxis: [
-      { type: 'category', data: dates, scale: true, boundaryGap: true, axisLabel: { show: false } },
-      { type: 'category', data: dates, gridIndex: 1, scale: true, boundaryGap: true }
-    ],
-    yAxis: [
-      { scale: true, splitArea: { show: true } },
-      { scale: true, position: 'right', axisLabel: { formatter: '{value}%' }, splitLine: { show: false } },
-      { scale: true, gridIndex: 1, splitNumber: 2 }
-    ],
+    grid: layout.grids,
+    xAxis: layout.xAxis,
+    yAxis: layout.yAxis,
     dataZoom: [
-      { type: 'inside', xAxisIndex: [0, 1], start: 55, end: 100 },
-      { type: 'slider', xAxisIndex: [0, 1], bottom: 8, height: 18, start: 55, end: 100 }
+      { type: 'inside', xAxisIndex: layout.xAxisIndexes, start: 64, end: 100 },
+      { type: 'slider', xAxisIndex: layout.xAxisIndexes, bottom: 8, height: 20, start: 64, end: 100 }
     ],
     series
   }
@@ -408,24 +922,56 @@ function buildKlineOption() {
 
 function buildTimelineOption() {
   const times = intradayData.value.map((item: any) => item.time)
+  const overlayCharts = showOverlay.value
+    ? overlayTimelineSeries.value.map((overlay, index) => {
+        const pointByTime = new Map(overlay.data.map((point: any) => [point.time, point]))
+        return {
+          ...overlay,
+          index,
+          points: times.map(time => pointByTime.get(time) ?? null)
+        }
+      })
+    : []
+  const layout = buildGridLayout(times, overlayCharts.length)
+  overlayCharts.forEach(overlay => {
+    const gridIndex = layout.overlayGridIndexes[overlay.index]
+    layout.yAxis[gridIndex].name = overlay.name
+  })
+
   return {
     animation: false,
-    tooltip: { trigger: 'axis', axisPointer: { type: 'cross' } },
-    grid: [
-      { left: 56, right: 24, top: 32, height: '58%' },
-      { left: 56, right: 24, top: '76%', height: '14%' }
-    ],
-    xAxis: [
-      { type: 'category', data: times, axisLabel: { show: false } },
-      { type: 'category', data: times, gridIndex: 1 }
-    ],
-    yAxis: [
-      { scale: true },
-      { scale: true, gridIndex: 1, splitNumber: 2 }
-    ],
+    tooltip: {
+      trigger: 'axis',
+      triggerOn: 'mousemove|click',
+      axisPointer: { type: 'cross', snap: true },
+      confine: true,
+      enterable: false,
+      transitionDuration: 0,
+      position: [8, 8],
+      formatter: (params: any) => {
+        const dataIndex = resolveTooltipDataIndex(params, times)
+        const time = times[dataIndex] || ''
+        const main = intradayData.value[dataIndex]
+        const html = [`<div style="font-size:12px;line-height:1.7;"><strong style="color:#111827;">${time}</strong>`]
+        if (main) {
+          html.push(tooltipLine(stockInfo.value.stock_name || stockCode.value, formatNumber(main.price), KLINE_UP_COLOR))
+        }
+        overlayCharts.forEach(overlay => {
+          const point = overlay.points[dataIndex]
+          if (!point) return
+          html.push(tooltipLine(overlay.name, formatNumber(point.price), getOverlayBaseColor(overlay.index)))
+        })
+        html.push('</div>')
+        return html.join('')
+      }
+    },
+    axisPointer: buildLinkedAxisPointerOption(layout.xAxisIndexes),
+    grid: layout.grids,
+    xAxis: layout.xAxis,
+    yAxis: layout.yAxis,
     dataZoom: [
-      { type: 'inside', xAxisIndex: [0, 1], start: 0, end: 100 },
-      { type: 'slider', xAxisIndex: [0, 1], bottom: 8, height: 18, start: 0, end: 100 }
+      { type: 'inside', xAxisIndex: layout.xAxisIndexes, start: 0, end: 100 },
+      { type: 'slider', xAxisIndex: layout.xAxisIndexes, bottom: 8, height: 20, start: 0, end: 100 }
     ],
     series: [
       {
@@ -434,17 +980,28 @@ function buildTimelineOption() {
         data: intradayData.value.map((item: any) => item.price),
         smooth: true,
         symbol: 'none',
-        xAxisIndex: 0,
-        yAxisIndex: 0,
-        lineStyle: { color: '#d82135' },
-        areaStyle: { color: 'rgba(216, 33, 53, 0.08)' }
+        xAxisIndex: layout.mainGridIndex,
+        yAxisIndex: layout.mainGridIndex,
+        lineStyle: { color: KLINE_UP_COLOR },
+        areaStyle: { color: 'rgba(239, 35, 42, 0.08)' }
       },
+      ...overlayCharts.map(overlay => ({
+        name: overlay.name,
+        type: 'line',
+        data: overlay.points.map((point: any) => point?.price ?? null),
+        smooth: true,
+        symbol: 'none',
+        xAxisIndex: layout.overlayGridIndexes[overlay.index],
+        yAxisIndex: layout.overlayGridIndexes[overlay.index],
+        lineStyle: { width: 1.6, color: getOverlayBaseColor(overlay.index) },
+        areaStyle: { color: withAlpha(getOverlayBaseColor(overlay.index), 0.08) }
+      })),
       {
         name: '成交量',
         type: 'bar',
         data: intradayData.value.map((item: any) => item.volume),
-        xAxisIndex: 1,
-        yAxisIndex: 1,
+        xAxisIndex: layout.volumeGridIndex,
+        yAxisIndex: layout.volumeGridIndex,
         itemStyle: { color: '#64748b' }
       }
     ]
@@ -552,7 +1109,7 @@ watch(stockCode, async () => {
 
 <style lang="scss" scoped>
 .stock-detail {
-  --chart-container-height: 460px;
+  --chart-container-height: 620px;
 
   display: flex;
   flex-direction: column;
@@ -612,7 +1169,7 @@ watch(stockCode, async () => {
     font-size: 30px;
     line-height: 1;
     font-weight: 800;
-    color: #d82135;
+    color: #ef232a;
   }
 
   .summary-item {
@@ -682,9 +1239,78 @@ watch(stockCode, async () => {
     display: inline-block;
   }
 
-  .stock { background: #d82135; }
-  .index { background: #2563eb; }
+  .stock { background: #ef232a; }
   .ma { background: #7c3aed; }
+}
+
+.ma-toggle {
+  --ma-color: #7c3aed;
+
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: #94a3b8;
+  font: inherit;
+  line-height: 1.4;
+  padding: 2px 4px;
+  cursor: pointer;
+
+  .legend {
+    opacity: 0.35;
+  }
+
+  &.active {
+    border-color: color-mix(in srgb, var(--ma-color) 30%, transparent);
+    background: color-mix(in srgb, var(--ma-color) 8%, #fff);
+    color: #334155;
+
+    .legend {
+      opacity: 1;
+    }
+  }
+}
+
+.overlay-manager {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 8px 14px 0;
+}
+
+.overlay-input {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+
+  .el-autocomplete {
+    width: 220px;
+  }
+}
+
+.overlay-tags {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+
+  :deep(.el-tag) {
+    border-color: color-mix(in srgb, var(--overlay-color) 36%, #fff);
+    background: color-mix(in srgb, var(--overlay-color) 10%, #fff);
+    color: var(--overlay-color);
+  }
+
+  :deep(.el-tag::before) {
+    content: '';
+    width: 14px;
+    height: 3px;
+    margin-right: 5px;
+    border-radius: 999px;
+    background: linear-gradient(90deg, var(--overlay-color), var(--overlay-limit-color));
+  }
 }
 
 .chart-container {
@@ -713,8 +1339,8 @@ watch(stockCode, async () => {
     text-align: right;
   }
 
-  .up { color: #d82135; }
-  .down { color: #1677ff; }
+  .up { color: #ef232a; }
+  .down { color: #14a058; }
 }
 
 .current-row {
@@ -725,7 +1351,7 @@ watch(stockCode, async () => {
   padding: 10px;
   border-radius: 6px;
   background: #fff1f0;
-  color: #d82135;
+  color: #ef232a;
   font-weight: 700;
 }
 
@@ -750,11 +1376,11 @@ watch(stockCode, async () => {
   font-size: 13px;
 
   &.buy strong {
-    color: #d82135;
+    color: #ef232a;
   }
 
   &.sell strong {
-    color: #1677ff;
+    color: #14a058;
   }
 }
 
@@ -797,7 +1423,7 @@ watch(stockCode, async () => {
     background: #fff7f7;
 
     strong {
-      color: #d82135;
+      color: #ef232a;
     }
   }
 
@@ -864,7 +1490,7 @@ watch(stockCode, async () => {
 
 @media (max-width: 720px) {
   .stock-detail {
-    --chart-container-height: 360px;
+    --chart-container-height: 480px;
   }
 
   .timeline-grid,

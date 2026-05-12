@@ -1,5 +1,5 @@
 import axios from 'axios'
-import type { OrderBook, BigOrder, FundFlow, KlineResponse, CompareSeries } from '@/types/market'
+import type { OrderBook, BigOrder, FundFlow, KlineResponse, CompareSeries, StockSearchItem } from '@/types/market'
 
 const api = axios.create({
   baseURL: '/api/v1',
@@ -60,6 +60,13 @@ export async function getCompareSeries(params: {
       period: params.period || 'day',
       limit: params.limit || 250
     }
+  })
+  return data
+}
+
+export async function searchStocks(q: string, limit = 10): Promise<StockSearchItem[]> {
+  const { data } = await api.get('/market/search', {
+    params: { q, limit }
   })
   return data
 }

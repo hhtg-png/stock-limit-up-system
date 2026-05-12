@@ -84,7 +84,17 @@ class KlineResponse(BaseModel):
 class ComparePointResponse(BaseModel):
     """叠加走势点位"""
     date: date
+    open: float
+    close: float
+    low: float
+    high: float
+    volume: int = 0
     change_pct_from_start: float
+    open_pct_from_start: float
+    close_pct_from_start: float
+    low_pct_from_start: float
+    high_pct_from_start: float
+    is_limit_up: bool = False
 
 
 class CompareSeriesResponse(BaseModel):
@@ -92,6 +102,17 @@ class CompareSeriesResponse(BaseModel):
     symbol: str
     name: str
     data: List[ComparePointResponse] = Field(default_factory=list)
+
+
+class StockSearchItemResponse(BaseModel):
+    """标的搜索结果"""
+    stock_code: str
+    stock_name: str
+    market: str
+    symbol: str
+    pinyin: str = ""
+    classify: str = ""
+    security_type: str = ""
 
 
 PERIOD_TO_KLT = {
@@ -102,6 +123,8 @@ PERIOD_TO_KLT = {
 MAX_COMPARE_SYMBOLS = 5
 EASTMONEY_KLINE_URL = "http://push2his.eastmoney.com/api/qt/stock/kline/get"
 EASTMONEY_DETAILS_URL = "http://push2.eastmoney.com/api/qt/stock/details/get"
+EASTMONEY_SEARCH_URL = "https://searchapi.eastmoney.com/api/suggest/get"
+EASTMONEY_SEARCH_TOKEN = "D43BF722C8E33E6D9237BAE1524BBE7E"
 SINA_KLINE_URL = "https://quotes.sina.cn/cn/api/jsonp.php/var%20_=/CN_MarketDataService.getKLineData"
 
 
@@ -150,6 +173,81 @@ def _normalize_symbol(symbol: str) -> tuple[str, str, str]:
 
     prefix = _eastmoney_market_prefix(market)
     return code, market, f"{prefix}.{code}"
+
+
+def _normalize_search_query(query: str) -> tuple[str, Optional[str]]:
+    normalized = query.strip().upper().replace(" ", "")
+    if "." not in normalized:
+        return normalized, None
+
+    code, market = normalized.split(".", 1)
+    if market == "BSE":
+        market = "BJ"
+    return code, market
+
+
+def _market_from_search_item(item: dict) -> str:
+    quote_id = str(item.get("QuoteID") or "")
+    code = str(item.get("Code") or item.get("UnifiedCode") or "")
+    security_type = str(item.get("SecurityTypeName") or "")
+
+    if "." in quote_id:
+        prefix, quote_code = quote_id.split(".", 1)
+        code = quote_code or code
+        if prefix == "1":
+            return "SH"
+
+    if code.startswith(("4", "8", "920")) or "北" in security_type or "京" in security_type:
+        return "BJ"
+    return "SZ"
+
+
+def _format_search_item(item: dict) -> Optional[dict]:
+    classify = str(item.get("Classify") or "")
+    if classify not in {"AStock", "Index"}:
+        return None
+
+    code = str(item.get("Code") or item.get("UnifiedCode") or "").strip().upper()
+    name = str(item.get("Name") or "").strip()
+    if not code or not name:
+        return None
+
+    market = _market_from_search_item(item)
+    return {
+        "stock_code": code,
+        "stock_name": name,
+        "market": market,
+        "symbol": f"{code}.{market}",
+        "pinyin": str(item.get("PinYin") or "").strip().upper(),
+        "classify": classify,
+        "security_type": str(item.get("SecurityTypeName") or "").strip(),
+    }
+
+
+def _parse_search_results(
+    payload: dict,
+    requested_market: Optional[str] = None,
+    requested_code: Optional[str] = None,
+    limit: int = 10,
+) -> List[dict]:
+    rows = (payload.get("QuotationCodeTable") or {}).get("Data") or []
+    results = []
+    seen = set()
+    for item in rows:
+        formatted = _format_search_item(item)
+        if not formatted:
+            continue
+        if requested_code and formatted["stock_code"] != requested_code:
+            continue
+        if requested_market and formatted["market"] != requested_market:
+            continue
+        if formatted["symbol"] in seen:
+            continue
+        seen.add(formatted["symbol"])
+        results.append(formatted)
+        if len(results) >= limit:
+            break
+    return results
 
 
 def _format_kline_item(
@@ -397,17 +495,77 @@ def _build_compare_series(symbol: str, name: str, points: List[dict]) -> dict:
         return {"symbol": symbol, "name": name, "data": []}
 
     base_close = float(valid_points[0]["close"])
+
+    def pct(point: dict, field: str) -> float:
+        value = point.get(field, point["close"])
+        return round((float(value) - base_close) / base_close * 100, 2)
+
     return {
         "symbol": symbol,
         "name": name,
         "data": [
             {
                 "date": point["date"],
-                "change_pct_from_start": round((float(point["close"]) - base_close) / base_close * 100, 2),
+                "open": float(point.get("open", point["close"])),
+                "close": float(point["close"]),
+                "low": float(point.get("low", point["close"])),
+                "high": float(point.get("high", point["close"])),
+                "volume": int(float(point.get("volume", 0) or 0)),
+                "change_pct_from_start": pct(point, "close"),
+                "open_pct_from_start": pct(point, "open"),
+                "close_pct_from_start": pct(point, "close"),
+                "low_pct_from_start": pct(point, "low"),
+                "high_pct_from_start": pct(point, "high"),
+                "is_limit_up": bool(point.get("is_limit_up")),
             }
             for point in valid_points
         ],
     }
+
+
+@router.get("/search", response_model=List[StockSearchItemResponse], summary="搜索可叠加标的")
+async def search_symbols(
+    q: str = Query(..., min_length=1, description="代码、拼音缩写或中文关键字"),
+    limit: int = Query(10, ge=1, le=20),
+):
+    """从东方财富搜索标的，支持代码、拼音缩写和中文关键字。"""
+    query, requested_market = _normalize_search_query(q)
+    if not query:
+        return []
+
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            resp = await client.get(
+                EASTMONEY_SEARCH_URL,
+                headers={"User-Agent": "Mozilla/5.0"},
+                params={
+                    "input": query,
+                    "type": "14",
+                    "count": max(limit * 2, 10),
+                    "token": EASTMONEY_SEARCH_TOKEN,
+                },
+            )
+            payload = resp.json()
+    except Exception as exc:
+        logger.warning(f"从东方财富搜索标的失败 {q}: {exc}")
+        payload = {}
+
+    requested_code = query if re.fullmatch(r"\d{6}", query) else None
+    results = _parse_search_results(payload, requested_market, requested_code, limit)
+    if not results and requested_market and re.fullmatch(r"\d{6}", query):
+        results = [
+            {
+                "stock_code": query,
+                "stock_name": f"{query}.{requested_market}",
+                "market": requested_market,
+                "symbol": f"{query}.{requested_market}",
+                "pinyin": "",
+                "classify": "Direct",
+                "security_type": "",
+            }
+        ]
+
+    return [StockSearchItemResponse(**item) for item in results[:limit]]
 
 
 @router.get("/{stock_code}/orderbook", response_model=OrderBookResponse, summary="获取五档盘口")
@@ -686,7 +844,8 @@ async def get_timeline_data(
     stock = stock_result.scalar_one_or_none()
     
     if not stock:
-        raise HTTPException(status_code=404, detail="股票不存在")
+        code, market, _secid = _normalize_symbol(stock_code)
+        return await _fetch_timeline_from_em(code, market, trade_date)
     
     # 先查本地数据库（L2盘口快照）
     snapshots_query = (
@@ -732,18 +891,25 @@ async def get_kline_data(
     stock_result = await db.execute(stock_query)
     stock = stock_result.scalar_one_or_none()
 
-    if not stock:
-        raise HTTPException(status_code=404, detail="股票不存在")
+    if stock:
+        code = stock_code
+        market = stock.market
+        stock_name = getattr(stock, "stock_name", None)
+        is_st = getattr(stock, "is_st", None)
+    else:
+        code, market, _secid = _normalize_symbol(stock_code)
+        stock_name = None
+        is_st = None
 
     points = await _fetch_kline_from_em(
-        stock_code,
-        stock.market,
+        code,
+        market,
         period,
         limit,
-        stock_name=getattr(stock, "stock_name", None),
-        is_st=getattr(stock, "is_st", None),
+        stock_name=stock_name,
+        is_st=is_st,
     )
-    return KlineResponse(stock_code=stock_code, period=period, data=points)
+    return KlineResponse(stock_code=code, period=period, data=points)
 
 
 @router.get("/compare", response_model=List[CompareSeriesResponse], summary="获取叠加走势")
@@ -769,7 +935,7 @@ async def get_compare_data(
 
 async def _fetch_timeline_from_em(stock_code: str, market: str, trade_date: date):
     """从东方财富获取分时数据"""
-    prefix = "0" if market == "SZ" else "1"
+    prefix = _eastmoney_market_prefix(market)
     url = "https://push2.eastmoney.com/api/qt/stock/trends2/get"
     params = {
         "secid": f"{prefix}.{stock_code}",

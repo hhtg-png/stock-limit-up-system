@@ -134,11 +134,31 @@ export interface KlineResponse {
 
 export interface ComparePoint {
   date: string
+  open: number
+  close: number
+  low: number
+  high: number
+  volume: number
   change_pct_from_start: number
+  open_pct_from_start: number
+  close_pct_from_start: number
+  low_pct_from_start: number
+  high_pct_from_start: number
+  is_limit_up: boolean
 }
 
 export interface CompareSeries {
   symbol: string
   name: string
   data: ComparePoint[]
+}
+
+export interface StockSearchItem {
+  stock_code: string
+  stock_name: string
+  market: string
+  symbol: string
+  pinyin: string
+  classify: string
+  security_type: string
 }

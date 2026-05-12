@@ -109,6 +109,57 @@ class CapturingAsyncClient:
         return EmptyKlinesResponse()
 
 
+class SuggestResponse:
+    def json(self):
+        return {
+            "QuotationCodeTable": {
+                "Data": [
+                    {
+                        "Code": "601318",
+                        "Name": "中国平安",
+                        "PinYin": "ZGPA",
+                        "Classify": "AStock",
+                        "SecurityTypeName": "沪A",
+                        "QuoteID": "1.601318",
+                    },
+                    {
+                        "Code": "000001",
+                        "Name": "上证指数",
+                        "PinYin": "SZZS",
+                        "Classify": "Index",
+                        "SecurityTypeName": "指数",
+                        "QuoteID": "1.000001",
+                    },
+                    {
+                        "Code": "000001",
+                        "Name": "华夏成长混合",
+                        "PinYin": "HXCZHH",
+                        "Classify": "OTCFUND",
+                        "SecurityTypeName": "基金",
+                        "QuoteID": "150.000001",
+                    },
+                ]
+            }
+        }
+
+
+class SuggestAsyncClient:
+    params = None
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def get(self, *args, **kwargs):
+        SuggestAsyncClient.params = kwargs["params"]
+        return SuggestResponse()
+
+
 class MarketKlineApiTests(unittest.IsolatedAsyncioTestCase):
     def test_format_kline_item_marks_main_board_limit_up(self):
         raw = "2026-05-12,96.10,103.42,103.42,95.60,560000,1820000000,8.20,10.00,9.40,17.42"
@@ -174,18 +225,65 @@ class MarketKlineApiTests(unittest.IsolatedAsyncioTestCase):
 
     def test_build_compare_series_normalizes_from_first_close(self):
         points = [
-            {"date": date(2026, 5, 10), "close": 10.0},
-            {"date": date(2026, 5, 11), "close": 11.0},
-            {"date": date(2026, 5, 12), "close": 9.5},
+            {"date": date(2026, 5, 10), "close": 10.0, "is_limit_up": False},
+            {"date": date(2026, 5, 11), "close": 11.0, "is_limit_up": True},
+            {"date": date(2026, 5, 12), "close": 9.5, "is_limit_up": False},
         ]
 
         series = market._build_compare_series("603893", "瑞芯微", points)
 
         self.assertEqual(series["symbol"], "603893")
         self.assertEqual(series["name"], "瑞芯微")
+        self.assertEqual(series["data"][0]["open"], 10.0)
+        self.assertEqual(series["data"][0]["close"], 10.0)
+        self.assertEqual(series["data"][0]["low"], 10.0)
+        self.assertEqual(series["data"][0]["high"], 10.0)
         self.assertEqual(series["data"][0]["change_pct_from_start"], 0.0)
+        self.assertEqual(series["data"][0]["open_pct_from_start"], 0.0)
+        self.assertEqual(series["data"][0]["close_pct_from_start"], 0.0)
+        self.assertEqual(series["data"][0]["low_pct_from_start"], 0.0)
+        self.assertEqual(series["data"][0]["high_pct_from_start"], 0.0)
         self.assertEqual(series["data"][1]["change_pct_from_start"], 10.0)
+        self.assertTrue(series["data"][1]["is_limit_up"])
         self.assertEqual(series["data"][2]["change_pct_from_start"], -5.0)
+        self.assertFalse(series["data"][2]["is_limit_up"])
+
+    def test_build_compare_series_normalizes_ohlc_from_first_close(self):
+        points = [
+            {"date": date(2026, 5, 10), "open": 9.8, "close": 10.0, "low": 9.7, "high": 10.3},
+            {"date": date(2026, 5, 11), "open": 10.0, "close": 11.0, "low": 9.9, "high": 11.0, "is_limit_up": True},
+        ]
+
+        series = market._build_compare_series("000858", "五粮液", points)
+
+        self.assertEqual(series["data"][0]["open"], 9.8)
+        self.assertEqual(series["data"][0]["close"], 10.0)
+        self.assertEqual(series["data"][0]["low"], 9.7)
+        self.assertEqual(series["data"][0]["high"], 10.3)
+        self.assertEqual(series["data"][0]["open_pct_from_start"], -2.0)
+        self.assertEqual(series["data"][0]["close_pct_from_start"], 0.0)
+        self.assertEqual(series["data"][0]["low_pct_from_start"], -3.0)
+        self.assertEqual(series["data"][0]["high_pct_from_start"], 3.0)
+        self.assertEqual(series["data"][1]["open_pct_from_start"], 0.0)
+        self.assertEqual(series["data"][1]["close_pct_from_start"], 10.0)
+        self.assertEqual(series["data"][1]["low_pct_from_start"], -1.0)
+        self.assertEqual(series["data"][1]["high_pct_from_start"], 10.0)
+        self.assertTrue(series["data"][1]["is_limit_up"])
+
+    async def test_search_symbols_supports_pinyin_name_and_market_suffix(self):
+        SuggestAsyncClient.params = None
+
+        with patch.object(market.httpx, "AsyncClient", SuggestAsyncClient):
+            pinyin_results = await market.search_symbols("zgpa", 10)
+            name_results = await market.search_symbols("中国平安", 10)
+            suffix_results = await market.search_symbols("000001.SH", 10)
+
+        self.assertEqual(SuggestAsyncClient.params["input"], "000001")
+        self.assertEqual(pinyin_results[0].symbol, "601318.SH")
+        self.assertEqual(name_results[0].stock_name, "中国平安")
+        self.assertEqual(suffix_results[0].symbol, "000001.SH")
+        self.assertEqual(suffix_results[0].stock_name, "上证指数")
+        self.assertNotIn("OTCFUND", [item.classify for item in pinyin_results])
 
     async def test_get_compare_data_fetches_each_symbol(self):
         with patch.object(
@@ -256,6 +354,44 @@ class MarketKlineApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.period, "day")
         self.assertEqual(response.data[0].close, 103.42)
         self.assertTrue(response.data[0].is_limit_up)
+
+    async def test_get_kline_data_falls_back_to_inferred_market_without_local_stock(self):
+        fake_db = FakeSession(None)
+        fetched = [
+            {
+                "date": date(2026, 5, 12),
+                "open": 10.0,
+                "close": 11.0,
+                "high": 11.0,
+                "low": 10.0,
+                "volume": 1000,
+                "amount": 1100000,
+                "change_pct": 10.0,
+                "is_limit_up": True,
+            }
+        ]
+
+        with patch.object(market, "_fetch_kline_from_em", AsyncMock(return_value=fetched)) as fetcher:
+            response = await market.get_kline_data("603311", "day", 250, fake_db)
+
+        fetcher.assert_awaited_once_with("603311", "SH", "day", 250, stock_name=None, is_st=None)
+        self.assertEqual(response.stock_code, "603311")
+        self.assertEqual(response.data[0].close, 11.0)
+
+    async def test_get_timeline_data_falls_back_to_inferred_market_without_local_stock(self):
+        fake_db = FakeSession(None)
+        fetched = {
+            "stock_code": "603311",
+            "trade_date": "2026-05-12",
+            "data": [{"time": "09:30:00", "price": 10.0, "volume": 1000}],
+        }
+
+        with patch.object(market, "_fetch_timeline_from_em", AsyncMock(return_value=fetched)) as fetcher:
+            response = await market.get_timeline_data("603311", date(2026, 5, 12), fake_db)
+
+        fetcher.assert_awaited_once_with("603311", "SH", date(2026, 5, 12))
+        self.assertEqual(response["stock_code"], "603311")
+        self.assertEqual(response["data"][0]["price"], 10.0)
 
     async def test_fetch_kline_from_em_raises_bad_gateway_on_upstream_failure(self):
         with patch.object(market.httpx, "AsyncClient", FailingAsyncClient):
