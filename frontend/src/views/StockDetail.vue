@@ -590,6 +590,10 @@ watch(stockCode, async () => {
     }
   }
 
+  .chart-container {
+    height: 460px;
+  }
+
   .chart-card {
     .chart-container {
       height: 300px;
