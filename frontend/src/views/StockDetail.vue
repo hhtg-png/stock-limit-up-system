@@ -1,151 +1,130 @@
 <template>
   <div class="stock-detail" v-loading="loading">
-    <!-- 股票头部信息 -->
-    <div class="stock-header card">
-      <div class="basic-info">
-        <h2>{{ stockInfo.stock_name }} <span class="code">{{ stockCode }}</span></h2>
-        <div class="tags">
-          <el-tag v-if="(stockInfo.continuous_limit_up_days ?? 0) > 1" type="info" size="small">
+    <section class="stock-hero">
+      <div class="stock-title-block">
+        <div class="stock-name-row">
+          <h2>{{ stockInfo.stock_name || stockCode }}</h2>
+          <span class="stock-code">{{ stockCode }}</span>
+          <el-tag v-if="stockInfo.market" size="small">{{ stockInfo.market }}</el-tag>
+        </div>
+        <div class="status-tags">
+          <el-tag v-if="stockInfo.continuous_limit_up_days && stockInfo.continuous_limit_up_days > 1" type="danger" size="small">
             {{ stockInfo.continuous_limit_up_days }}连板
           </el-tag>
-          <el-tag :type="stockInfo.is_final_sealed ? 'info' : 'warning'" size="small">
-            {{ stockInfo.is_final_sealed ? '封板' : '开板' }}
+          <el-tag :type="stockInfo.is_final_sealed ? 'danger' : 'warning'" size="small">
+            {{ stockInfo.is_final_sealed ? '涨停封板' : '开板' }}
           </el-tag>
-          <el-tag v-if="stockInfo.reason_category" size="small">{{ stockInfo.reason_category }}</el-tag>
-          <el-tag v-if="stockInfo.market" type="info" size="small">{{ stockInfo.market }}</el-tag>
+          <el-tag v-if="stockInfo.reason_category" type="success" size="small">{{ stockInfo.reason_category }}</el-tag>
+          <el-tag v-if="stockInfo.first_limit_up_time" size="small">首封 {{ stockInfo.first_limit_up_time }}</el-tag>
+          <el-tag size="small">开板 {{ stockInfo.open_count ?? 0 }} 次</el-tag>
         </div>
       </div>
-      <div class="price-info">
-        <div class="current-price">{{ stockInfo.limit_up_price?.toFixed(2) }}</div>
+
+      <div class="price-summary">
+        <div class="price-main">{{ formatPrice(stockInfo.current_price || stockInfo.limit_up_price) }}</div>
+        <div class="summary-item"><span>涨停价</span><strong>{{ formatPrice(stockInfo.limit_up_price) }}</strong></div>
+        <div class="summary-item"><span>封单</span><strong>{{ formatWanAmount(stockInfo.seal_amount) }}</strong></div>
+        <div class="summary-item"><span>换手</span><strong>{{ formatTurnoverRate(stockInfo.turnover_rate) }}</strong></div>
       </div>
-      <div class="action-btns">
-        <el-button :icon="Star" @click="toggleWatch">
-          {{ isWatched ? '取消关注' : '加入自选' }}
-        </el-button>
+
+      <el-button :icon="Star" @click="toggleWatch">
+        {{ isWatched ? '取消关注' : '加入自选' }}
+      </el-button>
+    </section>
+
+    <section class="detail-workbench">
+      <div class="chart-panel">
+        <div class="panel-header">
+          <h3>K线与叠加走势</h3>
+          <div class="chart-actions">
+            <el-button-group>
+              <el-button :type="activePeriod === 'timeline' ? 'primary' : 'default'" size="small" @click="setPeriod('timeline')">分时</el-button>
+              <el-button :type="activePeriod === 'day' ? 'primary' : 'default'" size="small" @click="setPeriod('day')">日K</el-button>
+              <el-button :type="activePeriod === 'week' ? 'primary' : 'default'" size="small" @click="setPeriod('week')">周K</el-button>
+              <el-button :type="activePeriod === 'month' ? 'primary' : 'default'" size="small" @click="setPeriod('month')">月K</el-button>
+            </el-button-group>
+            <el-button size="small" :type="showLimitUpHighlight ? 'danger' : 'default'" @click="toggleLimitUpHighlight">涨停变色</el-button>
+            <el-button size="small" :type="showOverlay ? 'primary' : 'default'" @click="toggleOverlay">叠加指数</el-button>
+            <el-button size="small" :icon="Plus" @click="zoomChart(8)" />
+            <el-button size="small" :icon="Minus" @click="zoomChart(-8)" />
+            <el-button size="small" :icon="Refresh" @click="fetchChartData" />
+          </div>
+        </div>
+        <div class="chart-meta">
+          <span class="legend stock"></span>{{ stockInfo.stock_name || stockCode }}
+          <span v-if="showOverlay" class="legend index"></span><span v-if="showOverlay">叠加走势</span>
+          <span v-if="showMa" class="legend ma"></span><span v-if="showMa">MA5</span>
+        </div>
+        <div ref="chartRef" v-loading="chartLoading" class="chart-container"></div>
       </div>
-    </div>
 
-    <!-- 核心数据 -->
-    <div class="card detail-card">
-      <el-descriptions :column="3" border size="default">
-        <el-descriptions-item label="首封时间">
-          <span class="highlight-value">{{ stockInfo.first_limit_up_time || '-' }}</span>
-        </el-descriptions-item>
-        <el-descriptions-item label="最终回封">
-          <span class="highlight-value">{{ stockInfo.final_seal_time || '-' }}</span>
-        </el-descriptions-item>
-        <el-descriptions-item label="连板天数">
-          <el-tag v-if="(stockInfo.continuous_limit_up_days ?? 0) > 1" type="danger" size="small">
-            {{ stockInfo.continuous_limit_up_days }}板
-          </el-tag>
-          <span v-else>首板</span>
-        </el-descriptions-item>
-        <el-descriptions-item label="涨停价">{{ stockInfo.limit_up_price?.toFixed(2) || '-' }}</el-descriptions-item>
-        <el-descriptions-item label="封单">{{ formatWanAmount(stockInfo.seal_amount) }}</el-descriptions-item>
-        <el-descriptions-item label="开板次数">{{ stockInfo.open_count ?? '-' }}</el-descriptions-item>
-        <el-descriptions-item label="换手率">{{ formatTurnoverRate(stockInfo.turnover_rate) }}</el-descriptions-item>
-        <el-descriptions-item label="成交额">{{ formatWanAmount(stockInfo.amount) }}</el-descriptions-item>
-        <el-descriptions-item label="行业">{{ stockInfo.industry || '-' }}</el-descriptions-item>
-        <el-descriptions-item label="涨停原因" :span="3">{{ stockInfo.limit_up_reason || '-' }}</el-descriptions-item>
-      </el-descriptions>
-    </div>
-
-    <el-row :gutter="16">
-      <!-- 左侧：K线图和时间轴 -->
-      <el-col :span="16">
-        <!-- K线图 -->
-        <div class="card chart-card">
-          <div class="card-header">
-            <h3>分时走势</h3>
-          </div>
-          <div ref="chartRef" class="chart-container"></div>
-        </div>
-
-        <!-- 涨停时间轴 -->
-        <div class="card timeline-card">
-          <div class="card-header">
-            <h3>涨停时间轴</h3>
-          </div>
-          <el-timeline>
-            <el-timeline-item
-              v-for="item in timelineData"
-              :key="item.change_time"
-              :type="getTimelineType(item.status)"
-              :timestamp="item.change_time"
-              placement="top"
-            >
-              <div class="timeline-content">
-                <span class="status">{{ getStatusText(item.status) }}</span>
-                <span v-if="item.price" class="price">{{ item.price.toFixed(2) }}</span>
-                <span v-if="item.seal_amount" class="seal">封单 {{ item.seal_amount.toFixed(0) }}万</span>
-              </div>
-            </el-timeline-item>
-          </el-timeline>
-        </div>
-      </el-col>
-
-      <!-- 右侧：盘口和大单 -->
-      <el-col :span="8">
-        <!-- 五档盘口 -->
-        <div class="card orderbook-card">
-          <div class="card-header">
-            <h3>五档盘口</h3>
-          </div>
+      <aside class="side-panels">
+        <div class="side-card">
+          <div class="panel-header compact"><h3>盘口</h3></div>
           <div class="orderbook">
-            <div class="asks">
-              <div v-for="i in 5" :key="'ask' + i" class="order-row ask">
-                <span class="label">卖{{ 6 - i }}</span>
-                <span class="price">{{ orderBook.ask_prices?.[5 - i]?.toFixed(2) || '-' }}</span>
-                <span class="volume">{{ orderBook.ask_volumes?.[5 - i] || '-' }}</span>
-              </div>
+            <div v-for="i in 3" :key="'ask' + i" class="book-row">
+              <span>卖{{ 4 - i }}</span>
+              <strong class="down">{{ formatPrice(orderBook.ask_prices?.[3 - i]) }}</strong>
+              <span>{{ orderBook.ask_volumes?.[3 - i] || '-' }}</span>
             </div>
-            <div class="current">
-              <span class="label">当前</span>
-              <span class="price text-up">{{ orderBook.current_price?.toFixed(2) || '-' }}</span>
+            <div class="current-row">
+              <span>当前涨停价</span>
+              <strong>{{ formatPrice(orderBook.current_price || stockInfo.limit_up_price) }}</strong>
             </div>
-            <div class="bids">
-              <div v-for="i in 5" :key="'bid' + i" class="order-row bid">
-                <span class="label">买{{ i }}</span>
-                <span class="price">{{ orderBook.bid_prices?.[i - 1]?.toFixed(2) || '-' }}</span>
-                <span class="volume">{{ orderBook.bid_volumes?.[i - 1] || '-' }}</span>
-              </div>
+            <div v-for="i in 3" :key="'bid' + i" class="book-row">
+              <span>买{{ i }}</span>
+              <strong class="up">{{ formatPrice(orderBook.bid_prices?.[i - 1]) }}</strong>
+              <span>{{ orderBook.bid_volumes?.[i - 1] || '-' }}</span>
             </div>
           </div>
         </div>
 
-        <!-- 大单列表 -->
-        <div class="card bigorder-card">
-          <div class="card-header">
+        <div class="side-card">
+          <div class="panel-header compact">
             <h3>大单成交</h3>
             <span class="threshold-hint">≥{{ bigOrderThreshold }}手</span>
           </div>
           <div class="bigorder-list">
-            <div v-if="filteredBigOrders.length === 0" class="empty-hint">
-              暂无≥{{ bigOrderThreshold }}手的大单
-            </div>
-            <div 
-              v-for="order in filteredBigOrders" 
-              :key="order.id" 
-              class="bigorder-item"
-              :class="order.direction"
-            >
-              <span class="time">{{ formatTime(order.trade_time) }}</span>
-              <span class="direction">{{ order.direction === 'buy' ? '买' : '卖' }}</span>
-              <span class="price">{{ order.trade_price.toFixed(2) }}</span>
-              <span class="volume">{{ order.trade_volume }}手</span>
-              <span class="amount">{{ (order.trade_amount / 10000).toFixed(0) }}万</span>
+            <div v-if="filteredBigOrders.length === 0" class="empty-hint">暂无大单</div>
+            <div v-for="order in filteredBigOrders" :key="order.id" class="bigorder-item" :class="order.direction">
+              <span>{{ formatTime(order.trade_time) }}</span>
+              <strong>{{ order.direction === 'buy' ? '买' : '卖' }}</strong>
+              <span>{{ formatPrice(order.trade_price) }}</span>
+              <span>{{ formatYuanAmount(order.trade_amount) }}</span>
             </div>
           </div>
         </div>
-      </el-col>
-    </el-row>
+      </aside>
+
+      <div class="timeline-panel">
+        <div class="panel-header compact"><h3>涨停时间线</h3></div>
+        <div class="timeline-grid">
+          <div v-for="item in timelineData" :key="item.change_time" class="timeline-event" :class="item.status">
+            <span>{{ formatTime(item.change_time) }}</span>
+            <strong>{{ getStatusText(item.status) }}</strong>
+            <small>{{ item.price ? formatPrice(item.price) : '' }} {{ item.seal_amount ? '封单 ' + formatWanAmount(item.seal_amount) : '' }}</small>
+          </div>
+          <div v-if="timelineData.length === 0" class="empty-hint">暂无封板变化记录</div>
+        </div>
+      </div>
+
+      <div class="info-panel">
+        <div class="panel-header compact"><h3>核心数据</h3></div>
+        <div class="info-grid">
+          <div class="info-item"><span>题材</span><strong>{{ stockInfo.reason_category || '-' }}</strong></div>
+          <div class="info-item"><span>行业</span><strong>{{ stockInfo.industry || '-' }}</strong></div>
+          <div class="info-item"><span>成交额</span><strong>{{ formatWanAmount(stockInfo.amount) }}</strong></div>
+          <div class="info-item"><span>涨停原因</span><strong>{{ stockInfo.limit_up_reason || '-' }}</strong></div>
+        </div>
+      </div>
+    </section>
   </div>
 </template>
 
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
 import { useRoute } from 'vue-router'
-import { Star } from '@element-plus/icons-vue'
+import { Minus, Plus, Refresh, Star } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import * as echarts from 'echarts'
 import { getLimitUpDetail } from '@/api/limit-up'
@@ -286,6 +265,11 @@ async function fetchData() {
 function formatTurnoverRate(rate: number | undefined | null): string {
   if (rate == null || rate === 0) return '-'
   return rate.toFixed(2) + '%'
+}
+
+function formatPrice(value: number | undefined | null): string {
+  if (value == null || Number.isNaN(value)) return '-'
+  return value.toFixed(2)
 }
 
 function formatYuanAmount(value?: number | null): string {
@@ -499,16 +483,6 @@ function toggleWatch() {
   } else {
     configStore.addToWatchList(stockCode.value)
     ElMessage.success('已加入自选')
-  }
-}
-
-// 时间轴类型
-function getTimelineType(status: string) {
-  switch (status) {
-    case 'sealed': return 'danger'
-    case 'opened': return 'warning'
-    case 'resealed': return 'success'
-    default: return 'info'
   }
 }
 
