@@ -1,5 +1,5 @@
 import axios from 'axios'
-import type { DailyStats, SectorStats, ContinuousLadder, SectorStatsResponse, ContinuousLadderResponse, YesterdayContinuousResponse } from '@/types/market'
+import type { DailyStats, SectorStatsResponse, ContinuousLadderResponse, YesterdayContinuousResponse } from '@/types/market'
 
 const api = axios.create({
   baseURL: '/api/v1',

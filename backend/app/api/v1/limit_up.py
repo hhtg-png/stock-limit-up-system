@@ -197,14 +197,16 @@ async def get_limit_up_detail(
         select(LimitUpRecord)
         .where(and_(
             LimitUpRecord.stock_id == stock.id,
-            LimitUpRecord.trade_date == trade_date
+            LimitUpRecord.trade_date <= trade_date
         ))
+        .order_by(LimitUpRecord.trade_date.desc())
+        .limit(1)
     )
     record_result = await db.execute(record_query)
     record = record_result.scalar_one_or_none()
     
     if not record:
-        raise HTTPException(status_code=404, detail="该日期没有涨停记录")
+        raise HTTPException(status_code=404, detail=f"{trade_date} 没有涨停记录")
     
     # 查询状态变化
     changes_query = (

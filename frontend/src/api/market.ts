@@ -1,5 +1,5 @@
 import axios from 'axios'
-import type { OrderBook, BigOrder, FundFlow } from '@/types/market'
+import type { OrderBook, BigOrder, FundFlow, KlineResponse, CompareSeries, StockSearchItem } from '@/types/market'
 
 const api = axios.create({
   baseURL: '/api/v1',
@@ -37,6 +37,36 @@ export async function getFundFlow(stockCode: string, tradeDate?: string): Promis
 export async function getTimeline(stockCode: string, tradeDate?: string) {
   const { data } = await api.get(`/market/${stockCode}/timeline`, {
     params: { trade_date: tradeDate }
+  })
+  return data
+}
+
+export async function getKline(stockCode: string, params?: {
+  period?: 'day' | 'week' | 'month'
+  limit?: number
+}): Promise<KlineResponse> {
+  const { data } = await api.get(`/market/${stockCode}/kline`, { params })
+  return data
+}
+
+export async function getCompareSeries(params: {
+  symbols: string[]
+  period?: 'day' | 'week' | 'month'
+  limit?: number
+}): Promise<CompareSeries[]> {
+  const { data } = await api.get('/market/compare', {
+    params: {
+      symbols: params.symbols.join(','),
+      period: params.period || 'day',
+      limit: params.limit || 250
+    }
+  })
+  return data
+}
+
+export async function searchStocks(q: string, limit = 10): Promise<StockSearchItem[]> {
+  const { data } = await api.get('/market/search', {
+    params: { q, limit }
   })
   return data
 }

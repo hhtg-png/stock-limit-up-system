@@ -60,6 +60,14 @@ class Settings(BaseSettings):
     MARKET_CLOSE_TIME: str = "15:00"
     MARKET_LUNCH_START: str = "11:30"
     MARKET_LUNCH_END: str = "13:00"
+
+    # 市场复盘配置
+    MARKET_REVIEW_ENABLED: bool = True
+    MARKET_REVIEW_BUILD_HOUR: int = 15
+    MARKET_REVIEW_BUILD_MINUTE: int = 5
+    MARKET_REVIEW_REPAIR_HOUR: int = 20
+    MARKET_REVIEW_REPAIR_MINUTE: int = 15
+    MARKET_REVIEW_REPAIR_ENABLED: bool = True
     
     # 日志配置
     LOG_LEVEL: str = "INFO"
