@@ -78,6 +78,19 @@ class KlineResponse(BaseModel):
     data: List[KlinePointResponse] = Field(default_factory=list)
 
 
+class ComparePointResponse(BaseModel):
+    """叠加走势点位"""
+    date: date
+    change_pct_from_start: float
+
+
+class CompareSeriesResponse(BaseModel):
+    """叠加走势序列"""
+    symbol: str
+    name: str
+    data: List[ComparePointResponse] = Field(default_factory=list)
+
+
 PERIOD_TO_KLT = {
     "day": "101",
     "week": "102",
@@ -218,6 +231,25 @@ async def _fetch_kline_from_em(
     except Exception as e:
         logger.warning(f"从东方财富获取{stock_code} {period} K线失败: {e}")
         raise HTTPException(status_code=502, detail="上游K线服务不可用") from e
+
+
+def _build_compare_series(symbol: str, name: str, points: List[dict]) -> dict:
+    valid_points = [point for point in points if point.get("close") not in (None, 0)]
+    if not valid_points:
+        return {"symbol": symbol, "name": name, "data": []}
+
+    base_close = float(valid_points[0]["close"])
+    return {
+        "symbol": symbol,
+        "name": name,
+        "data": [
+            {
+                "date": point["date"],
+                "change_pct_from_start": round((float(point["close"]) - base_close) / base_close * 100, 2),
+            }
+            for point in valid_points
+        ],
+    }
 
 
 @router.get("/{stock_code}/orderbook", response_model=OrderBookResponse, summary="获取五档盘口")
@@ -555,6 +587,21 @@ async def get_kline_data(
         is_st=getattr(stock, "is_st", None),
     )
     return KlineResponse(stock_code=stock_code, period=period, data=points)
+
+
+@router.get("/compare", response_model=List[CompareSeriesResponse], summary="获取叠加走势")
+async def get_compare_data(
+    symbols: str = Query(..., description="逗号分隔代码，如 603893,000001.SH"),
+    period: Literal["day", "week", "month"] = Query("day", description="周期 day/week/month"),
+    limit: int = Query(250, ge=1, le=1000),
+):
+    """获取多标的归一化叠加走势"""
+    result = []
+    for symbol in [item.strip() for item in symbols.split(",") if item.strip()]:
+        code, market, _secid = _normalize_symbol(symbol)
+        points = await _fetch_kline_from_em(code, market, period, limit)
+        result.append(CompareSeriesResponse(**_build_compare_series(symbol, symbol, points)))
+    return result
 
 
 async def _fetch_timeline_from_em(stock_code: str, market: str, trade_date: date):

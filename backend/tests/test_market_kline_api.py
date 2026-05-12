@@ -138,6 +138,45 @@ class MarketKlineApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(market._normalize_symbol("833171"), ("833171", "BJ", "0.833171"))
         self.assertEqual(market._normalize_symbol("920001"), ("920001", "BJ", "0.920001"))
 
+    def test_build_compare_series_normalizes_from_first_close(self):
+        points = [
+            {"date": date(2026, 5, 10), "close": 10.0},
+            {"date": date(2026, 5, 11), "close": 11.0},
+            {"date": date(2026, 5, 12), "close": 9.5},
+        ]
+
+        series = market._build_compare_series("603893", "瑞芯微", points)
+
+        self.assertEqual(series["symbol"], "603893")
+        self.assertEqual(series["name"], "瑞芯微")
+        self.assertEqual(series["data"][0]["change_pct_from_start"], 0.0)
+        self.assertEqual(series["data"][1]["change_pct_from_start"], 10.0)
+        self.assertEqual(series["data"][2]["change_pct_from_start"], -5.0)
+
+    async def test_get_compare_data_fetches_each_symbol(self):
+        with patch.object(
+            market,
+            "_fetch_kline_from_em",
+            AsyncMock(
+                side_effect=[
+                    [
+                        {"date": date(2026, 5, 10), "close": 10.0},
+                        {"date": date(2026, 5, 11), "close": 11.0},
+                    ],
+                    [
+                        {"date": date(2026, 5, 10), "close": 3000.0},
+                        {"date": date(2026, 5, 11), "close": 3030.0},
+                    ],
+                ]
+            ),
+        ) as fetcher:
+            response = await market.get_compare_data("603893,000001.SH", "day", 250)
+
+        self.assertEqual(fetcher.await_count, 2)
+        self.assertEqual([item.symbol for item in response], ["603893", "000001.SH"])
+        self.assertEqual(response[0].data[1].change_pct_from_start, 10.0)
+        self.assertEqual(response[1].data[1].change_pct_from_start, 1.0)
+
     async def test_get_kline_data_fetches_by_stock_market(self):
         stock = SimpleNamespace(stock_code="603893", stock_name="淳中科技", market="SH", is_st=0)
         fake_db = FakeSession(stock)
