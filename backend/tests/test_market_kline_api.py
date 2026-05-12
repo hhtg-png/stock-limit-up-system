@@ -22,6 +22,42 @@ class FakeSession:
         return FakeScalarResult(self.stock)
 
 
+class FailingAsyncClient:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def get(self, *args, **kwargs):
+        raise RuntimeError("upstream unavailable")
+
+
+class EmptyKlinesResponse:
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return {"data": {"klines": []}}
+
+
+class EmptyKlinesAsyncClient:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def get(self, *args, **kwargs):
+        return EmptyKlinesResponse()
+
+
 class MarketKlineApiTests(unittest.IsolatedAsyncioTestCase):
     def test_format_kline_item_marks_main_board_limit_up(self):
         raw = "2026-05-12,96.10,103.42,103.42,95.60,560000,1820000000,8.20,10.00,9.40,17.42"
@@ -45,13 +81,30 @@ class MarketKlineApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(point["is_limit_up"])
 
+    def test_format_kline_item_marks_st_five_percent_limit_up(self):
+        raw = "2026-05-12,10.00,10.50,10.50,9.90,1000,1050000,5.00,5.00,0.50,3.20"
+
+        point = market._format_kline_item(raw, "600001", stock_name="*ST示例")
+
+        self.assertTrue(point["is_limit_up"])
+
+    def test_format_kline_item_uses_thirty_percent_board_for_beijing_exchange(self):
+        thirty_pct = "2026-05-12,10.00,13.00,13.00,9.90,1000,1300000,30.00,30.00,3.00,3.20"
+        twenty_pct = "2026-05-12,10.00,12.00,12.00,9.90,1000,1200000,20.00,20.00,2.00,3.20"
+
+        limit_up = market._format_kline_item(thirty_pct, "833171", market="BJ")
+        not_limit_up = market._format_kline_item(twenty_pct, "833171", market="BJ")
+
+        self.assertTrue(limit_up["is_limit_up"])
+        self.assertFalse(not_limit_up["is_limit_up"])
+
     def test_normalize_symbol_infers_market_from_suffix_or_code(self):
         self.assertEqual(market._normalize_symbol("000001.SH"), ("000001", "SH", "1.000001"))
         self.assertEqual(market._normalize_symbol("603893"), ("603893", "SH", "1.603893"))
         self.assertEqual(market._normalize_symbol("300001"), ("300001", "SZ", "0.300001"))
 
     async def test_get_kline_data_fetches_by_stock_market(self):
-        stock = SimpleNamespace(stock_code="603893", market="SH")
+        stock = SimpleNamespace(stock_code="603893", stock_name="淳中科技", market="SH", is_st=0)
         fake_db = FakeSession(stock)
         fetched = [
             {
@@ -70,11 +123,24 @@ class MarketKlineApiTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(market, "_fetch_kline_from_em", AsyncMock(return_value=fetched)) as fetcher:
             response = await market.get_kline_data("603893", "day", 250, fake_db)
 
-        fetcher.assert_awaited_once_with("603893", "SH", "day", 250)
+        fetcher.assert_awaited_once_with("603893", "SH", "day", 250, stock_name="淳中科技", is_st=0)
         self.assertEqual(response.stock_code, "603893")
         self.assertEqual(response.period, "day")
         self.assertEqual(response.data[0].close, 103.42)
         self.assertTrue(response.data[0].is_limit_up)
+
+    async def test_fetch_kline_from_em_raises_bad_gateway_on_upstream_failure(self):
+        with patch.object(market.httpx, "AsyncClient", FailingAsyncClient):
+            with self.assertRaises(market.HTTPException) as raised:
+                await market._fetch_kline_from_em("603893", "SH", "day", 250)
+
+        self.assertEqual(raised.exception.status_code, 502)
+
+    async def test_fetch_kline_from_em_returns_empty_list_for_confirmed_empty_klines(self):
+        with patch.object(market.httpx, "AsyncClient", EmptyKlinesAsyncClient):
+            points = await market._fetch_kline_from_em("603893", "SH", "day", 250)
+
+        self.assertEqual(points, [])
 
 
 if __name__ == "__main__":

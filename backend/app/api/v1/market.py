@@ -85,7 +85,29 @@ PERIOD_TO_KLT = {
 }
 
 
-def _limit_up_threshold(stock_code: str) -> float:
+def _is_st_stock(stock_name: Optional[str], is_st: Optional[int]) -> bool:
+    if isinstance(is_st, str):
+        if is_st.strip().lower() in ("1", "true", "yes"):
+            return True
+    elif is_st:
+        return True
+    if not stock_name:
+        return False
+
+    normalized_name = stock_name.strip().upper()
+    return normalized_name.startswith("ST") or normalized_name.startswith("*ST")
+
+
+def _limit_up_threshold(
+    stock_code: str,
+    market: Optional[str] = None,
+    stock_name: Optional[str] = None,
+    is_st: Optional[int] = None,
+) -> float:
+    if _is_st_stock(stock_name, is_st):
+        return 4.9
+    if (market or "").upper() in ("BJ", "BSE") or stock_code.startswith(("4", "8", "920")):
+        return 29.9
     if stock_code.startswith("3") or stock_code.startswith("68"):
         return 19.9
     return 9.9
@@ -103,7 +125,13 @@ def _normalize_symbol(symbol: str) -> tuple[str, str, str]:
     return code, market, f"{prefix}.{code}"
 
 
-def _format_kline_item(raw: str, stock_code: str) -> dict:
+def _format_kline_item(
+    raw: str,
+    stock_code: str,
+    market: Optional[str] = None,
+    stock_name: Optional[str] = None,
+    is_st: Optional[int] = None,
+) -> dict:
     parts = raw.split(",")
     if len(parts) < 11:
         raise ValueError(f"K线数据字段不足: {raw}")
@@ -118,7 +146,12 @@ def _format_kline_item(raw: str, stock_code: str) -> dict:
         "volume": int(float(parts[5] or 0)),
         "amount": float(parts[6] or 0),
         "change_pct": change_pct,
-        "is_limit_up": change_pct is not None and change_pct >= _limit_up_threshold(stock_code),
+        "is_limit_up": change_pct is not None and change_pct >= _limit_up_threshold(
+            stock_code,
+            market=market,
+            stock_name=stock_name,
+            is_st=is_st,
+        ),
     }
 
 
@@ -127,6 +160,9 @@ async def _fetch_kline_from_em(
     market: str,
     period: str,
     limit: int,
+    *,
+    stock_name: Optional[str] = None,
+    is_st: Optional[int] = None,
 ) -> List[dict]:
     """从东方财富获取日/周/月K线"""
     if period not in PERIOD_TO_KLT:
@@ -147,13 +183,26 @@ async def _fetch_kline_from_em(
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"}, params=params)
+            resp.raise_for_status()
             result = resp.json()
 
-        klines = result.get("data", {}).get("klines") or []
+        data = result.get("data")
+        if not isinstance(data, dict):
+            return []
+
+        klines = data.get("klines") or []
         formatted = []
         for item in klines:
             try:
-                formatted.append(_format_kline_item(item, stock_code))
+                formatted.append(
+                    _format_kline_item(
+                        item,
+                        stock_code,
+                        market=market,
+                        stock_name=stock_name,
+                        is_st=is_st,
+                    )
+                )
             except (ValueError, TypeError) as exc:
                 logger.warning(f"跳过{stock_code}异常K线: {exc}")
         return formatted
@@ -161,7 +210,7 @@ async def _fetch_kline_from_em(
         raise
     except Exception as e:
         logger.warning(f"从东方财富获取{stock_code} {period} K线失败: {e}")
-        return []
+        raise HTTPException(status_code=502, detail="上游K线服务不可用") from e
 
 
 @router.get("/{stock_code}/orderbook", response_model=OrderBookResponse, summary="获取五档盘口")
@@ -490,7 +539,14 @@ async def get_kline_data(
     if not stock:
         raise HTTPException(status_code=404, detail="股票不存在")
 
-    points = await _fetch_kline_from_em(stock_code, stock.market, period, limit)
+    points = await _fetch_kline_from_em(
+        stock_code,
+        stock.market,
+        period,
+        limit,
+        stock_name=getattr(stock, "stock_name", None),
+        is_st=getattr(stock, "is_st", None),
+    )
     return KlineResponse(stock_code=stock_code, period=period, data=points)
 
 
