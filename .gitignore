@@ -32,6 +32,7 @@ yarn-error.log*
 frontend/dist/
 *.local
 .worktrees/
+.superpowers/
 
 # IDE
 .idea/
