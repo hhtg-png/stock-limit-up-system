@@ -529,203 +529,323 @@ watch(stockCode, async () => {
 
 <style lang="scss" scoped>
 .stock-detail {
-  .stock-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    margin-bottom: 16px;
-    padding: 20px;
+  --chart-container-height: 460px;
 
-    .basic-info {
-      h2 {
-        margin: 0 0 8px 0;
-        font-size: 20px;
-        
-        .code {
-          font-size: 14px;
-          color: #8c8c8c;
-          font-weight: normal;
-        }
-      }
-      
-      .tags {
-        display: flex;
-        gap: 8px;
-      }
-    }
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
 
-    .price-info {
-      text-align: right;
-      
-      .current-price {
-        font-size: 32px;
-        font-weight: bold;
-      }
-      
-      .change {
-        color: #f5222d;
-      }
-    }
+.stock-hero,
+.chart-panel,
+.side-card,
+.timeline-panel,
+.info-panel {
+  background: #fff;
+  border: 1px solid #e5eaf3;
+  border-radius: 8px;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+}
+
+.stock-hero {
+  display: grid;
+  grid-template-columns: minmax(260px, 1fr) auto auto;
+  gap: 16px;
+  align-items: center;
+  padding: 16px;
+}
+
+.stock-name-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+
+  h2 {
+    margin: 0;
+    font-size: 24px;
+    color: #111827;
   }
 
-  .card {
-    background: #fff;
-    border-radius: 8px;
-    padding: 16px;
-    margin-bottom: 16px;
-
-    .card-header {
-      margin-bottom: 16px;
-      
-      h3 {
-        margin: 0;
-        font-size: 16px;
-      }
-    }
+  .stock-code {
+    color: #64748b;
+    font-weight: 600;
   }
-  
-  .detail-card {
-    .highlight-value {
-      font-weight: 500;
-    }
-  }
+}
 
-  .chart-container {
-    height: 460px;
-  }
+.status-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
 
-  .chart-card {
-    .chart-container {
-      height: 300px;
-    }
+.price-summary {
+  display: flex;
+  align-items: flex-end;
+  gap: 16px;
+
+  .price-main {
+    font-size: 30px;
+    line-height: 1;
+    font-weight: 800;
+    color: #d82135;
   }
 
-  .timeline-card {
-    .timeline-content {
-      .status {
-        font-weight: 500;
-        margin-right: 8px;
-      }
-      .price {
-        color: #666;
-        margin-right: 8px;
-      }
-      .seal {
-        color: #8c8c8c;
-      }
-    }
-  }
+  .summary-item {
+    font-size: 12px;
+    color: #64748b;
 
-  .orderbook-card {
-    .orderbook {
+    strong {
+      display: block;
+      margin-top: 4px;
+      color: #111827;
       font-size: 14px;
+    }
+  }
+}
 
-      .order-row {
-        display: flex;
-        padding: 8px 12px;
-        border-bottom: 1px solid #f5f5f5;
-        
-        .label {
-          width: 50px;
-          color: #8c8c8c;
-        }
-        .price {
-          flex: 1;
-          text-align: center;
-          font-weight: 500;
-          color: #333;
-        }
-        .volume {
-          width: 100px;
-          text-align: right;
-        }
-      }
-      
-      .current {
-        display: flex;
-        padding: 14px 12px;
-        background: #f5f5f5;
-        margin: 8px 0;
-        border-radius: 4px;
-        
-        .label {
-          width: 50px;
-          color: #8c8c8c;
-        }
-        .price {
-          flex: 1;
-          text-align: center;
-          font-size: 20px;
-          font-weight: bold;
-          color: #333;
-        }
-      }
+.detail-workbench {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 320px;
+  gap: 12px;
+}
+
+.chart-panel {
+  min-width: 0;
+}
+
+.panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  border-bottom: 1px solid #edf1f7;
+
+  &.compact {
+    padding: 10px 12px;
+  }
+
+  h3 {
+    margin: 0;
+    font-size: 15px;
+    color: #111827;
+  }
+}
+
+.chart-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.chart-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px 0;
+  color: #64748b;
+  font-size: 12px;
+
+  .legend {
+    width: 18px;
+    height: 3px;
+    border-radius: 999px;
+    display: inline-block;
+  }
+
+  .stock { background: #d82135; }
+  .index { background: #2563eb; }
+  .ma { background: #7c3aed; }
+}
+
+.chart-container {
+  height: var(--chart-container-height);
+}
+
+.side-panels {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.orderbook {
+  padding: 10px 12px 12px;
+}
+
+.book-row {
+  display: grid;
+  grid-template-columns: 44px 1fr 1fr;
+  gap: 10px;
+  padding: 6px 0;
+  font-size: 13px;
+  color: #64748b;
+
+  strong {
+    text-align: right;
+  }
+
+  .up { color: #d82135; }
+  .down { color: #1677ff; }
+}
+
+.current-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin: 8px 0;
+  padding: 10px;
+  border-radius: 6px;
+  background: #fff1f0;
+  color: #d82135;
+  font-weight: 700;
+}
+
+.threshold-hint {
+  color: #94a3b8;
+  font-size: 12px;
+}
+
+.bigorder-list {
+  max-height: 260px;
+  overflow-y: auto;
+  padding: 0 12px 10px;
+}
+
+.bigorder-item {
+  display: grid;
+  grid-template-columns: 58px 34px 1fr 64px;
+  gap: 8px;
+  padding: 8px 0;
+  border-bottom: 1px solid #f1f5f9;
+  color: #64748b;
+  font-size: 13px;
+
+  &.buy strong {
+    color: #d82135;
+  }
+
+  &.sell strong {
+    color: #1677ff;
+  }
+}
+
+.timeline-panel {
+  grid-column: 1 / 2;
+}
+
+.timeline-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  padding: 12px;
+}
+
+.timeline-event {
+  border: 1px solid #e5eaf3;
+  border-radius: 8px;
+  padding: 10px;
+  min-height: 76px;
+
+  span,
+  small {
+    color: #64748b;
+    font-size: 12px;
+  }
+
+  strong {
+    display: block;
+    margin: 6px 0;
+    color: #111827;
+  }
+
+  &.sealed,
+  &.resealed {
+    border-color: #ffc9cf;
+    background: #fff7f7;
+
+    strong {
+      color: #d82135;
     }
   }
 
-  .bigorder-card {
-    .card-header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
+  &.opened {
+    border-color: #ffe4ba;
+    background: #fffaf0;
+  }
+}
 
-      .threshold-hint {
-        font-size: 12px;
-        color: #909399;
-      }
-    }
+.info-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  padding: 12px;
+}
 
-    .bigorder-list {
-      max-height: 320px;
-      overflow-y: auto;
+.info-item {
+  border: 1px solid #e5eaf3;
+  border-radius: 8px;
+  padding: 10px;
+  background: #fbfdff;
 
-      .empty-hint {
-        padding: 20px;
-        text-align: center;
-        color: #909399;
-        font-size: 13px;
-      }
+  span {
+    color: #64748b;
+    font-size: 12px;
+  }
 
-      .bigorder-item {
-        display: flex;
-        padding: 10px 8px;
-        border-bottom: 1px solid #f5f5f5;
-        font-size: 14px;
-        
-        &:hover {
-          background: #fafafa;
-        }
-        
-        &.buy {
-          .direction { color: #1890ff; }
-        }
-        &.sell {
-          .direction { color: #8c8c8c; }
-        }
+  strong {
+    display: block;
+    margin-top: 6px;
+    color: #111827;
+    font-size: 14px;
+  }
+}
 
-        .time {
-          width: 80px;
-          color: #8c8c8c;
-        }
-        .direction {
-          width: 35px;
-          font-weight: 600;
-        }
-        .price {
-          flex: 1;
-        }
-        .volume {
-          width: 75px;
-          text-align: right;
-          color: #595959;
-        }
-        .amount {
-          width: 70px;
-          text-align: right;
-          font-weight: 500;
-        }
-      }
-    }
+.empty-hint {
+  padding: 18px;
+  color: #94a3b8;
+  text-align: center;
+  font-size: 13px;
+}
+
+@media (max-width: 1180px) {
+  .stock-hero {
+    grid-template-columns: 1fr;
+  }
+
+  .price-summary {
+    flex-wrap: wrap;
+  }
+
+  .detail-workbench {
+    grid-template-columns: 1fr;
+  }
+
+  .timeline-panel {
+    grid-column: auto;
+  }
+
+  .timeline-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 720px) {
+  .stock-detail {
+    --chart-container-height: 360px;
+  }
+
+  .timeline-grid,
+  .info-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .panel-header {
+    align-items: flex-start;
+    flex-direction: column;
   }
 }
 </style>
