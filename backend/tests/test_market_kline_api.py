@@ -115,12 +115,28 @@ class MarketKlineApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(limit_up["is_limit_up"])
         self.assertFalse(not_limit_up["is_limit_up"])
 
+    def test_format_kline_item_applies_chinext_threshold_before_st(self):
+        raw = "2026-05-12,10.00,11.00,11.00,9.90,1000,1100000,10.00,10.00,1.00,3.20"
+
+        point = market._format_kline_item(raw, "300001", market="SZ", stock_name="ST示例")
+
+        self.assertFalse(point["is_limit_up"])
+
+    def test_format_kline_item_applies_star_threshold_before_st(self):
+        raw = "2026-05-12,10.00,11.00,11.00,9.90,1000,1100000,10.00,10.00,1.00,3.20"
+
+        point = market._format_kline_item(raw, "688001", market="SH", stock_name="ST示例")
+
+        self.assertFalse(point["is_limit_up"])
+
     def test_normalize_symbol_infers_market_from_suffix_or_code(self):
         self.assertEqual(market._normalize_symbol("000001.SH"), ("000001", "SH", "1.000001"))
         self.assertEqual(market._normalize_symbol("603893"), ("603893", "SH", "1.603893"))
         self.assertEqual(market._normalize_symbol("300001"), ("300001", "SZ", "0.300001"))
         self.assertEqual(market._normalize_symbol("833171.BJ"), ("833171", "BJ", "0.833171"))
         self.assertEqual(market._normalize_symbol("833171.BSE"), ("833171", "BSE", "0.833171"))
+        self.assertEqual(market._normalize_symbol("833171"), ("833171", "BJ", "0.833171"))
+        self.assertEqual(market._normalize_symbol("920001"), ("920001", "BJ", "0.920001"))
 
     async def test_get_kline_data_fetches_by_stock_market(self):
         stock = SimpleNamespace(stock_code="603893", stock_name="淳中科技", market="SH", is_st=0)

@@ -104,12 +104,12 @@ def _limit_up_threshold(
     stock_name: Optional[str] = None,
     is_st: Optional[int] = None,
 ) -> float:
-    if _is_st_stock(stock_name, is_st):
-        return 4.9
     if (market or "").upper() in ("BJ", "BSE") or stock_code.startswith(("4", "8", "920")):
         return 29.9
     if stock_code.startswith("3") or stock_code.startswith("68"):
         return 19.9
+    if _is_st_stock(stock_name, is_st):
+        return 4.9
     return 9.9
 
 
@@ -123,7 +123,10 @@ def _normalize_symbol(symbol: str) -> tuple[str, str, str]:
         code, market = raw.split(".", 1)
     else:
         code = raw
-        market = "SH" if code.startswith("6") else "SZ"
+        if code.startswith(("4", "8", "920")):
+            market = "BJ"
+        else:
+            market = "SH" if code.startswith("6") else "SZ"
 
     prefix = _eastmoney_market_prefix(market)
     return code, market, f"{prefix}.{code}"
