@@ -1,4 +1,4 @@
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, onUnmounted } from 'vue'
 import { useAlertStore } from '@/stores/alert'
 import { useLimitUpStore } from '@/stores/limit-up'
 import { useSpeech } from '@/composables/useSpeech'
