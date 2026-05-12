@@ -146,6 +146,7 @@ const bigOrders = ref<BigOrder[]>([])
 
 const chartRef = ref<HTMLElement>()
 let chart: echarts.ECharts | null = null
+let refreshTimer: ReturnType<typeof setInterval> | null = null
 
 const activePeriod = ref<KlinePeriod>('day')
 const chartLoading = ref(false)
@@ -527,16 +528,20 @@ onMounted(() => {
   })
   
   // 定时刷新
-  const timer = setInterval(() => {
+  refreshTimer = setInterval(() => {
     getOrderBook(stockCode.value).then(ob => orderBook.value = ob).catch(() => {})
     getBigOrders(stockCode.value, { page_size: 20 }).then(orders => bigOrders.value = orders).catch(() => {})
   }, 5000)
-  
-  onUnmounted(() => {
-    clearInterval(timer)
-    window.removeEventListener('resize', resizeChart)
-    chart?.dispose()
-  })
+})
+
+onUnmounted(() => {
+  if (refreshTimer) {
+    clearInterval(refreshTimer)
+    refreshTimer = null
+  }
+  window.removeEventListener('resize', resizeChart)
+  chart?.dispose()
+  chart = null
 })
 
 watch(stockCode, async () => {
