@@ -96,6 +96,7 @@ PERIOD_TO_KLT = {
     "week": "102",
     "month": "103",
 }
+MAX_COMPARE_SYMBOLS = 5
 
 
 def _is_st_stock(stock_name: Optional[str], is_st: Optional[int]) -> bool:
@@ -596,8 +597,14 @@ async def get_compare_data(
     limit: int = Query(250, ge=1, le=1000),
 ):
     """获取多标的归一化叠加走势"""
+    parsed_symbols = [item.strip() for item in symbols.split(",") if item.strip()]
+    if not parsed_symbols:
+        raise HTTPException(status_code=400, detail="symbols 不能为空")
+    if len(parsed_symbols) > MAX_COMPARE_SYMBOLS:
+        raise HTTPException(status_code=400, detail="最多支持5个叠加标的")
+
     result = []
-    for symbol in [item.strip() for item in symbols.split(",") if item.strip()]:
+    for symbol in parsed_symbols:
         code, market, _secid = _normalize_symbol(symbol)
         points = await _fetch_kline_from_em(code, market, period, limit)
         result.append(CompareSeriesResponse(**_build_compare_series(symbol, symbol, points)))

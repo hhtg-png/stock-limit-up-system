@@ -177,6 +177,26 @@ class MarketKlineApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response[0].data[1].change_pct_from_start, 10.0)
         self.assertEqual(response[1].data[1].change_pct_from_start, 1.0)
 
+    async def test_get_compare_data_rejects_empty_symbols(self):
+        with patch.object(market, "_fetch_kline_from_em", AsyncMock()) as fetcher:
+            with self.assertRaises(market.HTTPException) as raised:
+                await market.get_compare_data(" , ,, ", "day", 250)
+
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertEqual(raised.exception.detail, "symbols 不能为空")
+        fetcher.assert_not_awaited()
+
+    async def test_get_compare_data_rejects_too_many_symbols(self):
+        symbols = "600001,600002,600003,600004,600005,600006"
+
+        with patch.object(market, "_fetch_kline_from_em", AsyncMock()) as fetcher:
+            with self.assertRaises(market.HTTPException) as raised:
+                await market.get_compare_data(symbols, "day", 250)
+
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertEqual(raised.exception.detail, "最多支持5个叠加标的")
+        fetcher.assert_not_awaited()
+
     async def test_get_kline_data_fetches_by_stock_market(self):
         stock = SimpleNamespace(stock_code="603893", stock_name="淳中科技", market="SH", is_st=0)
         fake_db = FakeSession(stock)
