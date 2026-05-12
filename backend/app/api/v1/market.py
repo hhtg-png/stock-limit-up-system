@@ -4,7 +4,7 @@
 from fastapi import APIRouter, Depends, Query, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_
-from typing import Optional, List
+from typing import Optional, List, Literal
 from datetime import date, datetime
 
 import httpx
@@ -56,6 +56,112 @@ class FundFlowResponse(BaseModel):
     retail_in: float = Field(0, description="散户流入")
     retail_out: float = Field(0, description="散户流出")
     retail_net: float = Field(0, description="散户净流入")
+
+
+class KlinePointResponse(BaseModel):
+    """K线点位"""
+    date: date
+    open: float
+    close: float
+    high: float
+    low: float
+    volume: int
+    amount: float
+    change_pct: Optional[float] = None
+    is_limit_up: bool = False
+
+
+class KlineResponse(BaseModel):
+    """K线响应"""
+    stock_code: str
+    period: Literal["day", "week", "month"]
+    data: List[KlinePointResponse] = Field(default_factory=list)
+
+
+PERIOD_TO_KLT = {
+    "day": "101",
+    "week": "102",
+    "month": "103",
+}
+
+
+def _limit_up_threshold(stock_code: str) -> float:
+    if stock_code.startswith("3") or stock_code.startswith("68"):
+        return 19.9
+    return 9.9
+
+
+def _normalize_symbol(symbol: str) -> tuple[str, str, str]:
+    raw = symbol.strip().upper()
+    if "." in raw:
+        code, market = raw.split(".", 1)
+    else:
+        code = raw
+        market = "SH" if code.startswith("6") else "SZ"
+
+    prefix = "1" if market == "SH" else "0"
+    return code, market, f"{prefix}.{code}"
+
+
+def _format_kline_item(raw: str, stock_code: str) -> dict:
+    parts = raw.split(",")
+    if len(parts) < 11:
+        raise ValueError(f"K线数据字段不足: {raw}")
+
+    change_pct = float(parts[8]) if parts[8] not in ("", "-") else None
+    return {
+        "date": date.fromisoformat(parts[0]),
+        "open": float(parts[1]),
+        "close": float(parts[2]),
+        "high": float(parts[3]),
+        "low": float(parts[4]),
+        "volume": int(float(parts[5] or 0)),
+        "amount": float(parts[6] or 0),
+        "change_pct": change_pct,
+        "is_limit_up": change_pct is not None and change_pct >= _limit_up_threshold(stock_code),
+    }
+
+
+async def _fetch_kline_from_em(
+    stock_code: str,
+    market: str,
+    period: str,
+    limit: int,
+) -> List[dict]:
+    """从东方财富获取日/周/月K线"""
+    if period not in PERIOD_TO_KLT:
+        raise HTTPException(status_code=400, detail="period 仅支持 day/week/month")
+
+    prefix = "0" if market == "SZ" else "1"
+    url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+    params = {
+        "secid": f"{prefix}.{stock_code}",
+        "fields1": "f1,f2,f3,f4,f5,f6",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+        "klt": PERIOD_TO_KLT[period],
+        "fqt": "1",
+        "end": "20500101",
+        "lmt": str(limit),
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"}, params=params)
+            result = resp.json()
+
+        klines = result.get("data", {}).get("klines") or []
+        formatted = []
+        for item in klines:
+            try:
+                formatted.append(_format_kline_item(item, stock_code))
+            except (ValueError, TypeError) as exc:
+                logger.warning(f"跳过{stock_code}异常K线: {exc}")
+        return formatted
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.warning(f"从东方财富获取{stock_code} {period} K线失败: {e}")
+        return []
 
 
 @router.get("/{stock_code}/orderbook", response_model=OrderBookResponse, summary="获取五档盘口")
@@ -367,6 +473,25 @@ async def get_timeline_data(
     
     # 本地无数据，从东方财富API获取分时数据
     return await _fetch_timeline_from_em(stock_code, stock.market, trade_date)
+
+
+@router.get("/{stock_code}/kline", response_model=KlineResponse, summary="获取K线数据")
+async def get_kline_data(
+    stock_code: str,
+    period: Literal["day", "week", "month"] = Query("day", description="周期 day/week/month"),
+    limit: int = Query(250, ge=1, le=1000),
+    db: AsyncSession = Depends(get_db),
+):
+    """获取日/周/月K线数据"""
+    stock_query = select(Stock).where(Stock.stock_code == stock_code)
+    stock_result = await db.execute(stock_query)
+    stock = stock_result.scalar_one_or_none()
+
+    if not stock:
+        raise HTTPException(status_code=404, detail="股票不存在")
+
+    points = await _fetch_kline_from_em(stock_code, stock.market, period, limit)
+    return KlineResponse(stock_code=stock_code, period=period, data=points)
 
 
 async def _fetch_timeline_from_em(stock_code: str, market: str, trade_date: date):
