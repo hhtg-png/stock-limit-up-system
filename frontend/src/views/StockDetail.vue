@@ -41,10 +41,10 @@
           <span v-else>首板</span>
         </el-descriptions-item>
         <el-descriptions-item label="涨停价">{{ stockInfo.limit_up_price?.toFixed(2) || '-' }}</el-descriptions-item>
-        <el-descriptions-item label="封单">{{ formatAmount(stockInfo.seal_amount) }}</el-descriptions-item>
+        <el-descriptions-item label="封单">{{ formatWanAmount(stockInfo.seal_amount) }}</el-descriptions-item>
         <el-descriptions-item label="开板次数">{{ stockInfo.open_count ?? '-' }}</el-descriptions-item>
         <el-descriptions-item label="换手率">{{ formatTurnoverRate(stockInfo.turnover_rate) }}</el-descriptions-item>
-        <el-descriptions-item label="成交额">{{ formatAmount(stockInfo.amount) }}</el-descriptions-item>
+        <el-descriptions-item label="成交额">{{ formatWanAmount(stockInfo.amount) }}</el-descriptions-item>
         <el-descriptions-item label="行业">{{ stockInfo.industry || '-' }}</el-descriptions-item>
         <el-descriptions-item label="涨停原因" :span="3">{{ stockInfo.limit_up_reason || '-' }}</el-descriptions-item>
       </el-descriptions>
@@ -288,11 +288,16 @@ function formatTurnoverRate(rate: number | undefined | null): string {
   return rate.toFixed(2) + '%'
 }
 
-function formatAmount(value?: number | null): string {
+function formatYuanAmount(value?: number | null): string {
   if (value == null || Number.isNaN(value)) return '-'
   if (Math.abs(value) >= 100000000) return (value / 100000000).toFixed(2) + '亿'
   if (Math.abs(value) >= 10000) return (value / 10000).toFixed(0) + '万'
   return value.toFixed(0)
+}
+
+function formatWanAmount(valueWan?: number | null): string {
+  if (valueWan == null || Number.isNaN(valueWan)) return '-'
+  return formatYuanAmount(valueWan * 10000)
 }
 
 function getLimitUpColor(point: KlinePoint): string {
@@ -356,10 +361,11 @@ function buildKlineOption() {
 
   if (showOverlay.value) {
     compareSeries.value.forEach((overlay, index) => {
+      const pointByDate = new Map(overlay.data.map(point => [point.date, point.change_pct_from_start]))
       series.push({
         name: overlay.name || overlay.symbol,
         type: 'line',
-        data: overlay.data.map(item => item.change_pct_from_start),
+        data: dates.map(date => pointByDate.get(date) ?? null),
         smooth: true,
         symbol: 'none',
         xAxisIndex: 0,
