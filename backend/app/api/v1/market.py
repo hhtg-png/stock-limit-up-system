@@ -113,6 +113,10 @@ def _limit_up_threshold(
     return 9.9
 
 
+def _eastmoney_market_prefix(market: str) -> str:
+    return "1" if market.upper() == "SH" else "0"
+
+
 def _normalize_symbol(symbol: str) -> tuple[str, str, str]:
     raw = symbol.strip().upper()
     if "." in raw:
@@ -121,7 +125,7 @@ def _normalize_symbol(symbol: str) -> tuple[str, str, str]:
         code = raw
         market = "SH" if code.startswith("6") else "SZ"
 
-    prefix = "1" if market == "SH" else "0"
+    prefix = _eastmoney_market_prefix(market)
     return code, market, f"{prefix}.{code}"
 
 
@@ -168,7 +172,7 @@ async def _fetch_kline_from_em(
     if period not in PERIOD_TO_KLT:
         raise HTTPException(status_code=400, detail="period 仅支持 day/week/month")
 
-    prefix = "0" if market == "SZ" else "1"
+    prefix = _eastmoney_market_prefix(market)
     url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
     params = {
         "secid": f"{prefix}.{stock_code}",

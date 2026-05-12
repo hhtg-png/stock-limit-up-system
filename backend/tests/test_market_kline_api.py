@@ -58,6 +58,23 @@ class EmptyKlinesAsyncClient:
         return EmptyKlinesResponse()
 
 
+class CapturingAsyncClient:
+    params = None
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def get(self, *args, **kwargs):
+        CapturingAsyncClient.params = kwargs["params"]
+        return EmptyKlinesResponse()
+
+
 class MarketKlineApiTests(unittest.IsolatedAsyncioTestCase):
     def test_format_kline_item_marks_main_board_limit_up(self):
         raw = "2026-05-12,96.10,103.42,103.42,95.60,560000,1820000000,8.20,10.00,9.40,17.42"
@@ -102,6 +119,8 @@ class MarketKlineApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(market._normalize_symbol("000001.SH"), ("000001", "SH", "1.000001"))
         self.assertEqual(market._normalize_symbol("603893"), ("603893", "SH", "1.603893"))
         self.assertEqual(market._normalize_symbol("300001"), ("300001", "SZ", "0.300001"))
+        self.assertEqual(market._normalize_symbol("833171.BJ"), ("833171", "BJ", "0.833171"))
+        self.assertEqual(market._normalize_symbol("833171.BSE"), ("833171", "BSE", "0.833171"))
 
     async def test_get_kline_data_fetches_by_stock_market(self):
         stock = SimpleNamespace(stock_code="603893", stock_name="淳中科技", market="SH", is_st=0)
@@ -141,6 +160,15 @@ class MarketKlineApiTests(unittest.IsolatedAsyncioTestCase):
             points = await market._fetch_kline_from_em("603893", "SH", "day", 250)
 
         self.assertEqual(points, [])
+
+    async def test_fetch_kline_from_em_uses_sz_prefix_for_beijing_exchange(self):
+        CapturingAsyncClient.params = None
+
+        with patch.object(market.httpx, "AsyncClient", CapturingAsyncClient):
+            points = await market._fetch_kline_from_em("833171", "BJ", "day", 250)
+
+        self.assertEqual(points, [])
+        self.assertEqual(CapturingAsyncClient.params["secid"], "0.833171")
 
 
 if __name__ == "__main__":
