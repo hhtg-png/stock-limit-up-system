@@ -1,6 +1,9 @@
 """
 行情数据API
 """
+import json
+import re
+
 from fastapi import APIRouter, Depends, Query, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_
@@ -97,6 +100,9 @@ PERIOD_TO_KLT = {
     "month": "103",
 }
 MAX_COMPARE_SYMBOLS = 5
+EASTMONEY_KLINE_URL = "http://push2his.eastmoney.com/api/qt/stock/kline/get"
+EASTMONEY_DETAILS_URL = "http://push2.eastmoney.com/api/qt/stock/details/get"
+SINA_KLINE_URL = "https://quotes.sina.cn/cn/api/jsonp.php/var%20_=/CN_MarketDataService.getKLineData"
 
 
 def _is_st_stock(stock_name: Optional[str], is_st: Optional[int]) -> bool:
@@ -176,6 +182,147 @@ def _format_kline_item(
     }
 
 
+def _apply_change_pct(
+    points: List[dict],
+    stock_code: str,
+    market: Optional[str] = None,
+    stock_name: Optional[str] = None,
+    is_st: Optional[int] = None,
+) -> List[dict]:
+    previous_close: Optional[float] = None
+    normalized_points = []
+    for point in sorted(points, key=lambda item: item["date"]):
+        close = float(point["close"])
+        change_pct = None
+        if previous_close:
+            change_pct = round((close - previous_close) / previous_close * 100, 2)
+
+        normalized = {
+            **point,
+            "change_pct": change_pct,
+            "is_limit_up": change_pct is not None and change_pct >= _limit_up_threshold(
+                stock_code,
+                market=market,
+                stock_name=stock_name,
+                is_st=is_st,
+            ),
+        }
+        normalized_points.append(normalized)
+        previous_close = close
+
+    return normalized_points
+
+
+def _aggregate_kline_points(points: List[dict], period: str) -> List[dict]:
+    if period == "day":
+        return points
+
+    aggregated = []
+    current_key = None
+    current_point = None
+
+    for point in sorted(points, key=lambda item: item["date"]):
+        point_date = point["date"]
+        if period == "week":
+            iso = point_date.isocalendar()
+            key = (iso.year, iso.week)
+        else:
+            key = (point_date.year, point_date.month)
+
+        if key != current_key:
+            if current_point:
+                aggregated.append(current_point)
+            current_key = key
+            current_point = {
+                **point,
+                "date": point_date,
+            }
+            continue
+
+        current_point["date"] = point_date
+        current_point["close"] = point["close"]
+        current_point["high"] = max(current_point["high"], point["high"])
+        current_point["low"] = min(current_point["low"], point["low"])
+        current_point["volume"] += point["volume"]
+        current_point["amount"] += point["amount"]
+
+    if current_point:
+        aggregated.append(current_point)
+
+    return aggregated
+
+
+def _parse_sina_kline_payload(payload: str) -> list:
+    match = re.search(r"var\s+_\s*=\s*\(?(\[.*\])\)?\s*;?", payload, re.S)
+    if not match:
+        return []
+    return json.loads(match.group(1))
+
+
+def _sina_symbol(stock_code: str, market: str) -> str:
+    normalized_market = market.upper()
+    if normalized_market == "SH":
+        return f"sh{stock_code}"
+    if normalized_market in ("BJ", "BSE"):
+        return f"bj{stock_code}"
+    return f"sz{stock_code}"
+
+
+async def _fetch_kline_from_sina(
+    stock_code: str,
+    market: str,
+    period: str,
+    limit: int,
+    *,
+    stock_name: Optional[str] = None,
+    is_st: Optional[int] = None,
+) -> List[dict]:
+    """从新浪日线兜底，并在本地聚合周/月K线"""
+    if period not in PERIOD_TO_KLT:
+        raise HTTPException(status_code=400, detail="period 仅支持 day/week/month")
+
+    multiplier = {"day": 1, "week": 7, "month": 31}[period]
+    datalen = min(max(limit * multiplier + 30, limit + 1), 1200)
+    params = {
+        "symbol": _sina_symbol(stock_code, market),
+        "scale": "240",
+        "ma": "no",
+        "datalen": str(datalen),
+    }
+
+    async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+        resp = await client.get(SINA_KLINE_URL, headers={"User-Agent": "Mozilla/5.0"}, params=params)
+        resp.raise_for_status()
+        raw_items = _parse_sina_kline_payload(resp.text)
+
+    daily_points = []
+    for item in raw_items:
+        try:
+            daily_points.append(
+                {
+                    "date": date.fromisoformat(item["day"]),
+                    "open": float(item["open"]),
+                    "close": float(item["close"]),
+                    "high": float(item["high"]),
+                    "low": float(item["low"]),
+                    "volume": int(float(item.get("volume") or 0)),
+                    "amount": 0.0,
+                }
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            logger.warning(f"跳过{stock_code}异常新浪K线: {exc}")
+
+    aggregated = _aggregate_kline_points(daily_points, period)
+    with_change_pct = _apply_change_pct(
+        aggregated,
+        stock_code,
+        market=market,
+        stock_name=stock_name,
+        is_st=is_st,
+    )
+    return with_change_pct[-limit:]
+
+
 async def _fetch_kline_from_em(
     stock_code: str,
     market: str,
@@ -190,7 +337,6 @@ async def _fetch_kline_from_em(
         raise HTTPException(status_code=400, detail="period 仅支持 day/week/month")
 
     prefix = _eastmoney_market_prefix(market)
-    url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
     params = {
         "secid": f"{prefix}.{stock_code}",
         "fields1": "f1,f2,f3,f4,f5,f6",
@@ -203,7 +349,7 @@ async def _fetch_kline_from_em(
 
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"}, params=params)
+            resp = await client.get(EASTMONEY_KLINE_URL, headers={"User-Agent": "Mozilla/5.0"}, params=params)
             resp.raise_for_status()
             result = resp.json()
 
@@ -230,8 +376,19 @@ async def _fetch_kline_from_em(
     except HTTPException:
         raise
     except Exception as e:
-        logger.warning(f"从东方财富获取{stock_code} {period} K线失败: {e}")
-        raise HTTPException(status_code=502, detail="上游K线服务不可用") from e
+        logger.warning(f"从东方财富获取{stock_code} {period} K线失败，尝试新浪备用源: {e}")
+        try:
+            return await _fetch_kline_from_sina(
+                stock_code,
+                market,
+                period,
+                limit,
+                stock_name=stock_name,
+                is_st=is_st,
+            )
+        except Exception as fallback_exc:
+            logger.warning(f"从新浪获取{stock_code} {period} K线失败: {fallback_exc}")
+            raise HTTPException(status_code=502, detail="上游K线服务不可用") from fallback_exc
 
 
 def _build_compare_series(symbol: str, name: str, points: List[dict]) -> dict:
@@ -399,8 +556,7 @@ async def get_big_orders(
 async def _fetch_big_orders_from_em(stock_code: str, market: str, min_amount: Optional[float], limit: int):
     """从东方财富逐笔成交中筛选大单（volume >= 500手 或 金额 >= 50万）"""
     prefix = "0" if market == "SZ" else "1"
-    url = "https://push2.eastmoney.com/api/qt/stock/details/get"
-    
+
     # 获取最近的逐笔数据
     all_big_orders = []
     for pos_start in range(0, -2000, -500):
@@ -414,7 +570,7 @@ async def _fetch_big_orders_from_em(stock_code: str, market: str, min_amount: Op
         }
         try:
             async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"}, params=params)
+                resp = await client.get(EASTMONEY_DETAILS_URL, headers={"User-Agent": "Mozilla/5.0"}, params=params)
                 data = resp.json()
             
             if not data.get("data") or not data["data"].get("details"):

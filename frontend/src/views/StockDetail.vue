@@ -15,7 +15,7 @@
             {{ stockInfo.is_final_sealed ? '涨停封板' : '开板' }}
           </el-tag>
           <el-tag v-if="stockInfo.reason_category" type="success" size="small">{{ stockInfo.reason_category }}</el-tag>
-          <el-tag v-if="stockInfo.first_limit_up_time" size="small">首封 {{ stockInfo.first_limit_up_time }}</el-tag>
+          <el-tag v-if="stockInfo.first_limit_up_time" size="small">首封 {{ formatTime(stockInfo.first_limit_up_time) }}</el-tag>
           <el-tag size="small">开板 {{ stockInfo.open_count ?? 0 }} 次</el-tag>
         </div>
       </div>
@@ -284,8 +284,12 @@ function formatWanAmount(valueWan?: number | null): string {
   return formatYuanAmount(valueWan * 10000)
 }
 
+function isHighlightedLimitUpPoint(point: KlinePoint): boolean {
+  return Boolean(point.is_limit_up || (stockInfo.value.trade_date && point.date === stockInfo.value.trade_date))
+}
+
 function getLimitUpColor(point: KlinePoint): string {
-  if (showLimitUpHighlight.value && point.is_limit_up) return '#8b000f'
+  if (showLimitUpHighlight.value && isHighlightedLimitUpPoint(point)) return '#8b000f'
   return point.close >= point.open ? '#d82135' : '#1677ff'
 }
 
@@ -316,7 +320,21 @@ function buildKlineOption() {
       type: 'candlestick',
       data: candleData,
       xAxisIndex: 0,
-      yAxisIndex: 0
+      yAxisIndex: 0,
+      markPoint: {
+        symbol: 'pin',
+        symbolSize: 42,
+        itemStyle: { color: '#8b000f' },
+        label: { formatter: '涨停', color: '#fff', fontSize: 10 },
+        data: klineData.value
+          .map((item, index) => ({ item, index }))
+          .filter(({ item }) => showLimitUpHighlight.value && isHighlightedLimitUpPoint(item))
+          .map(({ item, index }) => ({
+            name: '涨停',
+            coord: [index, item.high],
+            value: item.close
+          }))
+      }
     },
     {
       name: '成交量',
@@ -365,7 +383,7 @@ function buildKlineOption() {
   return {
     animation: false,
     tooltip: { trigger: 'axis', axisPointer: { type: 'cross' } },
-    legend: { top: 8, left: 12 },
+    legend: { show: false },
     grid: [
       { left: 56, right: 58, top: 42, height: '58%' },
       { left: 56, right: 58, top: '76%', height: '14%' }

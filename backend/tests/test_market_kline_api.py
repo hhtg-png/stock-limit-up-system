@@ -44,6 +44,19 @@ class EmptyKlinesResponse:
         return {"data": {"klines": []}}
 
 
+class SinaKlinesResponse:
+    text = (
+        "var _=(["
+        '{"day":"2026-05-08","open":"10.000","high":"10.200","low":"9.900","close":"10.000","volume":"1000"},'
+        '{"day":"2026-05-11","open":"10.000","high":"11.000","low":"10.000","close":"11.000","volume":"1200"},'
+        '{"day":"2026-05-12","open":"11.000","high":"12.100","low":"10.900","close":"12.100","volume":"1500"}'
+        "]);"
+    )
+
+    def raise_for_status(self):
+        return None
+
+
 class EmptyKlinesAsyncClient:
     def __init__(self, *args, **kwargs):
         pass
@@ -58,7 +71,27 @@ class EmptyKlinesAsyncClient:
         return EmptyKlinesResponse()
 
 
+class EastmoneyFailureSinaSuccessClient:
+    urls = []
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def get(self, *args, **kwargs):
+        EastmoneyFailureSinaSuccessClient.urls.append(args[0])
+        if args[0] == market.EASTMONEY_KLINE_URL:
+            raise RuntimeError("eastmoney unavailable")
+        return SinaKlinesResponse()
+
+
 class CapturingAsyncClient:
+    url = None
     params = None
 
     def __init__(self, *args, **kwargs):
@@ -71,6 +104,7 @@ class CapturingAsyncClient:
         return False
 
     async def get(self, *args, **kwargs):
+        CapturingAsyncClient.url = args[0]
         CapturingAsyncClient.params = kwargs["params"]
         return EmptyKlinesResponse()
 
@@ -236,14 +270,31 @@ class MarketKlineApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(points, [])
 
+    async def test_fetch_kline_from_em_falls_back_to_sina_daily_kline(self):
+        EastmoneyFailureSinaSuccessClient.urls = []
+
+        with patch.object(market.httpx, "AsyncClient", EastmoneyFailureSinaSuccessClient):
+            points = await market._fetch_kline_from_em("002466", "SZ", "day", 2)
+
+        self.assertEqual(EastmoneyFailureSinaSuccessClient.urls, [market.EASTMONEY_KLINE_URL, market.SINA_KLINE_URL])
+        self.assertEqual([point["date"] for point in points], [date(2026, 5, 11), date(2026, 5, 12)])
+        self.assertEqual(points[0]["change_pct"], 10.0)
+        self.assertTrue(points[0]["is_limit_up"])
+        self.assertEqual(points[1]["change_pct"], 10.0)
+        self.assertTrue(points[1]["is_limit_up"])
+        self.assertEqual(points[1]["amount"], 0.0)
+
     async def test_fetch_kline_from_em_uses_sz_prefix_for_beijing_exchange(self):
+        CapturingAsyncClient.url = None
         CapturingAsyncClient.params = None
 
         with patch.object(market.httpx, "AsyncClient", CapturingAsyncClient):
             points = await market._fetch_kline_from_em("833171", "BJ", "day", 250)
 
         self.assertEqual(points, [])
+        self.assertEqual(CapturingAsyncClient.url, market.EASTMONEY_KLINE_URL)
         self.assertEqual(CapturingAsyncClient.params["secid"], "0.833171")
+        self.assertTrue(market.EASTMONEY_KLINE_URL.startswith("http://"))
 
 
 if __name__ == "__main__":
