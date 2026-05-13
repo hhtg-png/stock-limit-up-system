@@ -311,6 +311,20 @@ class MarketReviewApiTests(unittest.TestCase):
         self.assertEqual(payload["latest_trade_date"], "2026-04-28")
         self.assertTrue(payload["is_fallback"])
 
+    def test_daily_endpoint_days_without_requested_end_date_is_not_fallback(self):
+        response = self.client.get(
+            "/api/v1/statistics/review/daily",
+            params={"days": 1},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["data"]["series"], ["2026-04-28"])
+        self.assertEqual(payload["end_date"], "2026-04-28")
+        self.assertIsNone(payload["requested_end_date"])
+        self.assertEqual(payload["latest_trade_date"], "2026-04-28")
+        self.assertFalse(payload["is_fallback"])
+
     def test_detail_endpoint_sorts_by_continuous_days_then_amount_desc(self):
         response = self.client.get(
             "/api/v1/statistics/review/detail",

@@ -77,7 +77,10 @@ async def _resolve_daily_metric_range(
     if resolved_start_date is not None and resolved_start_date > resolved_end_date:
         resolved_start_date = resolved_end_date
 
-    is_fallback = resolved_start_date != start_date or resolved_end_date != end_date
+    is_fallback = (
+        (start_date is not None and resolved_start_date != start_date)
+        or (end_date is not None and resolved_end_date != end_date)
+    )
     return resolved_start_date, resolved_end_date, latest_trade_date, is_fallback
 
 
