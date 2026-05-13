@@ -95,17 +95,21 @@ export function useWebSocket() {
           content: `首次涨停 ${message.data.time}${message.data.reason ? ` - ${message.data.reason}` : ''}`,
           time: message.timestamp
         })
+        if (message.data.stock_name) {
+          const { announceStock } = useSpeech()
+          announceStock(message.data.stock_name, message.data.reason)
+        }
         break
 
       case 'limit_up_snapshot':
-        limitUpStore.setSnapshot(
+        limitUpStore.setRealtimeSnapshot(
           message.data.trade_date || '',
           message.data.items || []
         )
         break
 
       case 'limit_up_delta':
-        limitUpStore.applyDelta(
+        limitUpStore.applyRealtimeDelta(
           message.data.upsert || [],
           message.data.remove || [],
           message.data.trade_date || ''

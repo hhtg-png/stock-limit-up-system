@@ -7,6 +7,7 @@ export const useLimitUpStore = defineStore('limitUp', () => {
   const realtimeList = ref<LimitUpRealtime[]>([])
   const tradeDate = ref('')
   const lastSyncAt = ref('')
+  const acceptRealtimeUpdates = ref(true)
   
   // 加载状态
   const loading = ref(false)
@@ -76,6 +77,15 @@ export const useLimitUpStore = defineStore('limitUp', () => {
     setList(list, snapshotTradeDate)
   }
 
+  function setAcceptRealtimeUpdates(enabled: boolean) {
+    acceptRealtimeUpdates.value = enabled
+  }
+
+  function setRealtimeSnapshot(snapshotTradeDate: string, list: LimitUpRealtime[]) {
+    if (!acceptRealtimeUpdates.value) return
+    setSnapshot(snapshotTradeDate, list)
+  }
+
   // 更新单条记录
   function updateItem(code: string, data: Partial<LimitUpRealtime>) {
     const index = realtimeList.value.findIndex(item => item.stock_code === code)
@@ -128,6 +138,15 @@ export const useLimitUpStore = defineStore('limitUp', () => {
     lastSyncAt.value = new Date().toISOString()
   }
 
+  function applyRealtimeDelta(
+    upsert: LimitUpRealtime[],
+    remove: string[] = [],
+    deltaTradeDate = ''
+  ) {
+    if (!acceptRealtimeUpdates.value) return
+    applyDelta(upsert, remove, deltaTradeDate)
+  }
+
   // 设置筛选条件
   function setFilters(newFilters: Partial<typeof filters.value>) {
     Object.assign(filters.value, newFilters)
@@ -137,16 +156,20 @@ export const useLimitUpStore = defineStore('limitUp', () => {
     realtimeList,
     tradeDate,
     lastSyncAt,
+    acceptRealtimeUpdates,
     loading,
     filters,
     filteredList,
     stats,
     setList,
     setSnapshot,
+    setAcceptRealtimeUpdates,
+    setRealtimeSnapshot,
     updateItem,
     addItem,
     removeItems,
     applyDelta,
+    applyRealtimeDelta,
     setFilters
   }
 })

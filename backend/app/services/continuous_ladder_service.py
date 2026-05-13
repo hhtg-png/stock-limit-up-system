@@ -4,6 +4,8 @@ from collections import defaultdict
 from datetime import datetime
 from typing import Dict, Iterable, List, Optional
 
+from app.utils.market_data_sanitizer import normalize_change_pct
+
 
 class ContinuousLadderService:
     """Build continuous ladder payloads from realtime limit-up data."""
@@ -32,7 +34,11 @@ class ContinuousLadderService:
                     "reason": item.get("limit_up_reason", ""),
                     "is_sealed": is_sealed,
                     "open_count": int(item.get("open_count") or 0),
-                    "change_pct": self._to_float(item.get("change_pct")),
+                    "change_pct": normalize_change_pct(
+                        item.get("change_pct"),
+                        price=item.get("current_price") or item.get("limit_up_price"),
+                        amount=item.get("amount"),
+                    ),
                     "bid1_volume": self._to_float(item.get("bid1_volume")),
                     "turnover_rate": self._to_float(item.get("turnover_rate")),
                     "real_turnover_rate": self._calculate_real_turnover_rate(item),
@@ -85,7 +91,11 @@ class ContinuousLadderService:
                     "stock_name": item.get("n", ""),
                     "yesterday_days": yesterday_days,
                     "today_status": today_status,
-                    "today_change_pct": self._to_float(item.get("zdp")),
+                    "today_change_pct": normalize_change_pct(
+                        item.get("zdp"),
+                        price=item.get("p"),
+                        amount=item.get("amount"),
+                    ),
                 }
             )
 

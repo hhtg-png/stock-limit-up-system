@@ -22,6 +22,10 @@
               <el-icon><PieChart /></el-icon>
               <span>报表分析</span>
             </el-menu-item>
+            <el-menu-item index="/daily-analysis">
+              <el-icon><Calendar /></el-icon>
+              <span>每日分析</span>
+            </el-menu-item>
             <el-menu-item index="/continuous">
               <el-icon><TrendCharts /></el-icon>
               <span>连板梯队</span>
@@ -88,17 +92,20 @@ import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRoute } from 'vue-router'
 import {
   DataBoard, PieChart, Setting,
-  Fold, Expand, Bell, TrendCharts
+  Fold, Expand, Bell, TrendCharts, Calendar
 } from '@element-plus/icons-vue'
 import zhCn from 'element-plus/dist/locale/zh-cn.mjs'
 import AlertPanel from '@/components/alert/AlertPanel.vue'
 import { useWebSocket } from '@/composables/useWebSocket'
 import { useSpeech } from '@/composables/useSpeech'
 import { useAlertStore } from '@/stores/alert'
+import { useConfigStore } from '@/stores/config'
+import { getConfig, toggleAlert as toggleAlertConfig } from '@/api/config'
 import dayjs from 'dayjs'
 
 const route = useRoute()
 const alertStore = useAlertStore()
+const configStore = useConfigStore()
 const { connect } = useWebSocket()
 
 const isCollapsed = ref(false)
@@ -138,19 +145,40 @@ const marketStatusText = computed(() => {
 })
 
 // 切换播报
-const toggleAlert = (enabled: boolean) => {
+const loadAlertConfig = async () => {
+  try {
+    const config = await getConfig()
+    configStore.setConfig(config)
+    alertEnabled.value = config.alert_limit_up_enabled
+    alertStore.setEnabled(config.alert_limit_up_enabled)
+    alertStore.setSoundEnabled(config.alert_sound_enabled)
+    alertStore.setDesktopEnabled(config.alert_desktop_enabled)
+  } catch (e) {
+    console.error('Load alert config error:', e)
+  }
+}
+
+const toggleAlert = async (enabled: boolean) => {
   alertStore.setEnabled(enabled)
+  configStore.setConfig({ alert_limit_up_enabled: enabled })
   const { announceEnabled, announceDisabled } = useSpeech()
   if (enabled) {
     announceEnabled()
   } else {
     announceDisabled()
   }
+
+  try {
+    await toggleAlertConfig('limit_up', enabled)
+  } catch (e) {
+    console.error('Toggle alert config error:', e)
+  }
 }
 
 // 更新时间
 let timeInterval: number
 onMounted(() => {
+  loadAlertConfig()
   connect()
   timeInterval = window.setInterval(() => {
     currentTime.value = dayjs().format('HH:mm:ss')

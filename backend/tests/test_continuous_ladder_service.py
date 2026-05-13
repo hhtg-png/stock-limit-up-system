@@ -96,6 +96,28 @@ class ContinuousLadderServiceTests(unittest.TestCase):
             ["opened", "broken"],
         )
 
+    def test_build_yesterday_ladder_drops_sentinel_change_pct(self):
+        ladders = self.service.build_yesterday_ladder(
+            [
+                {
+                    "c": "603272",
+                    "n": "联翔股份",
+                    "ylbc": 2,
+                    "zdp": -100.0,
+                    "p": 0,
+                    "amount": 0,
+                    "ltsz": 0.0,
+                }
+            ],
+            [],
+            min_days=2,
+        )
+
+        self.assertEqual(len(ladders), 1)
+        stock = ladders[0]["stocks"][0]
+        self.assertEqual(stock["stock_code"], "603272")
+        self.assertIsNone(stock["today_change_pct"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -13,6 +13,7 @@ from app.api.v1.websocket import router as ws_router
 from app.core.event_bus import event_bus
 from app.utils.logger import setup_logging, logger
 from app.services.data_init_service import data_init_service
+from app.data_collectors.scheduler import data_scheduler
 
 
 @asynccontextmanager
@@ -29,6 +30,9 @@ async def lifespan(app: FastAPI):
     # 启动事件总线
     await event_bus.start()
     logger.info("EventBus started")
+
+    # 启动定时任务：盘中采集、盘后统计、市场复盘、每日分析
+    data_scheduler.start()
     
     # 自动爬取最近交易日数据（后台任务）
     asyncio.create_task(data_init_service.initialize())
@@ -36,6 +40,7 @@ async def lifespan(app: FastAPI):
     yield
     
     # 关闭时
+    data_scheduler.stop()
     await event_bus.stop()
     await close_db()
     logger.info("Application shutdown complete")

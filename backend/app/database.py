@@ -1,6 +1,8 @@
 """
 数据库连接和会话管理
 """
+from importlib import import_module
+
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy import event
@@ -44,6 +46,9 @@ async def get_db() -> AsyncSession:
 
 async def init_db():
     """初始化数据库（创建所有表）"""
+    # Ensure all model modules are imported before metadata.create_all() runs.
+    import_module("app.models")
+
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 

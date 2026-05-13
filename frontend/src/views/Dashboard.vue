@@ -3,6 +3,17 @@
     <!-- 筛选区 -->
     <div class="filter-bar card">
       <el-form inline>
+        <el-form-item label="交易日期">
+          <el-date-picker
+            v-model="selectedDate"
+            type="date"
+            value-format="YYYY-MM-DD"
+            format="YYYY-MM-DD"
+            :clearable="false"
+            style="width: 150px"
+            @change="handleDateChange"
+          />
+        </el-form-item>
         <el-form-item label="连板天数">
           <el-select v-model="filters.minContinuousDays" placeholder="全部" clearable style="width: 120px">
             <el-option label="2板以上" :value="2" />
@@ -27,6 +38,11 @@
           <el-button @click="resetFilters">重置</el-button>
           <el-button type="warning" @click="refreshData" :loading="refreshing">刷新数据</el-button>
           <el-button @click="exportData">导出</el-button>
+        </el-form-item>
+        <el-form-item v-if="displayTradeDate">
+          <el-tag :type="isFallbackDate ? 'warning' : 'info'" size="small">
+            数据日期 {{ displayTradeDate }}
+          </el-tag>
         </el-form-item>
         <el-form-item label="排序">
           <el-button-group size="small">
@@ -116,8 +132,9 @@
 <script setup lang="ts">
 import { computed, ref, reactive, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
-import { ElMessage, ElMessageBox } from 'element-plus'
-import { getRealtimeLimitUp, refreshLimitUpData } from '@/api/limit-up'
+import { ElMessage } from 'element-plus'
+import dayjs from 'dayjs'
+import { getRealtimeLimitUp } from '@/api/limit-up'
 import { useLimitUpStore } from '@/stores/limit-up'
 import type { LimitUpRealtime } from '@/types/limit-up'
 
@@ -127,6 +144,7 @@ const limitUpStore = useLimitUpStore()
 const loading = ref(false)
 const refreshing = ref(false)
 const isFetching = ref(false)
+const selectedDate = ref(dayjs().format('YYYY-MM-DD'))
 const sortBy = ref<'time' | 'reseal_time' | 'seal_amount' | 'continuous_days'>('time')
 const RESYNC_INTERVAL = 90000
 let refreshTimer: number | null = null
@@ -141,6 +159,12 @@ interface FetchOptions {
   showLoading?: boolean
   silent?: boolean
 }
+
+const displayTradeDate = computed(() => limitUpStore.tradeDate)
+const isSelectedToday = computed(() => selectedDate.value === dayjs().format('YYYY-MM-DD'))
+const isFallbackDate = computed(
+  () => Boolean(displayTradeDate.value && displayTradeDate.value !== selectedDate.value)
+)
 
 const reasonCategories = computed(() => {
   const cats = new Set<string>()
@@ -202,8 +226,13 @@ async function fetchData(options: FetchOptions = {}) {
   }
 
   try {
-    const response = await getRealtimeLimitUp()
+    const response = await getRealtimeLimitUp({
+      trade_date: selectedDate.value
+    })
     limitUpStore.setSnapshot(response.trade_date, response.data || [])
+    if (response.is_fallback && !silent) {
+      ElMessage.warning(`未找到 ${selectedDate.value} 数据，已显示 ${response.trade_date}`)
+    }
   } catch (e) {
     console.error('Fetch error:', e)
     if (!silent) {
@@ -221,6 +250,15 @@ function applyFilters() {
   // 列表已由计算属性自动响应筛选条件变化
 }
 
+function updateRealtimeMode() {
+  limitUpStore.setAcceptRealtimeUpdates(isSelectedToday.value)
+}
+
+function handleDateChange() {
+  updateRealtimeMode()
+  fetchData({ showLoading: true })
+}
+
 function setSortBy(type: 'time' | 'reseal_time' | 'seal_amount' | 'continuous_days') {
   sortBy.value = type
 }
@@ -233,24 +271,12 @@ function resetFilters() {
 
 async function refreshData() {
   try {
-    await ElMessageBox.confirm(
-      '将从开盘啦/同花顺重新获取涨停原因和状态，是否继续？',
-      '刷新数据',
-      { type: 'warning' }
-    )
-
     refreshing.value = true
-    await refreshLimitUpData()
-    ElMessage.success('刷新请求已提交，请稍后刷新页面查看')
-
-    setTimeout(() => {
-      fetchData({ showLoading: false, silent: true })
-    }, 3000)
+    await fetchData({ showLoading: false, silent: false })
+    ElMessage.success('数据已刷新')
   } catch (e: any) {
-    if (e !== 'cancel') {
-      console.error('Refresh error:', e)
-      ElMessage.error('刷新失败')
-    }
+    console.error('Refresh error:', e)
+    ElMessage.error('刷新失败')
   } finally {
     refreshing.value = false
   }
@@ -300,14 +326,17 @@ function exportData() {
 }
 
 onMounted(() => {
+  updateRealtimeMode()
   fetchData({ showLoading: limitUpStore.realtimeList.length === 0 })
   refreshTimer = window.setInterval(() => {
     if (document.visibilityState !== 'visible') return
+    if (!isSelectedToday.value) return
     fetchData({ showLoading: false, silent: true })
   }, RESYNC_INTERVAL)
 })
 
 onUnmounted(() => {
+  limitUpStore.setAcceptRealtimeUpdates(true)
   if (refreshTimer) {
     clearInterval(refreshTimer)
     refreshTimer = null
