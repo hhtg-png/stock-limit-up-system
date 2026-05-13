@@ -9,6 +9,7 @@ schedulers_module = types.ModuleType("apscheduler.schedulers")
 asyncio_module = types.ModuleType("apscheduler.schedulers.asyncio")
 triggers_module = types.ModuleType("apscheduler.triggers")
 cron_module = types.ModuleType("apscheduler.triggers.cron")
+date_module = types.ModuleType("apscheduler.triggers.date")
 interval_module = types.ModuleType("apscheduler.triggers.interval")
 
 
@@ -35,8 +36,15 @@ class StubIntervalTrigger:
         self.kwargs = kwargs
 
 
+class StubDateTrigger:
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
+
+
 asyncio_module.AsyncIOScheduler = StubAsyncIOScheduler
 cron_module.CronTrigger = StubCronTrigger
+date_module.DateTrigger = StubDateTrigger
 interval_module.IntervalTrigger = StubIntervalTrigger
 
 sys.modules.setdefault("apscheduler", apscheduler_module)
@@ -44,6 +52,7 @@ sys.modules.setdefault("apscheduler.schedulers", schedulers_module)
 sys.modules.setdefault("apscheduler.schedulers.asyncio", asyncio_module)
 sys.modules.setdefault("apscheduler.triggers", triggers_module)
 sys.modules.setdefault("apscheduler.triggers.cron", cron_module)
+sys.modules.setdefault("apscheduler.triggers.date", date_module)
 sys.modules.setdefault("apscheduler.triggers.interval", interval_module)
 
 from app.data_collectors.scheduler import DataScheduler

@@ -9,6 +9,7 @@ schedulers_module = types.ModuleType("apscheduler.schedulers")
 asyncio_module = types.ModuleType("apscheduler.schedulers.asyncio")
 triggers_module = types.ModuleType("apscheduler.triggers")
 cron_module = types.ModuleType("apscheduler.triggers.cron")
+date_module = types.ModuleType("apscheduler.triggers.date")
 interval_module = types.ModuleType("apscheduler.triggers.interval")
 
 
@@ -35,8 +36,15 @@ class StubIntervalTrigger:
         self.kwargs = kwargs
 
 
+class StubDateTrigger:
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
+
+
 asyncio_module.AsyncIOScheduler = StubAsyncIOScheduler
 cron_module.CronTrigger = StubCronTrigger
+date_module.DateTrigger = StubDateTrigger
 interval_module.IntervalTrigger = StubIntervalTrigger
 
 sys.modules.setdefault("apscheduler", apscheduler_module)
@@ -44,6 +52,7 @@ sys.modules.setdefault("apscheduler.schedulers", schedulers_module)
 sys.modules.setdefault("apscheduler.schedulers.asyncio", asyncio_module)
 sys.modules.setdefault("apscheduler.triggers", triggers_module)
 sys.modules.setdefault("apscheduler.triggers.cron", cron_module)
+sys.modules.setdefault("apscheduler.triggers.date", date_module)
 sys.modules.setdefault("apscheduler.triggers.interval", interval_module)
 
 
@@ -122,6 +131,7 @@ class MarketReviewSchedulerTests(unittest.IsolatedAsyncioTestCase):
             getattr(jobs_by_id["market_review_build"]["trigger"].kwargs["timezone"], "zone", None),
             "Asia/Shanghai",
         )
+        self.assertIn("after_close_catchup", job_ids)
 
     def test_start_skips_market_review_jobs_when_disabled(self):
         scheduler = self._create_scheduler()
@@ -254,6 +264,52 @@ class MarketReviewSchedulerTests(unittest.IsolatedAsyncioTestCase):
                 await scheduler._repair_market_review()
 
         run_for_date.assert_not_awaited()
+
+    async def test_after_close_catchup_runs_market_review_and_daily_analysis_after_build_time(self):
+        scheduler = self._create_scheduler()
+
+        with patch(
+            "app.data_collectors.scheduler._should_run_after_close_catchup",
+            return_value=True,
+            create=True,
+        ), patch(
+            "app.data_collectors.scheduler._resolve_cn_trade_date_for_market_review",
+            return_value=date(2026, 5, 13),
+            create=True,
+        ), patch.object(
+            scheduler,
+            "_build_market_review",
+            AsyncMock(),
+        ) as build_market_review, patch.object(
+            scheduler,
+            "_calculate_daily_analysis",
+            AsyncMock(),
+        ) as calculate_daily_analysis:
+            await scheduler._run_after_close_catchup()
+
+        build_market_review.assert_awaited_once()
+        calculate_daily_analysis.assert_awaited_once()
+
+    async def test_after_close_catchup_skips_before_build_time(self):
+        scheduler = self._create_scheduler()
+
+        with patch(
+            "app.data_collectors.scheduler._should_run_after_close_catchup",
+            return_value=False,
+            create=True,
+        ), patch.object(
+            scheduler,
+            "_build_market_review",
+            AsyncMock(),
+        ) as build_market_review, patch.object(
+            scheduler,
+            "_calculate_daily_analysis",
+            AsyncMock(),
+        ) as calculate_daily_analysis:
+            await scheduler._run_after_close_catchup()
+
+        build_market_review.assert_not_awaited()
+        calculate_daily_analysis.assert_not_awaited()
 
     def test_get_cn_trading_dates_raises_when_calendar_schema_is_invalid(self):
         class InvalidCalendar:

@@ -2,10 +2,11 @@
 任务调度器
 """
 import asyncio
-from datetime import datetime, time, date
+from datetime import datetime, time, date, timedelta
 from typing import List, Dict, Tuple, Optional
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from loguru import logger
 
@@ -63,6 +64,12 @@ def _resolve_cn_trade_date_for_market_review(current_date: Optional[date] = None
     if not trading_dates:
         return None
     return resolved_date
+
+
+def _should_run_after_close_catchup(now: Optional[datetime] = None) -> bool:
+    current = now or datetime.now(CN_TZ)
+    build_time = time(settings.MARKET_REVIEW_BUILD_HOUR, settings.MARKET_REVIEW_BUILD_MINUTE)
+    return current.time() >= build_time
 
 
 class DataScheduler:
@@ -162,6 +169,18 @@ class DataScheduler:
                     name="市场复盘修复",
                     max_instances=1,
                 )
+
+        self.scheduler.add_job(
+            self._run_after_close_catchup,
+            DateTrigger(
+                run_date=datetime.now(CN_TZ) + timedelta(seconds=5),
+                timezone=CN_TZ,
+            ),
+            id="after_close_catchup",
+            name="收盘后启动补跑",
+            max_instances=1,
+            replace_existing=True,
+        )
         
         self.scheduler.start()
         self._is_running = True
@@ -444,7 +463,7 @@ class DataScheduler:
             from app.database import async_session_maker
             from app.services.daily_analysis_service import daily_analysis_service
 
-            today = date.today()
+            today = today_cn()
             resolved_trade_date = _resolve_cn_trade_date_for_market_review(today)
             if resolved_trade_date is None:
                 logger.info("Skipping daily analysis build because current China date is not a trading day")
@@ -456,6 +475,25 @@ class DataScheduler:
             logger.info(f"Daily analysis calculated: {resolved_trade_date}")
         except Exception as e:
             logger.error(f"Calculate daily analysis error: {e}")
+
+    async def _run_after_close_catchup(self):
+        """补跑服务启动时错过的收盘后任务。"""
+        if not _should_run_after_close_catchup():
+            return
+
+        trade_date = _resolve_cn_trade_date_for_market_review(today_cn())
+        if trade_date is None:
+            logger.info("Skipping after-close catchup because current China date is not a trading day")
+            return
+
+        logger.info(f"Running after-close catchup for {trade_date}")
+        if settings.MARKET_REVIEW_ENABLED:
+            try:
+                await self._build_market_review()
+            except Exception as e:
+                logger.error(f"After-close market review catchup failed: {e}")
+
+        await self._calculate_daily_analysis()
     
     async def _clear_daily_cache(self):
         """清理每日缓存"""
