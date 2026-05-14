@@ -42,3 +42,16 @@ test('statistics view refreshes automatically without hiding historical comparis
   assert.match(statisticsSource, /盘中实时/, 'summary should identify live intraday data')
   assert.match(statisticsSource, /实时更新/, 'summary should display live snapshot update time')
 })
+
+test('statistics view requests intraday data using China trading date instead of browser local date', () => {
+  assert.match(
+    statisticsSource,
+    /getChinaDateString/,
+    'report should derive today from Asia/Shanghai so live intraday works outside China time zones'
+  )
+  assert.doesNotMatch(
+    statisticsSource,
+    /dayjs\(\)\.format\('YYYY-MM-DD'\)/,
+    'browser-local today can point at the previous day during China trading hours'
+  )
+})

@@ -252,6 +252,7 @@ import { ElMessage } from 'element-plus'
 import * as echarts from 'echarts'
 import dayjs from 'dayjs'
 import { getMarketReviewDaily, getMarketReviewDetail, getMarketReviewIntraday, getMarketReviewLadder } from '@/api'
+import { getChinaDateString } from '@/utils/chinaDate'
 import { buildReviewRange } from '@/utils/reviewRange'
 import type {
   MarketReviewDailyRow,
@@ -265,8 +266,9 @@ const router = useRouter()
 
 const timeRange = ref('30')
 const loading = ref(false)
-const activeStartDate = ref(dayjs().format('YYYY-MM-DD'))
-const activeEndDate = ref(dayjs().format('YYYY-MM-DD'))
+const initialReviewDate = getChinaDateString()
+const activeStartDate = ref(initialReviewDate)
+const activeEndDate = ref(initialReviewDate)
 
 const dailySeries = ref<string[]>([])
 const dailyRows = ref<MarketReviewDailyRow[]>([])
@@ -329,7 +331,7 @@ const strongestReason = computed(() => {
 })
 
 function getDateRange() {
-  return buildReviewRange(timeRange.value, dayjs().format('YYYY-MM-DD'))
+  return buildReviewRange(timeRange.value, getChinaDateString())
 }
 
 function mergeIntradayDailyRows(
@@ -1010,7 +1012,7 @@ async function fetchData(options: FetchDataOptions = {}) {
     loading.value = true
   }
 
-  const today = dayjs().format('YYYY-MM-DD')
+  const today = getChinaDateString()
   const { startDate, endDate, query } = getDateRange()
 
   if (shouldShowLoading) {
