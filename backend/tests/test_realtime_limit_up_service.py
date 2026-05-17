@@ -1,3 +1,4 @@
+import time
 import unittest
 from datetime import date, datetime
 from unittest.mock import AsyncMock, patch
@@ -7,6 +8,22 @@ from app.services.realtime_limit_up_service import RealtimeLimitUpService
 
 
 class RealtimeLimitUpServiceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_get_fast_limit_up_pool_can_wait_for_stale_refresh_before_returning(self):
+        service = RealtimeLimitUpService()
+        trade_date = date(2026, 4, 23)
+        service._POOL_CACHE_TTL = 1
+        service._POOL_STALE_TTL = 60
+        service._pool_cache[trade_date] = [{"stock_code": "000001", "stock_name": "Old"}]
+        service._pool_cache_time[trade_date] = time.time() - 2
+        service._refresh_pool_cache = AsyncMock(
+            return_value=[{"stock_code": "000002", "stock_name": "Fresh"}]
+        )
+
+        data = await service.get_fast_limit_up_pool(trade_date, wait_for_refresh=True)
+
+        self.assertEqual(data, [{"stock_code": "000002", "stock_name": "Fresh"}])
+        service._refresh_pool_cache.assert_awaited_once_with(trade_date)
+
     async def test_get_realtime_limit_up_list_merges_fast_pool_with_tencent_quotes(self):
         service = RealtimeLimitUpService()
         service.get_fast_limit_up_pool = AsyncMock(

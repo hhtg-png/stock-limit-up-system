@@ -45,7 +45,12 @@ class RealtimeLimitUpService:
         self._THS_CACHE_TTL = 300
         self._THS_STALE_TTL = 1800
 
-    async def get_fast_limit_up_pool(self, trade_date: Optional[date] = None) -> List[Dict]:
+    async def get_fast_limit_up_pool(
+        self,
+        trade_date: Optional[date] = None,
+        wait_for_refresh: bool = False,
+        max_cache_age: Optional[float] = None,
+    ) -> List[Dict]:
         """获取快速涨停池数据，不做自由流通市值补算"""
         if trade_date is None:
             trade_date = date.today()
@@ -54,24 +59,37 @@ class RealtimeLimitUpService:
         cached = self._pool_cache.get(trade_date)
         cached_at = self._pool_cache_time.get(trade_date, 0.0)
         age = now - cached_at
+        cache_ttl = self._POOL_CACHE_TTL if max_cache_age is None else max_cache_age
 
-        if cached and age < self._POOL_CACHE_TTL:
+        if cached and age < cache_ttl:
             return copy.deepcopy(cached)
 
         if cached and age < self._POOL_STALE_TTL:
+            if wait_for_refresh:
+                data = await self._refresh_pool_cache(trade_date)
+                return copy.deepcopy(data)
             self._ensure_pool_refresh(trade_date)
             return copy.deepcopy(cached)
 
         data = await self._refresh_pool_cache(trade_date)
         return copy.deepcopy(data)
 
-    async def get_realtime_limit_up_list(self, trade_date: Optional[date] = None) -> List[Dict]:
+    async def get_realtime_limit_up_list(
+        self,
+        trade_date: Optional[date] = None,
+        wait_for_pool_refresh: bool = False,
+        pool_max_cache_age: Optional[float] = None,
+    ) -> List[Dict]:
         """获取高实时涨停列表（EM 元数据 + THS 原因 + 腾讯行情）"""
         if trade_date is None:
             trade_date = date.today()
 
         raw_data, reason_map = await asyncio.gather(
-            self.get_fast_limit_up_pool(trade_date),
+            self.get_fast_limit_up_pool(
+                trade_date,
+                wait_for_refresh=wait_for_pool_refresh,
+                max_cache_age=pool_max_cache_age,
+            ),
             self._fetch_ths_reason_map(),
         )
 

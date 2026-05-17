@@ -21,8 +21,9 @@ router = APIRouter()
 realtime_alert_tracker = RealtimeLimitUpAlertTracker()
 realtime_stream_tracker = RealtimeLimitUpStreamTracker()
 realtime_sync_task: Optional[asyncio.Task] = None
-REALTIME_SYNC_INTERVAL = 2
+REALTIME_SYNC_INTERVAL = 1
 REALTIME_SYNC_IDLE_INTERVAL = 30
+REALTIME_POOL_MAX_CACHE_AGE = 1
 
 
 @router.websocket("/ws/realtime")
@@ -181,7 +182,11 @@ async def realtime_sync_loop():
                 continue
 
             trade_date = date.today()
-            realtime_data = await realtime_limit_up_service.get_realtime_limit_up_list(trade_date)
+            realtime_data = await realtime_limit_up_service.get_realtime_limit_up_list(
+                trade_date,
+                wait_for_pool_refresh=True,
+                pool_max_cache_age=REALTIME_POOL_MAX_CACHE_AGE,
+            )
             sync_message = realtime_stream_tracker.sync(realtime_data, trade_date)
             if sync_message:
                 await broadcast_realtime_sync_message(sync_message)
