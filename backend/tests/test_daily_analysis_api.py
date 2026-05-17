@@ -76,7 +76,23 @@ class DailyAnalysisApiTests(unittest.TestCase):
                 is_cy=0,
                 is_kc=0,
             )
-            session.add_all([leader, trend_20cm, popular_limit_down, popular_slump])
+            stale_leader = Stock(
+                stock_code="600379",
+                stock_name="宝光股份",
+                market="SH",
+                industry="电网设备",
+                is_cy=0,
+                is_kc=0,
+            )
+            review_leader = Stock(
+                stock_code="002918",
+                stock_name="蒙娜丽莎",
+                market="SZ",
+                industry="建筑陶瓷",
+                is_cy=0,
+                is_kc=0,
+            )
+            session.add_all([leader, trend_20cm, popular_limit_down, popular_slump, stale_leader, review_leader])
             await session.flush()
 
             session.add_all(
@@ -178,6 +194,22 @@ class DailyAnalysisApiTests(unittest.TestCase):
                         amount=85000,
                         turnover_rate=7,
                     ),
+                    LimitUpRecord(
+                        stock_id=stale_leader.id,
+                        trade_date=date(2026, 4, 27),
+                        first_limit_up_time=datetime(2026, 4, 27, 9, 38, 1),
+                        final_seal_time=datetime(2026, 4, 27, 9, 38, 1),
+                        reason_category="电网设备",
+                        limit_up_reason="旧源高标",
+                        continuous_limit_up_days=10,
+                        open_count=3,
+                        is_final_sealed=True,
+                        open_price=18,
+                        close_price=19.8,
+                        limit_up_price=19.8,
+                        amount=200000,
+                        turnover_rate=20,
+                    ),
                 ]
             )
             session.add(
@@ -237,6 +269,55 @@ class DailyAnalysisApiTests(unittest.TestCase):
                         limit_up_reason=None,
                         data_quality_flag="ok",
                     ),
+                    MarketReviewStockDaily(
+                        stock_id=stale_leader.id,
+                        trade_date=date(2026, 4, 27),
+                        stock_code="600379",
+                        stock_name="宝光股份",
+                        board_type="main",
+                        is_st=False,
+                        yesterday_limit_up=True,
+                        yesterday_continuous_days=9,
+                        today_touched_limit_up=True,
+                        today_sealed_close=False,
+                        today_opened_close=True,
+                        today_broken=True,
+                        today_continuous_days=1,
+                        first_limit_time=datetime(2026, 4, 27, 9, 38, 1).time(),
+                        open_count=4,
+                        close_price=18.66,
+                        pre_close=18.63,
+                        change_pct=0.16,
+                        amount=225812,
+                        turnover_rate=24.73,
+                        limit_up_reason="电网设备",
+                        data_quality_flag="ok",
+                    ),
+                    MarketReviewStockDaily(
+                        stock_id=review_leader.id,
+                        trade_date=date(2026, 4, 27),
+                        stock_code="002918",
+                        stock_name="蒙娜丽莎",
+                        board_type="main",
+                        is_st=False,
+                        yesterday_limit_up=True,
+                        yesterday_continuous_days=2,
+                        today_touched_limit_up=True,
+                        today_sealed_close=True,
+                        today_opened_close=False,
+                        today_broken=False,
+                        today_continuous_days=3,
+                        first_limit_time=datetime(2026, 4, 27, 9, 30, 39).time(),
+                        final_seal_time=datetime(2026, 4, 27, 9, 30, 39).time(),
+                        open_count=1,
+                        close_price=15.73,
+                        pre_close=14.3,
+                        change_pct=10.0,
+                        amount=44520,
+                        turnover_rate=8.5,
+                        limit_up_reason="建筑陶瓷",
+                        data_quality_flag="ok",
+                    ),
                 ]
             )
             await session.commit()
@@ -274,6 +355,23 @@ class DailyAnalysisApiTests(unittest.TestCase):
             self.assertEqual(rebuilt.status_code, 200)
             self.assertEqual(rebuilt.json()["columns"]["辨识度"]["content"], "人工确认：唯一高标")
             self.assertTrue(rebuilt.json()["columns"]["辨识度"]["is_manual"])
+
+    def test_rebuild_prefers_market_review_candidates_over_stale_limit_up_records(self):
+        trading_dates = {
+            date(2026, 4, 23),
+            date(2026, 4, 24),
+            date(2026, 4, 25),
+            date(2026, 4, 27),
+        }
+        with patch.object(daily_analysis_service, "_load_cn_trading_date_set", return_value=trading_dates):
+            rebuilt = self.client.post("/statistics/daily-analysis/2026-04-27/rebuild")
+
+        self.assertEqual(rebuilt.status_code, 200)
+        unique_items = rebuilt.json()["columns"]["连板唯一性"]["items"]
+        self.assertEqual(len(unique_items), 1)
+        self.assertEqual(unique_items[0]["stock_code"], "002918")
+        self.assertEqual(unique_items[0]["tags"], ["唯一", "3板"])
+        self.assertNotEqual(unique_items[0]["stock_code"], "600379")
 
 
 if __name__ == "__main__":

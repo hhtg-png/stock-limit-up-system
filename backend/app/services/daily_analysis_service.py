@@ -6,7 +6,7 @@ from datetime import date, datetime, time
 import re
 from typing import Any, Dict, Iterable, List, Optional, Set
 
-from sqlalchemy import distinct, select
+from sqlalchemy import distinct, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.limit_up import LimitUpRecord
@@ -748,15 +748,36 @@ class DailyAnalysisService:
         if not dates:
             return []
 
-        query = (
+        review_query = (
+            select(MarketReviewStockDaily, Stock)
+            .join(Stock, MarketReviewStockDaily.stock_id == Stock.id)
+            .where(
+                MarketReviewStockDaily.trade_date.in_(dates),
+                self._review_candidate_condition(),
+            )
+            .order_by(MarketReviewStockDaily.trade_date, MarketReviewStockDaily.stock_code)
+        )
+        review_result = await db.execute(review_query)
+        review_rows = review_result.all()
+        review_facts = [self._to_fact_from_review_stock(row, stock) for row, stock in review_rows]
+        review_dates = {fact.trade_date for fact in review_facts}
+
+        fallback_dates = [value for value in dates if value not in review_dates]
+        if not fallback_dates:
+            return review_facts
+
+        limit_up_query = (
             select(LimitUpRecord, Stock)
             .join(Stock, LimitUpRecord.stock_id == Stock.id)
-            .where(LimitUpRecord.trade_date.in_(dates))
+            .where(LimitUpRecord.trade_date.in_(fallback_dates))
             .order_by(LimitUpRecord.trade_date, Stock.stock_code)
         )
-        result = await db.execute(query)
-        rows = result.all()
-        return [self._to_fact(record, stock) for record, stock in rows]
+        limit_up_result = await db.execute(limit_up_query)
+        limit_up_rows = limit_up_result.all()
+        return sorted(
+            [*review_facts, *[self._to_fact(record, stock) for record, stock in limit_up_rows]],
+            key=lambda fact: (fact.trade_date, fact.stock_code),
+        )
 
     async def collect_negative_feedback_facts(
         self,
@@ -808,23 +829,52 @@ class DailyAnalysisService:
         return normalized
 
     async def _get_recent_trade_dates(self, db: AsyncSession, trade_date: date, limit: int) -> List[date]:
-        query = (
+        limit_up_query = (
             select(distinct(LimitUpRecord.trade_date))
             .where(LimitUpRecord.trade_date <= trade_date)
             .order_by(LimitUpRecord.trade_date.desc())
             .limit(limit)
         )
-        result = await db.execute(query)
-        return sorted(self._filter_trading_dates([row[0] for row in result.all()]))
+        limit_up_result = await db.execute(limit_up_query)
+        review_query = (
+            select(distinct(MarketReviewStockDaily.trade_date))
+            .where(
+                MarketReviewStockDaily.trade_date <= trade_date,
+                self._review_candidate_condition(),
+            )
+            .order_by(MarketReviewStockDaily.trade_date.desc())
+            .limit(limit)
+        )
+        review_result = await db.execute(review_query)
+        dates = sorted(
+            {row[0] for row in limit_up_result.all()} | {row[0] for row in review_result.all()},
+            reverse=True,
+        )
+        return sorted(self._filter_trading_dates(dates)[:limit])
 
     async def _get_trade_dates(self, db: AsyncSession, month: Optional[str]) -> List[date]:
-        query = select(distinct(LimitUpRecord.trade_date)).where(LimitUpRecord.trade_date <= date.today())
+        limit_up_query = select(distinct(LimitUpRecord.trade_date)).where(LimitUpRecord.trade_date <= date.today())
+        review_query = select(distinct(MarketReviewStockDaily.trade_date)).where(
+            MarketReviewStockDaily.trade_date <= date.today(),
+            self._review_candidate_condition(),
+        )
         if month:
             start, end = self._month_bounds(month)
-            query = query.where(LimitUpRecord.trade_date >= start, LimitUpRecord.trade_date <= end)
-        query = query.order_by(LimitUpRecord.trade_date)
-        result = await db.execute(query)
-        return self._filter_trading_dates([row[0] for row in result.all()])
+            limit_up_query = limit_up_query.where(LimitUpRecord.trade_date >= start, LimitUpRecord.trade_date <= end)
+            review_query = review_query.where(
+                MarketReviewStockDaily.trade_date >= start,
+                MarketReviewStockDaily.trade_date <= end,
+            )
+        limit_up_result = await db.execute(limit_up_query)
+        review_result = await db.execute(review_query)
+        dates = sorted({row[0] for row in limit_up_result.all()} | {row[0] for row in review_result.all()})
+        return self._filter_trading_dates(dates)
+
+    def _review_candidate_condition(self):
+        return or_(
+            MarketReviewStockDaily.today_touched_limit_up.is_(True),
+            MarketReviewStockDaily.today_continuous_days > 0,
+        )
 
     async def _get_month_records(self, db: AsyncSession, month: str) -> List[DailyAnalysisRecord]:
         query = (
