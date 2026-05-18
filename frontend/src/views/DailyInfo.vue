@@ -159,6 +159,7 @@ const modelStatusText = computed(() => {
   const statusMap: Record<string, string> = {
     ready: `DeepSeek ${dailyInfo.value?.model || ''} 已生成摘要`,
     missing_api_key: '未配置 DeepSeek API Key，当前展示本地兜底摘要',
+    refreshing_after_key_configured: 'DeepSeek Key 已配置，旧摘要正在后台刷新',
     fallback: '模型结果不可用，当前展示本地兜底摘要',
     error: dailyInfo.value?.summary.error || '模型调用失败，当前展示本地兜底摘要'
   }

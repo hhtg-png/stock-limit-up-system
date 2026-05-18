@@ -353,6 +353,7 @@ class IntelligenceService:
         self.ima_client = ima_client or ImaWikiClient()
         self.summary_client = summary_client or DeepSeekSummaryClient()
         self.sources = {source.key: source for source in (sources if sources is not None else DEFAULT_SOURCES)}
+        self._refreshing_daily_dates: set[date] = set()
 
     async def sync_all(self, db: AsyncSession, *, force_daily: bool = False) -> Dict[str, Any]:
         results = {}
@@ -419,6 +420,20 @@ class IntelligenceService:
 
     def daily_digest_needs_model_refresh(self, digest: DailyInfoDigest) -> bool:
         return self._has_api_key() and self._summary_from_missing_api_key(digest.summary_json)
+
+    async def refresh_daily_info_in_background(self, trade_date: date) -> None:
+        if trade_date in self._refreshing_daily_dates:
+            return
+        self._refreshing_daily_dates.add(trade_date)
+        try:
+            from app.database import async_session_maker
+
+            async with async_session_maker() as db:
+                await self.build_daily_info(db, trade_date, allow_latest_fallback=True, force=True)
+        except Exception as exc:
+            logger.warning(f"Background daily intelligence refresh failed for {trade_date}: {exc}")
+        finally:
+            self._refreshing_daily_dates.discard(trade_date)
 
     async def _refresh_stale_document_summaries(self, documents: List[KnowledgeDocument]) -> None:
         if not self._has_api_key():
