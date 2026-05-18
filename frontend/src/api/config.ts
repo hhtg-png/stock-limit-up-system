@@ -1,6 +1,10 @@
 import axios from 'axios'
 import type { UserConfig } from '@/stores/config'
 
+export type UserConfigUpdate = Partial<UserConfig> & {
+  deepseek_api_key?: string
+}
+
 const api = axios.create({
   baseURL: '/api/v1',
   timeout: 30000
@@ -13,7 +17,7 @@ export async function getConfig(): Promise<UserConfig> {
 }
 
 // 更新配置
-export async function updateConfig(config: Partial<UserConfig>): Promise<UserConfig> {
+export async function updateConfig(config: UserConfigUpdate): Promise<UserConfig> {
   const { data } = await api.put('/config', config)
   return data
 }

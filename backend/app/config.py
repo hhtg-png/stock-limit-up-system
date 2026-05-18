@@ -68,6 +68,19 @@ class Settings(BaseSettings):
     MARKET_REVIEW_REPAIR_HOUR: int = 20
     MARKET_REVIEW_REPAIR_MINUTE: int = 15
     MARKET_REVIEW_REPAIR_ENABLED: bool = True
+
+    # DeepSeek 总结配置
+    DEEPSEEK_API_KEY: Optional[str] = None
+    DEEPSEEK_BASE_URL: str = "https://api.deepseek.com"
+    DEEPSEEK_MODEL: str = "deepseek-v4-pro"
+    DEEPSEEK_REQUEST_TIMEOUT: int = 60
+
+    # ima 知识库同步配置
+    INTELLIGENCE_ENABLED: bool = True
+    IMA_DAILY_REVIEW_SHARE_ID: str = "12d27469b8ae3e0fae5d6ce8242cff813010a6a5b8bf3248155c1487f099bace"
+    IMA_JIEGE_SHARE_ID: str = "8fbac3ae9fb49b7d2d76a8e22f6bf866d83963ed7a9534f4d1057886fc13d161"
+    IMA_SYNC_PAGE_SIZE: int = 20
+    IMA_SYNC_MAX_PAGES: int = 20
     
     # 日志配置
     LOG_LEVEL: str = "INFO"

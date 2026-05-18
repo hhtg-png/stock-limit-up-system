@@ -84,6 +84,19 @@ class DailyAnalysisSchedulerTests(unittest.TestCase):
         job_ids = {job["id"] for job in scheduler.scheduler.jobs}
         self.assertIn("daily_analysis", job_ids)
 
+    def test_start_registers_intelligence_sync_jobs(self):
+        scheduler = DataScheduler()
+        scheduler.scheduler = FakeScheduler()
+
+        scheduler.start()
+
+        job_ids = {job["id"] for job in scheduler.scheduler.jobs}
+        self.assertIn("intelligence_sync_0845", job_ids)
+        self.assertIn("intelligence_sync_1145", job_ids)
+        self.assertIn("intelligence_sync_1520", job_ids)
+        self.assertIn("intelligence_sync_2030", job_ids)
+        self.assertIn("intelligence_startup_sync", job_ids)
+
     def test_calculate_daily_analysis_skips_non_trading_day(self):
         scheduler = DataScheduler()
 

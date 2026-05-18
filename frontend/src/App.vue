@@ -26,6 +26,14 @@
               <el-icon><Calendar /></el-icon>
               <span>每日分析</span>
             </el-menu-item>
+            <el-menu-item index="/daily-info">
+              <el-icon><Calendar /></el-icon>
+              <span>每日资讯</span>
+            </el-menu-item>
+            <el-menu-item index="/jiege-mode">
+              <el-icon><TrendCharts /></el-icon>
+              <span>杰哥交易模式</span>
+            </el-menu-item>
             <el-menu-item index="/continuous">
               <el-icon><TrendCharts /></el-icon>
               <span>连板梯队</span>

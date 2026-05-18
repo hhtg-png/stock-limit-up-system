@@ -34,6 +34,18 @@ const router = createRouter({
       meta: { title: '每日分析' }
     },
     {
+      path: '/daily-info',
+      name: 'DailyInfo',
+      component: () => import('@/views/DailyInfo.vue'),
+      meta: { title: '每日资讯' }
+    },
+    {
+      path: '/jiege-mode',
+      name: 'JiegeMode',
+      component: () => import('@/views/JiegeMode.vue'),
+      meta: { title: '杰哥交易模式' }
+    },
+    {
       path: '/continuous',
       name: 'ContinuousBoard',
       component: () => import('@/views/ContinuousBoard.vue'),

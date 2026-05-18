@@ -25,6 +25,9 @@ class UserConfigUpdate(UserConfigBase):
     watch_list: Optional[List[str]] = None
     display_columns: Optional[List[str]] = None
     custom_settings: Optional[Dict] = None
+    deepseek_api_key: Optional[str] = Field(None, description="DeepSeek API Key，仅写入，不在响应中返回")
+    deepseek_base_url: Optional[str] = Field(None, description="DeepSeek API 地址")
+    deepseek_model: Optional[str] = Field(None, description="DeepSeek 模型")
 
 
 class UserConfigResponse(UserConfigBase):
@@ -32,6 +35,9 @@ class UserConfigResponse(UserConfigBase):
     id: int
     watch_list: List[str] = Field(default_factory=list)
     display_columns: Optional[List[str]] = None
+    deepseek_api_key_configured: bool = Field(False, description="是否已配置 DeepSeek API Key")
+    deepseek_base_url: str = Field("https://api.deepseek.com", description="DeepSeek API 地址")
+    deepseek_model: str = Field("deepseek-v4-pro", description="DeepSeek 模型")
     
     class Config:
         from_attributes = True

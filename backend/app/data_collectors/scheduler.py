@@ -11,6 +11,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from loguru import logger
 
 from app.config import settings
+from app.services.intelligence_service import intelligence_service
 from app.services.market_review_pipeline_service import market_review_pipeline_service
 from app.utils.time_utils import CN_TZ, get_market_status, is_trading_time, today_cn
 
@@ -169,6 +170,28 @@ class DataScheduler:
                     name="市场复盘修复",
                     max_instances=1,
                 )
+
+        if settings.INTELLIGENCE_ENABLED:
+            for hour, minute in ((8, 45), (11, 45), (15, 20), (20, 30)):
+                self.scheduler.add_job(
+                    self._sync_intelligence,
+                    CronTrigger(hour=hour, minute=minute, timezone=CN_TZ),
+                    id=f"intelligence_sync_{hour:02d}{minute:02d}",
+                    name=f"知识库增量同步 {hour:02d}:{minute:02d}",
+                    max_instances=1,
+                )
+
+            self.scheduler.add_job(
+                self._sync_intelligence,
+                DateTrigger(
+                    run_date=datetime.now(CN_TZ) + timedelta(seconds=8),
+                    timezone=CN_TZ,
+                ),
+                id="intelligence_startup_sync",
+                name="知识库启动补跑",
+                max_instances=1,
+                replace_existing=True,
+            )
 
         self.scheduler.add_job(
             self._run_after_close_catchup,
@@ -475,6 +498,20 @@ class DataScheduler:
             logger.info(f"Daily analysis calculated: {resolved_trade_date}")
         except Exception as e:
             logger.error(f"Calculate daily analysis error: {e}")
+
+    async def _sync_intelligence(self):
+        """增量同步知识库并刷新每日资讯/杰哥交易模式。"""
+        if not settings.INTELLIGENCE_ENABLED:
+            return
+
+        try:
+            from app.database import async_session_maker
+
+            async with async_session_maker() as db:
+                await intelligence_service.sync_all(db)
+            logger.info("Knowledge intelligence sync completed")
+        except Exception as e:
+            logger.error(f"Knowledge intelligence sync error: {e}")
 
     async def _run_after_close_catchup(self):
         """补跑服务启动时错过的收盘后任务。"""

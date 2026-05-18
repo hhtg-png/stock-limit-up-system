@@ -1,6 +1,50 @@
 <template>
   <div class="settings">
     <el-row :gutter="16">
+      <el-col :span="24">
+        <div class="card">
+          <div class="card-title-row">
+            <h3>AI 总结设置</h3>
+            <el-tag :type="config.deepseek_api_key_configured ? 'success' : 'warning'">
+              {{ config.deepseek_api_key_configured ? 'DeepSeek Key 已配置' : 'DeepSeek Key 未配置' }}
+            </el-tag>
+          </div>
+          <el-form label-width="140px">
+            <el-form-item label="API 地址">
+              <el-input
+                v-model="config.deepseek_base_url"
+                placeholder="https://api.deepseek.com"
+                style="max-width: 520px"
+              />
+            </el-form-item>
+            <el-form-item label="模型">
+              <el-input
+                v-model="config.deepseek_model"
+                placeholder="deepseek-v4-pro"
+                style="max-width: 320px"
+              />
+            </el-form-item>
+            <el-form-item label="API Key">
+              <div class="secret-input-row">
+                <el-input
+                  v-model="deepseekApiKey"
+                  type="password"
+                  autocomplete="new-password"
+                  :placeholder="config.deepseek_api_key_configured ? '已保存，重新输入可覆盖' : '输入 DeepSeek API Key'"
+                  style="max-width: 520px"
+                />
+                <el-button type="primary" :loading="savingDeepSeek" @click="saveDeepSeekConfig">
+                  保存AI配置
+                </el-button>
+              </div>
+              <div class="form-hint">保存后密钥不会从接口返回，也不会在页面回显。</div>
+            </el-form-item>
+          </el-form>
+        </div>
+      </el-col>
+    </el-row>
+
+    <el-row :gutter="16">
       <!-- 播报设置 -->
       <el-col :span="12">
         <div class="card">
@@ -120,7 +164,7 @@
 <script setup lang="ts">
 import { ref, reactive, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
-import { getConfig, updateConfig } from '@/api/config'
+import { getConfig, updateConfig, type UserConfigUpdate } from '@/api/config'
 import { useConfigStore } from '@/stores/config'
 
 const configStore = useConfigStore()
@@ -136,10 +180,15 @@ const config = reactive({
   filter_new_stock: false,
   filter_low_price: 0,
   filter_high_price: 0,
-  watch_list: [] as string[]
+  watch_list: [] as string[],
+  deepseek_api_key_configured: false,
+  deepseek_base_url: 'https://api.deepseek.com',
+  deepseek_model: 'deepseek-v4-pro'
 })
 
 const newWatchCode = ref('')
+const deepseekApiKey = ref('')
+const savingDeepSeek = ref(false)
 const notificationPermission = ref(Notification?.permission || 'default')
 
 // 加载配置
@@ -156,13 +205,45 @@ async function loadConfig() {
 // 保存配置
 async function saveConfig() {
   try {
-    await updateConfig(config)
-    configStore.setConfig(config)
+    const payload = buildUserConfigPayload()
+    await updateConfig(payload)
+    configStore.setConfig(payload)
     ElMessage.success('保存成功')
   } catch (e) {
     console.error('Save config error:', e)
     ElMessage.error('保存失败')
   }
+}
+
+async function saveDeepSeekConfig() {
+  savingDeepSeek.value = true
+  try {
+    const payload: UserConfigUpdate = {
+      deepseek_base_url: config.deepseek_base_url,
+      deepseek_model: config.deepseek_model
+    }
+    if (deepseekApiKey.value.trim()) {
+      payload.deepseek_api_key = deepseekApiKey.value.trim()
+    }
+    const data = await updateConfig(payload)
+    Object.assign(config, data)
+    configStore.setConfig(data)
+    deepseekApiKey.value = ''
+    ElMessage.success('AI配置已保存')
+  } catch (e) {
+    console.error('Save DeepSeek config error:', e)
+    ElMessage.error('AI配置保存失败')
+  } finally {
+    savingDeepSeek.value = false
+  }
+}
+
+function buildUserConfigPayload(): UserConfigUpdate {
+  const payload = { ...config } as UserConfigUpdate
+  delete payload.deepseek_api_key_configured
+  delete payload.deepseek_base_url
+  delete payload.deepseek_model
+  return payload
 }
 
 // 请求通知权限
@@ -212,6 +293,36 @@ onMounted(() => {
       border-bottom: 1px solid #f0f0f0;
       padding-bottom: 12px;
     }
+  }
+
+  .card-title-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    border-bottom: 1px solid #f0f0f0;
+    margin-bottom: 20px;
+    padding-bottom: 12px;
+
+    h3 {
+      margin: 0;
+      border-bottom: 0;
+      padding-bottom: 0;
+    }
+  }
+
+  .secret-input-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+  }
+
+  .form-hint {
+    margin-top: 6px;
+    color: #909399;
+    font-size: 12px;
+    line-height: 1.5;
   }
 
   .watchlist {
