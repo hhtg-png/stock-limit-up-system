@@ -41,6 +41,7 @@ class FakeImaClient:
 
 class FakeSummaryClient:
     def __init__(self):
+        self.api_key = None
         self.document_calls = []
         self.daily_calls = []
         self.rule_calls = []
@@ -244,6 +245,45 @@ class IntelligenceServiceTests(unittest.TestCase):
         self.assertTrue(second["cache_hit"])
         self.assertEqual(service.summary_client.daily_calls, [(date(2026, 5, 18), ["2026-05-18-复盘.md"])])
         self.assertEqual(digest.source_count, 1)
+
+    def test_daily_digest_refreshes_document_summaries_after_key_is_configured(self):
+        summary = FakeSummaryClient()
+        summary.api_key = "configured"
+        service = IntelligenceService(
+            ima_client=FakeImaClient({}),
+            summary_client=summary,
+            sources=[],
+        )
+
+        async def run():
+            async with self.Session() as session:
+                session.add(KnowledgeDocument(
+                    source_key="daily",
+                    source_name="每日复盘更新",
+                    share_id="daily",
+                    media_id="markdown_1",
+                    title="2026-05-18-复盘.md",
+                    media_type=7,
+                    media_type_name="MD",
+                    md5_sum="a",
+                    update_time="1779119000000",
+                    abstract="AI摘要: 旧摘要。",
+                    content_text="# 复盘",
+                    content_hash="hash-1",
+                    summary_json={"summary": "旧摘要", "model_status": "missing_api_key"},
+                    summary_status="ready",
+                    trade_date=date(2026, 5, 18),
+                ))
+                await session.commit()
+                digest = await service.build_daily_info(session, date(2026, 5, 18))
+                refreshed_doc = (await session.execute(select(KnowledgeDocument))).scalar_one()
+                return digest, refreshed_doc
+
+        digest, refreshed_doc = asyncio.run(run())
+
+        self.assertEqual(summary.document_calls, ["2026-05-18-复盘.md"])
+        self.assertEqual(refreshed_doc.summary_json["summary"], "2026-05-18-复盘.md summary")
+        self.assertEqual(digest["summary"]["overview"], "2026-05-18 overview")
 
 
 class DeepSeekSummaryClientTests(unittest.TestCase):

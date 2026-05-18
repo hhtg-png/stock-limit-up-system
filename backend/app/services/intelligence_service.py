@@ -395,6 +395,7 @@ class IntelligenceService:
         if not documents and allow_latest_fallback:
             actual_date = await self._latest_daily_trade_date(db) or trade_date
             documents = await self._get_daily_documents(db, actual_date)
+        await self._refresh_stale_document_summaries(documents)
         content_hash = _json_hash([{"id": doc.id, "hash": doc.content_hash, "summary": doc.summary_json} for doc in documents])
         existing = await self._get_daily_digest(db, actual_date)
         if existing and existing.content_hash == content_hash and not force:
@@ -415,6 +416,22 @@ class IntelligenceService:
         await db.commit()
         await db.refresh(existing)
         return self.serialize_daily_digest(existing, cache_hit=False)
+
+    def daily_digest_needs_model_refresh(self, digest: DailyInfoDigest) -> bool:
+        return self._has_api_key() and self._summary_from_missing_api_key(digest.summary_json)
+
+    async def _refresh_stale_document_summaries(self, documents: List[KnowledgeDocument]) -> None:
+        if not self._has_api_key():
+            return
+        for doc in documents:
+            if self._summary_from_missing_api_key(doc.summary_json):
+                await self._summarize_document(doc)
+
+    def _has_api_key(self) -> bool:
+        return bool(getattr(self.summary_client, "api_key", None))
+
+    def _summary_from_missing_api_key(self, summary: Optional[Dict[str, Any]]) -> bool:
+        return (summary or {}).get("model_status") == "missing_api_key"
 
     async def build_jiege_rules(self, db: AsyncSession, *, force: bool = False) -> List[Dict[str, Any]]:
         documents = await self._get_jiege_rule_documents(db)

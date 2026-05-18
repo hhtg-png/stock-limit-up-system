@@ -21,9 +21,15 @@ async def get_daily_info(
 ):
     target_date = trade_date or today_cn()
     existing = await _get_daily_digest(db, target_date)
-    if existing is not None:
+    needs_model_refresh = existing is not None and intelligence_service.daily_digest_needs_model_refresh(existing)
+    if existing is not None and not needs_model_refresh:
         return intelligence_service.serialize_daily_digest(existing, cache_hit=True)
-    return await intelligence_service.build_daily_info(db, target_date, allow_latest_fallback=True)
+    return await intelligence_service.build_daily_info(
+        db,
+        target_date,
+        allow_latest_fallback=True,
+        force=needs_model_refresh,
+    )
 
 
 @router.post("/daily-info/sync", summary="同步每日资讯知识库")

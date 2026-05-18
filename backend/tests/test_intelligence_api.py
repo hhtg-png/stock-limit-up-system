@@ -5,9 +5,11 @@ from unittest.mock import AsyncMock, patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
+from app.api.v1 import intelligence as intelligence_api
 from app.api.v1.intelligence import router as intelligence_router
 from app.database import Base, get_db
 from app.models.intelligence import DailyInfoDigest, JiegeModeSignal
@@ -72,6 +74,40 @@ class IntelligenceApiTests(unittest.TestCase):
         self.assertEqual(payload["trade_date"], "2026-05-18")
         self.assertEqual(payload["summary"]["overview"], "市场修复")
         self.assertEqual(payload["source_count"], 2)
+
+    def test_get_daily_info_rebuilds_missing_key_cache_after_key_is_configured(self):
+        async def mark_digest_as_missing_key():
+            async with self.Session() as session:
+                result = await session.execute(
+                    select(DailyInfoDigest).where(DailyInfoDigest.trade_date == date(2026, 5, 18))
+                )
+                digest = result.scalar_one()
+                digest.summary_json = {"overview": "旧兜底", "model_status": "missing_api_key"}
+                await session.commit()
+
+        asyncio.run(mark_digest_as_missing_key())
+        rebuild = AsyncMock(return_value={
+            "trade_date": "2026-05-18",
+            "status": "ready",
+            "source_count": 2,
+            "summary": {"overview": "模型重算", "model_status": "ready"},
+            "model": "deepseek-v4-pro",
+            "generated_at": None,
+            "cache_hit": False,
+        })
+
+        with patch.object(intelligence_api.intelligence_service.summary_client, "api_key", "configured"), patch.object(
+            intelligence_api.intelligence_service,
+            "build_daily_info",
+            rebuild,
+        ):
+            response = self.client.get("/intelligence/daily-info", params={"trade_date": "2026-05-18"})
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["summary"]["model_status"], "ready")
+        rebuild.assert_awaited_once()
+        self.assertTrue(rebuild.await_args.kwargs["force"])
 
     def test_post_daily_sync_calls_service(self):
         fake_service = AsyncMock()
