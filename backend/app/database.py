@@ -11,6 +11,23 @@ import os
 from app.config import settings
 
 
+def build_engine_options(database_url: str) -> dict:
+    """Build SQLAlchemy engine options for the configured database."""
+    if database_url.startswith("sqlite"):
+        return {"connect_args": {"timeout": 30}}
+    return {}
+
+
+def configure_sqlite_connection(dbapi_connection, _connection_record) -> None:
+    """Reduce transient SQLite lock failures during background sync writes."""
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=30000")
+    finally:
+        cursor.close()
+
+
 # 确保数据目录存在
 os.makedirs("./data", exist_ok=True)
 os.makedirs("./logs", exist_ok=True)
@@ -19,8 +36,12 @@ os.makedirs("./logs", exist_ok=True)
 engine = create_async_engine(
     settings.DATABASE_URL,
     echo=settings.DEBUG,
-    future=True
+    future=True,
+    **build_engine_options(settings.DATABASE_URL),
 )
+
+if settings.DATABASE_URL.startswith("sqlite"):
+    event.listen(engine.sync_engine, "connect", configure_sqlite_connection)
 
 # 创建异步会话工厂
 async_session_maker = async_sessionmaker(
