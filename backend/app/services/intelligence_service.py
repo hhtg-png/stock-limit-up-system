@@ -398,7 +398,8 @@ class IntelligenceService:
             documents = await self._get_daily_documents(db, actual_date)
         await self._refresh_stale_document_summaries(documents)
         content_hash = _json_hash([{"id": doc.id, "hash": doc.content_hash, "summary": doc.summary_json} for doc in documents])
-        existing = await self._get_daily_digest(db, actual_date)
+        with db.no_autoflush:
+            existing = await self._get_daily_digest(db, actual_date)
         if existing and existing.content_hash == content_hash and not force:
             return self.serialize_daily_digest(existing, cache_hit=True)
 
