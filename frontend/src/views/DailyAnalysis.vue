@@ -6,6 +6,10 @@
         <span>近10日涨停/触板池自动识别，支持人工修正</span>
       </div>
       <div class="toolbar-actions">
+        <el-radio-group v-model="analysisSession" class="session-toggle">
+          <el-radio-button label="after_close">盘后</el-radio-button>
+          <el-radio-button label="intraday">盘中</el-radio-button>
+        </el-radio-group>
         <el-date-picker
           v-model="selectedMonth"
           type="month"
@@ -15,7 +19,13 @@
           :editable="false"
         />
         <el-button :icon="Refresh" @click="fetchData" :loading="loading">刷新</el-button>
-        <el-button type="primary" :icon="Files" @click="backfillMonth" :loading="backfilling">
+        <el-button
+          type="primary"
+          :icon="Files"
+          @click="backfillMonth"
+          :loading="backfilling"
+          :disabled="analysisSession === 'intraday'"
+        >
           回填本月
         </el-button>
       </div>
@@ -33,7 +43,7 @@
           <template #default="{ row }">
             <div class="date-cell">
               <strong>{{ row.trade_date }}</strong>
-              <span>v{{ row.calc_version }}</span>
+              <span>{{ sessionLabel(row.session) }} v{{ row.calc_version }}</span>
             </div>
           </template>
         </el-table-column>
@@ -101,11 +111,11 @@
       </el-table>
 
       <div class="mobile-analysis-list" v-loading="loading">
-        <article v-for="row in rows" :key="row.trade_date" class="mobile-analysis-card">
+        <article v-for="row in rows" :key="`${row.trade_date}-${row.session}`" class="mobile-analysis-card">
           <div class="mobile-analysis-header">
             <div>
               <strong>{{ row.trade_date }}</strong>
-              <span>v{{ row.calc_version }}</span>
+              <span>{{ sessionLabel(row.session) }} v{{ row.calc_version }}</span>
             </div>
             <el-button :icon="Refresh" link type="primary" @click.stop="rebuildRow(row)">
               重算
@@ -211,12 +221,14 @@ import {
   DAILY_ANALYSIS_COLUMNS,
   type DailyAnalysisCell,
   type DailyAnalysisColumn,
-  type DailyAnalysisRow
+  type DailyAnalysisRow,
+  type DailyAnalysisSession
 } from '@/types/daily-analysis'
 
 const router = useRouter()
 const analysisColumns = DAILY_ANALYSIS_COLUMNS
 const selectedMonth = ref(dayjs().format('YYYY-MM'))
+const analysisSession = ref<DailyAnalysisSession>('after_close')
 const rows = ref<DailyAnalysisRow[]>([])
 const loading = ref(false)
 const backfilling = ref(false)
@@ -234,7 +246,7 @@ const emptyCell: DailyAnalysisCell = {
 
 const editTitle = computed(() => {
   if (!editingRow.value || !editingColumn.value) return '编辑'
-  return `${editingRow.value.trade_date} ${editingColumn.value}`
+  return `${editingRow.value.trade_date} ${sessionLabel(editingRow.value.session)} ${editingColumn.value}`
 })
 
 const editingAutoContent = computed(() => {
@@ -247,7 +259,7 @@ const canRestoreEditingCell = computed(() => {
   return Boolean(editingRow.value.columns[editingColumn.value]?.is_manual)
 })
 
-watch(selectedMonth, () => {
+watch([selectedMonth, analysisSession], () => {
   fetchData()
 })
 
@@ -258,7 +270,7 @@ onMounted(() => {
 async function fetchData() {
   loading.value = true
   try {
-    const response = await getDailyAnalysisMonth(selectedMonth.value)
+    const response = await getDailyAnalysisMonth(selectedMonth.value, analysisSession.value)
     rows.value = response.data
   } catch (error) {
     console.error('获取每日分析失败:', error)
@@ -269,6 +281,10 @@ async function fetchData() {
 }
 
 async function backfillMonth() {
+  if (analysisSession.value === 'intraday') {
+    ElMessage.warning('盘中版由14:50定时生成')
+    return
+  }
   try {
     await ElMessageBox.confirm(`将按现有历史数据生成 ${selectedMonth.value} 月表，是否继续？`, '回填本月', {
       type: 'warning'
@@ -292,7 +308,7 @@ async function rebuildRow(row: DailyAnalysisRow) {
     await ElMessageBox.confirm(`重算 ${row.trade_date} 的自动分析，人工修正会保留。`, '重算单日', {
       type: 'warning'
     })
-    const updated = await rebuildDailyAnalysis(row.trade_date)
+    const updated = await rebuildDailyAnalysis(row.trade_date, analysisSession.value)
     replaceRow(updated)
     ElMessage.success('重算完成')
   } catch (error) {
@@ -317,7 +333,7 @@ async function saveOverride() {
   try {
     const updated = await updateDailyAnalysisOverrides(editingRow.value.trade_date, {
       [editingColumn.value]: editText.value
-    })
+    }, analysisSession.value)
     replaceRow(updated)
     editVisible.value = false
     ElMessage.success('已保存人工修正')
@@ -340,7 +356,7 @@ async function restoreOverride(row: DailyAnalysisRow, column: DailyAnalysisColum
   try {
     const updated = await updateDailyAnalysisOverrides(row.trade_date, {
       [column]: null
-    })
+    }, analysisSession.value)
     replaceRow(updated)
     ElMessage.success('已恢复自动结果')
   } catch (error) {
@@ -374,6 +390,10 @@ function tagType(tag: string): 'success' | 'warning' | 'danger' | 'info' {
   if (tag.includes('人工') || tag.includes('长上影')) return 'warning'
   if (tag.includes('趋势') || tag.includes('二波')) return 'success'
   return 'info'
+}
+
+function sessionLabel(session: DailyAnalysisSession): string {
+  return session === 'intraday' ? '盘中' : '盘后'
 }
 </script>
 
@@ -414,6 +434,10 @@ function tagType(tag: string): 'success' | 'warning' | 'danger' | 'info' {
     gap: 10px;
     flex-wrap: wrap;
   }
+}
+
+.session-toggle {
+  flex-shrink: 0;
 }
 
 .table-wrap {
@@ -566,6 +590,19 @@ function tagType(tag: string): 'success' | 'warning' | 'danger' | 'info' {
       display: grid;
       grid-template-columns: 1fr 1fr;
       gap: 8px;
+
+      .session-toggle {
+        grid-column: 1 / -1;
+        width: 100%;
+
+        :deep(.el-radio-button) {
+          flex: 1;
+        }
+
+        :deep(.el-radio-button__inner) {
+          width: 100%;
+        }
+      }
 
       :deep(.el-date-editor),
       :deep(.el-button) {

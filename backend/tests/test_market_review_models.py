@@ -39,6 +39,15 @@ class MarketReviewModelTests(unittest.TestCase):
         self.assertNotIn(("trade_date", "stock_id"), stock_daily_uniques)
         self.assertNotIn(("trade_date", "stock_id", "event_type", "event_seq"), limitup_event_uniques)
         self.assertIn("daily_analysis_records", Base.metadata.tables)
+        daily_analysis = Base.metadata.tables["daily_analysis_records"]
+        for column_name in (
+            "intraday_auto_result",
+            "intraday_manual_overrides",
+            "intraday_calc_version",
+            "intraday_data_status",
+            "intraday_generated_at",
+        ):
+            self.assertIn(column_name, daily_analysis.c)
 
 
 if __name__ == "__main__":

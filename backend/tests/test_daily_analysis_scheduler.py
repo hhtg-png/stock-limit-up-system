@@ -1,8 +1,9 @@
 import asyncio
 import unittest
+from datetime import date
 import sys
 import types
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 apscheduler_module = types.ModuleType("apscheduler")
 schedulers_module = types.ModuleType("apscheduler.schedulers")
@@ -84,6 +85,16 @@ class DailyAnalysisSchedulerTests(unittest.TestCase):
         job_ids = {job["id"] for job in scheduler.scheduler.jobs}
         self.assertIn("daily_analysis", job_ids)
 
+    def test_start_registers_daily_analysis_intraday_job_at_1450(self):
+        scheduler = DataScheduler()
+        scheduler.scheduler = FakeScheduler()
+
+        scheduler.start()
+
+        intraday_job = next(job for job in scheduler.scheduler.jobs if job["id"] == "daily_analysis_intraday")
+        self.assertEqual(intraday_job["trigger"].kwargs["hour"], 14)
+        self.assertEqual(intraday_job["trigger"].kwargs["minute"], 50)
+
     def test_start_registers_intelligence_sync_jobs(self):
         scheduler = DataScheduler()
         scheduler.scheduler = FakeScheduler()
@@ -105,6 +116,27 @@ class DailyAnalysisSchedulerTests(unittest.TestCase):
             return_value=None,
         ):
             asyncio.run(scheduler._calculate_daily_analysis())
+
+    def test_calculate_intraday_daily_analysis_refreshes_market_review_first(self):
+        scheduler = DataScheduler()
+        trade_date = date(2026, 5, 19)
+
+        with patch(
+            "app.data_collectors.scheduler._resolve_cn_trade_date_for_market_review",
+            return_value=trade_date,
+        ), patch(
+            "app.data_collectors.scheduler.market_review_pipeline_service.run_for_date",
+            new_callable=AsyncMock,
+        ) as run_market_review, patch(
+            "app.services.daily_analysis_service.daily_analysis_service.build_for_date",
+            new_callable=AsyncMock,
+        ) as build_daily_analysis:
+            asyncio.run(scheduler._calculate_intraday_daily_analysis())
+
+        run_market_review.assert_awaited_once_with(trade_date, calc_version=0)
+        build_daily_analysis.assert_awaited_once()
+        self.assertEqual(build_daily_analysis.await_args.args[1], trade_date)
+        self.assertEqual(build_daily_analysis.await_args.kwargs["session"], "intraday")
 
 
 if __name__ == "__main__":

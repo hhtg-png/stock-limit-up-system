@@ -136,6 +136,19 @@ class DataScheduler:
             name="每日分析月表生成",
             max_instances=1
         )
+
+        # 盘中每日分析月表（每个交易日14:50先刷新市场复盘事实，再生成盘中版）
+        self.scheduler.add_job(
+            self._calculate_intraday_daily_analysis,
+            CronTrigger(
+                hour=settings.DAILY_ANALYSIS_INTRADAY_HOUR,
+                minute=settings.DAILY_ANALYSIS_INTRADAY_MINUTE,
+                timezone=CN_TZ,
+            ),
+            id="daily_analysis_intraday",
+            name="每日分析盘中版生成",
+            max_instances=1
+        )
         
         # 每日缓存清理（每天16:00）
         self.scheduler.add_job(
@@ -493,11 +506,33 @@ class DataScheduler:
                 return
 
             async with async_session_maker() as db:
-                await daily_analysis_service.build_for_date(db, resolved_trade_date)
+                await daily_analysis_service.build_for_date(db, resolved_trade_date, session="after_close")
 
             logger.info(f"Daily analysis calculated: {resolved_trade_date}")
         except Exception as e:
             logger.error(f"Calculate daily analysis error: {e}")
+
+    async def _calculate_intraday_daily_analysis(self):
+        """生成每日分析盘中版数据。"""
+        try:
+            from app.database import async_session_maker
+            from app.services.daily_analysis_service import daily_analysis_service
+
+            today = today_cn()
+            resolved_trade_date = _resolve_cn_trade_date_for_market_review(today)
+            if resolved_trade_date is None:
+                logger.info("Skipping intraday daily analysis build because current China date is not a trading day")
+                return
+
+            if settings.MARKET_REVIEW_ENABLED:
+                await market_review_pipeline_service.run_for_date(resolved_trade_date, calc_version=0)
+
+            async with async_session_maker() as db:
+                await daily_analysis_service.build_for_date(db, resolved_trade_date, session="intraday")
+
+            logger.info(f"Intraday daily analysis calculated: {resolved_trade_date}")
+        except Exception as e:
+            logger.error(f"Calculate intraday daily analysis error: {e}")
 
     async def _sync_intelligence(self):
         """增量同步知识库并刷新每日资讯/杰哥交易模式。"""

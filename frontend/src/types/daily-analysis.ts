@@ -11,6 +11,7 @@ export const DAILY_ANALYSIS_COLUMNS = [
 ] as const
 
 export type DailyAnalysisColumn = typeof DAILY_ANALYSIS_COLUMNS[number]
+export type DailyAnalysisSession = 'after_close' | 'intraday'
 
 export interface DailyAnalysisItem {
   stock_code?: string
@@ -30,6 +31,7 @@ export interface DailyAnalysisCell {
 }
 
 export interface DailyAnalysisRow {
+  session: DailyAnalysisSession
   trade_date: string
   month: string
   status: string
@@ -43,6 +45,7 @@ export interface DailyAnalysisRow {
 
 export interface DailyAnalysisMonthResponse {
   month: string
+  session: DailyAnalysisSession
   data: DailyAnalysisRow[]
 }
 

@@ -27,6 +27,12 @@ DAILY_ANALYSIS_COLUMNS = [
     "负反馈",
 ]
 SIGNAL_COLUMNS = DAILY_ANALYSIS_COLUMNS[1:]
+DAILY_ANALYSIS_SESSION_AFTER_CLOSE = "after_close"
+DAILY_ANALYSIS_SESSION_INTRADAY = "intraday"
+DAILY_ANALYSIS_SESSIONS = {
+    DAILY_ANALYSIS_SESSION_AFTER_CLOSE,
+    DAILY_ANALYSIS_SESSION_INTRADAY,
+}
 
 
 @dataclass(frozen=True)
@@ -648,16 +654,32 @@ class DailyAnalysisService:
         self._cn_trading_calendar: Optional[Set[date]] = None
         self._cn_trading_calendar_unavailable = False
 
-    async def get_month(self, db: AsyncSession, month: str) -> Dict[str, Any]:
+    async def get_month(
+        self,
+        db: AsyncSession,
+        month: str,
+        session: str = DAILY_ANALYSIS_SESSION_AFTER_CLOSE,
+    ) -> Dict[str, Any]:
+        session = self._normalize_session(session)
         records = await self._get_month_records(db, month)
         return {
             "month": month,
-            "data": [self.serialize_record(record) for record in records],
+            "session": session,
+            "data": [
+                self.serialize_record(record, session=session)
+                for record in records
+                if self._record_has_session_data(record, session)
+            ],
         }
 
-    async def rebuild_for_date(self, db: AsyncSession, trade_date: date) -> Dict[str, Any]:
-        record = await self.build_for_date(db, trade_date)
-        return self.serialize_record(record)
+    async def rebuild_for_date(
+        self,
+        db: AsyncSession,
+        trade_date: date,
+        session: str = DAILY_ANALYSIS_SESSION_AFTER_CLOSE,
+    ) -> Dict[str, Any]:
+        record = await self.build_for_date(db, trade_date, session=session)
+        return self.serialize_record(record, session=session)
 
     async def backfill(self, db: AsyncSession, month: Optional[str] = None) -> Dict[str, Any]:
         dates = await self._get_trade_dates(db, month)
@@ -679,12 +701,14 @@ class DailyAnalysisService:
         db: AsyncSession,
         trade_date: date,
         overrides: Dict[str, Optional[str]],
+        session: str = DAILY_ANALYSIS_SESSION_AFTER_CLOSE,
     ) -> Dict[str, Any]:
+        session = self._normalize_session(session)
         record = await self._get_record(db, trade_date)
         if record is None:
-            record = await self.build_for_date(db, trade_date)
+            record = await self.build_for_date(db, trade_date, session=session)
 
-        current = dict(record.manual_overrides or {})
+        current = dict(self._get_manual_overrides(record, session) or {})
         for column, value in overrides.items():
             if column not in SIGNAL_COLUMNS:
                 continue
@@ -693,18 +717,20 @@ class DailyAnalysisService:
             else:
                 current[column] = str(value)
 
-        record.manual_overrides = current
+        self._set_manual_overrides(record, session, current)
         record.updated_at = datetime.now()
         await db.commit()
         await db.refresh(record)
-        return self.serialize_record(record)
+        return self.serialize_record(record, session=session)
 
     async def build_for_date(
         self,
         db: AsyncSession,
         trade_date: date,
         calc_version: Optional[int] = None,
+        session: str = DAILY_ANALYSIS_SESSION_AFTER_CLOSE,
     ) -> DailyAnalysisRecord:
+        session = self._normalize_session(session)
         facts = await self.collect_candidate_facts(db, trade_date)
         negative_feedback_facts = await self.collect_negative_feedback_facts(db, trade_date)
         auto_result = self.rule_engine.build_daily_result(
@@ -719,20 +745,24 @@ class DailyAnalysisService:
             record = DailyAnalysisRecord(
                 trade_date=trade_date,
                 month=trade_date.strftime("%Y-%m"),
-                auto_result=auto_result,
+                auto_result={},
                 manual_overrides={},
-                calc_version=calc_version or 1,
-                data_status="ready",
+                calc_version=0,
+                data_status="empty",
                 generated_at=now,
+                intraday_auto_result={},
+                intraday_manual_overrides={},
+                intraday_calc_version=0,
+                intraday_data_status="empty",
             )
             db.add(record)
-        else:
-            record.auto_result = auto_result
-            record.month = trade_date.strftime("%Y-%m")
-            record.calc_version = calc_version or (record.calc_version or 0) + 1
-            record.data_status = "ready"
-            record.generated_at = now
-            record.updated_at = now
+
+        record.month = trade_date.strftime("%Y-%m")
+        self._set_auto_result(record, session, auto_result)
+        self._set_calc_version(record, session, calc_version)
+        self._set_data_status(record, session, "ready")
+        self._set_generated_at(record, session, now)
+        record.updated_at = now
 
         await db.commit()
         await db.refresh(record)
@@ -794,9 +824,14 @@ class DailyAnalysisService:
         rows = result.all()
         return [self._to_fact_from_review_stock(row, stock) for row, stock in rows]
 
-    def serialize_record(self, record: DailyAnalysisRecord) -> Dict[str, Any]:
-        auto_result = self._normalize_auto_result(record.auto_result or {})
-        manual_overrides = dict(record.manual_overrides or {})
+    def serialize_record(
+        self,
+        record: DailyAnalysisRecord,
+        session: str = DAILY_ANALYSIS_SESSION_AFTER_CLOSE,
+    ) -> Dict[str, Any]:
+        session = self._normalize_session(session)
+        auto_result = self._normalize_auto_result(self._get_auto_result(record, session) or {})
+        manual_overrides = dict(self._get_manual_overrides(record, session) or {})
         columns = {}
         for column in SIGNAL_COLUMNS:
             auto_cell = dict(auto_result.get(column) or self.rule_engine._cell([]))
@@ -807,16 +842,82 @@ class DailyAnalysisService:
             columns[column] = auto_cell
 
         return {
+            "session": session,
             "trade_date": record.trade_date.isoformat(),
             "month": record.month,
-            "status": record.data_status,
-            "calc_version": record.calc_version,
-            "generated_at": record.generated_at.isoformat() if record.generated_at else None,
+            "status": self._get_data_status(record, session),
+            "calc_version": self._get_calc_version(record, session),
+            "generated_at": self._format_generated_at(record, session),
             "updated_at": record.updated_at.isoformat() if record.updated_at else None,
             "auto_result": auto_result,
             "manual_overrides": manual_overrides,
             "columns": columns,
         }
+
+    def _normalize_session(self, session: str) -> str:
+        if session not in DAILY_ANALYSIS_SESSIONS:
+            return DAILY_ANALYSIS_SESSION_AFTER_CLOSE
+        return session
+
+    def _record_has_session_data(self, record: DailyAnalysisRecord, session: str) -> bool:
+        if session == DAILY_ANALYSIS_SESSION_INTRADAY:
+            return self._get_data_status(record, session) == "ready" or bool(record.intraday_auto_result)
+        return self._get_data_status(record, session) == "ready" or bool(record.auto_result)
+
+    def _get_auto_result(self, record: DailyAnalysisRecord, session: str) -> Dict[str, Any]:
+        if session == DAILY_ANALYSIS_SESSION_INTRADAY:
+            return record.intraday_auto_result or {}
+        return record.auto_result or {}
+
+    def _set_auto_result(self, record: DailyAnalysisRecord, session: str, value: Dict[str, Any]) -> None:
+        if session == DAILY_ANALYSIS_SESSION_INTRADAY:
+            record.intraday_auto_result = value
+        else:
+            record.auto_result = value
+
+    def _get_manual_overrides(self, record: DailyAnalysisRecord, session: str) -> Dict[str, str]:
+        if session == DAILY_ANALYSIS_SESSION_INTRADAY:
+            return record.intraday_manual_overrides or {}
+        return record.manual_overrides or {}
+
+    def _set_manual_overrides(self, record: DailyAnalysisRecord, session: str, value: Dict[str, str]) -> None:
+        if session == DAILY_ANALYSIS_SESSION_INTRADAY:
+            record.intraday_manual_overrides = value
+        else:
+            record.manual_overrides = value
+
+    def _get_calc_version(self, record: DailyAnalysisRecord, session: str) -> int:
+        if session == DAILY_ANALYSIS_SESSION_INTRADAY:
+            return int(record.intraday_calc_version or 0)
+        return int(record.calc_version or 0)
+
+    def _set_calc_version(self, record: DailyAnalysisRecord, session: str, calc_version: Optional[int]) -> None:
+        next_version = calc_version if calc_version is not None else self._get_calc_version(record, session) + 1
+        if session == DAILY_ANALYSIS_SESSION_INTRADAY:
+            record.intraday_calc_version = next_version
+        else:
+            record.calc_version = next_version
+
+    def _get_data_status(self, record: DailyAnalysisRecord, session: str) -> str:
+        if session == DAILY_ANALYSIS_SESSION_INTRADAY:
+            return record.intraday_data_status or "empty"
+        return record.data_status or "empty"
+
+    def _set_data_status(self, record: DailyAnalysisRecord, session: str, value: str) -> None:
+        if session == DAILY_ANALYSIS_SESSION_INTRADAY:
+            record.intraday_data_status = value
+        else:
+            record.data_status = value
+
+    def _set_generated_at(self, record: DailyAnalysisRecord, session: str, value: datetime) -> None:
+        if session == DAILY_ANALYSIS_SESSION_INTRADAY:
+            record.intraday_generated_at = value
+        else:
+            record.generated_at = value
+
+    def _format_generated_at(self, record: DailyAnalysisRecord, session: str) -> Optional[str]:
+        generated_at = record.intraday_generated_at if session == DAILY_ANALYSIS_SESSION_INTRADAY else record.generated_at
+        return generated_at.isoformat() if generated_at else None
 
     def _normalize_auto_result(self, raw: Dict[str, Any]) -> Dict[str, Any]:
         normalized = {}

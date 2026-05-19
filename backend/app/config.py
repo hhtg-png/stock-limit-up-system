@@ -68,6 +68,8 @@ class Settings(BaseSettings):
     MARKET_REVIEW_REPAIR_HOUR: int = 20
     MARKET_REVIEW_REPAIR_MINUTE: int = 15
     MARKET_REVIEW_REPAIR_ENABLED: bool = True
+    DAILY_ANALYSIS_INTRADAY_HOUR: int = 14
+    DAILY_ANALYSIS_INTRADAY_MINUTE: int = 50
 
     # DeepSeek 总结配置
     DEEPSEEK_API_KEY: Optional[str] = None

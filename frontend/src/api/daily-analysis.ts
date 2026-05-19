@@ -3,7 +3,8 @@ import type {
   DailyAnalysisBackfillResponse,
   DailyAnalysisColumn,
   DailyAnalysisMonthResponse,
-  DailyAnalysisRow
+  DailyAnalysisRow,
+  DailyAnalysisSession
 } from '@/types/daily-analysis'
 
 const api = axios.create({
@@ -11,24 +12,35 @@ const api = axios.create({
   timeout: 30000
 })
 
-export async function getDailyAnalysisMonth(month: string): Promise<DailyAnalysisMonthResponse> {
+export async function getDailyAnalysisMonth(
+  month: string,
+  session: DailyAnalysisSession = 'after_close'
+): Promise<DailyAnalysisMonthResponse> {
   const { data } = await api.get('/statistics/daily-analysis', {
-    params: { month }
+    params: { month, session }
   })
   return data
 }
 
-export async function rebuildDailyAnalysis(tradeDate: string): Promise<DailyAnalysisRow> {
-  const { data } = await api.post(`/statistics/daily-analysis/${tradeDate}/rebuild`)
+export async function rebuildDailyAnalysis(
+  tradeDate: string,
+  session: DailyAnalysisSession = 'after_close'
+): Promise<DailyAnalysisRow> {
+  const { data } = await api.post(`/statistics/daily-analysis/${tradeDate}/rebuild`, null, {
+    params: { session }
+  })
   return data
 }
 
 export async function updateDailyAnalysisOverrides(
   tradeDate: string,
-  overrides: Partial<Record<DailyAnalysisColumn, string | null>>
+  overrides: Partial<Record<DailyAnalysisColumn, string | null>>,
+  session: DailyAnalysisSession = 'after_close'
 ): Promise<DailyAnalysisRow> {
   const { data } = await api.patch(`/statistics/daily-analysis/${tradeDate}/overrides`, {
     overrides
+  }, {
+    params: { session }
   })
   return data
 }

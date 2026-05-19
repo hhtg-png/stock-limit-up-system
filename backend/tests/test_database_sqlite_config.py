@@ -28,6 +28,7 @@ class DatabaseSqliteConfigTests(unittest.TestCase):
         with engine.begin() as connection:
             connection.exec_driver_sql("CREATE TABLE market_review_stock_daily (id INTEGER PRIMARY KEY)")
             connection.exec_driver_sql("CREATE TABLE market_review_limitup_event (id INTEGER PRIMARY KEY)")
+            connection.exec_driver_sql("CREATE TABLE daily_analysis_records (id INTEGER PRIMARY KEY)")
 
             database.ensure_sqlite_schema_compat(connection)
 
@@ -36,6 +37,9 @@ class DatabaseSqliteConfigTests(unittest.TestCase):
             }
             event_columns = {
                 row[1] for row in connection.exec_driver_sql("PRAGMA table_info(market_review_limitup_event)")
+            }
+            daily_analysis_columns = {
+                row[1] for row in connection.exec_driver_sql("PRAGMA table_info(daily_analysis_records)")
             }
             stock_daily_indexes = {
                 row[1] for row in connection.exec_driver_sql("PRAGMA index_list(market_review_stock_daily)")
@@ -46,6 +50,11 @@ class DatabaseSqliteConfigTests(unittest.TestCase):
 
         self.assertIn("stock_id", stock_daily_columns)
         self.assertIn("stock_id", event_columns)
+        self.assertIn("intraday_auto_result", daily_analysis_columns)
+        self.assertIn("intraday_manual_overrides", daily_analysis_columns)
+        self.assertIn("intraday_calc_version", daily_analysis_columns)
+        self.assertIn("intraday_data_status", daily_analysis_columns)
+        self.assertIn("intraday_generated_at", daily_analysis_columns)
         self.assertIn("ix_market_review_stock_daily_stock_id", stock_daily_indexes)
         self.assertIn("ix_market_review_limitup_event_stock_id", event_indexes)
 

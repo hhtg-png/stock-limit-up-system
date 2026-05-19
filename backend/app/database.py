@@ -50,6 +50,36 @@ def ensure_sqlite_schema_compat(sync_connection) -> None:
         "CREATE INDEX IF NOT EXISTS ix_market_review_limitup_event_stock_id "
         "ON market_review_limitup_event (stock_id)"
     )
+    _add_sqlite_column_if_missing(
+        sync_connection,
+        "daily_analysis_records",
+        "intraday_auto_result",
+        "JSON DEFAULT '{}'",
+    )
+    _add_sqlite_column_if_missing(
+        sync_connection,
+        "daily_analysis_records",
+        "intraday_manual_overrides",
+        "JSON DEFAULT '{}'",
+    )
+    _add_sqlite_column_if_missing(
+        sync_connection,
+        "daily_analysis_records",
+        "intraday_calc_version",
+        "INTEGER DEFAULT 0",
+    )
+    _add_sqlite_column_if_missing(
+        sync_connection,
+        "daily_analysis_records",
+        "intraday_data_status",
+        "VARCHAR(20) DEFAULT 'empty'",
+    )
+    _add_sqlite_column_if_missing(
+        sync_connection,
+        "daily_analysis_records",
+        "intraday_generated_at",
+        "DATETIME",
+    )
 
 
 def _add_sqlite_column_if_missing(sync_connection, table_name: str, column_name: str, column_def: str) -> None:

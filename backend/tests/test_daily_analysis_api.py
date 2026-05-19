@@ -373,6 +373,51 @@ class DailyAnalysisApiTests(unittest.TestCase):
         self.assertEqual(unique_items[0]["tags"], ["唯一", "3板"])
         self.assertNotEqual(unique_items[0]["stock_code"], "600379")
 
+    def test_intraday_and_after_close_sessions_are_stored_separately(self):
+        trading_dates = {date(2026, 4, 23), date(2026, 4, 24)}
+        with patch.object(daily_analysis_service, "_load_cn_trading_date_set", return_value=trading_dates):
+            intraday = self.client.post(
+                "/statistics/daily-analysis/2026-04-24/rebuild",
+                params={"session": "intraday"},
+            )
+            after_close = self.client.post(
+                "/statistics/daily-analysis/2026-04-24/rebuild",
+                params={"session": "after_close"},
+            )
+
+        self.assertEqual(intraday.status_code, 200)
+        self.assertEqual(after_close.status_code, 200)
+        self.assertEqual(intraday.json()["session"], "intraday")
+        self.assertEqual(after_close.json()["session"], "after_close")
+
+        patched_intraday = self.client.patch(
+            "/statistics/daily-analysis/2026-04-24/overrides",
+            params={"session": "intraday"},
+            json={"overrides": {"辨识度": "盘中人工"}},
+        )
+        patched_after_close = self.client.patch(
+            "/statistics/daily-analysis/2026-04-24/overrides",
+            params={"session": "after_close"},
+            json={"overrides": {"辨识度": "盘后人工"}},
+        )
+        self.assertEqual(patched_intraday.status_code, 200)
+        self.assertEqual(patched_after_close.status_code, 200)
+        self.assertEqual(patched_intraday.json()["columns"]["辨识度"]["content"], "盘中人工")
+        self.assertEqual(patched_after_close.json()["columns"]["辨识度"]["content"], "盘后人工")
+
+        intraday_month = self.client.get(
+            "/statistics/daily-analysis",
+            params={"month": "2026-04", "session": "intraday"},
+        )
+        after_close_month = self.client.get(
+            "/statistics/daily-analysis",
+            params={"month": "2026-04", "session": "after_close"},
+        )
+        intraday_row = next(row for row in intraday_month.json()["data"] if row["trade_date"] == "2026-04-24")
+        after_close_row = next(row for row in after_close_month.json()["data"] if row["trade_date"] == "2026-04-24")
+        self.assertEqual(intraday_row["columns"]["辨识度"]["content"], "盘中人工")
+        self.assertEqual(after_close_row["columns"]["辨识度"]["content"], "盘后人工")
+
 
 if __name__ == "__main__":
     unittest.main()
