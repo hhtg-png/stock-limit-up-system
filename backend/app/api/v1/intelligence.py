@@ -2,7 +2,7 @@
 from datetime import date
 from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -33,26 +33,17 @@ async def search_daily_info(
 
 @router.get("/daily-info", summary="获取每日资讯")
 async def get_daily_info(
-    background_tasks: BackgroundTasks,
     trade_date: Optional[date] = Query(None, description="交易日期，默认今天"),
     db: AsyncSession = Depends(get_db),
 ):
     target_date = trade_date or today_cn()
     existing = await _get_daily_digest(db, target_date)
-    needs_model_refresh = existing is not None and intelligence_service.daily_digest_needs_model_refresh(existing)
     if existing is not None:
-        if needs_model_refresh:
-            background_tasks.add_task(intelligence_service.refresh_daily_info_in_background, target_date)
-            payload = await intelligence_service.serialize_daily_digest_with_sources(db, existing, cache_hit=True)
-            payload["summary"] = dict(payload["summary"])
-            payload["summary"]["model_status"] = "refreshing_after_key_configured"
-            return payload
         return await intelligence_service.serialize_daily_digest_with_sources(db, existing, cache_hit=True)
     return await intelligence_service.build_daily_info(
         db,
         target_date,
         allow_latest_fallback=True,
-        force=needs_model_refresh,
     )
 
 
@@ -65,8 +56,11 @@ async def get_document_source(document_id: int, db: AsyncSession = Depends(get_d
 
 
 @router.post("/daily-info/sync", summary="同步每日资讯知识库")
-async def sync_daily_info(db: AsyncSession = Depends(get_db)):
-    return await intelligence_service.sync_all(db, force_daily=True)
+async def sync_daily_info(
+    force: bool = Query(False, description="是否强制重算每日摘要；默认只在知识库内容更新后调用模型"),
+    db: AsyncSession = Depends(get_db),
+):
+    return await intelligence_service.sync_all(db, force_daily=force)
 
 
 @router.get("/jiege-mode", summary="获取杰哥交易模式")

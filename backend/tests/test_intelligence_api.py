@@ -164,7 +164,7 @@ class IntelligenceApiTests(unittest.TestCase):
         self.assertEqual([item["trade_date"] for item in summary_response.json()["items"]], ["2026-05-18"])
         self.assertEqual([item["trade_date"] for item in content_response.json()["items"]], ["2026-05-17"])
 
-    def test_get_daily_info_schedules_refresh_for_missing_key_cache_after_key_is_configured(self):
+    def test_get_daily_info_returns_cached_digest_without_model_refresh(self):
         async def mark_digest_as_missing_key():
             async with self.Session() as session:
                 result = await session.execute(
@@ -186,9 +186,9 @@ class IntelligenceApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()
-        self.assertEqual(payload["summary"]["model_status"], "refreshing_after_key_configured")
+        self.assertEqual(payload["summary"]["model_status"], "missing_api_key")
         self.assertTrue(payload["cache_hit"])
-        refresh.assert_awaited_once()
+        refresh.assert_not_awaited()
 
     def test_post_daily_sync_calls_service(self):
         fake_service = AsyncMock()
@@ -200,6 +200,17 @@ class IntelligenceApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["sources"]["daily"]["changed_documents"], 1)
         fake_service.sync_all.assert_awaited_once()
+        self.assertFalse(fake_service.sync_all.await_args.kwargs["force_daily"])
+
+    def test_post_daily_sync_can_force_rebuild(self):
+        fake_service = AsyncMock()
+        fake_service.sync_all.return_value = {"sources": {"daily": {"changed_documents": 0}}}
+
+        with patch("app.api.v1.intelligence.intelligence_service", fake_service):
+            response = self.client.post("/intelligence/daily-info/sync", params={"force": "true"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(fake_service.sync_all.await_args.kwargs["force_daily"])
 
     def test_get_jiege_mode_returns_existing_signal(self):
         response = self.client.get("/intelligence/jiege-mode", params={"trade_date": "2026-05-18"})

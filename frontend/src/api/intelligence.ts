@@ -39,8 +39,10 @@ export async function getIntelligenceDocument(documentId: number): Promise<Daily
   return data
 }
 
-export async function syncDailyInfo(): Promise<IntelligenceSyncResponse> {
-  const { data } = await api.post('/intelligence/daily-info/sync')
+export async function syncDailyInfo(force = false): Promise<IntelligenceSyncResponse> {
+  const { data } = await api.post('/intelligence/daily-info/sync', null, {
+    params: force ? { force: true } : {}
+  })
   return data
 }
 

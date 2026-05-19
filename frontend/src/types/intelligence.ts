@@ -16,8 +16,13 @@ export interface DailyInfoSummary {
 export interface DailyInfoMentionedStock {
   name: string
   code?: string
+  sector?: string
+  summary?: string
   reason?: string
   source_title?: string
+  sentiment?: string
+  risk?: string
+  watch_points?: string[] | string
 }
 
 export interface DailyInfoResponse {

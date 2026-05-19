@@ -13,6 +13,7 @@ from app.services.intelligence_service import (
     DeepSeekSummaryClient,
     ImaKnowledgeSource,
     IntelligenceService,
+    _json_hash,
 )
 from app.utils.time_utils import today_cn
 
@@ -78,6 +79,55 @@ class FakeSummaryClient:
                 "payload": {"signals": ["涨跌家数", "封板率"]},
             }
         ]
+
+
+class StockAnalysisSummaryClient(FakeSummaryClient):
+    def __init__(self):
+        super().__init__()
+        self.api_key = "configured"
+
+    async def summarize_document(self, document):
+        self.document_calls.append(document.title)
+        return {
+            "summary": "物理AI与AI PCB油墨方向个股梳理。",
+            "themes": ["物理AI", "AI PCB油墨"],
+            "catalysts": ["Figure 24h直播", "日系龙头提价15-25%"],
+            "risks": ["题材轮动较快"],
+            "sectors": ["机器人", "PCB"],
+            "stocks": [
+                {
+                    "name": "美格智能",
+                    "code": "002881",
+                    "sector": "物理AI/具身基建",
+                    "summary": "高算力AI模组供应商，受益具身智能硬件底座需求。",
+                    "reason": "孙宇晨预测物理AI主线，Figure 24h直播催化。",
+                },
+                {
+                    "name": "容大感光",
+                    "code": "300576",
+                    "sector": "AI PCB油墨",
+                    "summary": "PCB油墨核心标的，受益高端AI PCB材料国产替代。",
+                    "reason": "日系龙头提价15-25%，供需紧平衡。",
+                },
+            ],
+            "stock_analysis_status": "ready",
+        }
+
+    async def summarize_daily_info(self, trade_date, documents):
+        self.daily_calls.append((trade_date, [doc.title for doc in documents]))
+        return {
+            "overview": "物理AI和AI PCB油墨是当日重点方向。",
+            "main_lines": ["物理AI", "AI PCB油墨"],
+            "catalysts": ["Figure 24h直播", "日系龙头提价15-25%"],
+            "risks": ["题材轮动较快"],
+            "plan": "观察核心标的承接和产业验证。",
+            "mentioned_stocks": [
+                stock
+                for document in documents
+                for stock in (document.summary_json or {}).get("stocks", [])
+            ],
+            "stock_analysis_status": "ready",
+        }
 
 
 def md_item(**overrides):
@@ -247,7 +297,7 @@ class IntelligenceServiceTests(unittest.TestCase):
         self.assertEqual(service.summary_client.daily_calls, [(date(2026, 5, 18), ["2026-05-18-复盘.md"])])
         self.assertEqual(digest.source_count, 1)
 
-    def test_daily_digest_refreshes_document_summaries_after_key_is_configured(self):
+    def test_daily_digest_force_refreshes_document_summaries_after_key_is_configured(self):
         summary = FakeSummaryClient()
         summary.api_key = "configured"
         service = IntelligenceService(
@@ -276,7 +326,12 @@ class IntelligenceServiceTests(unittest.TestCase):
                     trade_date=date(2026, 5, 18),
                 ))
                 await session.commit()
-                digest = await service.build_daily_info(session, date(2026, 5, 18))
+                digest = await service.build_daily_info(
+                    session,
+                    date(2026, 5, 18),
+                    force=True,
+                    refresh_stale_documents=True,
+                )
                 refreshed_doc = (await session.execute(select(KnowledgeDocument))).scalar_one()
                 return digest, refreshed_doc
 
@@ -285,6 +340,57 @@ class IntelligenceServiceTests(unittest.TestCase):
         self.assertEqual(summary.document_calls, ["2026-05-18-复盘.md"])
         self.assertEqual(refreshed_doc.summary_json["summary"], "2026-05-18-复盘.md summary")
         self.assertEqual(digest["summary"]["overview"], "2026-05-18 overview")
+
+    def test_daily_digest_cache_does_not_refresh_document_summaries_after_key_is_configured(self):
+        summary = FakeSummaryClient()
+        summary.api_key = "configured"
+        service = IntelligenceService(
+            ima_client=FakeImaClient({}),
+            summary_client=summary,
+            sources=[],
+        )
+
+        async def run():
+            async with self.Session() as session:
+                document = KnowledgeDocument(
+                    source_key="daily",
+                    source_name="每日复盘更新",
+                    share_id="daily",
+                    media_id="markdown_1",
+                    title="2026-05-18-复盘.md",
+                    media_type=7,
+                    media_type_name="MD",
+                    md5_sum="a",
+                    update_time="1779119000000",
+                    abstract="AI摘要: 旧摘要。",
+                    content_text="# 复盘",
+                    content_hash="hash-1",
+                    summary_json={"summary": "旧摘要", "model_status": "missing_api_key"},
+                    summary_status="ready",
+                    trade_date=date(2026, 5, 18),
+                )
+                session.add(document)
+                await session.flush()
+                session.add(DailyInfoDigest(
+                    trade_date=date(2026, 5, 18),
+                    status="ready",
+                    source_count=1,
+                    content_hash=_json_hash([{
+                        "id": document.id,
+                        "hash": "hash-1",
+                        "summary": {"summary": "旧摘要", "model_status": "missing_api_key"},
+                    }]),
+                    summary_json={"overview": "旧兜底", "model_status": "missing_api_key"},
+                    model="deepseek-v4-pro",
+                ))
+                await session.commit()
+                return await service.build_daily_info(session, date(2026, 5, 18))
+
+        digest = asyncio.run(run())
+
+        self.assertTrue(digest["cache_hit"])
+        self.assertEqual(summary.document_calls, [])
+        self.assertEqual(summary.daily_calls, [])
 
     def test_daily_digest_adds_stock_mentions_from_source_documents(self):
         service = IntelligenceService(
@@ -358,6 +464,53 @@ class IntelligenceServiceTests(unittest.TestCase):
         self.assertNotIn("并注意结合最新", names)
         self.assertNotIn("结合最新", names)
         self.assertNotIn("盘前纪要", names)
+
+    def test_deepseek_refreshes_old_document_summary_to_build_stock_analysis(self):
+        summary = StockAnalysisSummaryClient()
+        service = IntelligenceService(
+            ima_client=FakeImaClient({}),
+            summary_client=summary,
+            sources=[],
+        )
+
+        async def run():
+            async with self.Session() as session:
+                session.add(KnowledgeDocument(
+                    source_key="daily",
+                    source_name="每日复盘更新",
+                    share_id="daily",
+                    media_id="markdown_deepseek_stocks",
+                    title="今日板块深度整理_5月18日.md",
+                    media_type=7,
+                    media_type_name="MD",
+                    md5_sum="stock-analysis-md5",
+                    update_time="1779205400000",
+                    abstract="核心标的表格。",
+                    content_text="| 板块 | 核心标的 | 催化逻辑 |\n| 物理AI | 美格智能、容大感光 | Figure直播、PCB油墨提价 |",
+                    content_hash="stock-analysis-hash",
+                    summary_json={"summary": "旧摘要，尚无个股结构化总结。", "model_status": "ready"},
+                    summary_status="ready",
+                    trade_date=date(2026, 5, 19),
+                ))
+                await session.commit()
+                digest = await service.build_daily_info(
+                    session,
+                    date(2026, 5, 19),
+                    force=True,
+                    refresh_stale_documents=True,
+                )
+                document = (await session.execute(select(KnowledgeDocument))).scalar_one()
+                return digest, document
+
+        digest, document = asyncio.run(run())
+        stocks = digest["summary"]["mentioned_stocks"]
+        by_name = {item["name"]: item for item in stocks}
+
+        self.assertEqual(summary.document_calls, ["今日板块深度整理_5月18日.md"])
+        self.assertEqual(document.summary_json["stock_analysis_status"], "ready")
+        self.assertEqual(by_name["美格智能"]["sector"], "物理AI/具身基建")
+        self.assertEqual(by_name["美格智能"]["summary"], "高算力AI模组供应商，受益具身智能硬件底座需求。")
+        self.assertEqual(by_name["容大感光"]["reason"], "日系龙头提价15-25%，供需紧平衡。")
 
     def test_serialized_stock_mentions_filter_previous_generic_cache(self):
         service = IntelligenceService(

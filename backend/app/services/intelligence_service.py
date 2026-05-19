@@ -147,6 +147,57 @@ def _is_known_stock_entity(name: str) -> bool:
     return _normalize_stock_name(name) in _KNOWN_ENTITY_PREFIXES
 
 
+def _normalize_stock_mentions(
+    items: Iterable[Any],
+    *,
+    default_source_title: str = "",
+    trusted: bool = False,
+    limit: int = 30,
+) -> List[Dict[str, Any]]:
+    mentions: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in items or []:
+        if isinstance(item, dict):
+            raw_name = item.get("name") or item.get("stock_name") or ""
+            code = str(item.get("code") or item.get("stock_code") or "").strip()
+            source_title = str(item.get("source_title") or default_source_title)
+            reason = str(item.get("reason") or item.get("catalyst") or "")
+            summary = str(item.get("summary") or "")
+            sector = str(item.get("sector") or item.get("theme") or "")
+        else:
+            raw_name = str(item or "")
+            code = ""
+            source_title = default_source_title
+            reason = ""
+            summary = ""
+            sector = ""
+
+        name = _normalize_stock_name(str(raw_name))
+        if not _is_valid_stock_name(name):
+            continue
+        if not trusted and not code and not _is_known_stock_entity(name):
+            continue
+        key = code or name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        payload = {
+            "name": name,
+            "code": code,
+            "sector": sector,
+            "summary": summary[:220],
+            "reason": reason[:180],
+            "source_title": source_title,
+        }
+        for optional_key in ("sentiment", "risk", "watch_points"):
+            if isinstance(item, dict) and item.get(optional_key):
+                payload[optional_key] = item[optional_key]
+        mentions.append(payload)
+        if len(mentions) >= limit:
+            break
+    return mentions
+
+
 def _extract_stock_mentions_from_documents(documents: Iterable[Any], *, limit: int = 20) -> List[Dict[str, Any]]:
     mentions: List[Dict[str, Any]] = []
     seen: set[str] = set()
@@ -175,6 +226,7 @@ def _extract_stock_mentions_from_documents(documents: Iterable[Any], *, limit: i
     for document in documents:
         source_title = str(getattr(document, "title", "") or "")
         summary = getattr(document, "summary_json", None) or {}
+        text = _stock_document_text(document)
         for item in (summary.get("stocks") or summary.get("mentioned_stocks") or []):
             if isinstance(item, dict):
                 add(
@@ -187,7 +239,6 @@ def _extract_stock_mentions_from_documents(documents: Iterable[Any], *, limit: i
             elif item:
                 add(str(item), source_title=source_title, require_known_without_code=True)
 
-        text = _stock_document_text(document)
         for match in _STOCK_CODE_PATTERN.finditer(text):
             name = _normalize_stock_name(match.group(1))
             add(name, code=match.group(2), reason=_mention_reason(text, name, match.start()), source_title=source_title)
@@ -210,12 +261,54 @@ def _extract_stock_mentions_from_documents(documents: Iterable[Any], *, limit: i
 
 def _merge_stock_mentions(summary: Dict[str, Any], documents: Iterable[Any]) -> Dict[str, Any]:
     merged = dict(summary or {})
-    model_mentions = merged.get("mentioned_stocks") or merged.get("stocks") or []
-    pseudo_document = SimpleNamespace(title="", abstract="", introduction="", content_text="", summary_json={"stocks": model_mentions})
-    combined = _extract_stock_mentions_from_documents([pseudo_document, *list(documents)])
+    document_items = list(documents)
+    trusted_daily = merged.get("stock_analysis_status") == "ready"
+    daily_mentions = _normalize_stock_mentions(
+        merged.get("mentioned_stocks") or merged.get("stocks") or [],
+        trusted=trusted_daily,
+    )
+    document_mentions: List[Dict[str, Any]] = []
+    for document in document_items:
+        doc_summary = getattr(document, "summary_json", None) or {}
+        if doc_summary.get("stock_analysis_status") == "ready":
+            document_mentions.extend(
+                _normalize_stock_mentions(
+                    doc_summary.get("stocks") or doc_summary.get("mentioned_stocks") or [],
+                    default_source_title=str(getattr(document, "title", "") or ""),
+                    trusted=True,
+                )
+            )
+
+    if trusted_daily and daily_mentions:
+        combined = _dedupe_stock_mentions([*daily_mentions, *document_mentions])
+    elif document_mentions:
+        combined = _dedupe_stock_mentions(document_mentions)
+    else:
+        pseudo_document = SimpleNamespace(
+            title="",
+            abstract="",
+            introduction="",
+            content_text="",
+            summary_json={"stocks": daily_mentions},
+        )
+        combined = _extract_stock_mentions_from_documents([pseudo_document, *document_items])
     if combined:
         merged["mentioned_stocks"] = combined
     return merged
+
+
+def _dedupe_stock_mentions(items: Iterable[Dict[str, Any]], *, limit: int = 30) -> List[Dict[str, Any]]:
+    result: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in items:
+        key = str(item.get("code") or item.get("name") or "").lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+        if len(result) >= limit:
+            break
+    return result
 
 
 class ImaWikiClient:
@@ -300,16 +393,19 @@ class DeepSeekSummaryClient:
             "content": (document.content_text or "")[:18000],
         }
         try:
-            return await self._request_json(
+            result = await self._request_json(
                 "你是A股短线复盘助手。请从资料中提炼结构化摘要，只输出JSON。",
                 (
-                    "按以下键输出JSON：summary(100字内), themes(数组), catalysts(数组), "
-                    "risks(数组), sectors(数组), stocks(数组，每项包含name,code,reason；只列资料明确提及对象), "
-                    "trade_date_hint(字符串或空)。资料："
+                    "按以下键输出JSON：summary(100字内), themes(数组), catalysts(数组), risks(数组), sectors(数组), "
+                    "stocks(数组，每项包含name,code,sector,summary,reason,source_title；"
+                    "name为个股/港美股/明确公司名，summary用一句话说明文章中该个股的交易相关逻辑，"
+                    "reason写催化或验证依据；只根据原文总结，不补充外部信息，不给买卖建议), "
+                    "stock_analysis_status(固定为ready), trade_date_hint(字符串或空)。资料："
                     f"{json.dumps(prompt, ensure_ascii=False)}"
                 ),
                 fallback,
             )
+            return self._finalize_document_summary(result, document)
         except Exception as exc:
             logger.warning(f"DeepSeek document summary failed: {exc}")
             fallback["model_status"] = "error"
@@ -335,22 +431,48 @@ class DeepSeekSummaryClient:
             for doc in documents
         ]
         try:
-            return await self._request_json(
+            result = await self._request_json(
                 "你是A股每日资讯编辑。请聚合资料，输出严格JSON。",
                 (
                     "按以下键输出JSON：overview, main_lines(数组), catalysts(数组), "
                     "risks(数组), plan, source_titles(数组), "
-                    "mentioned_stocks(数组，每项包含name,code,reason,source_title；仅列资料明确提及对象)。"
+                    "mentioned_stocks(数组，每项包含name,code,sector,summary,reason,source_title；"
+                    "从各文档stocks聚合，summary保留个股逻辑，不要只截取原文), "
+                    "stock_analysis_status(固定为ready)。"
                     "不要给买卖建议，只做资讯总结。"
                     f"日期：{trade_date.isoformat()}。资料：{json.dumps(compact_docs, ensure_ascii=False)}"
                 ),
                 fallback,
             )
+            return self._finalize_daily_summary(result)
         except Exception as exc:
             logger.warning(f"DeepSeek daily summary failed: {exc}")
             fallback["model_status"] = "error"
             fallback["error"] = str(exc)
             return fallback
+
+    def _finalize_document_summary(self, payload: Dict[str, Any], document: KnowledgeDocument) -> Dict[str, Any]:
+        summary = dict(payload or {})
+        summary["stocks"] = _normalize_stock_mentions(
+            summary.get("stocks") or summary.get("mentioned_stocks") or [],
+            default_source_title=document.title,
+            trusted=summary.get("model_status") == "ready",
+        )
+        if summary.get("model_status") == "ready":
+            summary["stock_analysis_status"] = "ready"
+        elif "stock_analysis_status" not in summary:
+            summary["stock_analysis_status"] = summary.get("model_status") or "fallback"
+        return summary
+
+    def _finalize_daily_summary(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        summary = dict(payload or {})
+        if summary.get("model_status") == "ready":
+            summary.setdefault("stock_analysis_status", "ready")
+        summary["mentioned_stocks"] = _normalize_stock_mentions(
+            summary.get("mentioned_stocks") or summary.get("stocks") or [],
+            trusted=summary.get("stock_analysis_status") == "ready",
+        )
+        return summary
 
     async def build_jiege_rules(self, documents: List[KnowledgeDocument]) -> List[Dict[str, Any]]:
         fallback = self._fallback_jiege_rules()
@@ -433,6 +555,7 @@ class DeepSeekSummaryClient:
             "risks": [],
             "sectors": [],
             "stocks": _extract_stock_mentions_from_documents([document]),
+            "stock_analysis_status": status,
             "model": self.model,
             "model_status": status,
         }
@@ -451,6 +574,7 @@ class DeepSeekSummaryClient:
             "plan": "基于已同步资料观察主线承接与风险变化。",
             "source_titles": titles,
             "mentioned_stocks": _extract_stock_mentions_from_documents(documents),
+            "stock_analysis_status": status,
             "trade_date": trade_date.isoformat(),
             "model": self.model,
             "model_status": status,
@@ -533,11 +657,13 @@ class IntelligenceService:
         dates_to_build.extend(sorted((item for item in changed_daily_dates if item != today), reverse=True))
         daily = None
         for target_date in dates_to_build:
+            should_rebuild_daily = force_daily or target_date in changed_daily_dates
             daily = await self.build_daily_info(
                 db,
                 target_date,
                 allow_latest_fallback=target_date == today,
-                force=force_daily or target_date in changed_daily_dates,
+                force=should_rebuild_daily,
+                refresh_stale_documents=force_daily,
             )
         jiege = await self.build_jiege_mode(db, today, allow_latest_fallback=True)
         return {"sources": results, "daily_info": daily, "jiege_mode": jiege}
@@ -600,6 +726,7 @@ class IntelligenceService:
         *,
         allow_latest_fallback: bool = False,
         force: bool = False,
+        refresh_stale_documents: bool = False,
     ) -> Dict[str, Any]:
         documents = await self._get_daily_documents(db, trade_date)
         actual_date = trade_date
@@ -608,7 +735,8 @@ class IntelligenceService:
             documents = await self._get_daily_documents(db, actual_date)
         document_snapshots = [self._snapshot_document(doc) for doc in documents]
         await db.commit()
-        await self._refresh_stale_document_summaries(db, document_snapshots)
+        if refresh_stale_documents:
+            await self._refresh_stale_document_summaries(db, document_snapshots)
         content_hash = _json_hash(
             [{"id": doc.id, "hash": doc.content_hash, "summary": doc.summary_json} for doc in document_snapshots]
         )
@@ -632,7 +760,10 @@ class IntelligenceService:
         return self.serialize_daily_digest(existing, cache_hit=False, sources=document_snapshots)
 
     def daily_digest_needs_model_refresh(self, digest: DailyInfoDigest) -> bool:
-        return self._has_api_key() and self._summary_from_missing_api_key(digest.summary_json)
+        return self._has_api_key() and (
+            self._summary_from_missing_api_key(digest.summary_json)
+            or self._summary_missing_stock_analysis(digest.summary_json)
+        )
 
     async def refresh_daily_info_in_background(self, trade_date: date) -> None:
         if trade_date in self._refreshing_daily_dates:
@@ -674,7 +805,7 @@ class IntelligenceService:
         if not self._has_api_key():
             return
         for doc in documents:
-            if self._summary_from_missing_api_key(doc.summary_json):
+            if self._document_summary_needs_model_refresh(doc):
                 await self._summarize_document(doc)
                 await self._write_document_summary_with_retry(
                     db,
@@ -753,6 +884,16 @@ class IntelligenceService:
 
     def _summary_from_missing_api_key(self, summary: Optional[Dict[str, Any]]) -> bool:
         return (summary or {}).get("model_status") == "missing_api_key"
+
+    def _summary_missing_stock_analysis(self, summary: Optional[Dict[str, Any]]) -> bool:
+        payload = summary or {}
+        return payload.get("model_status") == "ready" and payload.get("stock_analysis_status") != "ready"
+
+    def _document_summary_needs_model_refresh(self, doc: Any) -> bool:
+        summary = getattr(doc, "summary_json", None) or {}
+        return self._summary_from_missing_api_key(summary) or (
+            getattr(doc, "source_key", "") == "daily" and self._summary_missing_stock_analysis(summary)
+        )
 
     async def build_jiege_rules(self, db: AsyncSession, *, force: bool = False) -> List[Dict[str, Any]]:
         documents = await self._get_jiege_rule_documents(db)

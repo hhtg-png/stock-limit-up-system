@@ -111,10 +111,16 @@
             <section class="panel">
               <div class="section-header">
                 <h4>个股提及</h4>
-                <el-tag size="small" type="warning">资讯提及，不构成推荐</el-tag>
+                <el-tag size="small" type="warning">DeepSeek 总结，不构成推荐</el-tag>
               </div>
               <el-table v-if="mentionedStocks.length" :data="mentionedStocks" size="small" class="stock-table">
-                <el-table-column label="名称" min-width="110">
+                <el-table-column label="方向" min-width="130">
+                  <template #default="{ row }">
+                    <el-tag v-if="row.sector" size="small" effect="plain">{{ row.sector }}</el-tag>
+                    <span v-else class="empty-text">-</span>
+                  </template>
+                </el-table-column>
+                <el-table-column label="个股" min-width="110">
                   <template #default="{ row }">
                     <span class="stock-name">{{ row.name }}</span>
                   </template>
@@ -125,7 +131,12 @@
                     <span v-else class="empty-text">-</span>
                   </template>
                 </el-table-column>
-                <el-table-column prop="reason" label="提及原因" min-width="260" />
+                <el-table-column label="个股总结" min-width="280">
+                  <template #default="{ row }">
+                    {{ row.summary || row.reason || '-' }}
+                  </template>
+                </el-table-column>
+                <el-table-column prop="reason" label="催化依据" min-width="220" />
                 <el-table-column prop="source_title" label="来源" min-width="180" />
               </el-table>
               <span v-else class="empty-text">暂无个股提及</span>
