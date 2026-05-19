@@ -104,6 +104,15 @@ export interface JiegeCandidate {
   score: number
 }
 
+export interface JiegeYesterdayPrediction {
+  source_date?: string | null
+  target_date: string
+  candidates: JiegeCandidate[]
+  risk_flags: string[]
+  market_phase: JiegeMarketPhase
+  notes: string
+}
+
 export interface JiegeSignalData {
   trade_date: string
   market_phase: JiegeMarketPhase
@@ -113,6 +122,7 @@ export interface JiegeSignalData {
     daily_analysis: Record<string, unknown>
     risk_flags: string[]
   }
+  yesterday_prediction?: JiegeYesterdayPrediction
   review: {
     sealed_count: number
     opened_count: number

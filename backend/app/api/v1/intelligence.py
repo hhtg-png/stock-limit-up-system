@@ -70,9 +70,15 @@ async def get_jiege_mode(
 ):
     target_date = trade_date or today_cn()
     existing = await _get_jiege_signal(db, target_date)
-    if existing is not None:
+    if existing is not None and _jiege_signal_has_yesterday_prediction(existing):
         return intelligence_service.serialize_jiege_signal(existing, cache_hit=True)
-    return await intelligence_service.build_jiege_mode(db, target_date, allow_latest_fallback=True)
+    if existing is not None:
+        return await intelligence_service.ensure_jiege_yesterday_prediction(db, existing)
+    return await intelligence_service.build_jiege_mode(
+        db,
+        target_date,
+        allow_latest_fallback=True,
+    )
 
 
 @router.post("/jiege-mode/rebuild", summary="重算杰哥交易模式")
@@ -102,3 +108,7 @@ async def _get_daily_digest(db: AsyncSession, trade_date: date) -> Optional[Dail
 async def _get_jiege_signal(db: AsyncSession, trade_date: date) -> Optional[JiegeModeSignal]:
     result = await db.execute(select(JiegeModeSignal).where(JiegeModeSignal.trade_date == trade_date))
     return result.scalar_one_or_none()
+
+
+def _jiege_signal_has_yesterday_prediction(signal: JiegeModeSignal) -> bool:
+    return isinstance(signal.signal_json, dict) and "yesterday_prediction" in signal.signal_json

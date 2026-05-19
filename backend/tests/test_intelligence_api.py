@@ -1,6 +1,6 @@
 import asyncio
 import unittest
-from datetime import date, datetime
+from datetime import date, datetime, time
 from unittest.mock import AsyncMock, patch
 
 from fastapi import FastAPI
@@ -13,6 +13,8 @@ from app.api.v1 import intelligence as intelligence_api
 from app.api.v1.intelligence import router as intelligence_router
 from app.database import Base, get_db
 from app.models.intelligence import DailyInfoDigest, JiegeModeSignal, KnowledgeDocument
+from app.models.market_review import MarketReviewDailyMetric, MarketReviewStockDaily
+from app.models.stock import Stock
 
 
 class IntelligenceApiTests(unittest.TestCase):
@@ -114,10 +116,77 @@ class IntelligenceApiTests(unittest.TestCase):
                 JiegeModeSignal(
                     trade_date=date(2026, 5, 18),
                     status="ready",
-                    signal_json={"market_phase": {"label": "修复期"}, "prediction": {"candidates": []}},
+                    signal_json={
+                        "market_phase": {"label": "修复期"},
+                        "prediction": {"candidates": []},
+                        "yesterday_prediction": {
+                            "source_date": None,
+                            "target_date": "2026-05-18",
+                            "candidates": [],
+                            "risk_flags": [],
+                            "market_phase": {"label": "暂无昨日复盘数据", "score": 0, "basis": []},
+                            "notes": "测试缓存",
+                        },
+                    },
                     content_hash="jiege-hash",
                     generated_at=datetime(2026, 5, 18, 20, 31, 0),
                 )
+            )
+            session.add_all(
+                [
+                    Stock(
+                        id=1,
+                        stock_code="000001",
+                        stock_name="昨日龙头",
+                        market="SZ",
+                    ),
+                    Stock(
+                        id=2,
+                        stock_code="000002",
+                        stock_name="今日结果",
+                        market="SZ",
+                    ),
+                    MarketReviewDailyMetric(
+                        trade_date=date(2026, 5, 18),
+                        limit_up_count=82,
+                        limit_down_count=1,
+                        max_board_height=5,
+                        seal_rate=80,
+                        up_count_ex_st=3300,
+                        down_count_ex_st=1600,
+                    ),
+                    MarketReviewStockDaily(
+                        trade_date=date(2026, 5, 18),
+                        stock_id=1,
+                        stock_code="000001",
+                        stock_name="昨日龙头",
+                        today_sealed_close=True,
+                        today_continuous_days=5,
+                        first_limit_time=time(9, 31),
+                        amount=800000,
+                        limit_up_reason="昨日主线",
+                    ),
+                    MarketReviewDailyMetric(
+                        trade_date=date(2026, 5, 19),
+                        limit_up_count=30,
+                        limit_down_count=8,
+                        max_board_height=2,
+                        seal_rate=50,
+                        up_count_ex_st=1200,
+                        down_count_ex_st=3600,
+                    ),
+                    MarketReviewStockDaily(
+                        trade_date=date(2026, 5, 19),
+                        stock_id=2,
+                        stock_code="000002",
+                        stock_name="今日结果",
+                        today_sealed_close=True,
+                        today_continuous_days=2,
+                        first_limit_time=time(10, 2),
+                        amount=500000,
+                        limit_up_reason="今日已发生",
+                    ),
+                ]
             )
             await session.commit()
 
@@ -219,6 +288,41 @@ class IntelligenceApiTests(unittest.TestCase):
         payload = response.json()
         self.assertEqual(payload["trade_date"], "2026-05-18")
         self.assertEqual(payload["data"]["market_phase"]["label"], "修复期")
+
+    def test_get_jiege_mode_includes_yesterday_prediction_for_target_date(self):
+        response = self.client.get("/intelligence/jiege-mode", params={"trade_date": "2026-05-19"})
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        yesterday_prediction = payload["data"]["yesterday_prediction"]
+        self.assertEqual(yesterday_prediction["source_date"], "2026-05-18")
+        self.assertEqual(yesterday_prediction["target_date"], "2026-05-19")
+        self.assertEqual(yesterday_prediction["candidates"][0]["stock_code"], "000001")
+        self.assertNotEqual(yesterday_prediction["candidates"][0]["stock_code"], "000002")
+
+    def test_get_jiege_mode_enriches_legacy_cache_without_yesterday_prediction(self):
+        async def seed_legacy_signal():
+            async with self.Session() as session:
+                session.add(
+                    JiegeModeSignal(
+                        trade_date=date(2026, 5, 19),
+                        status="ready",
+                        signal_json={"market_phase": {"label": "旧缓存"}, "prediction": {"candidates": []}},
+                        content_hash="legacy-jiege-hash",
+                        generated_at=datetime(2026, 5, 19, 9, 0, 0),
+                    )
+                )
+                await session.commit()
+
+        asyncio.run(seed_legacy_signal())
+
+        response = self.client.get("/intelligence/jiege-mode", params={"trade_date": "2026-05-19"})
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertFalse(payload["cache_hit"])
+        self.assertEqual(payload["data"]["market_phase"]["label"], "旧缓存")
+        self.assertEqual(payload["data"]["yesterday_prediction"]["source_date"], "2026-05-18")
 
 
 if __name__ == "__main__":

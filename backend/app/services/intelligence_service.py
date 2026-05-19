@@ -965,6 +965,23 @@ class IntelligenceService:
         await db.refresh(existing)
         return self.serialize_jiege_signal(existing, cache_hit=False)
 
+    async def ensure_jiege_yesterday_prediction(
+        self,
+        db: AsyncSession,
+        signal: JiegeModeSignal,
+    ) -> Dict[str, Any]:
+        payload = dict(signal.signal_json or {})
+        if "yesterday_prediction" in payload:
+            return self.serialize_jiege_signal(signal, cache_hit=True)
+
+        payload["yesterday_prediction"] = await self._build_yesterday_prediction(db, signal.trade_date)
+        signal.signal_json = payload
+        signal.content_hash = _json_hash(payload)
+        signal.updated_at = datetime.now()
+        await db.commit()
+        await db.refresh(signal)
+        return self.serialize_jiege_signal(signal, cache_hit=False)
+
     async def _collect_source_items(self, source: ImaKnowledgeSource) -> List[Dict[str, Any]]:
         items: List[Dict[str, Any]] = []
         visited_folders = {""}
@@ -1252,6 +1269,15 @@ class IntelligenceService:
         )
         return result.scalar_one_or_none()
 
+    async def _previous_market_review_date(self, db: AsyncSession, trade_date: date) -> Optional[date]:
+        result = await db.execute(
+            select(MarketReviewDailyMetric.trade_date)
+            .where(MarketReviewDailyMetric.trade_date < trade_date)
+            .order_by(MarketReviewDailyMetric.trade_date.desc())
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
     async def _get_jiege_signal(self, db: AsyncSession, trade_date: date) -> Optional[JiegeModeSignal]:
         result = await db.execute(select(JiegeModeSignal).where(JiegeModeSignal.trade_date == trade_date))
         return result.scalar_one_or_none()
@@ -1268,6 +1294,7 @@ class IntelligenceService:
         candidates = self._build_rule_candidates(stocks)
         risk_flags = self._build_risk_flags(metric, stocks)
         daily_analysis = await self._load_daily_analysis_cells(db, trade_date)
+        yesterday_prediction = await self._build_yesterday_prediction(db, trade_date)
         return {
             "trade_date": trade_date.isoformat(),
             "market_phase": market_phase,
@@ -1277,6 +1304,7 @@ class IntelligenceService:
                 "daily_analysis": daily_analysis,
                 "risk_flags": risk_flags,
             },
+            "yesterday_prediction": yesterday_prediction,
             "review": {
                 "sealed_count": sum(1 for stock in stocks if stock.today_sealed_close),
                 "opened_count": sum(1 for stock in stocks if stock.today_opened_close or stock.today_broken),
@@ -1355,6 +1383,29 @@ class IntelligenceService:
         if any(stock.today_opened_close or stock.today_broken for stock in stocks[:8]):
             flags.append("核心候选存在开板/炸板，需验证承接")
         return flags
+
+    async def _build_yesterday_prediction(self, db: AsyncSession, target_date: date) -> Dict[str, Any]:
+        source_date = await self._previous_market_review_date(db, target_date)
+        if source_date is None:
+            return {
+                "source_date": None,
+                "target_date": target_date.isoformat(),
+                "candidates": [],
+                "risk_flags": [],
+                "market_phase": {"label": "暂无昨日复盘数据", "score": 0, "basis": []},
+                "notes": "未找到目标日前一复盘日，无法生成昨日预判。",
+            }
+
+        metric = await self._get_metric(db, source_date)
+        stocks = await self._get_review_stocks(db, source_date)
+        return {
+            "source_date": source_date.isoformat(),
+            "target_date": target_date.isoformat(),
+            "candidates": self._build_rule_candidates(stocks),
+            "risk_flags": self._build_risk_flags(metric, stocks),
+            "market_phase": self._classify_market_phase(metric),
+            "notes": f"基于 {source_date.isoformat()} 盘后复盘数据，生成 {target_date.isoformat()} 的盘前观察候选。",
+        }
 
     async def _load_daily_analysis_cells(self, db: AsyncSession, trade_date: date) -> Dict[str, Any]:
         result = await db.execute(select(DailyAnalysisRecord).where(DailyAnalysisRecord.trade_date == trade_date))

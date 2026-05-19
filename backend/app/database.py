@@ -28,6 +28,36 @@ def configure_sqlite_connection(dbapi_connection, _connection_record) -> None:
         cursor.close()
 
 
+def ensure_sqlite_schema_compat(sync_connection) -> None:
+    """Apply lightweight SQLite compatibility migrations for existing local DBs."""
+    _add_sqlite_column_if_missing(
+        sync_connection,
+        "market_review_stock_daily",
+        "stock_id",
+        "INTEGER",
+    )
+    _add_sqlite_column_if_missing(
+        sync_connection,
+        "market_review_limitup_event",
+        "stock_id",
+        "INTEGER",
+    )
+    sync_connection.exec_driver_sql(
+        "CREATE INDEX IF NOT EXISTS ix_market_review_stock_daily_stock_id "
+        "ON market_review_stock_daily (stock_id)"
+    )
+    sync_connection.exec_driver_sql(
+        "CREATE INDEX IF NOT EXISTS ix_market_review_limitup_event_stock_id "
+        "ON market_review_limitup_event (stock_id)"
+    )
+
+
+def _add_sqlite_column_if_missing(sync_connection, table_name: str, column_name: str, column_def: str) -> None:
+    columns = {row[1] for row in sync_connection.exec_driver_sql(f"PRAGMA table_info({table_name})")}
+    if columns and column_name not in columns:
+        sync_connection.exec_driver_sql(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_def}")
+
+
 # 确保数据目录存在
 os.makedirs("./data", exist_ok=True)
 os.makedirs("./logs", exist_ok=True)
@@ -72,6 +102,8 @@ async def init_db():
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        if settings.DATABASE_URL.startswith("sqlite"):
+            await conn.run_sync(ensure_sqlite_schema_compat)
 
 
 async def close_db():

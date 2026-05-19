@@ -86,10 +86,55 @@
           <el-empty v-else description="暂无规则" />
         </section>
 
+        <section class="panel yesterday-panel">
+          <div class="section-header">
+            <div>
+              <h4>昨日预判</h4>
+              <p class="section-note">{{ yesterdayPredictionLabel }}</p>
+            </div>
+            <span>{{ yesterdayCandidates.length }} 个候选</span>
+          </div>
+          <el-table
+            v-if="yesterdayCandidates.length"
+            :data="yesterdayCandidates"
+            border
+            size="small"
+            :header-cell-style="{ background: '#fafafa', fontWeight: 600 }"
+          >
+            <el-table-column prop="label" label="标的" min-width="140">
+              <template #default="{ row }">
+                <el-button link type="primary" @click="goStock(row.stock_code)">
+                  {{ row.label }}
+                </el-button>
+              </template>
+            </el-table-column>
+            <el-table-column prop="tags" label="模式" min-width="150">
+              <template #default="{ row }">
+                <div class="tag-list compact">
+                  <el-tag
+                    v-for="tag in row.tags"
+                    :key="tag"
+                    size="small"
+                    :type="candidateTagType(tag)"
+                  >
+                    {{ tag }}
+                  </el-tag>
+                </div>
+              </template>
+            </el-table-column>
+            <el-table-column prop="score" label="评分" width="74" align="right" />
+            <el-table-column prop="reason" label="昨日依据" min-width="180" show-overflow-tooltip />
+          </el-table>
+          <span v-else class="empty-text">{{ yesterdayPrediction?.notes || '暂无昨日预判候选' }}</span>
+          <ul v-if="yesterdayRiskFlags.length" class="item-list compact-risk">
+            <li v-for="item in yesterdayRiskFlags" :key="item">{{ item }}</li>
+          </ul>
+        </section>
+
         <div class="two-column">
           <section class="panel">
             <div class="section-header">
-              <h4>交易预判</h4>
+              <h4>当日模式结果</h4>
               <span>{{ candidates.length }} 个候选</span>
             </div>
             <el-table
@@ -172,6 +217,15 @@ const errorMessage = ref('')
 const signalData = computed(() => jiegeMode.value?.data || null)
 const candidates = computed<JiegeCandidate[]>(() => signalData.value?.prediction.candidates || [])
 const riskFlags = computed(() => signalData.value?.prediction.risk_flags || [])
+const yesterdayPrediction = computed(() => signalData.value?.yesterday_prediction || null)
+const yesterdayCandidates = computed<JiegeCandidate[]>(() => yesterdayPrediction.value?.candidates || [])
+const yesterdayRiskFlags = computed(() => yesterdayPrediction.value?.risk_flags || [])
+const yesterdayPredictionLabel = computed(() => {
+  if (!yesterdayPrediction.value) return '等待后端返回昨日预判数据'
+  const { source_date: sourceDate, target_date: targetDate } = yesterdayPrediction.value
+  if (!sourceDate) return yesterdayPrediction.value.notes || '暂无昨日复盘数据'
+  return `基于 ${sourceDate} 盘后复盘，预判 ${targetDate} 盘前观察方向`
+})
 const dailyAnalysisItems = computed(() => {
   const source = signalData.value?.prediction.daily_analysis || {}
   return Object.entries(source)
@@ -361,6 +415,10 @@ function formatTime(value?: string | null): string {
   border-left: 4px solid #f59e0b;
 }
 
+.yesterday-panel {
+  border-left: 4px solid #1677ff;
+}
+
 .section-header {
   display: flex;
   align-items: center;
@@ -378,6 +436,13 @@ function formatTime(value?: string | null): string {
   span {
     color: #6b7280;
     font-size: 13px;
+  }
+
+  .section-note {
+    margin: 4px 0 0;
+    color: #6b7280;
+    font-size: 12px;
+    line-height: 1.5;
   }
 }
 
@@ -447,6 +512,10 @@ function formatTime(value?: string | null): string {
   padding-left: 18px;
   color: #374151;
   line-height: 1.8;
+
+  &.compact-risk {
+    margin-top: 10px;
+  }
 }
 
 .analysis-list {
