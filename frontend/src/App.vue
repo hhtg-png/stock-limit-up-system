@@ -66,6 +66,15 @@
               <el-badge :value="alertCount" :hidden="alertCount === 0" class="alert-badge">
                 <el-button :icon="Bell" circle @click="showAlertPanel = true" />
               </el-badge>
+              <el-button
+                class="mobile-speech-unlock"
+                size="small"
+                type="primary"
+                text
+                @click="enableMobileSpeech"
+              >
+                {{ speechUnlocked ? '语音已启用' : '启用语音' }}
+              </el-button>
               <el-switch
                 v-model="alertEnabled"
                 active-text="播报"
@@ -130,6 +139,7 @@ const route = useRoute()
 const alertStore = useAlertStore()
 const configStore = useConfigStore()
 const { connect } = useWebSocket()
+const { unlockSpeech, speechUnlocked } = useSpeech()
 
 const isCollapsed = ref(false)
 const showAlertPanel = ref(false)
@@ -139,6 +149,8 @@ const mobileNavItems = [
   { path: '/', label: '监控', icon: DataBoard },
   { path: '/statistics', label: '报表', icon: PieChart },
   { path: '/daily-analysis', label: '分析', icon: Calendar },
+  { path: '/daily-info', label: '资讯', icon: Calendar },
+  { path: '/jiege-mode', label: '杰哥', icon: TrendCharts },
   { path: '/continuous', label: '连板', icon: TrendCharts },
   { path: '/settings', label: '设置', icon: Setting }
 ]
@@ -210,6 +222,10 @@ const toggleAlert = async (enabled: boolean) => {
   } catch (e) {
     console.error('Toggle alert config error:', e)
   }
+}
+
+const enableMobileSpeech = () => {
+  unlockSpeech()
 }
 
 // 更新时间
@@ -352,6 +368,10 @@ onUnmounted(() => {
   display: none;
 }
 
+.mobile-speech-unlock {
+  display: none;
+}
+
 @media (max-width: 767px) {
   .app-container {
     height: 100dvh;
@@ -395,6 +415,12 @@ onUnmounted(() => {
       .alert-badge {
         margin-right: 0;
       }
+
+      .mobile-speech-unlock {
+        display: inline-flex;
+        padding: 0 6px;
+        font-size: 12px;
+      }
     }
   }
 
@@ -408,18 +434,28 @@ onUnmounted(() => {
     right: 0;
     bottom: 0;
     z-index: 30;
-    display: grid;
-    grid-template-columns: repeat(5, minmax(0, 1fr));
+    display: flex;
+    gap: 2px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+    scroll-snap-type: x proximity;
     height: calc(58px + env(safe-area-inset-bottom));
     padding: 6px 4px calc(6px + env(safe-area-inset-bottom));
     border-top: 1px solid #e5e7eb;
     background: rgba(255, 255, 255, 0.96);
     box-shadow: 0 -8px 22px rgba(15, 23, 42, 0.08);
+
+    &::-webkit-scrollbar {
+      display: none;
+    }
   }
 
   .mobile-nav-item {
     display: flex;
-    min-width: 0;
+    flex: 0 0 64px;
+    min-width: 64px;
     flex-direction: column;
     align-items: center;
     justify-content: center;
@@ -428,6 +464,7 @@ onUnmounted(() => {
     font-size: 11px;
     line-height: 1;
     text-decoration: none;
+    scroll-snap-align: center;
 
     .el-icon {
       font-size: 18px;

@@ -11,6 +11,10 @@ function read(path) {
 const app = read('src/App.vue')
 assert.match(app, /class="mobile-bottom-nav"/, 'App.vue should expose a mobile bottom navigation')
 assert.match(app, /mobileNavItems/, 'App.vue should define mobile navigation items')
+assert.match(app, /path:\s*'\/daily-info'/, 'mobile navigation should include DailyInfo')
+assert.match(app, /path:\s*'\/jiege-mode'/, 'mobile navigation should include JiegeMode')
+assert.match(app, /overflow-x:\s*auto/, 'mobile bottom navigation should support horizontal scrolling')
+assert.match(app, /class="mobile-speech-unlock"/, 'mobile header should expose speech unlock action')
 
 const dashboard = read('src/views/Dashboard.vue')
 const limitUpList = read('src/views/LimitUpList.vue')

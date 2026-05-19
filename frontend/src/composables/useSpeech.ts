@@ -5,6 +5,7 @@ import { useAlertStore } from '@/stores/alert'
 // 语音播报配置 - 从config store获取设置
 const speechRate = ref(1.2) // 语速
 const speechVolume = ref(0.8) // 音量
+const speechUnlocked = ref(false)
 
 // 动态获取开关状态
 function getSpeechEnabled(): boolean {
@@ -24,9 +25,25 @@ let isSpeaking = false
 // 已播报的股票记录（防止重复播报）
 const announcedStocks = new Set<string>()
 
+function hasSpeechSupport(): boolean {
+  return typeof window !== 'undefined' &&
+    'speechSynthesis' in window &&
+    'SpeechSynthesisUtterance' in window
+}
+
+function requiresSpeechUnlock(): boolean {
+  if (typeof window === 'undefined' || typeof navigator === 'undefined') return false
+  return navigator.maxTouchPoints > 0 || window.matchMedia?.('(max-width: 767px)').matches
+}
+
+function canSpeakNow(): boolean {
+  return hasSpeechSupport() && (!requiresSpeechUnlock() || speechUnlocked.value)
+}
+
 // 播报函数（内部使用，不检查开关）
-function speakInternal(text: string) {
+function speakInternal(text: string, force = false) {
   if (!text) return
+  if (!force && !canSpeakNow()) return
   
   speechQueue.push(text)
   processQueue()
@@ -35,35 +52,50 @@ function speakInternal(text: string) {
 // 播报函数（检查开关）
 function speak(text: string) {
   if (!getSpeechEnabled() || !text) return
+  if (!canSpeakNow()) return
   
   speechQueue.push(text)
   processQueue()
 }
 
 function processQueue() {
-  if (isSpeaking || speechQueue.length === 0) return
+  if (isSpeaking || speechQueue.length === 0 || !canSpeakNow()) return
   
   const text = speechQueue.shift()
   if (!text) return
   
   isSpeaking = true
-  
-  const utterance = new SpeechSynthesisUtterance(text)
-  utterance.lang = 'zh-CN'
-  utterance.rate = speechRate.value
-  utterance.volume = speechVolume.value
-  
-  utterance.onend = () => {
+
+  try {
+    const utterance = new SpeechSynthesisUtterance(text)
+    utterance.lang = 'zh-CN'
+    utterance.rate = speechRate.value
+    utterance.volume = speechVolume.value
+
+    utterance.onend = () => {
+      isSpeaking = false
+      processQueue()
+    }
+
+    utterance.onerror = () => {
+      isSpeaking = false
+      processQueue()
+    }
+
+    window.speechSynthesis.speak(utterance)
+  } catch {
     isSpeaking = false
-    processQueue()
+    speechQueue.length = 0
   }
-  
-  utterance.onerror = () => {
-    isSpeaking = false
-    processQueue()
-  }
-  
-  window.speechSynthesis.speak(utterance)
+}
+
+function unlockSpeech(): boolean {
+  if (!hasSpeechSupport()) return false
+
+  speechUnlocked.value = true
+  window.speechSynthesis.resume()
+  speakInternal('语音播报已启用', true)
+  return true
 }
 
 // 播报涨停股票
@@ -133,7 +165,9 @@ export function useSpeech() {
   return {
     speechRate,
     speechVolume,
+    speechUnlocked,
     speak,
+    unlockSpeech,
     announceStock,
     announceNewStocks,
     announceReseal,
