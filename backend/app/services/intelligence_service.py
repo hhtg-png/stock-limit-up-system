@@ -6,6 +6,7 @@ import json
 import re
 from dataclasses import dataclass
 from datetime import date, datetime
+from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Optional
 from urllib.parse import parse_qs, urlparse
 
@@ -398,9 +399,12 @@ class IntelligenceService:
         if not documents and allow_latest_fallback:
             actual_date = await self._latest_daily_trade_date(db) or trade_date
             documents = await self._get_daily_documents(db, actual_date)
+        document_snapshots = [self._snapshot_document(doc) for doc in documents]
         await db.commit()
-        await self._refresh_stale_document_summaries(db, documents)
-        content_hash = _json_hash([{"id": doc.id, "hash": doc.content_hash, "summary": doc.summary_json} for doc in documents])
+        await self._refresh_stale_document_summaries(db, document_snapshots)
+        content_hash = _json_hash(
+            [{"id": doc.id, "hash": doc.content_hash, "summary": doc.summary_json} for doc in document_snapshots]
+        )
         with db.no_autoflush:
             existing = await self._get_daily_digest(db, actual_date)
         if existing and existing.content_hash == content_hash and not force:
@@ -408,7 +412,7 @@ class IntelligenceService:
             return self.serialize_daily_digest(existing, cache_hit=True)
 
         await db.commit()
-        summary = await self.summary_client.summarize_daily_info(actual_date, documents)
+        summary = await self.summary_client.summarize_daily_info(actual_date, document_snapshots)
         existing = await self._write_daily_digest_with_retry(
             db,
             actual_date,
@@ -438,21 +442,46 @@ class IntelligenceService:
         finally:
             self._refreshing_daily_dates.discard(trade_date)
 
-    async def _refresh_stale_document_summaries(self, db: AsyncSession, documents: List[KnowledgeDocument]) -> None:
+    def _snapshot_document(self, doc: KnowledgeDocument) -> SimpleNamespace:
+        return SimpleNamespace(
+            id=doc.id,
+            title=doc.title,
+            media_type_name=doc.media_type_name,
+            abstract=doc.abstract,
+            content_text=doc.content_text,
+            content_hash=doc.content_hash,
+            summary_json=dict(doc.summary_json or {}),
+            summary_status=doc.summary_status,
+            summary_error=doc.summary_error or "",
+        )
+
+    async def _refresh_stale_document_summaries(self, db: AsyncSession, documents: List[SimpleNamespace]) -> None:
         if not self._has_api_key():
             return
         for doc in documents:
             if self._summary_from_missing_api_key(doc.summary_json):
                 await self._summarize_document(doc)
-                await self._write_document_summary_with_retry(db, doc)
+                await self._write_document_summary_with_retry(
+                    db,
+                    doc.id,
+                    doc.summary_json,
+                    doc.summary_status,
+                    doc.summary_error,
+                )
 
-    async def _write_document_summary_with_retry(self, db: AsyncSession, doc: KnowledgeDocument) -> None:
-        summary_json = dict(doc.summary_json or {})
-        summary_status = doc.summary_status
-        summary_error = doc.summary_error or ""
+    async def _write_document_summary_with_retry(
+        self,
+        db: AsyncSession,
+        doc_id: int,
+        summary_json: Dict[str, Any],
+        summary_status: str,
+        summary_error: str,
+    ) -> None:
+        summary_json = dict(summary_json or {})
+        summary_error = summary_error or ""
         for attempt in range(5):
             try:
-                target = doc if attempt == 0 else await db.get(KnowledgeDocument, doc.id)
+                target = await db.get(KnowledgeDocument, doc_id)
                 if target is None:
                     return
                 target.summary_json = summary_json
@@ -460,9 +489,6 @@ class IntelligenceService:
                 target.summary_error = summary_error
                 target.updated_at = datetime.now()
                 await db.commit()
-                doc.summary_json = summary_json
-                doc.summary_status = summary_status
-                doc.summary_error = summary_error
                 return
             except OperationalError as exc:
                 await db.rollback()
