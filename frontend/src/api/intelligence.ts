@@ -1,6 +1,8 @@
 import axios from 'axios'
 import type {
+  DailyInfoHistoryResponse,
   DailyInfoResponse,
+  DailyInfoSourceDetail,
   IntelligenceSourcesResponse,
   IntelligenceSyncResponse,
   JiegeModeResponse
@@ -15,6 +17,18 @@ export async function getDailyInfo(tradeDate: string): Promise<DailyInfoResponse
   const { data } = await api.get('/intelligence/daily-info', {
     params: { trade_date: tradeDate }
   })
+  return data
+}
+
+export async function getDailyInfoHistory(limit = 30): Promise<DailyInfoHistoryResponse> {
+  const { data } = await api.get('/intelligence/daily-info/history', {
+    params: { limit }
+  })
+  return data
+}
+
+export async function getIntelligenceDocument(documentId: number): Promise<DailyInfoSourceDetail> {
+  const { data } = await api.get(`/intelligence/documents/${documentId}`)
   return data
 }
 

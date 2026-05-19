@@ -2,7 +2,7 @@
 from datetime import date
 from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -12,6 +12,14 @@ from app.services.intelligence_service import intelligence_service
 from app.utils.time_utils import today_cn
 
 router = APIRouter()
+
+
+@router.get("/daily-info/history", summary="获取每日资讯历史")
+async def get_daily_info_history(
+    limit: int = Query(30, ge=1, le=100, description="返回条数"),
+    db: AsyncSession = Depends(get_db),
+):
+    return {"items": await intelligence_service.list_daily_digests(db, limit=limit)}
 
 
 @router.get("/daily-info", summary="获取每日资讯")
@@ -26,17 +34,25 @@ async def get_daily_info(
     if existing is not None:
         if needs_model_refresh:
             background_tasks.add_task(intelligence_service.refresh_daily_info_in_background, target_date)
-            payload = intelligence_service.serialize_daily_digest(existing, cache_hit=True)
+            payload = await intelligence_service.serialize_daily_digest_with_sources(db, existing, cache_hit=True)
             payload["summary"] = dict(payload["summary"])
             payload["summary"]["model_status"] = "refreshing_after_key_configured"
             return payload
-        return intelligence_service.serialize_daily_digest(existing, cache_hit=True)
+        return await intelligence_service.serialize_daily_digest_with_sources(db, existing, cache_hit=True)
     return await intelligence_service.build_daily_info(
         db,
         target_date,
         allow_latest_fallback=True,
         force=needs_model_refresh,
     )
+
+
+@router.get("/documents/{document_id}", summary="获取知识库原文")
+async def get_document_source(document_id: int, db: AsyncSession = Depends(get_db)):
+    document = await intelligence_service.get_document_source(db, document_id)
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    return document
 
 
 @router.post("/daily-info/sync", summary="同步每日资讯知识库")

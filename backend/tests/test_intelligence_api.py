@@ -12,7 +12,7 @@ from sqlalchemy.pool import StaticPool
 from app.api.v1 import intelligence as intelligence_api
 from app.api.v1.intelligence import router as intelligence_router
 from app.database import Base, get_db
-from app.models.intelligence import DailyInfoDigest, JiegeModeSignal
+from app.models.intelligence import DailyInfoDigest, JiegeModeSignal, KnowledgeDocument
 
 
 class IntelligenceApiTests(unittest.TestCase):
@@ -56,6 +56,61 @@ class IntelligenceApiTests(unittest.TestCase):
                 )
             )
             session.add(
+                DailyInfoDigest(
+                    trade_date=date(2026, 5, 17),
+                    status="ready",
+                    source_count=1,
+                    summary_json={"overview": "AI 主线扩散", "source_titles": ["AI资讯.md"]},
+                    content_hash="daily-hash-old",
+                    model="codex-local",
+                    generated_at=datetime(2026, 5, 17, 20, 30, 0),
+                )
+            )
+            session.add(
+                KnowledgeDocument(
+                    source_key="daily",
+                    source_name="每日复盘更新",
+                    share_id="daily",
+                    media_id="daily-20260518",
+                    title="复盘.md",
+                    media_type=7,
+                    media_type_name="MD",
+                    md5_sum="md5-a",
+                    update_time="1779119000000",
+                    jump_url="https://example.test/review.md",
+                    source_path="file_manager/review.md",
+                    abstract="AI摘要: 市场修复",
+                    introduction="# 复盘",
+                    content_text="# 复盘\n市场修复，AI主线较强。",
+                    content_hash="doc-hash-a",
+                    summary_json={"summary": "市场修复"},
+                    summary_status="ready",
+                    trade_date=date(2026, 5, 18),
+                )
+            )
+            session.add(
+                KnowledgeDocument(
+                    source_key="daily",
+                    source_name="每日复盘更新",
+                    share_id="daily",
+                    media_id="daily-20260517",
+                    title="AI资讯.md",
+                    media_type=7,
+                    media_type_name="MD",
+                    md5_sum="md5-b",
+                    update_time="1779032600000",
+                    jump_url="https://example.test/ai.md",
+                    source_path="file_manager/ai.md",
+                    abstract="AI摘要: AI主线扩散",
+                    introduction="# AI资讯",
+                    content_text="# AI资讯\n算力和机器人轮动。",
+                    content_hash="doc-hash-b",
+                    summary_json={"summary": "AI主线扩散"},
+                    summary_status="ready",
+                    trade_date=date(2026, 5, 17),
+                )
+            )
+            session.add(
                 JiegeModeSignal(
                     trade_date=date(2026, 5, 18),
                     status="ready",
@@ -74,6 +129,24 @@ class IntelligenceApiTests(unittest.TestCase):
         self.assertEqual(payload["trade_date"], "2026-05-18")
         self.assertEqual(payload["summary"]["overview"], "市场修复")
         self.assertEqual(payload["source_count"], 2)
+        self.assertEqual(payload["sources"][0]["title"], "复盘.md")
+        self.assertEqual(payload["sources"][0]["jump_url"], "https://example.test/review.md")
+
+    def test_get_daily_info_history_returns_latest_first(self):
+        response = self.client.get("/intelligence/daily-info/history", params={"limit": 10})
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual([item["trade_date"] for item in payload["items"]], ["2026-05-18", "2026-05-17"])
+        self.assertEqual(payload["items"][0]["sources"][0]["title"], "复盘.md")
+
+    def test_get_document_source_returns_original_content(self):
+        response = self.client.get("/intelligence/documents/1")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["title"], "复盘.md")
+        self.assertIn("市场修复", payload["content_text"])
 
     def test_get_daily_info_schedules_refresh_for_missing_key_cache_after_key_is_configured(self):
         async def mark_digest_as_missing_key():

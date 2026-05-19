@@ -19,6 +19,30 @@ export interface DailyInfoResponse {
   model?: string | null
   generated_at?: string | null
   cache_hit: boolean
+  sources: DailyInfoSource[]
+}
+
+export interface DailyInfoSource {
+  id: number
+  title: string
+  source_name: string
+  source_key: string
+  media_type_name: string
+  trade_date?: string | null
+  update_time?: string
+  jump_url?: string
+  source_path?: string
+}
+
+export interface DailyInfoSourceDetail extends DailyInfoSource {
+  abstract?: string
+  introduction?: string
+  content_text?: string
+  summary?: Record<string, unknown>
+}
+
+export interface DailyInfoHistoryResponse {
+  items: DailyInfoResponse[]
 }
 
 export interface IntelligenceSource {

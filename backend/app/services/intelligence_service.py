@@ -360,10 +360,26 @@ class IntelligenceService:
 
     async def sync_all(self, db: AsyncSession, *, force_daily: bool = False) -> Dict[str, Any]:
         results = {}
+        changed_daily_dates: set[date] = set()
         for source_key in self.sources:
             results[source_key] = await self.sync_source(db, source_key)
+            if source_key == "daily":
+                changed_daily_dates.update(
+                    date.fromisoformat(value)
+                    for value in results[source_key].get("changed_trade_dates", [])
+                    if value
+                )
         today = today_cn()
-        daily = await self.build_daily_info(db, today, allow_latest_fallback=True, force=force_daily)
+        dates_to_build = [today]
+        dates_to_build.extend(sorted((item for item in changed_daily_dates if item != today), reverse=True))
+        daily = None
+        for target_date in dates_to_build:
+            daily = await self.build_daily_info(
+                db,
+                target_date,
+                allow_latest_fallback=target_date == today,
+                force=force_daily or target_date in changed_daily_dates,
+            )
         jiege = await self.build_jiege_mode(db, today, allow_latest_fallback=True)
         return {"sources": results, "daily_info": daily, "jiege_mode": jiege}
 
@@ -372,16 +388,20 @@ class IntelligenceService:
         items = await self._collect_source_items(source)
         changed = 0
         summarized = 0
+        changed_trade_dates: set[date] = set()
         for entry in items:
-            is_changed, is_summarized = await self._sync_source_entry(db, source, entry)
+            is_changed, is_summarized, trade_date = await self._sync_source_entry(db, source, entry)
             if is_changed:
                 changed += 1
                 summarized += 1 if is_summarized else 0
+                if source.key == "daily" and trade_date:
+                    changed_trade_dates.add(trade_date)
         return {
             "source_key": source.key,
             "total_documents": len(items),
             "changed_documents": changed,
             "summarized_documents": summarized,
+            "changed_trade_dates": [item.isoformat() for item in sorted(changed_trade_dates, reverse=True)],
         }
 
     async def _sync_source_entry(
@@ -389,7 +409,7 @@ class IntelligenceService:
         db: AsyncSession,
         source: ImaKnowledgeSource,
         entry: Dict[str, Any],
-    ) -> tuple[bool, bool]:
+    ) -> tuple[bool, bool, Optional[date]]:
         for attempt in range(5):
             try:
                 doc, is_changed = await self._upsert_document_from_entry(db, source, entry)
@@ -397,7 +417,7 @@ class IntelligenceService:
                 snapshot = self._snapshot_document(doc)
                 await db.commit()
                 if not is_changed:
-                    return False, False
+                    return False, False, snapshot.trade_date
                 await self._summarize_document(snapshot)
                 await self._write_document_summary_with_retry(
                     db,
@@ -406,7 +426,7 @@ class IntelligenceService:
                     snapshot.summary_status,
                     snapshot.summary_error,
                 )
-                return True, snapshot.summary_status == "ready"
+                return True, snapshot.summary_status == "ready", snapshot.trade_date
             except OperationalError as exc:
                 await db.rollback()
                 if not self._is_database_locked(exc) or attempt == 4:
@@ -437,7 +457,7 @@ class IntelligenceService:
             existing = await self._get_daily_digest(db, actual_date)
         if existing and existing.content_hash == content_hash and not force:
             await db.commit()
-            return self.serialize_daily_digest(existing, cache_hit=True)
+            return self.serialize_daily_digest(existing, cache_hit=True, sources=document_snapshots)
 
         await db.commit()
         summary = await self.summary_client.summarize_daily_info(actual_date, document_snapshots)
@@ -449,7 +469,7 @@ class IntelligenceService:
             source_count=len(documents),
             content_hash=content_hash,
         )
-        return self.serialize_daily_digest(existing, cache_hit=False)
+        return self.serialize_daily_digest(existing, cache_hit=False, sources=document_snapshots)
 
     def daily_digest_needs_model_refresh(self, digest: DailyInfoDigest) -> bool:
         return self._has_api_key() and self._summary_from_missing_api_key(digest.summary_json)
@@ -473,11 +493,18 @@ class IntelligenceService:
     def _snapshot_document(self, doc: KnowledgeDocument) -> SimpleNamespace:
         return SimpleNamespace(
             id=doc.id,
+            source_name=doc.source_name,
+            source_key=doc.source_key,
             title=doc.title,
             media_type_name=doc.media_type_name,
             abstract=doc.abstract,
+            introduction=doc.introduction,
             content_text=doc.content_text,
             content_hash=doc.content_hash,
+            trade_date=doc.trade_date,
+            update_time=doc.update_time,
+            jump_url=doc.jump_url,
+            source_path=doc.source_path,
             summary_json=dict(doc.summary_json or {}),
             summary_status=doc.summary_status,
             summary_error=doc.summary_error or "",
@@ -830,6 +857,34 @@ class IntelligenceService:
         result = await db.execute(select(DailyInfoDigest).where(DailyInfoDigest.trade_date == trade_date))
         return result.scalar_one_or_none()
 
+    async def list_daily_digests(self, db: AsyncSession, *, limit: int = 30) -> List[Dict[str, Any]]:
+        result = await db.execute(
+            select(DailyInfoDigest)
+            .order_by(DailyInfoDigest.trade_date.desc(), DailyInfoDigest.generated_at.desc(), DailyInfoDigest.id.desc())
+            .limit(limit)
+        )
+        items = []
+        for digest in result.scalars().all():
+            sources = await self._get_daily_documents(db, digest.trade_date)
+            items.append(self.serialize_daily_digest(digest, cache_hit=True, sources=sources))
+        return items
+
+    async def serialize_daily_digest_with_sources(
+        self,
+        db: AsyncSession,
+        digest: DailyInfoDigest,
+        *,
+        cache_hit: bool = False,
+    ) -> Dict[str, Any]:
+        sources = await self._get_daily_documents(db, digest.trade_date)
+        return self.serialize_daily_digest(digest, cache_hit=cache_hit, sources=sources)
+
+    async def get_document_source(self, db: AsyncSession, document_id: int) -> Optional[Dict[str, Any]]:
+        document = await db.get(KnowledgeDocument, document_id)
+        if document is None:
+            return None
+        return self.serialize_document_source(document, include_content=True)
+
     async def _get_jiege_rule_documents(self, db: AsyncSession) -> List[KnowledgeDocument]:
         result = await db.execute(
             select(KnowledgeDocument)
@@ -970,7 +1025,13 @@ class IntelligenceService:
             return {}
         return daily_analysis_service.serialize_record(record).get("columns", {})
 
-    def serialize_daily_digest(self, digest: DailyInfoDigest, *, cache_hit: bool = False) -> Dict[str, Any]:
+    def serialize_daily_digest(
+        self,
+        digest: DailyInfoDigest,
+        *,
+        cache_hit: bool = False,
+        sources: Optional[Iterable[Any]] = None,
+    ) -> Dict[str, Any]:
         return {
             "trade_date": digest.trade_date.isoformat(),
             "status": digest.status,
@@ -979,7 +1040,29 @@ class IntelligenceService:
             "model": digest.model,
             "generated_at": digest.generated_at.isoformat() if digest.generated_at else None,
             "cache_hit": cache_hit,
+            "sources": [self.serialize_document_source(source) for source in (sources or [])],
         }
+
+    def serialize_document_source(self, document: Any, *, include_content: bool = False) -> Dict[str, Any]:
+        payload = {
+            "id": document.id,
+            "title": document.title,
+            "source_name": document.source_name,
+            "source_key": document.source_key,
+            "media_type_name": document.media_type_name,
+            "trade_date": document.trade_date.isoformat() if document.trade_date else None,
+            "update_time": document.update_time,
+            "jump_url": document.jump_url,
+            "source_path": document.source_path,
+        }
+        if include_content:
+            payload.update({
+                "abstract": document.abstract,
+                "introduction": document.introduction,
+                "content_text": document.content_text,
+                "summary": document.summary_json or {},
+            })
+        return payload
 
     def serialize_rule(self, rule: JiegeTradingRule) -> Dict[str, Any]:
         return {

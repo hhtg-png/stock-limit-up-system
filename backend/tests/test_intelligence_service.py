@@ -14,6 +14,7 @@ from app.services.intelligence_service import (
     ImaKnowledgeSource,
     IntelligenceService,
 )
+from app.utils.time_utils import today_cn
 
 
 class FakeImaClient:
@@ -284,6 +285,53 @@ class IntelligenceServiceTests(unittest.TestCase):
         self.assertEqual(summary.document_calls, ["2026-05-18-复盘.md"])
         self.assertEqual(refreshed_doc.summary_json["summary"], "2026-05-18-复盘.md summary")
         self.assertEqual(digest["summary"]["overview"], "2026-05-18 overview")
+
+    def test_sync_all_rebuilds_changed_daily_history_dates(self):
+        today = today_cn()
+        old_date = date(2026, 5, 17)
+        today_title = f"{today.isoformat()}-复盘.md"
+        old_title = "2026-05-17-复盘.md"
+        pages = {
+            ("daily", "", ""): {
+                "code": 0,
+                "knowledge_list": [
+                    md_item(media_id="today", title=today_title, update_time="1779291800000"),
+                    md_item(media_id="old", title=old_title, update_time="1779032600000"),
+                ],
+                "is_end": True,
+                "next_cursor": "",
+                "version": "v1",
+                "knowledge_base_info": {"basic_info": {"name": "每日复盘更新"}},
+                "current_path": [{"name": "每日复盘更新", "folder_id": "root"}],
+            }
+        }
+        ima = FakeImaClient(
+            pages,
+            contents={
+                "https://example.test/a.md": "# 复盘\nAI 主线继续。",
+            },
+        )
+        summary = FakeSummaryClient()
+        service = IntelligenceService(
+            ima_client=ima,
+            summary_client=summary,
+            sources=[ImaKnowledgeSource("daily", "每日复盘更新", "daily", "daily")],
+        )
+
+        async def run():
+            async with self.Session() as session:
+                result = await service.sync_all(session)
+                digests = (await session.execute(select(DailyInfoDigest))).scalars().all()
+                return result, digests
+
+        result, digests = asyncio.run(run())
+
+        self.assertEqual(result["sources"]["daily"]["changed_trade_dates"], [today.isoformat(), old_date.isoformat()])
+        self.assertEqual(
+            sorted(call[0] for call in summary.daily_calls),
+            sorted([today, old_date]),
+        )
+        self.assertEqual({digest.trade_date for digest in digests}, {today, old_date})
 
 
 class DeepSeekSummaryClientTests(unittest.TestCase):
