@@ -46,7 +46,7 @@
 
     <el-row :gutter="16">
       <!-- 播报设置 -->
-      <el-col :span="12">
+      <el-col :xs="24" :md="12">
         <div class="card">
           <h3>播报设置</h3>
           <el-form label-width="120px">
@@ -73,7 +73,7 @@
       </el-col>
 
       <!-- 大单设置 -->
-      <el-col :span="12">
+      <el-col :xs="24" :md="12">
         <div class="card">
           <h3>大单阈值设置</h3>
           <el-form label-width="140px">
@@ -104,7 +104,7 @@
 
     <el-row :gutter="16">
       <!-- 过滤设置 -->
-      <el-col :span="12">
+      <el-col :xs="24" :md="12">
         <div class="card">
           <h3>过滤设置</h3>
           <el-form label-width="120px">
@@ -136,7 +136,7 @@
       </el-col>
 
       <!-- 自选股管理 -->
-      <el-col :span="12">
+      <el-col :xs="24" :md="12">
         <div class="card">
           <h3>自选股管理</h3>
           <div class="watchlist">
@@ -329,6 +329,44 @@ onMounted(() => {
     display: flex;
     flex-wrap: wrap;
     align-items: center;
+  }
+}
+
+@media (max-width: 767px) {
+  .settings {
+    :deep(.el-row) {
+      margin-left: 0 !important;
+      margin-right: 0 !important;
+    }
+
+    :deep(.el-col) {
+      padding-left: 0 !important;
+      padding-right: 0 !important;
+    }
+
+    .card {
+      padding: 14px;
+      margin-bottom: 10px;
+    }
+
+    :deep(.el-form-item) {
+      display: block;
+      margin-bottom: 14px;
+    }
+
+    :deep(.el-form-item__label) {
+      justify-content: flex-start;
+      width: auto !important;
+      height: auto;
+      margin-bottom: 6px;
+      line-height: 1.3;
+    }
+
+    :deep(.el-input-number),
+    :deep(.el-input),
+    :deep(.el-button) {
+      max-width: 100%;
+    }
   }
 }
 </style>

@@ -9,6 +9,10 @@ html, body {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
 }
 
+body {
+  overflow: hidden;
+}
+
 // 自定义滚动条
 ::-webkit-scrollbar {
   width: 6px;
@@ -95,4 +99,21 @@ html, body {
 
 .animate-flash {
   animation: flash 0.5s ease-in-out;
+}
+
+@media (max-width: 767px) {
+  html, body {
+    width: 100%;
+    overflow-x: hidden;
+  }
+
+  .page-container {
+    min-height: 100%;
+    height: auto;
+  }
+
+  .card {
+    border-radius: 8px;
+    padding: 14px;
+  }
 }

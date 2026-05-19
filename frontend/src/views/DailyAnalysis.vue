@@ -100,6 +100,72 @@
         </el-table-column>
       </el-table>
 
+      <div class="mobile-analysis-list" v-loading="loading">
+        <article v-for="row in rows" :key="row.trade_date" class="mobile-analysis-card">
+          <div class="mobile-analysis-header">
+            <div>
+              <strong>{{ row.trade_date }}</strong>
+              <span>v{{ row.calc_version }}</span>
+            </div>
+            <el-button :icon="Refresh" link type="primary" @click.stop="rebuildRow(row)">
+              重算
+            </el-button>
+          </div>
+
+          <section
+            v-for="column in analysisColumns"
+            :key="`${row.trade_date}-${column}`"
+            class="mobile-analysis-section"
+            :class="{ manual: cell(row, column).is_manual }"
+          >
+            <div class="mobile-section-title">
+              <span>{{ column }}</span>
+              <div class="mobile-section-actions">
+                <el-tag v-if="cell(row, column).is_manual" size="small" type="warning">人工</el-tag>
+                <el-button :icon="Edit" link size="small" @click.stop="openEdit(row, column)" />
+                <el-button
+                  v-if="cell(row, column).is_manual"
+                  :icon="RefreshLeft"
+                  link
+                  size="small"
+                  @click.stop="restoreOverride(row, column)"
+                />
+              </div>
+            </div>
+
+            <p v-if="cell(row, column).is_manual" class="manual-content">
+              {{ cell(row, column).content || '-' }}
+            </p>
+
+            <div v-else-if="cell(row, column).items.length" class="mobile-signal-list">
+              <button
+                v-for="item in cell(row, column).items"
+                :key="`${item.stock_code || item.label}-${item.tags.join('-')}`"
+                class="signal-item"
+                :class="{ clickable: Boolean(item.stock_code) }"
+                type="button"
+                @click.stop="goStock(item.stock_code)"
+              >
+                <span class="item-label">{{ item.label }}</span>
+                <span v-if="item.time" class="item-time">{{ item.time }}</span>
+                <span class="tag-list">
+                  <el-tag
+                    v-for="tag in item.tags"
+                    :key="tag"
+                    :type="tagType(tag)"
+                    size="small"
+                  >
+                    {{ tag }}
+                  </el-tag>
+                </span>
+              </button>
+            </div>
+
+            <span v-else class="empty-cell">-</span>
+          </section>
+        </article>
+      </div>
+
       <el-empty v-if="!loading && rows.length === 0" description="本月暂无分析数据，可先回填本月" />
     </div>
 
@@ -356,6 +422,10 @@ function tagType(tag: string): 'success' | 'warning' | 'danger' | 'info' {
   overflow: hidden;
 }
 
+.mobile-analysis-list {
+  display: none;
+}
+
 .date-cell {
   display: flex;
   flex-direction: column;
@@ -478,6 +548,121 @@ function tagType(tag: string): 'success' | 'warning' | 'danger' | 'info' {
     font-size: 13px;
     line-height: 1.5;
     word-break: break-word;
+  }
+}
+
+@media (max-width: 767px) {
+  .daily-analysis {
+    gap: 10px;
+  }
+
+  .toolbar {
+    align-items: flex-start;
+    flex-direction: column;
+    padding: 12px;
+
+    .toolbar-actions {
+      width: 100%;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+
+      :deep(.el-date-editor),
+      :deep(.el-button) {
+        width: 100%;
+      }
+    }
+  }
+
+  .table-wrap {
+    padding: 0;
+    overflow: visible;
+
+    :deep(.el-table) {
+      display: none;
+    }
+  }
+
+  .mobile-analysis-list {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    min-height: 160px;
+  }
+
+  .mobile-analysis-card {
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    background: #fff;
+    overflow: hidden;
+  }
+
+  .mobile-analysis-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px;
+    border-bottom: 1px solid #f1f5f9;
+
+    strong {
+      display: block;
+      color: #111827;
+      font-size: 15px;
+    }
+
+    span {
+      color: #94a3b8;
+      font-size: 12px;
+    }
+  }
+
+  .mobile-analysis-section {
+    padding: 12px;
+    border-bottom: 1px solid #f1f5f9;
+
+    &:last-child {
+      border-bottom: none;
+    }
+
+    &.manual {
+      background: #fffbe6;
+    }
+  }
+
+  .mobile-section-title {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-bottom: 8px;
+
+    > span {
+      color: #111827;
+      font-size: 14px;
+      font-weight: 600;
+    }
+  }
+
+  .mobile-section-actions {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+
+  .mobile-signal-list {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+  }
+
+  .signal-item {
+    padding: 7px;
+  }
+
+  .edit-dialog {
+    :deep(.el-textarea__inner) {
+      min-height: 140px !important;
+    }
   }
 }
 </style>

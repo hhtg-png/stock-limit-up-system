@@ -181,4 +181,29 @@ onMounted(() => {
     }
   }
 }
+
+@media (max-width: 767px) {
+  .heatmap {
+    .card {
+      padding: 14px;
+
+      .card-header {
+        align-items: flex-start;
+        flex-direction: column;
+        gap: 10px;
+
+        :deep(.el-radio-group) {
+          width: 100%;
+          display: grid;
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+      }
+
+      .heatmap-container {
+        height: calc(100dvh - 190px);
+        min-height: 360px;
+      }
+    }
+  }
+}
 </style>

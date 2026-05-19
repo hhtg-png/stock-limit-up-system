@@ -32,8 +32,15 @@
       </el-button>
     </section>
 
+    <nav class="mobile-detail-anchors" aria-label="个股详情移动端分区">
+      <a href="#stock-chart">图表</a>
+      <a href="#stock-trading">盘口</a>
+      <a href="#stock-timeline">时间线</a>
+      <a href="#stock-core">数据</a>
+    </nav>
+
     <section class="detail-workbench">
-      <div class="chart-panel">
+      <div id="stock-chart" class="chart-panel">
         <div class="panel-header">
           <h3>K线与叠加走势</h3>
           <div class="chart-actions">
@@ -101,7 +108,7 @@
         <div ref="chartRef" v-loading="chartLoading" class="chart-container" :style="{ height: chartHeight }"></div>
       </div>
 
-      <aside class="side-panels">
+      <aside id="stock-trading" class="side-panels">
         <div class="side-card">
           <div class="panel-header compact"><h3>盘口</h3></div>
           <div class="orderbook">
@@ -139,7 +146,7 @@
         </div>
       </aside>
 
-      <div class="timeline-panel">
+      <div id="stock-timeline" class="timeline-panel">
         <div class="panel-header compact"><h3>涨停时间线</h3></div>
         <div class="timeline-grid">
           <div v-for="item in timelineData" :key="item.change_time" class="timeline-event" :class="item.status">
@@ -151,7 +158,7 @@
         </div>
       </div>
 
-      <div class="info-panel">
+      <div id="stock-core" class="info-panel">
         <div class="panel-header compact"><h3>核心数据</h3></div>
         <div class="info-grid">
           <div class="info-item"><span>题材</span><strong>{{ stockInfo.reason_category || '-' }}</strong></div>
@@ -1127,6 +1134,10 @@ watch(stockCode, async () => {
   box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
 }
 
+.mobile-detail-anchors {
+  display: none;
+}
+
 .stock-hero {
   display: grid;
   grid-template-columns: minmax(260px, 1fr) auto auto;
@@ -1491,6 +1502,81 @@ watch(stockCode, async () => {
 @media (max-width: 720px) {
   .stock-detail {
     --chart-container-height: 480px;
+  }
+
+  .stock-hero {
+    gap: 12px;
+    padding: 14px;
+  }
+
+  .stock-name-row h2 {
+    font-size: 20px;
+  }
+
+  .price-summary {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+    width: 100%;
+
+    .price-main {
+      grid-column: 1 / -1;
+      font-size: 30px;
+    }
+
+    .summary-item {
+      border-radius: 6px;
+      background: #f8fafc;
+      padding: 8px;
+    }
+  }
+
+  .mobile-detail-anchors {
+    position: sticky;
+    top: 52px;
+    z-index: 12;
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 6px;
+    margin: -2px 0 10px;
+    padding: 8px 0;
+    background: #f0f2f5;
+
+    a {
+      border: 1px solid #e5e7eb;
+      border-radius: 999px;
+      background: #fff;
+      padding: 8px 0;
+      color: #475569;
+      font-size: 12px;
+      font-weight: 600;
+      text-align: center;
+      text-decoration: none;
+    }
+  }
+
+  .chart-actions {
+    width: 100%;
+    justify-content: flex-start;
+    overflow-x: auto;
+    padding-bottom: 2px;
+
+    :deep(.el-button) {
+      flex-shrink: 0;
+    }
+  }
+
+  .chart-meta,
+  .overlay-manager {
+    padding: 10px;
+  }
+
+  .overlay-input {
+    width: 100%;
+
+    :deep(.el-autocomplete) {
+      flex: 1;
+    }
   }
 
   .timeline-grid,

@@ -33,18 +33,18 @@
             <el-option label="开板" value="opened" />
           </el-select>
         </el-form-item>
-        <el-form-item>
+        <el-form-item class="filter-actions">
           <el-button type="primary" @click="applyFilters">查询</el-button>
           <el-button @click="resetFilters">重置</el-button>
           <el-button type="warning" @click="refreshData" :loading="refreshing">刷新数据</el-button>
           <el-button @click="exportData">导出</el-button>
         </el-form-item>
-        <el-form-item v-if="displayTradeDate">
+        <el-form-item v-if="displayTradeDate" class="filter-date-tag">
           <el-tag :type="isFallbackDate ? 'warning' : 'info'" size="small">
             数据日期 {{ displayTradeDate }}
           </el-tag>
         </el-form-item>
-        <el-form-item label="排序">
+        <el-form-item label="排序" class="filter-sort">
           <el-button-group size="small">
             <el-button :type="sortBy === 'time' ? 'primary' : 'default'" @click="setSortBy('time')">首封</el-button>
             <el-button :type="sortBy === 'reseal_time' ? 'primary' : 'default'" @click="setSortBy('reseal_time')">回封</el-button>
@@ -126,6 +126,12 @@
         <el-table-column prop="limit_up_reason" label="涨停原因" min-width="180" show-overflow-tooltip />
       </el-table>
     </div>
+
+    <MobileLimitUpCards
+      :items="tableData"
+      :loading="loading"
+      @select="handleRowClick"
+    />
   </div>
 </template>
 
@@ -137,6 +143,7 @@ import dayjs from 'dayjs'
 import { getRealtimeLimitUp } from '@/api/limit-up'
 import { useLimitUpStore } from '@/stores/limit-up'
 import type { LimitUpRealtime } from '@/types/limit-up'
+import MobileLimitUpCards from '@/components/stock/MobileLimitUpCards.vue'
 
 const router = useRouter()
 const limitUpStore = useLimitUpStore()
@@ -361,6 +368,62 @@ onUnmounted(() => {
       .el-table__row:hover {
         background-color: #fafafa;
       }
+    }
+  }
+}
+
+@media (max-width: 767px) {
+  .limit-up-list {
+    .filter-bar {
+      margin-bottom: 10px;
+      padding: 12px;
+
+      :deep(.el-form) {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 8px;
+      }
+
+      :deep(.el-form-item) {
+        margin: 0;
+      }
+
+      :deep(.el-form-item__label) {
+        display: none;
+      }
+
+      :deep(.el-form-item__content),
+      :deep(.el-date-editor),
+      :deep(.el-select),
+      :deep(.el-button-group) {
+        width: 100% !important;
+      }
+
+      :deep(.el-button-group) {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+      }
+
+      :deep(.el-button) {
+        min-width: 0;
+        padding: 8px 10px;
+      }
+
+      :deep(.filter-actions),
+      :deep(.filter-sort),
+      :deep(.filter-date-tag) {
+        grid-column: 1 / -1;
+      }
+
+      :deep(.filter-actions .el-form-item__content) {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 6px;
+      }
+    }
+
+    .data-table {
+      display: none;
     }
   }
 }

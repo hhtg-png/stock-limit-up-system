@@ -91,6 +91,21 @@
       >
         <AlertPanel />
       </el-drawer>
+
+      <nav class="mobile-bottom-nav" aria-label="移动端主导航">
+        <router-link
+          v-for="item in mobileNavItems"
+          :key="item.path"
+          :to="item.path"
+          class="mobile-nav-item"
+          :class="{ active: isMobileNavActive(item.path) }"
+        >
+          <el-icon>
+            <component :is="item.icon" />
+          </el-icon>
+          <span>{{ item.label }}</span>
+        </router-link>
+      </nav>
     </div>
   </el-config-provider>
 </template>
@@ -120,9 +135,23 @@ const isCollapsed = ref(false)
 const showAlertPanel = ref(false)
 const alertEnabled = ref(true)
 const currentTime = ref(dayjs().format('HH:mm:ss'))
+const mobileNavItems = [
+  { path: '/', label: '监控', icon: DataBoard },
+  { path: '/statistics', label: '报表', icon: PieChart },
+  { path: '/daily-analysis', label: '分析', icon: Calendar },
+  { path: '/continuous', label: '连板', icon: TrendCharts },
+  { path: '/settings', label: '设置', icon: Setting }
+]
 
 // 当前路由
 const currentRoute = computed(() => route.path)
+
+const isMobileNavActive = (path: string) => {
+  if (path === '/') {
+    return route.path === '/' || route.path === '/limit-up' || route.path.startsWith('/stock/')
+  }
+  return route.path.startsWith(path)
+}
 
 // 播报数量
 const alertCount = computed(() => alertStore.unreadCount)
@@ -317,5 +346,101 @@ onUnmounted(() => {
   background: #f0f2f5;
   padding: 16px;
   overflow-y: auto;
+}
+
+.mobile-bottom-nav {
+  display: none;
+}
+
+@media (max-width: 767px) {
+  .app-container {
+    height: 100dvh;
+  }
+
+  .aside {
+    display: none;
+  }
+
+  .layout-container {
+    min-width: 0;
+  }
+
+  .header {
+    height: 52px !important;
+    padding: 0 12px;
+    position: sticky;
+    top: 0;
+    z-index: 20;
+
+    .header-left {
+      gap: 8px;
+
+      .market-status {
+        padding: 3px 8px;
+        font-size: 12px;
+      }
+
+      .current-time {
+        font-size: 13px;
+      }
+    }
+
+    .header-right {
+      gap: 8px;
+
+      :deep(.el-switch) {
+        display: none;
+      }
+
+      .alert-badge {
+        margin-right: 0;
+      }
+    }
+  }
+
+  .main {
+    padding: 10px 10px 74px;
+  }
+
+  .mobile-bottom-nav {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 30;
+    display: grid;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    height: calc(58px + env(safe-area-inset-bottom));
+    padding: 6px 4px calc(6px + env(safe-area-inset-bottom));
+    border-top: 1px solid #e5e7eb;
+    background: rgba(255, 255, 255, 0.96);
+    box-shadow: 0 -8px 22px rgba(15, 23, 42, 0.08);
+  }
+
+  .mobile-nav-item {
+    display: flex;
+    min-width: 0;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 3px;
+    color: #64748b;
+    font-size: 11px;
+    line-height: 1;
+    text-decoration: none;
+
+    .el-icon {
+      font-size: 18px;
+    }
+
+    &.active {
+      color: #1677ff;
+      font-weight: 600;
+    }
+  }
+
+  :deep(.el-drawer.rtl) {
+    width: min(400px, 92vw) !important;
+  }
 }
 </style>
