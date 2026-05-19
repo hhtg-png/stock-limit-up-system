@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import asyncio
 import json
 import re
 from dataclasses import dataclass
@@ -11,6 +12,7 @@ from urllib.parse import parse_qs, urlparse
 import httpx
 from sqlalchemy import select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -396,27 +398,25 @@ class IntelligenceService:
         if not documents and allow_latest_fallback:
             actual_date = await self._latest_daily_trade_date(db) or trade_date
             documents = await self._get_daily_documents(db, actual_date)
-        await self._refresh_stale_document_summaries(documents)
+        await db.commit()
+        await self._refresh_stale_document_summaries(db, documents)
         content_hash = _json_hash([{"id": doc.id, "hash": doc.content_hash, "summary": doc.summary_json} for doc in documents])
         with db.no_autoflush:
             existing = await self._get_daily_digest(db, actual_date)
         if existing and existing.content_hash == content_hash and not force:
+            await db.commit()
             return self.serialize_daily_digest(existing, cache_hit=True)
 
-        summary = await self.summary_client.summarize_daily_info(actual_date, documents)
-        now = datetime.now()
-        if existing is None:
-            existing = DailyInfoDigest(trade_date=actual_date)
-            db.add(existing)
-        existing.summary_json = summary
-        existing.status = "ready" if documents else "empty"
-        existing.source_count = len(documents)
-        existing.content_hash = content_hash
-        existing.model = summary.get("model", getattr(self.summary_client, "model", ""))
-        existing.generated_at = now
-        existing.updated_at = now
         await db.commit()
-        await db.refresh(existing)
+        summary = await self.summary_client.summarize_daily_info(actual_date, documents)
+        existing = await self._write_daily_digest_with_retry(
+            db,
+            actual_date,
+            summary,
+            status="ready" if documents else "empty",
+            source_count=len(documents),
+            content_hash=content_hash,
+        )
         return self.serialize_daily_digest(existing, cache_hit=False)
 
     def daily_digest_needs_model_refresh(self, digest: DailyInfoDigest) -> bool:
@@ -429,19 +429,83 @@ class IntelligenceService:
         try:
             from app.database import async_session_maker
 
+            logger.info(f"Background daily intelligence refresh started for {trade_date}")
             async with async_session_maker() as db:
                 await self.build_daily_info(db, trade_date, allow_latest_fallback=True, force=True)
+            logger.info(f"Background daily intelligence refresh finished for {trade_date}")
         except Exception as exc:
             logger.warning(f"Background daily intelligence refresh failed for {trade_date}: {exc}")
         finally:
             self._refreshing_daily_dates.discard(trade_date)
 
-    async def _refresh_stale_document_summaries(self, documents: List[KnowledgeDocument]) -> None:
+    async def _refresh_stale_document_summaries(self, db: AsyncSession, documents: List[KnowledgeDocument]) -> None:
         if not self._has_api_key():
             return
         for doc in documents:
             if self._summary_from_missing_api_key(doc.summary_json):
                 await self._summarize_document(doc)
+                await self._write_document_summary_with_retry(db, doc)
+
+    async def _write_document_summary_with_retry(self, db: AsyncSession, doc: KnowledgeDocument) -> None:
+        summary_json = dict(doc.summary_json or {})
+        summary_status = doc.summary_status
+        summary_error = doc.summary_error or ""
+        for attempt in range(5):
+            try:
+                target = doc if attempt == 0 else await db.get(KnowledgeDocument, doc.id)
+                if target is None:
+                    return
+                target.summary_json = summary_json
+                target.summary_status = summary_status
+                target.summary_error = summary_error
+                target.updated_at = datetime.now()
+                await db.commit()
+                doc.summary_json = summary_json
+                doc.summary_status = summary_status
+                doc.summary_error = summary_error
+                return
+            except OperationalError as exc:
+                await db.rollback()
+                if not self._is_database_locked(exc) or attempt == 4:
+                    raise
+                await asyncio.sleep(1.5 * (attempt + 1))
+
+    async def _write_daily_digest_with_retry(
+        self,
+        db: AsyncSession,
+        trade_date: date,
+        summary: Dict[str, Any],
+        *,
+        status: str,
+        source_count: int,
+        content_hash: str,
+    ) -> DailyInfoDigest:
+        for attempt in range(5):
+            try:
+                existing = await self._get_daily_digest(db, trade_date)
+                now = datetime.now()
+                if existing is None:
+                    existing = DailyInfoDigest(trade_date=trade_date, created_at=now)
+                    db.add(existing)
+                existing.summary_json = summary
+                existing.status = status
+                existing.source_count = source_count
+                existing.content_hash = content_hash
+                existing.model = summary.get("model", getattr(self.summary_client, "model", ""))
+                existing.generated_at = now
+                existing.updated_at = now
+                await db.commit()
+                await db.refresh(existing)
+                return existing
+            except OperationalError as exc:
+                await db.rollback()
+                if not self._is_database_locked(exc) or attempt == 4:
+                    raise
+                await asyncio.sleep(1.5 * (attempt + 1))
+        raise RuntimeError("failed to write daily intelligence digest")
+
+    def _is_database_locked(self, exc: OperationalError) -> bool:
+        return "database is locked" in str(exc).lower()
 
     def _has_api_key(self) -> bool:
         return bool(getattr(self.summary_client, "api_key", None))
