@@ -1028,7 +1028,6 @@ class IntelligenceService:
             for attr, key in (
                 ("md5_sum", "md5_sum"),
                 ("update_time", "update_time"),
-                ("jump_url", "jump_url"),
                 ("source_path", "source_path"),
                 ("abstract", "abstract"),
                 ("introduction", "introduction"),

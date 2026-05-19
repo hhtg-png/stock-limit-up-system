@@ -223,6 +223,50 @@ class IntelligenceServiceTests(unittest.TestCase):
         self.assertEqual(docs[0].trade_date, date(2026, 5, 18))
         self.assertEqual(docs[0].summary_status, "ready")
 
+    def test_sync_ignores_signed_jump_url_change_when_version_fields_are_same(self):
+        first_item = md_item(jump_url="https://example.test/a.md?sign=old&t=1")
+        second_item = md_item(jump_url="https://example.test/a.md?sign=new&t=2")
+        pages = {
+            ("daily", "", ""): {
+                "code": 0,
+                "knowledge_list": [first_item],
+                "is_end": True,
+                "next_cursor": "",
+                "version": "v1",
+                "knowledge_base_info": {"basic_info": {"name": "每日复盘更新"}},
+                "current_path": [{"name": "每日复盘更新", "folder_id": "root"}],
+            }
+        }
+        ima = FakeImaClient(
+            pages,
+            contents={
+                "https://example.test/a.md?sign=old&t=1": "# 复盘\nAI 主线继续。",
+                "https://example.test/a.md?sign=new&t=2": "# 复盘\nAI 主线继续。",
+            },
+        )
+        summary = FakeSummaryClient()
+        service = IntelligenceService(
+            ima_client=ima,
+            summary_client=summary,
+            sources=[ImaKnowledgeSource("daily", "每日复盘更新", "daily", "daily")],
+        )
+
+        async def run():
+            async with self.Session() as session:
+                first = await service.sync_source(session, "daily")
+                pages[("daily", "", "")]["knowledge_list"] = [second_item]
+                second = await service.sync_source(session, "daily")
+                doc = (await session.execute(select(KnowledgeDocument))).scalar_one()
+                return first, second, doc
+
+        first, second, doc = asyncio.run(run())
+
+        self.assertEqual(first["changed_documents"], 1)
+        self.assertEqual(second["changed_documents"], 0)
+        self.assertEqual(ima.markdown_calls, ["https://example.test/a.md?sign=old&t=1"])
+        self.assertEqual(summary.document_calls, ["2026-05-18-复盘.md"])
+        self.assertEqual(doc.jump_url, "https://example.test/a.md?sign=new&t=2")
+
     def test_sync_uses_pdf_summary_without_downloading_large_file(self):
         pages = {
             ("jiege", "", ""): {
