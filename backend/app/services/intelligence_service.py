@@ -373,18 +373,46 @@ class IntelligenceService:
         changed = 0
         summarized = 0
         for entry in items:
-            doc, is_changed = await self._upsert_document_from_entry(db, source, entry)
+            is_changed, is_summarized = await self._sync_source_entry(db, source, entry)
             if is_changed:
                 changed += 1
-                await self._summarize_document(doc)
-                summarized += 1 if doc.summary_status == "ready" else 0
-        await db.commit()
+                summarized += 1 if is_summarized else 0
         return {
             "source_key": source.key,
             "total_documents": len(items),
             "changed_documents": changed,
             "summarized_documents": summarized,
         }
+
+    async def _sync_source_entry(
+        self,
+        db: AsyncSession,
+        source: ImaKnowledgeSource,
+        entry: Dict[str, Any],
+    ) -> tuple[bool, bool]:
+        for attempt in range(5):
+            try:
+                doc, is_changed = await self._upsert_document_from_entry(db, source, entry)
+                await db.flush()
+                snapshot = self._snapshot_document(doc)
+                await db.commit()
+                if not is_changed:
+                    return False, False
+                await self._summarize_document(snapshot)
+                await self._write_document_summary_with_retry(
+                    db,
+                    snapshot.id,
+                    snapshot.summary_json,
+                    snapshot.summary_status,
+                    snapshot.summary_error,
+                )
+                return True, snapshot.summary_status == "ready"
+            except OperationalError as exc:
+                await db.rollback()
+                if not self._is_database_locked(exc) or attempt == 4:
+                    raise
+                await asyncio.sleep(1.5 * (attempt + 1))
+        raise RuntimeError("failed to sync intelligence source entry")
 
     async def build_daily_info(
         self,
