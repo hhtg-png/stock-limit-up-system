@@ -22,6 +22,15 @@ async def get_daily_info_history(
     return {"items": await intelligence_service.list_daily_digests(db, limit=limit)}
 
 
+@router.get("/daily-info/search", summary="搜索每日资讯摘要和原文")
+async def search_daily_info(
+    keyword: str = Query("", description="关键词，匹配摘要、标题、简介和已缓存原文"),
+    limit: int = Query(50, ge=1, le=100, description="返回条数"),
+    db: AsyncSession = Depends(get_db),
+):
+    return {"items": await intelligence_service.search_daily_digests(db, keyword=keyword, limit=limit)}
+
+
 @router.get("/daily-info", summary="获取每日资讯")
 async def get_daily_info(
     background_tasks: BackgroundTasks,

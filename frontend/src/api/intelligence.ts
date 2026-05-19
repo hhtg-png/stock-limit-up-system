@@ -27,6 +27,13 @@ export async function getDailyInfoHistory(limit = 30): Promise<DailyInfoHistoryR
   return data
 }
 
+export async function searchDailyInfo(keyword: string, limit = 50): Promise<DailyInfoHistoryResponse> {
+  const { data } = await api.get('/intelligence/daily-info/search', {
+    params: { keyword, limit }
+  })
+  return data
+}
+
 export async function getIntelligenceDocument(documentId: number): Promise<DailyInfoSourceDetail> {
   const { data } = await api.get(`/intelligence/documents/${documentId}`)
   return data

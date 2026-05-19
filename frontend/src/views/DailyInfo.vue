@@ -6,6 +6,16 @@
         <span>知识库增量同步后保存每日摘要，最新日期显示在最上方</span>
       </div>
       <div class="toolbar-actions">
+        <el-input
+          v-model="searchKeyword"
+          class="search-input"
+          clearable
+          placeholder="搜索摘要/原文/个股"
+          :prefix-icon="Search"
+          @keyup.enter="searchData"
+          @clear="clearSearch"
+        />
+        <el-button :icon="Search" @click="searchData" :loading="searching">搜索</el-button>
         <el-date-picker
           v-model="selectedDate"
           type="date"
@@ -48,7 +58,7 @@
         <div class="intelligence-layout">
           <aside class="history-panel">
             <div class="section-header">
-              <h4>历史摘要</h4>
+              <h4>{{ searchKeyword.trim() ? '搜索结果' : '历史摘要' }}</h4>
               <el-tag size="small" type="info">{{ historyItems.length }}</el-tag>
             </div>
             <div v-if="historyItems.length" class="history-list">
@@ -96,6 +106,29 @@
                 </el-tag>
               </div>
               <p>{{ dailyInfo.summary.overview || '-' }}</p>
+            </section>
+
+            <section class="panel">
+              <div class="section-header">
+                <h4>个股提及</h4>
+                <el-tag size="small" type="warning">资讯提及，不构成推荐</el-tag>
+              </div>
+              <el-table v-if="mentionedStocks.length" :data="mentionedStocks" size="small" class="stock-table">
+                <el-table-column label="名称" min-width="110">
+                  <template #default="{ row }">
+                    <span class="stock-name">{{ row.name }}</span>
+                  </template>
+                </el-table-column>
+                <el-table-column label="代码" min-width="90">
+                  <template #default="{ row }">
+                    <el-tag v-if="row.code" size="small" effect="plain">{{ row.code }}</el-tag>
+                    <span v-else class="empty-text">-</span>
+                  </template>
+                </el-table-column>
+                <el-table-column prop="reason" label="提及原因" min-width="260" />
+                <el-table-column prop="source_title" label="来源" min-width="180" />
+              </el-table>
+              <span v-else class="empty-text">暂无个股提及</span>
             </section>
 
             <div class="two-column">
@@ -188,17 +221,19 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
-import { Document, Files, Refresh } from '@element-plus/icons-vue'
+import { Document, Files, Refresh, Search } from '@element-plus/icons-vue'
 import dayjs from 'dayjs'
-import { getDailyInfo, getDailyInfoHistory, getIntelligenceDocument, syncDailyInfo } from '@/api/intelligence'
-import type { DailyInfoResponse, DailyInfoSource, DailyInfoSourceDetail } from '@/types/intelligence'
+import { getDailyInfo, getDailyInfoHistory, getIntelligenceDocument, searchDailyInfo, syncDailyInfo } from '@/api/intelligence'
+import type { DailyInfoMentionedStock, DailyInfoResponse, DailyInfoSource, DailyInfoSourceDetail } from '@/types/intelligence'
 
 const selectedDate = ref(dayjs().format('YYYY-MM-DD'))
 const dailyInfo = ref<DailyInfoResponse | null>(null)
 const historyItems = ref<DailyInfoResponse[]>([])
 const loading = ref(false)
 const syncing = ref(false)
+const searching = ref(false)
 const errorMessage = ref('')
+const searchKeyword = ref('')
 const sourceDialogVisible = ref(false)
 const sourceLoading = ref(false)
 const sourceDetail = ref<DailyInfoSourceDetail | null>(null)
@@ -207,6 +242,9 @@ const mainLines = computed(() => stringList(dailyInfo.value?.summary.main_lines)
 const catalysts = computed(() => stringList(dailyInfo.value?.summary.catalysts))
 const risks = computed(() => stringList(dailyInfo.value?.summary.risks))
 const sourceTitles = computed(() => stringList(dailyInfo.value?.summary.source_titles))
+const mentionedStocks = computed<DailyInfoMentionedStock[]>(() => stockList(
+  dailyInfo.value?.summary.mentioned_stocks || dailyInfo.value?.summary.stocks
+))
 const sourceRefs = computed<DailyInfoSource[]>(() => {
   if (dailyInfo.value?.sources?.length) return dailyInfo.value.sources
   return sourceTitles.value.map((title, index) => ({
@@ -253,12 +291,8 @@ async function loadInitialData() {
   loading.value = true
   errorMessage.value = ''
   try {
-    const history = await getDailyInfoHistory()
-    historyItems.value = history.items
-    if (history.items.length) {
-      dailyInfo.value = history.items[0]
-      selectedDate.value = history.items[0].trade_date
-    } else {
+    const hasHistory = await loadHistory()
+    if (!hasHistory) {
       const response = await getDailyInfo(selectedDate.value)
       dailyInfo.value = response
       upsertHistory(response)
@@ -270,6 +304,17 @@ async function loadInitialData() {
   } finally {
     loading.value = false
   }
+}
+
+async function loadHistory(): Promise<boolean> {
+  const history = await getDailyInfoHistory()
+  historyItems.value = history.items
+  if (history.items.length) {
+    dailyInfo.value = history.items[0]
+    selectedDate.value = history.items[0].trade_date
+    return true
+  }
+  return false
 }
 
 async function fetchData(tradeDate = selectedDate.value) {
@@ -306,6 +351,50 @@ async function syncData() {
     ElMessage.error(errorMessage.value)
   } finally {
     syncing.value = false
+  }
+}
+
+async function searchData() {
+  const keyword = searchKeyword.value.trim()
+  if (!keyword) {
+    await clearSearch()
+    return
+  }
+  searching.value = true
+  loading.value = true
+  errorMessage.value = ''
+  try {
+    const response = await searchDailyInfo(keyword)
+    historyItems.value = response.items
+    dailyInfo.value = response.items[0] || null
+    if (dailyInfo.value) {
+      selectedDate.value = dailyInfo.value.trade_date
+    }
+  } catch (error) {
+    console.error('搜索每日资讯失败:', error)
+    errorMessage.value = '搜索每日资讯失败'
+    ElMessage.error(errorMessage.value)
+  } finally {
+    searching.value = false
+    loading.value = false
+  }
+}
+
+async function clearSearch() {
+  searchKeyword.value = ''
+  loading.value = true
+  errorMessage.value = ''
+  try {
+    const hasHistory = await loadHistory()
+    if (!hasHistory) {
+      dailyInfo.value = null
+    }
+  } catch (error) {
+    console.error('恢复历史摘要失败:', error)
+    errorMessage.value = '恢复历史摘要失败'
+    ElMessage.error(errorMessage.value)
+  } finally {
+    loading.value = false
   }
 }
 
@@ -348,6 +437,14 @@ function stringList(value: unknown): string[] {
   return value.map(item => String(item)).filter(Boolean)
 }
 
+function stockList(value: unknown): DailyInfoMentionedStock[] {
+  if (!Array.isArray(value)) return []
+  return value
+    .filter(item => item && typeof item === 'object')
+    .map(item => item as DailyInfoMentionedStock)
+    .filter(item => Boolean(item.name))
+}
+
 function changedCount(sources: Record<string, { changed_documents: number }>): number {
   return Object.values(sources).reduce((total, source) => total + source.changed_documents, 0)
 }
@@ -378,6 +475,8 @@ function formatTime(value?: string | null): string {
 }
 
 .toolbar-title {
+  min-width: 0;
+
   h3 {
     margin: 0 0 4px;
     font-size: 18px;
@@ -395,6 +494,10 @@ function formatTime(value?: string | null): string {
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
+}
+
+.search-input {
+  width: 280px;
 }
 
 .state-alert {
@@ -417,6 +520,7 @@ function formatTime(value?: string | null): string {
   display: flex;
   flex-direction: column;
   gap: 14px;
+  min-width: 0;
 }
 
 .history-panel {
@@ -436,6 +540,7 @@ function formatTime(value?: string | null): string {
 
 .history-item {
   width: 100%;
+  min-width: 0;
   min-height: 78px;
   padding: 10px;
   border: 1px solid #e5e7eb;
@@ -503,6 +608,8 @@ function formatTime(value?: string | null): string {
 }
 
 .panel {
+  min-width: 0;
+  overflow: hidden;
   padding: 16px;
   background: #fff;
   border: 1px solid #e5e7eb;
@@ -513,6 +620,7 @@ function formatTime(value?: string | null): string {
     color: #374151;
     line-height: 1.8;
     white-space: pre-wrap;
+    overflow-wrap: anywhere;
   }
 }
 
@@ -528,6 +636,10 @@ function formatTime(value?: string | null): string {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 14px;
+
+  > .panel {
+    min-width: 0;
+  }
 }
 
 .section-header {
@@ -549,6 +661,22 @@ function formatTime(value?: string | null): string {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+  min-width: 0;
+
+  :deep(.el-tag) {
+    max-width: 100%;
+    height: auto;
+    min-height: 24px;
+    padding: 4px 8px;
+    white-space: normal;
+    line-height: 1.5;
+    overflow-wrap: anywhere;
+  }
+
+  :deep(.el-tag__content) {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
 }
 
 .item-list {
@@ -556,6 +684,24 @@ function formatTime(value?: string | null): string {
   padding-left: 18px;
   color: #374151;
   line-height: 1.8;
+
+  li {
+    overflow-wrap: anywhere;
+  }
+}
+
+.stock-table {
+  width: 100%;
+
+  :deep(.cell) {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+}
+
+.stock-name {
+  color: #111827;
+  font-weight: 600;
 }
 
 .source-list {
@@ -626,6 +772,11 @@ function formatTime(value?: string | null): string {
   .toolbar {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .toolbar-actions,
+  .search-input {
+    width: 100%;
   }
 
   .intelligence-layout {

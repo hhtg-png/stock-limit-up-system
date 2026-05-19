@@ -5,10 +5,19 @@ export interface DailyInfoSummary {
   risks?: string[]
   plan?: string
   source_titles?: string[]
+  mentioned_stocks?: DailyInfoMentionedStock[]
+  stocks?: DailyInfoMentionedStock[]
   trade_date?: string
   model?: string
   model_status?: string
   error?: string
+}
+
+export interface DailyInfoMentionedStock {
+  name: string
+  code?: string
+  reason?: string
+  source_title?: string
 }
 
 export interface DailyInfoResponse {

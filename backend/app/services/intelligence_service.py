@@ -11,7 +11,7 @@ from typing import Any, Dict, Iterable, List, Optional
 from urllib.parse import parse_qs, urlparse
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import String, cast, or_, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -63,6 +63,159 @@ def _json_hash(value: Any) -> str:
 
 def _strip_ai_summary_prefix(value: str) -> str:
     return re.sub(r"^\s*AI摘要[:：]\s*", "", value or "").strip()
+
+
+_STOCK_CODE_PATTERN = re.compile(r"([\u4e00-\u9fa5A-Za-z0-9·]{2,16})[（(]([0368]\d{5})[）)]")
+_STOCK_EVENT_PATTERN = re.compile(
+    r"([\u4e00-\u9fa5A-Za-z0-9·]{2,16})"
+    r"(?:Q[1-4]|目标价|业绩|订单|公告|涨停|跌停|发布|突破|量产|中标|营收|首飞|发射|合作|回购|增持|减持)"
+)
+_ENGLISH_ENTITY_PATTERN = re.compile(r"\b(?:SpaceX|Figure|NVIDIA)\b", re.IGNORECASE)
+_KNOWN_ENTITY_PREFIXES = [
+    "长鑫存储",
+    "寒武纪",
+    "中际旭创",
+    "新易盛",
+    "工业富联",
+    "赛微电子",
+    "英伟达",
+    "SpaceX",
+    "Figure",
+    "NVIDIA",
+    "百度",
+    "长鑫",
+]
+_GENERIC_STOCK_TERMS = {
+    "人工智能",
+    "机器人",
+    "半导体",
+    "商业航天",
+    "光通信",
+    "集成电路",
+    "产业链",
+    "新闻联播",
+    "日系龙头",
+    "核心AI新业务",
+}
+
+
+def _stock_document_text(document: Any) -> str:
+    summary = getattr(document, "summary_json", None) or {}
+    summary_text = json.dumps(summary, ensure_ascii=False, default=str) if summary else ""
+    return "\n".join(
+        str(value or "")
+        for value in [
+            getattr(document, "title", ""),
+            getattr(document, "abstract", ""),
+            getattr(document, "introduction", ""),
+            getattr(document, "content_text", ""),
+            summary_text,
+        ]
+    )
+
+
+def _normalize_stock_name(raw_name: str) -> str:
+    name = re.sub(r"\s+", "", str(raw_name or ""))
+    name = name.strip(" #*`[]【】《》“”\"'，。；;、:：()（）")
+    name = re.sub(r"^(?:关注|提及|观察|包括|以及|和|与|受益|标的|个股|公司|消息称|后续关注)", "", name)
+    for prefix in sorted(_KNOWN_ENTITY_PREFIXES, key=len, reverse=True):
+        if name.startswith(prefix):
+            return prefix
+    return name
+
+
+def _mention_reason(text: str, name: str, start: int = 0) -> str:
+    window = text[max(0, start - 80): start + 180]
+    for segment in re.split(r"[。！？!?；;\n\r]", window):
+        segment = re.sub(r"\s+", " ", segment).strip()
+        if name and name in segment:
+            return segment[:160]
+    return re.sub(r"\s+", " ", window).strip()[:160]
+
+
+def _is_valid_stock_name(name: str) -> bool:
+    if len(name) < 2 or len(name) > 16:
+        return False
+    if name in _GENERIC_STOCK_TERMS:
+        return False
+    if re.fullmatch(r"(?:AI|A股|Q[1-4]|PCB|CPU|GPU|\d+)", name, flags=re.IGNORECASE):
+        return False
+    return True
+
+
+def _is_known_stock_entity(name: str) -> bool:
+    return _normalize_stock_name(name) in _KNOWN_ENTITY_PREFIXES
+
+
+def _extract_stock_mentions_from_documents(documents: Iterable[Any], *, limit: int = 20) -> List[Dict[str, Any]]:
+    mentions: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add(
+        name: str,
+        *,
+        code: str = "",
+        reason: str = "",
+        source_title: str = "",
+        require_known_without_code: bool = False,
+    ) -> None:
+        normalized = _normalize_stock_name(name)
+        if not _is_valid_stock_name(normalized):
+            return
+        normalized_code = str(code or "").strip()
+        if require_known_without_code and not normalized_code and not _is_known_stock_entity(normalized):
+            return
+        key = normalized_code or normalized.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        payload = {"name": normalized, "code": normalized_code, "reason": reason[:160], "source_title": source_title}
+        mentions.append(payload)
+
+    for document in documents:
+        source_title = str(getattr(document, "title", "") or "")
+        summary = getattr(document, "summary_json", None) or {}
+        for item in (summary.get("stocks") or summary.get("mentioned_stocks") or []):
+            if isinstance(item, dict):
+                add(
+                    str(item.get("name") or ""),
+                    code=str(item.get("code") or ""),
+                    reason=str(item.get("reason") or ""),
+                    source_title=str(item.get("source_title") or source_title),
+                    require_known_without_code=True,
+                )
+            elif item:
+                add(str(item), source_title=source_title, require_known_without_code=True)
+
+        text = _stock_document_text(document)
+        for match in _STOCK_CODE_PATTERN.finditer(text):
+            name = _normalize_stock_name(match.group(1))
+            add(name, code=match.group(2), reason=_mention_reason(text, name, match.start()), source_title=source_title)
+
+        for match in _STOCK_EVENT_PATTERN.finditer(text):
+            name = _normalize_stock_name(match.group(1))
+            if name not in _KNOWN_ENTITY_PREFIXES:
+                continue
+            add(name, reason=_mention_reason(text, name, match.start()), source_title=source_title)
+
+        for match in _ENGLISH_ENTITY_PATTERN.finditer(text):
+            raw_name = match.group(0)
+            name = "英伟达" if raw_name.lower() == "nvidia" else raw_name
+            add(name, reason=_mention_reason(text, name, match.start()), source_title=source_title)
+
+        if len(mentions) >= limit:
+            break
+    return mentions[:limit]
+
+
+def _merge_stock_mentions(summary: Dict[str, Any], documents: Iterable[Any]) -> Dict[str, Any]:
+    merged = dict(summary or {})
+    model_mentions = merged.get("mentioned_stocks") or merged.get("stocks") or []
+    pseudo_document = SimpleNamespace(title="", abstract="", introduction="", content_text="", summary_json={"stocks": model_mentions})
+    combined = _extract_stock_mentions_from_documents([pseudo_document, *list(documents)])
+    if combined:
+        merged["mentioned_stocks"] = combined
+    return merged
 
 
 class ImaWikiClient:
@@ -151,7 +304,8 @@ class DeepSeekSummaryClient:
                 "你是A股短线复盘助手。请从资料中提炼结构化摘要，只输出JSON。",
                 (
                     "按以下键输出JSON：summary(100字内), themes(数组), catalysts(数组), "
-                    "risks(数组), sectors(数组), trade_date_hint(字符串或空)。资料："
+                    "risks(数组), sectors(数组), stocks(数组，每项包含name,code,reason；只列资料明确提及对象), "
+                    "trade_date_hint(字符串或空)。资料："
                     f"{json.dumps(prompt, ensure_ascii=False)}"
                 ),
                 fallback,
@@ -176,6 +330,7 @@ class DeepSeekSummaryClient:
                 "catalysts": (doc.summary_json or {}).get("catalysts") or [],
                 "risks": (doc.summary_json or {}).get("risks") or [],
                 "sectors": (doc.summary_json or {}).get("sectors") or [],
+                "stocks": (doc.summary_json or {}).get("stocks") or (doc.summary_json or {}).get("mentioned_stocks") or [],
             }
             for doc in documents
         ]
@@ -184,7 +339,9 @@ class DeepSeekSummaryClient:
                 "你是A股每日资讯编辑。请聚合资料，输出严格JSON。",
                 (
                     "按以下键输出JSON：overview, main_lines(数组), catalysts(数组), "
-                    "risks(数组), plan, source_titles(数组)。不要给买卖建议，只做资讯总结。"
+                    "risks(数组), plan, source_titles(数组), "
+                    "mentioned_stocks(数组，每项包含name,code,reason,source_title；仅列资料明确提及对象)。"
+                    "不要给买卖建议，只做资讯总结。"
                     f"日期：{trade_date.isoformat()}。资料：{json.dumps(compact_docs, ensure_ascii=False)}"
                 ),
                 fallback,
@@ -275,6 +432,7 @@ class DeepSeekSummaryClient:
             "catalysts": [],
             "risks": [],
             "sectors": [],
+            "stocks": _extract_stock_mentions_from_documents([document]),
             "model": self.model,
             "model_status": status,
         }
@@ -292,6 +450,7 @@ class DeepSeekSummaryClient:
             "risks": self._unique_from_docs(documents, "risks"),
             "plan": "基于已同步资料观察主线承接与风险变化。",
             "source_titles": titles,
+            "mentioned_stocks": _extract_stock_mentions_from_documents(documents),
             "trade_date": trade_date.isoformat(),
             "model": self.model,
             "model_status": status,
@@ -461,6 +620,7 @@ class IntelligenceService:
 
         await db.commit()
         summary = await self.summary_client.summarize_daily_info(actual_date, document_snapshots)
+        summary = _merge_stock_mentions(summary, document_snapshots)
         existing = await self._write_daily_digest_with_retry(
             db,
             actual_date,
@@ -869,6 +1029,44 @@ class IntelligenceService:
             items.append(self.serialize_daily_digest(digest, cache_hit=True, sources=sources))
         return items
 
+    async def search_daily_digests(self, db: AsyncSession, *, keyword: str, limit: int = 50) -> List[Dict[str, Any]]:
+        keyword = (keyword or "").strip()
+        if not keyword:
+            return await self.list_daily_digests(db, limit=limit)
+
+        pattern = f"%{keyword}%"
+        document_result = await db.execute(
+            select(KnowledgeDocument.trade_date)
+            .where(
+                KnowledgeDocument.source_key == "daily",
+                KnowledgeDocument.trade_date.is_not(None),
+                or_(
+                    KnowledgeDocument.title.like(pattern),
+                    KnowledgeDocument.abstract.like(pattern),
+                    KnowledgeDocument.introduction.like(pattern),
+                    KnowledgeDocument.content_text.like(pattern),
+                    cast(KnowledgeDocument.summary_json, String).like(pattern),
+                ),
+            )
+            .distinct()
+        )
+        matched_dates = {item for item in document_result.scalars().all() if item is not None}
+        conditions = [cast(DailyInfoDigest.summary_json, String).like(pattern)]
+        if matched_dates:
+            conditions.append(DailyInfoDigest.trade_date.in_(matched_dates))
+
+        result = await db.execute(
+            select(DailyInfoDigest)
+            .where(or_(*conditions))
+            .order_by(DailyInfoDigest.trade_date.desc(), DailyInfoDigest.generated_at.desc(), DailyInfoDigest.id.desc())
+            .limit(limit)
+        )
+        items = []
+        for digest in result.scalars().all():
+            sources = await self._get_daily_documents(db, digest.trade_date)
+            items.append(self.serialize_daily_digest(digest, cache_hit=True, sources=sources))
+        return items
+
     async def serialize_daily_digest_with_sources(
         self,
         db: AsyncSession,
@@ -1032,15 +1230,17 @@ class IntelligenceService:
         cache_hit: bool = False,
         sources: Optional[Iterable[Any]] = None,
     ) -> Dict[str, Any]:
+        source_items = list(sources or [])
+        summary = _merge_stock_mentions(dict(digest.summary_json or {}), source_items)
         return {
             "trade_date": digest.trade_date.isoformat(),
             "status": digest.status,
             "source_count": digest.source_count,
-            "summary": digest.summary_json or {},
+            "summary": summary,
             "model": digest.model,
             "generated_at": digest.generated_at.isoformat() if digest.generated_at else None,
             "cache_hit": cache_hit,
-            "sources": [self.serialize_document_source(source) for source in (sources or [])],
+            "sources": [self.serialize_document_source(source) for source in source_items],
         }
 
     def serialize_document_source(self, document: Any, *, include_content: bool = False) -> Dict[str, Any]:

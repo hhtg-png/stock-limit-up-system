@@ -286,6 +286,105 @@ class IntelligenceServiceTests(unittest.TestCase):
         self.assertEqual(refreshed_doc.summary_json["summary"], "2026-05-18-复盘.md summary")
         self.assertEqual(digest["summary"]["overview"], "2026-05-18 overview")
 
+    def test_daily_digest_adds_stock_mentions_from_source_documents(self):
+        service = IntelligenceService(
+            ima_client=FakeImaClient({}),
+            summary_client=FakeSummaryClient(),
+            sources=[],
+        )
+
+        async def run():
+            async with self.Session() as session:
+                session.add(KnowledgeDocument(
+                    source_key="daily",
+                    source_name="每日复盘更新",
+                    share_id="daily",
+                    media_id="markdown_stocks",
+                    title="2026-05-18-个股资讯.md",
+                    media_type=7,
+                    media_type_name="MD",
+                    md5_sum="stock-md5",
+                    update_time="1779119000000",
+                    abstract="AI摘要: 赛微电子订单验证，英伟达目标价上调。",
+                    content_text="赛微电子(300456)公告订单验证，英伟达目标价上调，机器人主线继续扩散。",
+                    content_hash="stock-hash",
+                    summary_json={"summary": "赛微电子订单验证，英伟达目标价上调。", "themes": ["机器人"]},
+                    summary_status="ready",
+                    trade_date=date(2026, 5, 18),
+                ))
+                await session.commit()
+                return await service.build_daily_info(session, date(2026, 5, 18))
+
+        digest = asyncio.run(run())
+        stocks = digest["summary"]["mentioned_stocks"]
+
+        self.assertIn({"name": "赛微电子", "code": "300456"}, [{ "name": item["name"], "code": item.get("code", "") } for item in stocks])
+        self.assertTrue(any(item["name"] == "英伟达" for item in stocks))
+        self.assertTrue(all(item.get("source_title") == "2026-05-18-个股资讯.md" for item in stocks))
+
+    def test_stock_mentions_do_not_include_generic_event_phrases(self):
+        service = IntelligenceService(
+            ima_client=FakeImaClient({}),
+            summary_client=FakeSummaryClient(),
+            sources=[],
+        )
+
+        async def run():
+            async with self.Session() as session:
+                session.add(KnowledgeDocument(
+                    source_key="daily",
+                    source_name="每日复盘更新",
+                    share_id="daily",
+                    media_id="markdown_generic",
+                    title="5月19日盘前纪要",
+                    media_type=7,
+                    media_type_name="MD",
+                    md5_sum="generic-md5",
+                    update_time="1779205400000",
+                    abstract="建议结合最新公告验证，盘前纪要发布时间为07:10，SpaceX星舰V3周三首飞。",
+                    content_text="建议结合最新公告验证，盘前纪要发布时间为07:10，SpaceX星舰V3周三首飞。",
+                    content_hash="generic-hash",
+                    summary_json={"summary": "建议结合最新公告验证，SpaceX星舰V3周三首飞。"},
+                    summary_status="ready",
+                    trade_date=date(2026, 5, 19),
+                ))
+                await session.commit()
+                return await service.build_daily_info(session, date(2026, 5, 19))
+
+        digest = asyncio.run(run())
+        names = [item["name"] for item in digest["summary"]["mentioned_stocks"]]
+
+        self.assertIn("SpaceX", names)
+        self.assertNotIn("并注意结合最新", names)
+        self.assertNotIn("结合最新", names)
+        self.assertNotIn("盘前纪要", names)
+
+    def test_serialized_stock_mentions_filter_previous_generic_cache(self):
+        service = IntelligenceService(
+            ima_client=FakeImaClient({}),
+            summary_client=FakeSummaryClient(),
+            sources=[],
+        )
+        digest = SimpleNamespace(
+            trade_date=date(2026, 5, 19),
+            status="ready",
+            source_count=1,
+            summary_json={
+                "overview": "资讯摘要",
+                "mentioned_stocks": [
+                    {"name": "结合最新", "code": "", "reason": "建议结合最新公告验证", "source_title": "盘前纪要"},
+                    {"name": "SpaceX", "code": "", "reason": "SpaceX星舰V3首飞", "source_title": "晚间资讯"},
+                ],
+            },
+            model="codex-local",
+            generated_at=None,
+        )
+
+        payload = service.serialize_daily_digest(digest, sources=[])
+        names = [item["name"] for item in payload["summary"]["mentioned_stocks"]]
+
+        self.assertEqual(names, ["SpaceX"])
+
     def test_sync_all_rebuilds_changed_daily_history_dates(self):
         today = today_cn()
         old_date = date(2026, 5, 17)

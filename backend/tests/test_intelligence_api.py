@@ -79,9 +79,9 @@ class IntelligenceApiTests(unittest.TestCase):
                     update_time="1779119000000",
                     jump_url="https://example.test/review.md",
                     source_path="file_manager/review.md",
-                    abstract="AI摘要: 市场修复",
+                    abstract="AI摘要: 市场修复，赛微电子订单验证。",
                     introduction="# 复盘",
-                    content_text="# 复盘\n市场修复，AI主线较强。",
+                    content_text="# 复盘\n市场修复，AI主线较强，赛微电子(300456)公告订单验证。",
                     content_hash="doc-hash-a",
                     summary_json={"summary": "市场修复"},
                     summary_status="ready",
@@ -132,6 +132,13 @@ class IntelligenceApiTests(unittest.TestCase):
         self.assertEqual(payload["sources"][0]["title"], "复盘.md")
         self.assertEqual(payload["sources"][0]["jump_url"], "https://example.test/review.md")
 
+    def test_get_daily_info_backfills_stock_mentions_from_sources(self):
+        response = self.client.get("/intelligence/daily-info", params={"trade_date": "2026-05-18"})
+
+        self.assertEqual(response.status_code, 200)
+        stocks = response.json()["summary"]["mentioned_stocks"]
+        self.assertTrue(any(stock["name"] == "赛微电子" and stock["code"] == "300456" for stock in stocks))
+
     def test_get_daily_info_history_returns_latest_first(self):
         response = self.client.get("/intelligence/daily-info/history", params={"limit": 10})
 
@@ -147,6 +154,15 @@ class IntelligenceApiTests(unittest.TestCase):
         payload = response.json()
         self.assertEqual(payload["title"], "复盘.md")
         self.assertIn("市场修复", payload["content_text"])
+
+    def test_search_daily_info_matches_digest_and_original_content(self):
+        summary_response = self.client.get("/intelligence/daily-info/search", params={"keyword": "市场修复"})
+        content_response = self.client.get("/intelligence/daily-info/search", params={"keyword": "机器人"})
+
+        self.assertEqual(summary_response.status_code, 200)
+        self.assertEqual(content_response.status_code, 200)
+        self.assertEqual([item["trade_date"] for item in summary_response.json()["items"]], ["2026-05-18"])
+        self.assertEqual([item["trade_date"] for item in content_response.json()["items"]], ["2026-05-17"])
 
     def test_get_daily_info_schedules_refresh_for_missing_key_cache_after_key_is_configured(self):
         async def mark_digest_as_missing_key():
