@@ -107,6 +107,10 @@ class DailyAnalysisSchedulerTests(unittest.TestCase):
         self.assertIn("intelligence_sync_1520", job_ids)
         self.assertIn("intelligence_sync_2030", job_ids)
         self.assertIn("intelligence_startup_sync", job_ids)
+        self.assertIn("intelligence_probe", job_ids)
+
+        probe_job = next(job for job in scheduler.scheduler.jobs if job["id"] == "intelligence_probe")
+        self.assertEqual(probe_job["trigger"].kwargs["seconds"], 60)
 
     def test_calculate_daily_analysis_skips_non_trading_day(self):
         scheduler = DataScheduler()

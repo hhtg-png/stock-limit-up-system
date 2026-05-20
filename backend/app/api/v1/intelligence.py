@@ -58,9 +58,31 @@ async def get_document_source(document_id: int, db: AsyncSession = Depends(get_d
 @router.post("/daily-info/sync", summary="同步每日资讯知识库")
 async def sync_daily_info(
     force: bool = Query(False, description="是否强制重算每日摘要；默认只在知识库内容更新后调用模型"),
+    wait: bool = Query(False, description="是否等待同步完成；默认后台执行，避免前端超时"),
     db: AsyncSession = Depends(get_db),
 ):
+    if not wait:
+        return intelligence_service.queue_background_sync(force_daily=force, reason="manual")
     return await intelligence_service.sync_all(db, force_daily=force)
+
+
+@router.get("/daily-info/sync-status", summary="获取每日资讯同步状态")
+async def get_daily_info_sync_status():
+    return intelligence_service.get_sync_status()
+
+
+@router.post("/daily-info/probe", summary="轻量探测每日资讯知识库更新")
+async def probe_daily_info(db: AsyncSession = Depends(get_db)):
+    probe = await intelligence_service.probe_daily_source(db)
+    queued = False
+    if probe.get("changed"):
+        status = intelligence_service.queue_background_sync(force_daily=False, reason="probe")
+        queued = bool(status.get("queued"))
+    return {
+        "probe": probe,
+        "queued": queued,
+        "sync": intelligence_service.get_sync_status(),
+    }
 
 
 @router.get("/jiege-mode", summary="获取杰哥交易模式")

@@ -3,8 +3,10 @@ import type {
   DailyInfoHistoryResponse,
   DailyInfoResponse,
   DailyInfoSourceDetail,
+  IntelligenceProbeResponse,
   IntelligenceSourcesResponse,
   IntelligenceSyncResponse,
+  IntelligenceSyncResult,
   JiegeModeResponse
 } from '@/types/intelligence'
 
@@ -43,6 +45,23 @@ export async function syncDailyInfo(force = false): Promise<IntelligenceSyncResp
   const { data } = await api.post('/intelligence/daily-info/sync', null, {
     params: force ? { force: true } : {}
   })
+  return data
+}
+
+export async function syncDailyInfoAndWait(force = false): Promise<IntelligenceSyncResult> {
+  const { data } = await api.post('/intelligence/daily-info/sync', null, {
+    params: force ? { force: true, wait: true } : { wait: true }
+  })
+  return data
+}
+
+export async function getDailyInfoSyncStatus(): Promise<IntelligenceSyncResponse> {
+  const { data } = await api.get('/intelligence/daily-info/sync-status')
+  return data
+}
+
+export async function probeDailyInfo(): Promise<IntelligenceProbeResponse> {
+  const { data } = await api.post('/intelligence/daily-info/probe')
   return data
 }
 

@@ -1,7 +1,7 @@
 import asyncio
 import unittest
 from datetime import date, datetime, time
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -259,27 +259,59 @@ class IntelligenceApiTests(unittest.TestCase):
         self.assertTrue(payload["cache_hit"])
         refresh.assert_not_awaited()
 
-    def test_post_daily_sync_calls_service(self):
-        fake_service = AsyncMock()
-        fake_service.sync_all.return_value = {"sources": {"daily": {"changed_documents": 1}}}
+    def test_post_daily_sync_queues_background_job(self):
+        fake_service = Mock()
+        fake_service.queue_background_sync.return_value = {
+            "state": "queued",
+            "queued": True,
+            "reason": "manual",
+        }
 
         with patch("app.api.v1.intelligence.intelligence_service", fake_service):
             response = self.client.post("/intelligence/daily-info/sync")
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["sources"]["daily"]["changed_documents"], 1)
-        fake_service.sync_all.assert_awaited_once()
-        self.assertFalse(fake_service.sync_all.await_args.kwargs["force_daily"])
+        self.assertTrue(response.json()["queued"])
+        fake_service.queue_background_sync.assert_called_once_with(force_daily=False, reason="manual")
 
-    def test_post_daily_sync_can_force_rebuild(self):
+    def test_post_daily_sync_can_wait_for_force_rebuild(self):
         fake_service = AsyncMock()
         fake_service.sync_all.return_value = {"sources": {"daily": {"changed_documents": 0}}}
 
         with patch("app.api.v1.intelligence.intelligence_service", fake_service):
-            response = self.client.post("/intelligence/daily-info/sync", params={"force": "true"})
+            response = self.client.post("/intelligence/daily-info/sync", params={"force": "true", "wait": "true"})
 
         self.assertEqual(response.status_code, 200)
         self.assertTrue(fake_service.sync_all.await_args.kwargs["force_daily"])
+
+    def test_get_daily_sync_status_returns_current_job_state(self):
+        fake_service = Mock()
+        fake_service.get_sync_status.return_value = {
+            "state": "running",
+            "reason": "probe",
+            "started_at": "2026-05-20T11:30:00+08:00",
+        }
+
+        with patch("app.api.v1.intelligence.intelligence_service", fake_service):
+            response = self.client.get("/intelligence/daily-info/sync-status")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["state"], "running")
+
+    def test_post_daily_probe_queues_sync_when_source_changed(self):
+        fake_service = Mock()
+        fake_service.probe_daily_source = AsyncMock(return_value={"changed": True, "reason": "new_document"})
+        fake_service.queue_background_sync.return_value = {"state": "queued", "queued": True, "reason": "probe"}
+        fake_service.get_sync_status.return_value = {"state": "queued", "reason": "probe"}
+
+        with patch("app.api.v1.intelligence.intelligence_service", fake_service):
+            response = self.client.post("/intelligence/daily-info/probe")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["probe"]["changed"])
+        self.assertTrue(payload["queued"])
+        fake_service.queue_background_sync.assert_called_once_with(force_daily=False, reason="probe")
 
     def test_get_jiege_mode_returns_existing_signal(self):
         response = self.client.get("/intelligence/jiege-mode", params={"trade_date": "2026-05-18"})

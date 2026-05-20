@@ -742,6 +742,58 @@ class IntelligenceServiceTests(unittest.TestCase):
         self.assertEqual(trade_date, date(2026, 5, 20))
         self.assertEqual(summary.document_calls, [])
 
+    def test_probe_daily_source_detects_new_nested_daily_item(self):
+        pages = {
+            ("daily", "", ""): {
+                "code": 0,
+                "knowledge_list": [
+                    {
+                        "media_id": "folder-20260520",
+                        "title": "2026-05-20",
+                        "media_type": 1,
+                        "media_type_info": {"name": "Folder"},
+                        "md5_sum": "",
+                        "update_time": "1779235200000",
+                        "source_path": "",
+                        "folder_info": {"folder_id": "folder-20260520"},
+                    }
+                ],
+                "is_end": True,
+                "next_cursor": "",
+                "version": "root-v1",
+            },
+            ("daily", "folder-20260520", ""): {
+                "code": 0,
+                "knowledge_list": [
+                    md_item(
+                        media_id="daily-new-0520",
+                        title="5月20日盘前纪要_AI深度整理.md",
+                        update_time="1779235482990",
+                    )
+                ],
+                "is_end": True,
+                "next_cursor": "",
+                "version": "folder-v2",
+                "current_path": [{"name": "2026-05-20", "folder_id": "folder-20260520"}],
+            },
+        }
+        service = IntelligenceService(
+            ima_client=FakeImaClient(pages),
+            summary_client=FakeSummaryClient(),
+            sources=[ImaKnowledgeSource("daily", "每日复盘更新", "daily", "daily")],
+        )
+
+        async def run():
+            async with self.Session() as session:
+                return await service.probe_daily_source(session)
+
+        result = asyncio.run(run())
+
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["reason"], "new_document")
+        self.assertEqual(result["media_id"], "daily-new-0520")
+        self.assertEqual(result["checked_documents"], 2)
+
 
 class DeepSeekSummaryClientTests(unittest.TestCase):
     def test_missing_api_key_returns_fallback_without_http_call(self):

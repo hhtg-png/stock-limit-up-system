@@ -25,8 +25,8 @@
           :editable="false"
           @change="handleDateChange"
         />
-        <el-button :icon="Refresh" @click="fetchData()" :loading="loading">刷新</el-button>
-        <el-button type="primary" :icon="Files" @click="syncData" :loading="syncing">同步知识库</el-button>
+        <el-button :icon="Refresh" @click="refreshData" :loading="loading || probing">刷新</el-button>
+        <el-button type="primary" :icon="Files" @click="syncData" :loading="syncing || syncRunning">同步知识库</el-button>
       </div>
     </div>
 
@@ -40,7 +40,16 @@
     />
 
     <el-alert
-      v-else-if="modelStatus"
+      v-if="syncNotice"
+      class="state-alert"
+      type="info"
+      :title="syncNotice"
+      show-icon
+      :closable="false"
+    />
+
+    <el-alert
+      v-if="!errorMessage && !syncNotice && modelStatus"
       class="state-alert"
       :type="modelStatus === 'ready' ? 'success' : 'warning'"
       :title="modelStatusText"
@@ -230,24 +239,43 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Document, Files, Refresh, Search } from '@element-plus/icons-vue'
 import dayjs from 'dayjs'
-import { getDailyInfo, getDailyInfoHistory, getIntelligenceDocument, searchDailyInfo, syncDailyInfo } from '@/api/intelligence'
-import type { DailyInfoMentionedStock, DailyInfoResponse, DailyInfoSource, DailyInfoSourceDetail } from '@/types/intelligence'
+import {
+  getDailyInfo,
+  getDailyInfoHistory,
+  getDailyInfoSyncStatus,
+  getIntelligenceDocument,
+  probeDailyInfo,
+  searchDailyInfo,
+  syncDailyInfo
+} from '@/api/intelligence'
+import type {
+  DailyInfoMentionedStock,
+  DailyInfoResponse,
+  DailyInfoSource,
+  DailyInfoSourceDetail,
+  IntelligenceSyncResponse,
+  IntelligenceSyncResult
+} from '@/types/intelligence'
 
 const selectedDate = ref(dayjs().format('YYYY-MM-DD'))
 const dailyInfo = ref<DailyInfoResponse | null>(null)
 const historyItems = ref<DailyInfoResponse[]>([])
 const loading = ref(false)
 const syncing = ref(false)
+const probing = ref(false)
 const searching = ref(false)
 const errorMessage = ref('')
 const searchKeyword = ref('')
 const sourceDialogVisible = ref(false)
 const sourceLoading = ref(false)
 const sourceDetail = ref<DailyInfoSourceDetail | null>(null)
+const syncStatus = ref<IntelligenceSyncResponse | null>(null)
+let syncPollTimer: number | null = null
+let appliedSyncFinishedAt = ''
 
 const mainLines = computed(() => stringList(dailyInfo.value?.summary.main_lines))
 const catalysts = computed(() => stringList(dailyInfo.value?.summary.catalysts))
@@ -293,9 +321,23 @@ const sourceBody = computed(() => {
   if (!sourceDetail.value) return ''
   return sourceDetail.value.content_text || sourceDetail.value.introduction || sourceDetail.value.abstract || '暂无原文内容'
 })
+const syncRunning = computed(() => ['queued', 'running'].includes(syncStatus.value?.state || ''))
+const syncNotice = computed(() => {
+  if (probing.value) return '正在检查共享知识库是否有更新'
+  if (!syncStatus.value) return ''
+  if (syncRunning.value) return '发现同步任务正在运行，摘要生成完成后会自动刷新'
+  if (syncStatus.value.state === 'failed') return `知识库同步失败：${syncStatus.value.error || '请稍后重试'}`
+  return ''
+})
 
-onMounted(() => {
-  loadInitialData()
+onMounted(async () => {
+  await loadInitialData()
+  await refreshSyncStatus()
+  await probeKnowledgeUpdates()
+})
+
+onUnmounted(() => {
+  stopSyncPolling()
 })
 
 async function loadInitialData() {
@@ -346,16 +388,18 @@ async function fetchData(tradeDate = selectedDate.value) {
   }
 }
 
+async function refreshData() {
+  await fetchData()
+  await probeKnowledgeUpdates(true)
+}
+
 async function syncData() {
   syncing.value = true
   errorMessage.value = ''
   try {
     const response = await syncDailyInfo()
-    dailyInfo.value = response.daily_info
-    selectedDate.value = response.daily_info.trade_date
-    const history = await getDailyInfoHistory()
-    historyItems.value = history.items
-    ElMessage.success(`同步完成，更新 ${changedCount(response.sources)} 篇资料`)
+    applySyncStatus(response)
+    ElMessage.success('同步任务已启动，完成后自动刷新')
   } catch (error) {
     console.error('同步知识库失败:', error)
     errorMessage.value = '同步知识库失败'
@@ -363,6 +407,73 @@ async function syncData() {
   } finally {
     syncing.value = false
   }
+}
+
+async function probeKnowledgeUpdates(showUnchangedMessage = false) {
+  probing.value = true
+  try {
+    const response = await probeDailyInfo()
+    applySyncStatus(response.sync)
+    if (response.probe.changed) {
+      ElMessage.info('发现共享知识库更新，正在后台生成摘要')
+    } else if (showUnchangedMessage) {
+      ElMessage.success('知识库暂无新内容')
+    }
+  } catch (error) {
+    console.warn('探测知识库更新失败:', error)
+    if (showUnchangedMessage) {
+      ElMessage.warning('检查知识库更新失败')
+    }
+  } finally {
+    probing.value = false
+  }
+}
+
+async function refreshSyncStatus() {
+  try {
+    const status = await getDailyInfoSyncStatus()
+    applySyncStatus(status)
+  } catch (error) {
+    console.warn('获取知识库同步状态失败:', error)
+  }
+}
+
+function applySyncStatus(status: IntelligenceSyncResponse) {
+  syncStatus.value = status
+  if (['queued', 'running'].includes(status.state || '')) {
+    startSyncPolling()
+    return
+  }
+  stopSyncPolling()
+  if (status.state === 'completed' && status.result && status.finished_at !== appliedSyncFinishedAt) {
+    appliedSyncFinishedAt = status.finished_at || ''
+    applySyncResult(status.result)
+  }
+}
+
+function applySyncResult(result: IntelligenceSyncResult) {
+  if (result.daily_info) {
+    dailyInfo.value = result.daily_info
+    selectedDate.value = result.daily_info.trade_date
+    upsertHistory(result.daily_info)
+  }
+  if (result.sources) {
+    ElMessage.success(`同步完成，更新 ${changedCount(result.sources)} 篇资料`)
+  }
+  void loadHistory()
+}
+
+function startSyncPolling() {
+  if (syncPollTimer !== null) return
+  syncPollTimer = window.setInterval(() => {
+    refreshSyncStatus()
+  }, 3000)
+}
+
+function stopSyncPolling() {
+  if (syncPollTimer === null) return
+  window.clearInterval(syncPollTimer)
+  syncPollTimer = null
 }
 
 async function searchData() {

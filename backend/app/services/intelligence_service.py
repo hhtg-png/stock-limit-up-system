@@ -640,6 +640,16 @@ class IntelligenceService:
         self.summary_client = summary_client or DeepSeekSummaryClient()
         self.sources = {source.key: source for source in (sources if sources is not None else DEFAULT_SOURCES)}
         self._refreshing_daily_dates: set[date] = set()
+        self._background_sync_task: Optional[asyncio.Task] = None
+        self._sync_status: Dict[str, Any] = {
+            "state": "idle",
+            "reason": "",
+            "queued": False,
+            "started_at": None,
+            "finished_at": None,
+            "error": "",
+            "result": None,
+        }
 
     async def sync_all(self, db: AsyncSession, *, force_daily: bool = False) -> Dict[str, Any]:
         results = {}
@@ -667,6 +677,131 @@ class IntelligenceService:
             )
         jiege = await self.build_jiege_mode(db, today, allow_latest_fallback=True)
         return {"sources": results, "daily_info": daily, "jiege_mode": jiege}
+
+    def get_sync_status(self) -> Dict[str, Any]:
+        status = dict(self._sync_status)
+        task = self._background_sync_task
+        if task is not None and not task.done():
+            status["state"] = "running"
+            status["queued"] = True
+        return status
+
+    def queue_background_sync(self, *, force_daily: bool = False, reason: str = "manual") -> Dict[str, Any]:
+        task = self._background_sync_task
+        if task is not None and not task.done():
+            status = self.get_sync_status()
+            status["queued"] = False
+            return status
+
+        now = datetime.now(CN_TZ).isoformat()
+        self._sync_status = {
+            "state": "queued",
+            "reason": reason,
+            "queued": True,
+            "started_at": now,
+            "finished_at": None,
+            "error": "",
+            "result": None,
+        }
+        self._background_sync_task = asyncio.create_task(
+            self._run_background_sync(force_daily=force_daily, reason=reason)
+        )
+        return self.get_sync_status()
+
+    async def _run_background_sync(self, *, force_daily: bool, reason: str) -> None:
+        started_at = datetime.now(CN_TZ).isoformat()
+        self._sync_status.update(
+            {
+                "state": "running",
+                "reason": reason,
+                "queued": True,
+                "started_at": started_at,
+                "finished_at": None,
+                "error": "",
+                "result": None,
+            }
+        )
+        try:
+            from app.database import async_session_maker
+
+            async with async_session_maker() as db:
+                result = await self.sync_all(db, force_daily=force_daily)
+            self._sync_status.update(
+                {
+                    "state": "completed",
+                    "queued": False,
+                    "finished_at": datetime.now(CN_TZ).isoformat(),
+                    "error": "",
+                    "result": result,
+                }
+            )
+        except Exception as exc:
+            logger.error(f"Background knowledge intelligence sync error: {exc}")
+            self._sync_status.update(
+                {
+                    "state": "failed",
+                    "queued": False,
+                    "finished_at": datetime.now(CN_TZ).isoformat(),
+                    "error": str(exc),
+                    "result": None,
+                }
+            )
+
+    async def probe_daily_source(self, db: AsyncSession) -> Dict[str, Any]:
+        source = self.sources.get("daily")
+        if source is None:
+            return {
+                "changed": False,
+                "reason": "daily_source_disabled",
+                "checked_documents": 0,
+                "checked_at": datetime.now(CN_TZ).isoformat(),
+            }
+
+        entries = await self._collect_source_probe_items(source)
+        checked = 0
+        first_change: Optional[Dict[str, Any]] = None
+        for entry in entries:
+            checked += 1
+            media_id = self._media_id_from_entry(entry)
+            result = await db.execute(
+                select(KnowledgeDocument).where(
+                    KnowledgeDocument.source_key == source.key,
+                    KnowledgeDocument.media_id == media_id,
+                )
+            )
+            doc = result.scalar_one_or_none()
+            if doc is None:
+                change = {
+                    "changed": True,
+                    "reason": "new_document",
+                    "media_id": media_id,
+                    "title": str(entry.get("title") or ""),
+                    "_is_folder": bool((entry.get("folder_info") or {}).get("folder_id")),
+                }
+                first_change = self._prefer_probe_change(first_change, change, entry)
+                continue
+            changed_field = self._changed_metadata_field(doc, entry)
+            if changed_field:
+                change = {
+                    "changed": True,
+                    "reason": "metadata_changed",
+                    "field": changed_field,
+                    "media_id": media_id,
+                    "title": str(entry.get("title") or ""),
+                    "_is_folder": bool((entry.get("folder_info") or {}).get("folder_id")),
+                }
+                first_change = self._prefer_probe_change(first_change, change, entry)
+        if first_change is not None:
+            first_change["checked_documents"] = checked
+            first_change["checked_at"] = datetime.now(CN_TZ).isoformat()
+            first_change.pop("_is_folder", None)
+            return first_change
+        return {
+            "changed": False,
+            "reason": "unchanged",
+            "checked_documents": checked,
+            "checked_at": datetime.now(CN_TZ).isoformat(),
+        }
 
     async def sync_source(self, db: AsyncSession, source_key: str) -> Dict[str, Any]:
         source = self.sources[source_key]
@@ -1022,13 +1157,92 @@ class IntelligenceService:
                 cursor = data.get("next_cursor") or ""
         return items
 
+    async def _collect_source_probe_items(self, source: ImaKnowledgeSource) -> List[Dict[str, Any]]:
+        items: List[Dict[str, Any]] = []
+        root = await self.ima_client.get_share_page(
+            source.share_id,
+            cursor="",
+            folder_id="",
+            limit=settings.INTELLIGENCE_PROBE_LIMIT,
+        )
+        if root.get("code") != 0:
+            raise RuntimeError(root.get("msg") or f"ima share error: {root.get('code')}")
+        root_version = str(root.get("version") or "")
+        folders: List[str] = []
+        for item in root.get("knowledge_list") or []:
+            normalized = dict(item)
+            normalized["_source_version"] = root_version
+            normalized["_folder_id"] = ""
+            normalized["_folder_path"] = ""
+            items.append(normalized)
+            folder_info = item.get("folder_info") or {}
+            folder_id = folder_info.get("folder_id")
+            if folder_id:
+                folders.append(str(folder_id))
+
+        for folder_id in folders:
+            page = await self.ima_client.get_share_page(
+                source.share_id,
+                cursor="",
+                folder_id=folder_id,
+                limit=settings.INTELLIGENCE_PROBE_LIMIT,
+            )
+            if page.get("code") != 0:
+                raise RuntimeError(page.get("msg") or f"ima share error: {page.get('code')}")
+            current_path = page.get("current_path") or []
+            folder_path = " / ".join(path.get("name") or "" for path in current_path if path.get("name"))
+            source_version = str(page.get("version") or "")
+            for item in page.get("knowledge_list") or []:
+                normalized = dict(item)
+                normalized["_source_version"] = source_version
+                normalized["_folder_id"] = folder_id
+                normalized["_folder_path"] = folder_path
+                items.append(normalized)
+        return items
+
+    def _media_id_from_entry(self, entry: Dict[str, Any]) -> str:
+        folder_info = entry.get("folder_info") or {}
+        return str(entry.get("media_id") or folder_info.get("folder_id") or entry.get("title") or "")
+
+    def _changed_metadata_field(self, doc: KnowledgeDocument, entry: Dict[str, Any]) -> str:
+        checks = (
+            ("source_version", "_source_version"),
+            ("md5_sum", "md5_sum"),
+            ("update_time", "update_time"),
+            ("source_path", "source_path"),
+            ("title", "title"),
+            ("media_type", "media_type"),
+        )
+        for attr, key in checks:
+            current = getattr(doc, attr)
+            incoming: Any = entry.get(key)
+            if attr == "media_type":
+                incoming = int(incoming or 0)
+            else:
+                incoming = str(incoming or "")
+            if current != incoming:
+                return attr
+        return ""
+
+    def _prefer_probe_change(
+        self,
+        current: Optional[Dict[str, Any]],
+        candidate: Dict[str, Any],
+        entry: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if current is None:
+            return candidate
+        if not candidate.get("_is_folder") and current.get("_is_folder"):
+            return candidate
+        return current
+
     async def _upsert_document_from_entry(
         self,
         db: AsyncSession,
         source: ImaKnowledgeSource,
         entry: Dict[str, Any],
     ) -> tuple[KnowledgeDocument, bool, set[date]]:
-        media_id = str(entry.get("media_id") or entry.get("folder_info", {}).get("folder_id") or entry.get("title") or "")
+        media_id = self._media_id_from_entry(entry)
         result = await db.execute(
             select(KnowledgeDocument).where(
                 KnowledgeDocument.source_key == source.key,

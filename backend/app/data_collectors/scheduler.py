@@ -185,6 +185,14 @@ class DataScheduler:
                 )
 
         if settings.INTELLIGENCE_ENABLED:
+            self.scheduler.add_job(
+                self._probe_intelligence,
+                IntervalTrigger(seconds=settings.INTELLIGENCE_PROBE_INTERVAL_SECONDS),
+                id="intelligence_probe",
+                name="知识库轻量探测",
+                max_instances=1,
+            )
+
             for hour, minute in ((8, 45), (11, 45), (15, 20), (20, 30)):
                 self.scheduler.add_job(
                     self._sync_intelligence,
@@ -547,6 +555,24 @@ class DataScheduler:
             logger.info("Knowledge intelligence sync completed")
         except Exception as e:
             logger.error(f"Knowledge intelligence sync error: {e}")
+
+    async def _probe_intelligence(self):
+        """轻量探测每日资讯知识库更新，发现变化后后台同步。"""
+        if not settings.INTELLIGENCE_ENABLED:
+            return
+
+        try:
+            from app.database import async_session_maker
+
+            async with async_session_maker() as db:
+                result = await intelligence_service.probe_daily_source(db)
+            if result.get("changed"):
+                intelligence_service.queue_background_sync(force_daily=False, reason="scheduled_probe")
+                logger.info(f"Knowledge intelligence update detected: {result}")
+            else:
+                logger.debug(f"Knowledge intelligence probe unchanged: {result}")
+        except Exception as e:
+            logger.error(f"Knowledge intelligence probe error: {e}")
 
     async def _run_after_close_catchup(self):
         """补跑服务启动时错过的收盘后任务。"""

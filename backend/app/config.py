@@ -83,6 +83,8 @@ class Settings(BaseSettings):
     IMA_JIEGE_SHARE_ID: str = "8fbac3ae9fb49b7d2d76a8e22f6bf866d83963ed7a9534f4d1057886fc13d161"
     IMA_SYNC_PAGE_SIZE: int = 20
     IMA_SYNC_MAX_PAGES: int = 20
+    INTELLIGENCE_PROBE_INTERVAL_SECONDS: int = 60
+    INTELLIGENCE_PROBE_LIMIT: int = 20
     
     # 日志配置
     LOG_LEVEL: str = "INFO"

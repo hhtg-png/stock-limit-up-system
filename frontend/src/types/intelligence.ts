@@ -71,6 +71,30 @@ export interface IntelligenceSourcesResponse {
 }
 
 export interface IntelligenceSyncResponse {
+  state?: string
+  reason?: string
+  queued?: boolean
+  started_at?: string | null
+  finished_at?: string | null
+  error?: string
+  result?: IntelligenceSyncResult | null
+}
+
+export interface IntelligenceProbeResponse {
+  probe: {
+    changed: boolean
+    reason: string
+    media_id?: string
+    title?: string
+    field?: string
+    checked_documents: number
+    checked_at: string
+  }
+  queued: boolean
+  sync: IntelligenceSyncResponse
+}
+
+export interface IntelligenceSyncResult {
   sources: Record<string, {
     source_key: string
     total_documents: number
