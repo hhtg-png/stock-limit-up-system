@@ -629,6 +629,119 @@ class IntelligenceServiceTests(unittest.TestCase):
         )
         self.assertEqual({digest.trade_date for digest in digests}, {today, old_date})
 
+    def test_daily_source_trade_date_uses_update_time_not_title_date(self):
+        pages = {
+            ("daily", "", ""): {
+                "code": 0,
+                "knowledge_list": [
+                    md_item(
+                        media_id="daily-0520-updated",
+                        title="5月19日盘前纪要_AI深度整理.md",
+                        update_time="1779235482990",
+                    ),
+                ],
+                "is_end": True,
+                "next_cursor": "",
+                "version": "v1",
+                "knowledge_base_info": {"basic_info": {"name": "每日复盘更新"}},
+                "current_path": [{"name": "每日复盘更新", "folder_id": "root"}],
+            }
+        }
+        ima = FakeImaClient(
+            pages,
+            contents={
+                "https://example.test/a.md": "# 5月19日盘前纪要\nAI 主线继续。",
+            },
+        )
+        service = IntelligenceService(
+            ima_client=ima,
+            summary_client=FakeSummaryClient(),
+            sources=[ImaKnowledgeSource("daily", "每日复盘更新", "daily", "daily")],
+        )
+
+        async def run():
+            async with self.Session() as session:
+                result = await service.sync_source(session, "daily")
+                doc = (
+                    await session.execute(
+                        select(KnowledgeDocument).where(KnowledgeDocument.media_id == "daily-0520-updated")
+                    )
+                ).scalar_one()
+                return result, doc.trade_date
+
+        result, trade_date = asyncio.run(run())
+
+        self.assertEqual(result["changed_trade_dates"], ["2026-05-20"])
+        self.assertEqual(trade_date, date(2026, 5, 20))
+
+    def test_daily_source_reclassifies_cached_title_date_to_update_date(self):
+        pages = {
+            ("daily", "", ""): {
+                "code": 0,
+                "knowledge_list": [
+                    md_item(
+                        media_id="daily-0520-updated",
+                        title="5月19日盘前纪要_AI深度整理.md",
+                        update_time="1779235482990",
+                    ),
+                ],
+                "is_end": True,
+                "next_cursor": "",
+                "version": "v1",
+                "knowledge_base_info": {"basic_info": {"name": "每日复盘更新"}},
+                "current_path": [{"name": "每日复盘更新", "folder_id": "root"}],
+            }
+        }
+        ima = FakeImaClient(pages, contents={"https://example.test/a.md": "# 5月19日盘前纪要\nAI 主线继续。"})
+        summary = FakeSummaryClient()
+        service = IntelligenceService(
+            ima_client=ima,
+            summary_client=summary,
+            sources=[ImaKnowledgeSource("daily", "每日复盘更新", "daily", "daily")],
+        )
+
+        async def seed_and_run():
+            async with self.Session() as session:
+                session.add(
+                    KnowledgeDocument(
+                        source_key="daily",
+                        source_name="每日复盘更新",
+                        share_id="daily",
+                        media_id="daily-0520-updated",
+                        title="5月19日盘前纪要_AI深度整理.md",
+                        media_type=7,
+                        media_type_name="MD",
+                        md5_sum="md5-a",
+                        update_time="1779235482990",
+                        jump_url="https://example.test/a.md",
+                        source_path="file_manager/a.md",
+                        abstract="AI摘要: 市场修复，AI主线较强。",
+                        introduction="# 2026-05-18 复盘",
+                        content_text="# 5月19日盘前纪要\nAI 主线继续。",
+                        content_hash="doc-hash-a",
+                        summary_json={"summary": "旧摘要"},
+                        summary_status="ready",
+                        trade_date=date(2026, 5, 19),
+                    )
+                )
+                await session.commit()
+
+                result = await service.sync_source(session, "daily")
+                doc = (
+                    await session.execute(
+                        select(KnowledgeDocument).where(KnowledgeDocument.media_id == "daily-0520-updated")
+                    )
+                ).scalar_one()
+                return result, doc.trade_date
+
+        result, trade_date = asyncio.run(seed_and_run())
+
+        self.assertEqual(result["changed_documents"], 1)
+        self.assertEqual(result["summarized_documents"], 0)
+        self.assertEqual(result["changed_trade_dates"], ["2026-05-20", "2026-05-19"])
+        self.assertEqual(trade_date, date(2026, 5, 20))
+        self.assertEqual(summary.document_calls, [])
+
 
 class DeepSeekSummaryClientTests(unittest.TestCase):
     def test_missing_api_key_returns_fallback_without_http_call(self):

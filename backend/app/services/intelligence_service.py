@@ -26,7 +26,7 @@ from app.models.intelligence import (
 from app.models.market_review import DailyAnalysisRecord, MarketReviewDailyMetric, MarketReviewStockDaily
 from app.services.daily_analysis_service import daily_analysis_service
 from app.utils.logger import logger
-from app.utils.time_utils import today_cn
+from app.utils.time_utils import CN_TZ, today_cn
 
 
 @dataclass(frozen=True)
@@ -675,12 +675,12 @@ class IntelligenceService:
         summarized = 0
         changed_trade_dates: set[date] = set()
         for entry in items:
-            is_changed, is_summarized, trade_date = await self._sync_source_entry(db, source, entry)
+            is_changed, is_summarized, trade_dates = await self._sync_source_entry(db, source, entry)
             if is_changed:
                 changed += 1
                 summarized += 1 if is_summarized else 0
-                if source.key == "daily" and trade_date:
-                    changed_trade_dates.add(trade_date)
+                if source.key == "daily":
+                    changed_trade_dates.update(trade_dates)
         return {
             "source_key": source.key,
             "total_documents": len(items),
@@ -694,24 +694,25 @@ class IntelligenceService:
         db: AsyncSession,
         source: ImaKnowledgeSource,
         entry: Dict[str, Any],
-    ) -> tuple[bool, bool, Optional[date]]:
+    ) -> tuple[bool, bool, set[date]]:
         for attempt in range(5):
             try:
-                doc, is_changed = await self._upsert_document_from_entry(db, source, entry)
+                doc, needs_summary, changed_trade_dates = await self._upsert_document_from_entry(db, source, entry)
                 await db.flush()
                 snapshot = self._snapshot_document(doc)
                 await db.commit()
-                if not is_changed:
-                    return False, False, snapshot.trade_date
-                await self._summarize_document(snapshot)
-                await self._write_document_summary_with_retry(
-                    db,
-                    snapshot.id,
-                    snapshot.summary_json,
-                    snapshot.summary_status,
-                    snapshot.summary_error,
-                )
-                return True, snapshot.summary_status == "ready", snapshot.trade_date
+                if not needs_summary and not changed_trade_dates:
+                    return False, False, set()
+                if needs_summary:
+                    await self._summarize_document(snapshot)
+                    await self._write_document_summary_with_retry(
+                        db,
+                        snapshot.id,
+                        snapshot.summary_json,
+                        snapshot.summary_status,
+                        snapshot.summary_error,
+                    )
+                return True, needs_summary and snapshot.summary_status == "ready", changed_trade_dates
             except OperationalError as exc:
                 await db.rollback()
                 if not self._is_database_locked(exc) or attempt == 4:
@@ -1026,7 +1027,7 @@ class IntelligenceService:
         db: AsyncSession,
         source: ImaKnowledgeSource,
         entry: Dict[str, Any],
-    ) -> tuple[KnowledgeDocument, bool]:
+    ) -> tuple[KnowledgeDocument, bool, set[date]]:
         media_id = str(entry.get("media_id") or entry.get("folder_info", {}).get("folder_id") or entry.get("title") or "")
         result = await db.execute(
             select(KnowledgeDocument).where(
@@ -1039,6 +1040,7 @@ class IntelligenceService:
         if doc is None:
             doc = KnowledgeDocument(source_key=source.key, source_name=source.name, share_id=source.share_id, media_id=media_id)
             db.add(doc)
+        previous_trade_date = doc.trade_date
 
         metadata_changed = is_new or any(
             getattr(doc, attr) != str(entry.get(key) or "")
@@ -1051,14 +1053,26 @@ class IntelligenceService:
             )
         )
         self._apply_entry_metadata(doc, source, entry, media_id)
+        inferred_trade_date = self._infer_trade_date(doc)
+        trade_date_changed = previous_trade_date != inferred_trade_date
+        changed_trade_dates: set[date] = set()
         if metadata_changed:
             doc.content_text = await self._resolve_content_text(entry)
             doc.content_hash = self._build_document_hash(doc)
-            doc.trade_date = self._infer_trade_date(doc)
+            doc.trade_date = inferred_trade_date
             doc.summary_status = "pending"
             doc.summary_error = ""
             doc.updated_at = datetime.now()
-        return doc, metadata_changed
+        elif trade_date_changed:
+            doc.trade_date = inferred_trade_date
+            doc.updated_at = datetime.now()
+
+        if metadata_changed or trade_date_changed:
+            if previous_trade_date:
+                changed_trade_dates.add(previous_trade_date)
+            if inferred_trade_date:
+                changed_trade_dates.add(inferred_trade_date)
+        return doc, metadata_changed, changed_trade_dates
 
     def _apply_entry_metadata(self, doc: KnowledgeDocument, source: ImaKnowledgeSource, entry: Dict[str, Any], media_id: str) -> None:
         media_type_info = entry.get("media_type_info") or {}
@@ -1116,6 +1130,11 @@ class IntelligenceService:
         )
 
     def _infer_trade_date(self, doc: KnowledgeDocument) -> Optional[date]:
+        if getattr(doc, "source_key", "") == "daily":
+            updated_date = self._date_from_timestamp(doc.update_time)
+            if updated_date:
+                return updated_date
+
         text = f"{doc.title} {doc.introduction[:200]}"
         patterns = [
             r"(20\d{2})[-/.年](\d{1,2})[-/.月](\d{1,2})",
@@ -1149,7 +1168,7 @@ class IntelligenceService:
         if timestamp > 10_000_000_000:
             timestamp = timestamp // 1000
         try:
-            return datetime.fromtimestamp(timestamp).date()
+            return datetime.fromtimestamp(timestamp, CN_TZ).date()
         except (OSError, ValueError):
             return None
 
