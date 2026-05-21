@@ -487,6 +487,56 @@ class DailyAnalysisApiTests(unittest.TestCase):
         self.assertEqual(intraday_row["columns"]["辨识度"]["content"], "盘中人工")
         self.assertEqual(after_close_row["columns"]["辨识度"]["content"], "盘后人工")
 
+    def test_intraday_rebuild_preserves_existing_snapshot_by_default(self):
+        async def seed_intraday_snapshot():
+            async with self.Session() as session:
+                session.add(
+                    DailyAnalysisRecord(
+                        trade_date=date(2026, 4, 24),
+                        month="2026-04",
+                        auto_result={},
+                        manual_overrides={},
+                        calc_version=0,
+                        data_status="empty",
+                        generated_at=datetime(2026, 4, 24, 15, 5, 0),
+                        intraday_auto_result={
+                            "连板唯一性": {
+                                "items": [
+                                    {
+                                        "stock_code": "001259",
+                                        "stock_name": "利仁科技",
+                                        "label": "利仁科技(001259)",
+                                        "tags": ["唯一", "7板"],
+                                        "content": "利仁科技(001259)[唯一,7板]",
+                                    }
+                                ],
+                                "content": "利仁科技(001259)[唯一,7板]",
+                            },
+                        },
+                        intraday_manual_overrides={},
+                        intraday_calc_version=1,
+                        intraday_data_status="ready",
+                        intraday_generated_at=datetime(2026, 4, 24, 14, 50, 0),
+                    )
+                )
+                await session.commit()
+
+        asyncio.run(seed_intraday_snapshot())
+
+        trading_dates = {date(2026, 4, 23), date(2026, 4, 24)}
+        with patch.object(daily_analysis_service, "_load_cn_trading_date_set", return_value=trading_dates):
+            rebuilt = self.client.post(
+                "/statistics/daily-analysis/2026-04-24/rebuild",
+                params={"session": "intraday"},
+            )
+
+        self.assertEqual(rebuilt.status_code, 200)
+        self.assertEqual(rebuilt.json()["calc_version"], 1)
+        self.assertEqual(
+            rebuilt.json()["columns"]["连板唯一性"]["content"],
+            "利仁科技(001259)[唯一,7板]",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

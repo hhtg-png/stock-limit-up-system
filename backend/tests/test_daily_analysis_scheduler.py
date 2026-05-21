@@ -85,6 +85,10 @@ class DailyAnalysisSchedulerTests(unittest.TestCase):
         job_ids = {job["id"] for job in scheduler.scheduler.jobs}
         self.assertIn("daily_analysis", job_ids)
 
+        daily_job = next(job for job in scheduler.scheduler.jobs if job["id"] == "daily_analysis")
+        self.assertEqual(daily_job["trigger"].kwargs["hour"], 15)
+        self.assertEqual(daily_job["trigger"].kwargs["minute"], 6)
+
     def test_start_registers_daily_analysis_intraday_job_at_1450(self):
         scheduler = DataScheduler()
         scheduler.scheduler = FakeScheduler()

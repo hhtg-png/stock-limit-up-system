@@ -678,6 +678,12 @@ class DailyAnalysisService:
         trade_date: date,
         session: str = DAILY_ANALYSIS_SESSION_AFTER_CLOSE,
     ) -> Dict[str, Any]:
+        session = self._normalize_session(session)
+        if session == DAILY_ANALYSIS_SESSION_INTRADAY:
+            existing = await self._get_record(db, trade_date)
+            if existing is not None and self._record_has_session_data(existing, session):
+                return self.serialize_record(existing, session=session)
+
         record = await self.build_for_date(db, trade_date, session=session)
         return self.serialize_record(record, session=session)
 

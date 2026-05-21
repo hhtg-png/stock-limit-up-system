@@ -73,6 +73,14 @@ def _should_run_after_close_catchup(now: Optional[datetime] = None) -> bool:
     return current.time() >= build_time
 
 
+def _daily_analysis_after_close_time() -> time:
+    build_at = datetime.combine(
+        date(2000, 1, 1),
+        time(settings.MARKET_REVIEW_BUILD_HOUR, settings.MARKET_REVIEW_BUILD_MINUTE),
+    )
+    return (build_at + timedelta(minutes=1)).time()
+
+
 class DataScheduler:
     """数据采集任务调度器"""
     
@@ -124,12 +132,13 @@ class DataScheduler:
             name="每日统计计算"
         )
 
-        # 收盘后每日分析月表（默认复用市场复盘任务时间）
+        # 收盘后每日分析月表：晚于市场复盘 1 分钟，避免读取到盘中快照
+        daily_analysis_after_close_time = _daily_analysis_after_close_time()
         self.scheduler.add_job(
             self._calculate_daily_analysis,
             CronTrigger(
-                hour=settings.MARKET_REVIEW_BUILD_HOUR,
-                minute=settings.MARKET_REVIEW_BUILD_MINUTE,
+                hour=daily_analysis_after_close_time.hour,
+                minute=daily_analysis_after_close_time.minute,
                 timezone=CN_TZ,
             ),
             id="daily_analysis",
