@@ -10,7 +10,7 @@ from sqlalchemy import distinct, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.limit_up import LimitUpRecord
-from app.models.market_review import DailyAnalysisRecord, MarketReviewStockDaily
+from app.models.market_review import DailyAnalysisRecord, MarketReviewDailyMetric, MarketReviewStockDaily
 from app.models.stock import Stock
 
 
@@ -951,7 +951,8 @@ class DailyAnalysisService:
             {row[0] for row in limit_up_result.all()} | {row[0] for row in review_result.all()},
             reverse=True,
         )
-        return sorted(self._filter_trading_dates(dates)[:limit])
+        valid_dates = await self._valid_trade_dates_with_current_market_review(db, dates)
+        return sorted(valid_dates[:limit])
 
     async def _get_trade_dates(self, db: AsyncSession, month: Optional[str]) -> List[date]:
         limit_up_query = select(distinct(LimitUpRecord.trade_date)).where(LimitUpRecord.trade_date <= date.today())
@@ -969,7 +970,7 @@ class DailyAnalysisService:
         limit_up_result = await db.execute(limit_up_query)
         review_result = await db.execute(review_query)
         dates = sorted({row[0] for row in limit_up_result.all()} | {row[0] for row in review_result.all()})
-        return self._filter_trading_dates(dates)
+        return await self._valid_trade_dates_with_current_market_review(db, dates)
 
     def _review_candidate_condition(self):
         return or_(
@@ -985,7 +986,12 @@ class DailyAnalysisService:
         )
         result = await db.execute(query)
         records = list(result.scalars().all())
-        trading_dates = set(self._filter_trading_dates([record.trade_date for record in records]))
+        trading_dates = set(
+            await self._valid_trade_dates_with_current_market_review(
+                db,
+                [record.trade_date for record in records],
+            )
+        )
         return [record for record in records if record.trade_date in trading_dates]
 
     async def _delete_non_trading_records(self, db: AsyncSession, month: Optional[str]) -> int:
@@ -995,13 +1001,51 @@ class DailyAnalysisService:
             query = query.where(DailyAnalysisRecord.trade_date >= start, DailyAnalysisRecord.trade_date <= end)
         result = await db.execute(query)
         records = list(result.scalars().all())
-        trading_dates = set(self._filter_trading_dates([record.trade_date for record in records]))
+        trading_dates = set(
+            await self._valid_trade_dates_with_current_market_review(
+                db,
+                [record.trade_date for record in records],
+            )
+        )
         removed = 0
         for record in records:
             if record.trade_date not in trading_dates:
                 await db.delete(record)
                 removed += 1
         return removed
+
+    async def _valid_trade_dates_with_current_market_review(
+        self,
+        db: AsyncSession,
+        dates: List[date],
+    ) -> List[date]:
+        ordered_dates = list(dict.fromkeys(dates))
+        if not ordered_dates:
+            return []
+
+        valid_dates = set(self._filter_trading_dates(ordered_dates))
+        valid_dates.update(await self._get_current_market_review_dates(db, ordered_dates))
+        return [value for value in ordered_dates if value in valid_dates]
+
+    async def _get_current_market_review_dates(
+        self,
+        db: AsyncSession,
+        dates: Iterable[date],
+    ) -> Set[date]:
+        today = date.today()
+        current_dates = {value for value in dates if value == today}
+        if not current_dates:
+            return set()
+
+        metric_query = select(distinct(MarketReviewDailyMetric.trade_date)).where(
+            MarketReviewDailyMetric.trade_date.in_(current_dates)
+        )
+        stock_query = select(distinct(MarketReviewStockDaily.trade_date)).where(
+            MarketReviewStockDaily.trade_date.in_(current_dates)
+        )
+        metric_result = await db.execute(metric_query)
+        stock_result = await db.execute(stock_query)
+        return {row[0] for row in metric_result.all()} | {row[0] for row in stock_result.all()}
 
     def _filter_trading_dates(self, dates: List[date]) -> List[date]:
         ordered_dates = list(dict.fromkeys(dates))

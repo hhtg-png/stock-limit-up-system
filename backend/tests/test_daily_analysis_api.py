@@ -356,6 +356,75 @@ class DailyAnalysisApiTests(unittest.TestCase):
             self.assertEqual(rebuilt.json()["columns"]["辨识度"]["content"], "人工确认：唯一高标")
             self.assertTrue(rebuilt.json()["columns"]["辨识度"]["is_manual"])
 
+    def test_backfill_keeps_current_day_when_calendar_cache_lags_market_review(self):
+        class FrozenDate(date):
+            @classmethod
+            def today(cls):
+                return cls(2026, 4, 27)
+
+        async def seed_generated_current_day_record():
+            async with self.Session() as session:
+                session.add(
+                    DailyAnalysisRecord(
+                        trade_date=date(2026, 4, 27),
+                        month="2026-04",
+                        auto_result={
+                            "辨识度": {
+                                "items": [],
+                                "content": "盘后已生成",
+                            },
+                        },
+                        manual_overrides={},
+                        calc_version=1,
+                        data_status="ready",
+                        generated_at=datetime(2026, 4, 27, 15, 5, 0),
+                        intraday_auto_result={
+                            "辨识度": {
+                                "items": [],
+                                "content": "盘中已生成",
+                            },
+                        },
+                        intraday_manual_overrides={},
+                        intraday_calc_version=1,
+                        intraday_data_status="ready",
+                        intraday_generated_at=datetime(2026, 4, 27, 14, 50, 0),
+                    )
+                )
+                await session.commit()
+
+        asyncio.run(seed_generated_current_day_record())
+
+        stale_calendar_dates = {date(2026, 4, 23), date(2026, 4, 24)}
+        with patch("app.services.daily_analysis_service.date", FrozenDate), patch.object(
+            daily_analysis_service,
+            "_load_cn_trading_date_set",
+            return_value=stale_calendar_dates,
+        ):
+            backfill = self.client.post("/statistics/daily-analysis/backfill", json={"month": "2026-04"})
+            self.assertEqual(backfill.status_code, 200)
+            self.assertIn("2026-04-27", backfill.json()["trade_dates"])
+            self.assertEqual(backfill.json()["removed_non_trading_count"], 1)
+
+            after_close_month = self.client.get(
+                "/statistics/daily-analysis",
+                params={"month": "2026-04", "session": "after_close"},
+            )
+            intraday_month = self.client.get(
+                "/statistics/daily-analysis",
+                params={"month": "2026-04", "session": "intraday"},
+            )
+
+        self.assertEqual(after_close_month.status_code, 200)
+        self.assertEqual(intraday_month.status_code, 200)
+        self.assertIn(
+            "2026-04-27",
+            {row["trade_date"] for row in after_close_month.json()["data"]},
+        )
+        self.assertIn(
+            "2026-04-27",
+            {row["trade_date"] for row in intraday_month.json()["data"]},
+        )
+
     def test_rebuild_prefers_market_review_candidates_over_stale_limit_up_records(self):
         trading_dates = {
             date(2026, 4, 23),

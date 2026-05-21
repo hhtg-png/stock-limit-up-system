@@ -1,6 +1,6 @@
 import asyncio
 import unittest
-from datetime import date
+from datetime import date, datetime
 from types import SimpleNamespace
 
 from sqlalchemy import select
@@ -15,7 +15,7 @@ from app.services.intelligence_service import (
     IntelligenceService,
     _json_hash,
 )
-from app.utils.time_utils import today_cn
+from app.utils.time_utils import CN_TZ, today_cn
 
 
 class FakeImaClient:
@@ -587,11 +587,14 @@ class IntelligenceServiceTests(unittest.TestCase):
         old_date = date(2026, 5, 17)
         today_title = f"{today.isoformat()}-复盘.md"
         old_title = "2026-05-17-复盘.md"
+        today_update_time = str(
+            int(datetime(today.year, today.month, today.day, 9, 30, tzinfo=CN_TZ).timestamp() * 1000)
+        )
         pages = {
             ("daily", "", ""): {
                 "code": 0,
                 "knowledge_list": [
-                    md_item(media_id="today", title=today_title, update_time="1779291800000"),
+                    md_item(media_id="today", title=today_title, update_time=today_update_time),
                     md_item(media_id="old", title=old_title, update_time="1779032600000"),
                 ],
                 "is_end": True,
