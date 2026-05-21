@@ -609,10 +609,7 @@ function getPercentPointLabelOption(position: 'top' | 'bottom' = 'top', signed =
     color: '#262626',
     fontSize: 11,
     lineHeight: 14,
-    distance: 6,
-    backgroundColor: 'rgba(255, 255, 255, 0.86)',
-    borderRadius: 4,
-    padding: [2, 4]
+    distance: 6
   }
 }
 
