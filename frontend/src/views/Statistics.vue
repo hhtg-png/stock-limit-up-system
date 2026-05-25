@@ -526,6 +526,7 @@ function getBaseGridOption(boundaryGap = false): Pick<echarts.EChartsOption, 'gr
 
 type BoardLabelField = 'max_board_label' | 'second_board_label' | 'gem_board_label'
 type BoardHeightField = 'max_board_height' | 'second_board_height' | 'gem_board_height'
+const BOARD_TOOLTIP_ITEMS_PER_LINE = 4
 
 const boardHeightFieldMap: Record<BoardLabelField, BoardHeightField> = {
   max_board_label: 'max_board_height',
@@ -624,6 +625,42 @@ function getYiAmountLabelOption() {
   }
 }
 
+function escapeTooltipHtml(value: string) {
+  return value.replace(/[&<>"']/g, char => {
+    const entities: Record<string, string> = {
+      '&': '&amp;',
+      '<': '&lt;',
+      '>': '&gt;',
+      '"': '&quot;',
+      "'": '&#39;'
+    }
+    return entities[char] || char
+  })
+}
+
+function formatBoardTooltipStockLine(title: string, label: string) {
+  const stocks = label
+    .split(/[\n、]/)
+    .map(item => item.trim())
+    .filter(Boolean)
+
+  if (!stocks.length) {
+    return ''
+  }
+
+  const lines: string[] = []
+  for (let index = 0; index < stocks.length; index += BOARD_TOOLTIP_ITEMS_PER_LINE) {
+    lines.push(stocks.slice(index, index + BOARD_TOOLTIP_ITEMS_PER_LINE).map(escapeTooltipHtml).join('、'))
+  }
+
+  return [
+    '<div style="line-height:20px;white-space:normal;overflow-wrap:anywhere;">',
+    `<span style="color:#64748b;">${escapeTooltipHtml(title)}：</span>`,
+    lines.join('<br/>'),
+    '</div>'
+  ].join('')
+}
+
 function formatBoardHeightTooltip(params: unknown) {
   const items = Array.isArray(params) ? params : [params]
   const dataIndex = Number((items[0] as { dataIndex?: number } | undefined)?.dataIndex ?? -1)
@@ -634,16 +671,16 @@ function formatBoardHeightTooltip(params: unknown) {
 
   const metricLines = items.map(item => {
     const point = item as { marker?: string; seriesName?: string; value?: number | string }
-    return `${point.marker || ''}${point.seriesName || ''}: ${point.value ?? '-'}`
+    return `${point.marker || ''}${escapeTooltipHtml(point.seriesName || '')}: ${escapeTooltipHtml(String(point.value ?? '-'))}`
   })
   const stockLines = [
-    row.max_board_label ? `最高板：${row.max_board_label.replace(/\n/g, '、')}` : '',
-    row.second_board_label ? `次高板：${row.second_board_label.replace(/\n/g, '、')}` : '',
-    row.gem_board_label ? `创业板：${row.gem_board_label.replace(/\n/g, '、')}` : ''
+    row.max_board_label ? formatBoardTooltipStockLine('最高板', row.max_board_label) : '',
+    row.second_board_label ? formatBoardTooltipStockLine('次高板', row.second_board_label) : '',
+    row.gem_board_label ? formatBoardTooltipStockLine('创业板', row.gem_board_label) : ''
   ].filter(Boolean)
 
   return [
-    formatDateLabel(row.trade_date),
+    escapeTooltipHtml(formatDateLabel(row.trade_date)),
     ...metricLines,
     ...stockLines
   ].join('<br/>')
@@ -675,6 +712,8 @@ function updateCharts() {
       },
       tooltip: {
         trigger: 'axis',
+        confine: true,
+        extraCssText: 'max-width: 460px; white-space: normal; overflow-wrap: anywhere;',
         formatter: formatBoardHeightTooltip
       },
       yAxis: {
