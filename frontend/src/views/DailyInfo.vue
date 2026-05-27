@@ -73,9 +73,9 @@
             <div v-if="historyItems.length" class="history-list">
               <button
                 v-for="item in historyItems"
-                :key="item.trade_date"
+                :key="historyKey(item)"
                 class="history-item"
-                :class="{ active: item.trade_date === dailyInfo.trade_date }"
+                :class="{ active: isActiveHistory(item) }"
                 type="button"
                 @click="selectHistory(item)"
               >
@@ -108,11 +108,27 @@
             </div>
 
             <section class="panel overview-panel">
-              <div class="section-header">
+              <div class="section-header overview-header">
                 <h4>每日复盘</h4>
-                <el-tag size="small" :type="dailyInfo.cache_hit ? 'info' : 'success'">
-                  {{ dailyInfo.cache_hit ? '缓存命中' : '已更新' }}
-                </el-tag>
+                <div class="overview-actions">
+                  <el-pagination
+                    v-if="sameDateVersions.length > 1"
+                    small
+                    background
+                    layout="prev, pager, next"
+                    :page-size="1"
+                    :total="sameDateVersions.length"
+                    :current-page="currentVersionPage"
+                    @current-change="handleVersionPageChange"
+                  />
+                  <el-tag size="small" :type="dailyInfo.cache_hit ? 'info' : 'success'">
+                    {{ dailyInfo.cache_hit ? '缓存命中' : '已更新' }}
+                  </el-tag>
+                </div>
+              </div>
+              <div v-if="sameDateVersions.length > 1" class="version-meta">
+                <span>同日版本 {{ currentVersionPage }} / {{ sameDateVersions.length }}</span>
+                <span>{{ formatTime(dailyInfo.generated_at) }}</span>
               </div>
               <p>{{ dailyInfo.summary.overview || '-' }}</p>
             </section>
@@ -293,6 +309,20 @@ const sourceRefs = computed<DailyInfoSource[]>(() => {
     source_key: 'daily',
     media_type_name: '',
   }))
+})
+const sameDateVersions = computed<DailyInfoResponse[]>(() => {
+  const current = dailyInfo.value
+  if (!current) return []
+  return historyItems.value
+    .filter(item => item.trade_date === current.trade_date)
+    .slice()
+    .sort(compareHistoryItems)
+})
+const currentVersionPage = computed(() => {
+  const current = dailyInfo.value
+  if (!current) return 1
+  const index = sameDateVersions.value.findIndex(item => historyKey(item) === historyKey(current))
+  return index >= 0 ? index + 1 : 1
 })
 const modelStatus = computed(() => dailyInfo.value?.summary.model_status || '')
 const statusText = computed(() => {
@@ -529,6 +559,13 @@ function selectHistory(item: DailyInfoResponse) {
   selectedDate.value = item.trade_date
 }
 
+function handleVersionPageChange(page: number) {
+  const target = sameDateVersions.value[page - 1]
+  if (target) {
+    selectHistory(target)
+  }
+}
+
 async function openSource(source: DailyInfoSource) {
   if (source.id <= 0) {
     ElMessage.warning('该来源暂无缓存原文')
@@ -548,10 +585,33 @@ async function openSource(source: DailyInfoSource) {
 }
 
 function upsertHistory(item: DailyInfoResponse) {
-  const next = historyItems.value.filter(history => history.trade_date !== item.trade_date)
+  const itemKey = historyKey(item)
+  const next = historyItems.value.filter(history => historyKey(history) !== itemKey)
   next.push(item)
-  next.sort((a, b) => b.trade_date.localeCompare(a.trade_date))
+  next.sort(compareHistoryItems)
   historyItems.value = next
+}
+
+function isActiveHistory(item: DailyInfoResponse): boolean {
+  return Boolean(dailyInfo.value && historyKey(item) === historyKey(dailyInfo.value))
+}
+
+function historyKey(item: DailyInfoResponse): string {
+  if (item.version_id) return `version-${item.version_id}`
+  return `digest-${item.trade_date}-${item.digest_id || item.id || 'latest'}-${item.generated_at || ''}`
+}
+
+function compareHistoryItems(a: DailyInfoResponse, b: DailyInfoResponse): number {
+  const dateCompare = b.trade_date.localeCompare(a.trade_date)
+  if (dateCompare !== 0) return dateCompare
+  const timeCompare = safeTimestamp(b.generated_at) - safeTimestamp(a.generated_at)
+  if (timeCompare !== 0) return timeCompare
+  return (b.version_id || b.id || 0) - (a.version_id || a.id || 0)
+}
+
+function safeTimestamp(value?: string | null): number {
+  const timestamp = value ? dayjs(value).valueOf() : 0
+  return Number.isFinite(timestamp) ? timestamp : 0
 }
 
 function stringList(value: unknown): string[] {
@@ -750,6 +810,35 @@ function formatTime(value?: string | null): string {
   border-left: 4px solid #1677ff;
 }
 
+.overview-header {
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+
+.overview-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+
+  :deep(.el-pagination) {
+    --el-pagination-button-width: 26px;
+    --el-pagination-button-height: 24px;
+    margin: 0;
+  }
+}
+
+.version-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  margin: -4px 0 10px;
+  color: #6b7280;
+  font-size: 12px;
+}
+
 .risk-panel {
   border-left: 4px solid #f59e0b;
 }
@@ -907,6 +996,11 @@ function formatTime(value?: string | null): string {
 
   .history-panel {
     position: static;
+  }
+
+  .overview-actions {
+    width: 100%;
+    justify-content: flex-start;
   }
 
   .summary-row,

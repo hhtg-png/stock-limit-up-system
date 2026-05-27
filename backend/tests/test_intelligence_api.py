@@ -12,7 +12,7 @@ from sqlalchemy.pool import StaticPool
 from app.api.v1 import intelligence as intelligence_api
 from app.api.v1.intelligence import router as intelligence_router
 from app.database import Base, get_db
-from app.models.intelligence import DailyInfoDigest, JiegeModeSignal, KnowledgeDocument
+from app.models.intelligence import DailyInfoDigest, DailyInfoDigestVersion, JiegeModeSignal, KnowledgeDocument
 from app.models.market_review import MarketReviewDailyMetric, MarketReviewStockDaily
 from app.models.stock import Stock
 
@@ -53,6 +53,28 @@ class IntelligenceApiTests(unittest.TestCase):
                     source_count=2,
                     summary_json={"overview": "市场修复", "source_titles": ["复盘.md"]},
                     content_hash="daily-hash",
+                    model="deepseek-v4-pro",
+                    generated_at=datetime(2026, 5, 18, 20, 30, 0),
+                )
+            )
+            session.add(
+                DailyInfoDigestVersion(
+                    trade_date=date(2026, 5, 18),
+                    status="ready",
+                    source_count=2,
+                    summary_json={"overview": "盘中第一版", "source_titles": ["复盘.md"]},
+                    content_hash="daily-hash-intraday",
+                    model="deepseek-v4-pro",
+                    generated_at=datetime(2026, 5, 18, 14, 50, 0),
+                )
+            )
+            session.add(
+                DailyInfoDigestVersion(
+                    trade_date=date(2026, 5, 18),
+                    status="ready",
+                    source_count=2,
+                    summary_json={"overview": "盘后第二版", "source_titles": ["复盘.md"]},
+                    content_hash="daily-hash-close",
                     model="deepseek-v4-pro",
                     generated_at=datetime(2026, 5, 18, 20, 30, 0),
                 )
@@ -196,7 +218,8 @@ class IntelligenceApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         self.assertEqual(payload["trade_date"], "2026-05-18")
-        self.assertEqual(payload["summary"]["overview"], "市场修复")
+        self.assertEqual(payload["summary"]["overview"], "盘后第二版")
+        self.assertIsNotNone(payload["version_id"])
         self.assertEqual(payload["source_count"], 2)
         self.assertEqual(payload["sources"][0]["title"], "复盘.md")
         self.assertEqual(payload["sources"][0]["jump_url"], "https://example.test/review.md")
@@ -213,8 +236,24 @@ class IntelligenceApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()
-        self.assertEqual([item["trade_date"] for item in payload["items"]], ["2026-05-18", "2026-05-17"])
+        self.assertEqual([item["trade_date"] for item in payload["items"]], ["2026-05-18", "2026-05-18", "2026-05-17"])
+        self.assertEqual([item["summary"]["overview"] for item in payload["items"][:2]], ["盘后第二版", "盘中第一版"])
         self.assertEqual(payload["items"][0]["sources"][0]["title"], "复盘.md")
+
+    def test_get_daily_info_can_return_selected_same_day_version(self):
+        history_response = self.client.get("/intelligence/daily-info/history", params={"limit": 10})
+        first_version = next(
+            item for item in history_response.json()["items"]
+            if item["trade_date"] == "2026-05-18" and item["summary"]["overview"] == "盘中第一版"
+        )
+
+        response = self.client.get(
+            "/intelligence/daily-info",
+            params={"trade_date": "2026-05-18", "version_id": first_version["version_id"]},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["summary"]["overview"], "盘中第一版")
 
     def test_get_document_source_returns_original_content(self):
         response = self.client.get("/intelligence/documents/1")
@@ -230,7 +269,7 @@ class IntelligenceApiTests(unittest.TestCase):
 
         self.assertEqual(summary_response.status_code, 200)
         self.assertEqual(content_response.status_code, 200)
-        self.assertEqual([item["trade_date"] for item in summary_response.json()["items"]], ["2026-05-18"])
+        self.assertEqual([item["trade_date"] for item in summary_response.json()["items"]], ["2026-05-18", "2026-05-18"])
         self.assertEqual([item["trade_date"] for item in content_response.json()["items"]], ["2026-05-17"])
 
     def test_get_daily_info_returns_cached_digest_without_model_refresh(self):
@@ -241,6 +280,14 @@ class IntelligenceApiTests(unittest.TestCase):
                 )
                 digest = result.scalar_one()
                 digest.summary_json = {"overview": "旧兜底", "model_status": "missing_api_key"}
+                version_result = await session.execute(
+                    select(DailyInfoDigestVersion)
+                    .where(DailyInfoDigestVersion.trade_date == date(2026, 5, 18))
+                    .order_by(DailyInfoDigestVersion.generated_at.desc(), DailyInfoDigestVersion.id.desc())
+                    .limit(1)
+                )
+                latest_version = version_result.scalar_one()
+                latest_version.summary_json = {"overview": "旧兜底", "model_status": "missing_api_key"}
                 await session.commit()
 
         asyncio.run(mark_digest_as_missing_key())

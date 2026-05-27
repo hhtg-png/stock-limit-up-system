@@ -26,6 +26,9 @@ export interface DailyInfoMentionedStock {
 }
 
 export interface DailyInfoResponse {
+  id?: number
+  version_id?: number | null
+  digest_id?: number | null
   trade_date: string
   status: string
   source_count: number

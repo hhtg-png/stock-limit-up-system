@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.models.intelligence import (
     DailyInfoDigest,
+    DailyInfoDigestVersion,
     JiegeModeSignal,
     JiegeTradingRule,
     KnowledgeDocument,
@@ -879,8 +880,9 @@ class IntelligenceService:
         with db.no_autoflush:
             existing = await self._get_daily_digest(db, actual_date)
         if existing and existing.content_hash == content_hash and not force:
+            latest_version = await self.get_latest_daily_digest_version(db, actual_date)
             await db.commit()
-            return self.serialize_daily_digest(existing, cache_hit=True, sources=document_snapshots)
+            return self.serialize_daily_digest(latest_version or existing, cache_hit=True, sources=document_snapshots)
 
         await db.commit()
         summary = await self.summary_client.summarize_daily_info(actual_date, document_snapshots)
@@ -987,7 +989,7 @@ class IntelligenceService:
         status: str,
         source_count: int,
         content_hash: str,
-    ) -> DailyInfoDigest:
+    ) -> Any:
         for attempt in range(5):
             try:
                 existing = await self._get_daily_digest(db, trade_date)
@@ -1002,9 +1004,22 @@ class IntelligenceService:
                 existing.model = summary.get("model", getattr(self.summary_client, "model", ""))
                 existing.generated_at = now
                 existing.updated_at = now
+                await db.flush()
+                version = DailyInfoDigestVersion(
+                    digest_id=existing.id,
+                    trade_date=trade_date,
+                    summary_json=dict(summary or {}),
+                    status=status,
+                    source_count=source_count,
+                    content_hash=content_hash,
+                    model=existing.model,
+                    generated_at=now,
+                    created_at=now,
+                )
+                db.add(version)
                 await db.commit()
-                await db.refresh(existing)
-                return existing
+                await db.refresh(version)
+                return version
             except OperationalError as exc:
                 await db.rollback()
                 if not self._is_database_locked(exc) or attempt == 4:
@@ -1408,16 +1423,33 @@ class IntelligenceService:
         return result.scalar_one_or_none()
 
     async def list_daily_digests(self, db: AsyncSession, *, limit: int = 30) -> List[Dict[str, Any]]:
-        result = await db.execute(
-            select(DailyInfoDigest)
-            .order_by(DailyInfoDigest.trade_date.desc(), DailyInfoDigest.generated_at.desc(), DailyInfoDigest.id.desc())
+        version_result = await db.execute(
+            select(DailyInfoDigestVersion)
+            .order_by(
+                DailyInfoDigestVersion.trade_date.desc(),
+                DailyInfoDigestVersion.generated_at.desc(),
+                DailyInfoDigestVersion.id.desc(),
+            )
             .limit(limit)
         )
-        items = []
-        for digest in result.scalars().all():
-            sources = await self._get_daily_documents(db, digest.trade_date)
-            items.append(self.serialize_daily_digest(digest, cache_hit=True, sources=sources))
-        return items
+        records: List[Any] = list(version_result.scalars().all())
+        remaining = max(limit - len(records), 0)
+        if remaining:
+            version_dates = {record.trade_date for record in records}
+            digest_stmt = (
+                select(DailyInfoDigest)
+                .order_by(
+                    DailyInfoDigest.trade_date.desc(),
+                    DailyInfoDigest.generated_at.desc(),
+                    DailyInfoDigest.id.desc(),
+                )
+                .limit(remaining)
+            )
+            if version_dates:
+                digest_stmt = digest_stmt.where(DailyInfoDigest.trade_date.notin_(version_dates))
+            digest_result = await db.execute(digest_stmt)
+            records.extend(digest_result.scalars().all())
+        return await self._serialize_daily_digest_records(db, records[:limit])
 
     async def search_daily_digests(self, db: AsyncSession, *, keyword: str, limit: int = 50) -> List[Dict[str, Any]]:
         keyword = (keyword or "").strip()
@@ -1441,31 +1473,94 @@ class IntelligenceService:
             .distinct()
         )
         matched_dates = {item for item in document_result.scalars().all() if item is not None}
-        conditions = [cast(DailyInfoDigest.summary_json, String).like(pattern)]
+        version_conditions = [cast(DailyInfoDigestVersion.summary_json, String).like(pattern)]
         if matched_dates:
-            conditions.append(DailyInfoDigest.trade_date.in_(matched_dates))
+            version_conditions.append(DailyInfoDigestVersion.trade_date.in_(matched_dates))
 
-        result = await db.execute(
-            select(DailyInfoDigest)
-            .where(or_(*conditions))
-            .order_by(DailyInfoDigest.trade_date.desc(), DailyInfoDigest.generated_at.desc(), DailyInfoDigest.id.desc())
+        version_result = await db.execute(
+            select(DailyInfoDigestVersion)
+            .where(or_(*version_conditions))
+            .order_by(
+                DailyInfoDigestVersion.trade_date.desc(),
+                DailyInfoDigestVersion.generated_at.desc(),
+                DailyInfoDigestVersion.id.desc(),
+            )
             .limit(limit)
         )
-        items = []
-        for digest in result.scalars().all():
-            sources = await self._get_daily_documents(db, digest.trade_date)
-            items.append(self.serialize_daily_digest(digest, cache_hit=True, sources=sources))
-        return items
+        records: List[Any] = list(version_result.scalars().all())
+        remaining = max(limit - len(records), 0)
+        if remaining:
+            digest_conditions = [cast(DailyInfoDigest.summary_json, String).like(pattern)]
+            if matched_dates:
+                digest_conditions.append(DailyInfoDigest.trade_date.in_(matched_dates))
+            digest_stmt = (
+                select(DailyInfoDigest)
+                .where(or_(*digest_conditions))
+                .order_by(
+                    DailyInfoDigest.trade_date.desc(),
+                    DailyInfoDigest.generated_at.desc(),
+                    DailyInfoDigest.id.desc(),
+                )
+                .limit(remaining)
+            )
+            version_dates = {record.trade_date for record in records}
+            if version_dates:
+                digest_stmt = digest_stmt.where(DailyInfoDigest.trade_date.notin_(version_dates))
+            digest_result = await db.execute(digest_stmt)
+            records.extend(digest_result.scalars().all())
+        return await self._serialize_daily_digest_records(db, records[:limit])
+
+    async def get_daily_digest_version(
+        self,
+        db: AsyncSession,
+        version_id: int,
+    ) -> Optional[DailyInfoDigestVersion]:
+        result = await db.execute(
+            select(DailyInfoDigestVersion).where(DailyInfoDigestVersion.id == version_id)
+        )
+        return result.scalar_one_or_none()
+
+    async def get_latest_daily_digest_version(
+        self,
+        db: AsyncSession,
+        trade_date: date,
+    ) -> Optional[DailyInfoDigestVersion]:
+        result = await db.execute(
+            select(DailyInfoDigestVersion)
+            .where(DailyInfoDigestVersion.trade_date == trade_date)
+            .order_by(DailyInfoDigestVersion.generated_at.desc(), DailyInfoDigestVersion.id.desc())
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
 
     async def serialize_daily_digest_with_sources(
         self,
         db: AsyncSession,
-        digest: DailyInfoDigest,
+        digest: Any,
         *,
         cache_hit: bool = False,
     ) -> Dict[str, Any]:
         sources = await self._get_daily_documents(db, digest.trade_date)
         return self.serialize_daily_digest(digest, cache_hit=cache_hit, sources=sources)
+
+    async def _serialize_daily_digest_records(
+        self,
+        db: AsyncSession,
+        records: List[Any],
+    ) -> List[Dict[str, Any]]:
+        records.sort(key=self._daily_digest_order_key, reverse=True)
+        items = []
+        for digest in records:
+            sources = await self._get_daily_documents(db, digest.trade_date)
+            items.append(self.serialize_daily_digest(digest, cache_hit=True, sources=sources))
+        return items
+
+    def _daily_digest_order_key(self, digest: Any) -> tuple:
+        return (
+            digest.trade_date,
+            digest.generated_at or datetime.min,
+            digest.id or 0,
+        )
 
     async def get_document_source(self, db: AsyncSession, document_id: int) -> Optional[Dict[str, Any]]:
         document = await db.get(KnowledgeDocument, document_id)
@@ -1649,14 +1744,19 @@ class IntelligenceService:
 
     def serialize_daily_digest(
         self,
-        digest: DailyInfoDigest,
+        digest: Any,
         *,
         cache_hit: bool = False,
         sources: Optional[Iterable[Any]] = None,
     ) -> Dict[str, Any]:
         source_items = list(sources or [])
         summary = _merge_stock_mentions(dict(digest.summary_json or {}), source_items)
+        is_version = isinstance(digest, DailyInfoDigestVersion)
+        record_id = getattr(digest, "id", None)
         return {
+            "id": record_id,
+            "version_id": record_id if is_version else None,
+            "digest_id": getattr(digest, "digest_id", record_id),
             "trade_date": digest.trade_date.isoformat(),
             "status": digest.status,
             "source_count": digest.source_count,

@@ -15,9 +15,10 @@ const api = axios.create({
   timeout: 60000
 })
 
-export async function getDailyInfo(tradeDate: string): Promise<DailyInfoResponse> {
+export async function getDailyInfo(tradeDate: string, versionId?: number | null): Promise<DailyInfoResponse> {
+  const params = versionId ? { trade_date: tradeDate, version_id: versionId } : { trade_date: tradeDate }
   const { data } = await api.get('/intelligence/daily-info', {
-    params: { trade_date: tradeDate }
+    params
   })
   return data
 }

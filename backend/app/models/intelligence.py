@@ -1,7 +1,7 @@
 """Knowledge intelligence cache models."""
 from datetime import datetime
 
-from sqlalchemy import Column, Date, DateTime, Integer, JSON, String, Text, UniqueConstraint
+from sqlalchemy import Column, Date, DateTime, ForeignKey, Integer, JSON, String, Text, UniqueConstraint
 
 from app.database import Base
 
@@ -61,6 +61,23 @@ class DailyInfoDigest(Base):
     generated_at = Column(DateTime, default=datetime.now, nullable=False)
     created_at = Column(DateTime, default=datetime.now, nullable=False)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, nullable=False)
+
+
+class DailyInfoDigestVersion(Base):
+    """Immutable generation history for daily info digests."""
+
+    __tablename__ = "daily_info_digest_versions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    digest_id = Column(Integer, ForeignKey("daily_info_digests.id"), nullable=True, index=True)
+    trade_date = Column(Date, nullable=False, index=True)
+    summary_json = Column(JSON, default=dict, nullable=False)
+    status = Column(String(20), default="pending", nullable=False)
+    source_count = Column(Integer, default=0, nullable=False)
+    content_hash = Column(String(64), default="", nullable=False)
+    model = Column(String(80), default="", nullable=False)
+    generated_at = Column(DateTime, default=datetime.now, nullable=False)
+    created_at = Column(DateTime, default=datetime.now, nullable=False)
 
 
 class JiegeTradingRule(Base):

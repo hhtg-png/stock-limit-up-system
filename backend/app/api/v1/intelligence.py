@@ -34,9 +34,20 @@ async def search_daily_info(
 @router.get("/daily-info", summary="获取每日资讯")
 async def get_daily_info(
     trade_date: Optional[date] = Query(None, description="交易日期，默认今天"),
+    version_id: Optional[int] = Query(None, ge=1, description="每日资讯生成版本 ID"),
     db: AsyncSession = Depends(get_db),
 ):
+    if version_id is not None:
+        version = await intelligence_service.get_daily_digest_version(db, version_id)
+        if version is None or (trade_date is not None and version.trade_date != trade_date):
+            raise HTTPException(status_code=404, detail="Daily info version not found")
+        return await intelligence_service.serialize_daily_digest_with_sources(db, version, cache_hit=True)
+
     target_date = trade_date or today_cn()
+    latest_version = await intelligence_service.get_latest_daily_digest_version(db, target_date)
+    if latest_version is not None:
+        return await intelligence_service.serialize_daily_digest_with_sources(db, latest_version, cache_hit=True)
+
     existing = await _get_daily_digest(db, target_date)
     if existing is not None:
         return await intelligence_service.serialize_daily_digest_with_sources(db, existing, cache_hit=True)

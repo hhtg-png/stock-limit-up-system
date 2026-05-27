@@ -341,6 +341,53 @@ class IntelligenceServiceTests(unittest.TestCase):
         self.assertEqual(service.summary_client.daily_calls, [(date(2026, 5, 18), ["2026-05-18-复盘.md"])])
         self.assertEqual(digest.source_count, 1)
 
+    def test_force_daily_digest_keeps_same_day_versions_in_history(self):
+        class SequentialDailySummaryClient(FakeSummaryClient):
+            async def summarize_daily_info(self, trade_date, documents):
+                self.daily_calls.append((trade_date, [doc.title for doc in documents]))
+                return {
+                    "overview": f"第{len(self.daily_calls)}次生成",
+                    "main_lines": ["人工智能"],
+                    "catalysts": ["订单验证"],
+                    "risks": ["高位分歧"],
+                    "plan": "观察承接",
+                }
+
+        service = IntelligenceService(
+            ima_client=FakeImaClient({}),
+            summary_client=SequentialDailySummaryClient(),
+            sources=[],
+        )
+
+        async def run():
+            async with self.Session() as session:
+                session.add(KnowledgeDocument(
+                    source_key="daily",
+                    source_name="每日复盘更新",
+                    share_id="daily",
+                    media_id="markdown_1",
+                    title="2026-05-18-复盘.md",
+                    media_type=7,
+                    media_type_name="MD",
+                    md5_sum="a",
+                    update_time="1779119000000",
+                    abstract="AI摘要: 市场修复。",
+                    content_text="# 复盘",
+                    content_hash="hash-1",
+                    summary_json={"summary": "市场修复", "themes": ["AI"]},
+                    summary_status="ready",
+                    trade_date=date(2026, 5, 18),
+                ))
+                await session.commit()
+                await service.build_daily_info(session, date(2026, 5, 18), force=True)
+                await service.build_daily_info(session, date(2026, 5, 18), force=True)
+                return await service.list_daily_digests(session, limit=10)
+
+        history = asyncio.run(run())
+
+        self.assertEqual([item["summary"]["overview"] for item in history], ["第2次生成", "第1次生成"])
+        self.assertEqual([item["trade_date"] for item in history], ["2026-05-18", "2026-05-18"])
+
     def test_daily_digest_force_refreshes_document_summaries_after_key_is_configured(self):
         summary = FakeSummaryClient()
         summary.api_key = "configured"
