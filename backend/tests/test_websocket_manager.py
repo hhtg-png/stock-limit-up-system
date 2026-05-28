@@ -13,6 +13,23 @@ class WebSocketManagerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("limit_up_snapshot", manager.message_types["client-1"])
         self.assertIn("limit_up_delta", manager.message_types["client-1"])
+        self.assertIn("tdx_limit_up_event", manager.message_types["client-1"])
+        self.assertIn("tdx_stock_move_event", manager.message_types["client-1"])
+        self.assertIn("tdx_news_event", manager.message_types["client-1"])
+        self.assertIn("tdx_plate_strength_update", manager.message_types["client-1"])
+
+    async def test_broadcast_tdx_plugin_event_uses_plugin_message_type(self):
+        manager = ConnectionManager()
+        manager.broadcast = AsyncMock()
+
+        await manager.broadcast_tdx_plugin_event(
+            "tdx_limit_up_event",
+            {"stock_code": "001259", "stock_name": "利仁科技", "event_label": "封死涨停"},
+            stock_code="001259",
+        )
+
+        self.assertEqual(manager.broadcast.await_args.args[1], "tdx_limit_up_event")
+        self.assertEqual(manager.broadcast.await_args.args[2], "001259")
 
     async def test_broadcast_limit_up_alert_deduplicates_same_stock(self):
         manager = ConnectionManager()

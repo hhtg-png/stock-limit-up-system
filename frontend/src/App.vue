@@ -1,6 +1,9 @@
 <template>
   <el-config-provider :locale="zhCn">
-    <div class="app-container">
+    <div v-if="isTdxRoute" class="tdx-standalone">
+      <router-view />
+    </div>
+    <div v-else class="app-container">
       <el-container class="layout-container">
         <!-- 侧边栏 -->
         <el-aside :width="isCollapsed ? '64px' : '200px'" class="aside">
@@ -157,6 +160,7 @@ const mobileNavItems = [
 
 // 当前路由
 const currentRoute = computed(() => route.path)
+const isTdxRoute = computed(() => route.path === '/tdx' || route.path.startsWith('/tdx/'))
 
 const isMobileNavActive = (path: string) => {
   if (path === '/') {
@@ -248,6 +252,13 @@ onUnmounted(() => {
   height: 100vh;
   width: 100vw;
   overflow: hidden;
+}
+
+.tdx-standalone {
+  min-height: 100vh;
+  width: 100vw;
+  overflow: auto;
+  background: #050b12;
 }
 
 .layout-container {

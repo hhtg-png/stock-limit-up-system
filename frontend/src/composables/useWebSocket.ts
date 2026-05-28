@@ -154,6 +154,46 @@ export function useWebSocket() {
         })
         break
 
+      case 'tdx_limit_up_event':
+        if (message.data.stock_name) {
+          const { enqueuePluginSpeech } = useSpeech()
+          enqueuePluginSpeech(
+            message.data.speech_text || `${message.data.stock_name}${message.data.event_label || '涨停异动'}`,
+            message.data.event_id
+          )
+        }
+        break
+
+      case 'tdx_stock_move_event':
+        if (message.data.stock_name) {
+          const { enqueuePluginSpeech } = useSpeech()
+          enqueuePluginSpeech(
+            message.data.speech_text || `${message.data.stock_name}出现异动解析更新`,
+            message.data.event_id || `stock-move-${message.data.stock_code}-${message.timestamp}`
+          )
+        }
+        break
+
+      case 'tdx_news_event':
+        if (message.data.title) {
+          const { enqueuePluginSpeech } = useSpeech()
+          enqueuePluginSpeech(
+            message.data.speech_text || message.data.title,
+            message.data.news_id || `news-${message.timestamp}`
+          )
+        }
+        break
+
+      case 'tdx_plate_strength_update':
+        if (message.data.speech_text) {
+          const { enqueuePluginSpeech } = useSpeech()
+          enqueuePluginSpeech(
+            message.data.speech_text,
+            message.data.event_id || `plate-strength-${message.timestamp}`
+          )
+        }
+        break
+
       case 'market_update':
         // 处理行情更新
         break

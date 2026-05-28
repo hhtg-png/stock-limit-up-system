@@ -201,6 +201,7 @@ async def realtime_sync_loop():
                     alert.get("reason"),
                     alert.get("continuous_days", 1),
                 )
+                await broadcast_tdx_limit_up_event(alert)
 
             await asyncio.sleep(REALTIME_SYNC_INTERVAL)
         except asyncio.CancelledError:
@@ -221,6 +222,30 @@ async def broadcast_realtime_sync_message(message: dict):
 
     if msg_type == "limit_up_delta":
         await manager.broadcast_limit_up_delta(payload)
+
+
+async def broadcast_tdx_limit_up_event(alert: dict):
+    """广播通达信插件涨停事件。"""
+    stock_code = alert.get("stock_code", "")
+    stock_name = alert.get("stock_name", "")
+    event_time = alert.get("time", "")
+    continuous_days = alert.get("continuous_days", 1)
+    event_id = f"tdx-limit-up-{stock_code}-{event_time}"
+    await manager.broadcast_tdx_plugin_event(
+        "tdx_limit_up_event",
+        {
+            "event_id": event_id,
+            "event_type": "limit_up_sealed",
+            "event_label": "封死涨停",
+            "event_time": event_time,
+            "stock_code": stock_code,
+            "stock_name": stock_name,
+            "board": continuous_days,
+            "reason": alert.get("reason"),
+            "speech_text": f"{stock_name}封死涨停",
+        },
+        stock_code=stock_code,
+    )
 
 
 def is_trading_time() -> bool:

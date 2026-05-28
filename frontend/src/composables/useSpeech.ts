@@ -24,6 +24,7 @@ let isSpeaking = false
 
 // 已播报的股票记录（防止重复播报）
 const announcedStocks = new Set<string>()
+const pluginSpeechKeys = new Set<string>()
 
 function hasSpeechSupport(): boolean {
   return typeof window !== 'undefined' &&
@@ -56,6 +57,14 @@ function speak(text: string) {
   
   speechQueue.push(text)
   processQueue()
+}
+
+function enqueuePluginSpeech(text: string, key?: string) {
+  if (!getSpeechEnabled() || !text) return
+  const speechKey = key || `plugin-${text}-${new Date().toDateString()}`
+  if (pluginSpeechKeys.has(speechKey)) return
+  pluginSpeechKeys.add(speechKey)
+  speak(text)
 }
 
 function processQueue() {
@@ -129,6 +138,7 @@ function announceNewStocks(stocks: Array<{ stock_name: string; limit_up_reason?:
 // 清除今日已播报记录
 function clearAnnounced() {
   announcedStocks.clear()
+  pluginSpeechKeys.clear()
 }
 
 // 测试播报
@@ -167,6 +177,7 @@ export function useSpeech() {
     speechVolume,
     speechUnlocked,
     speak,
+    enqueuePluginSpeech,
     unlockSpeech,
     announceStock,
     announceNewStocks,

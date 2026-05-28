@@ -41,6 +41,10 @@ class ConnectionManager:
                 "continuous_ladder",
                 "limit_up_snapshot",
                 "limit_up_delta",
+                "tdx_limit_up_event",
+                "tdx_stock_move_event",
+                "tdx_news_event",
+                "tdx_plate_strength_update",
             }
         logger.info(f"WebSocket connected: {client_id}, total: {len(self.active_connections)}")
     
@@ -190,6 +194,14 @@ class ConnectionManager:
         await self.broadcast(
             data,
             "limit_up_delta"
+        )
+
+    async def broadcast_tdx_plugin_event(self, message_type: str, data: dict, stock_code: Optional[str] = None):
+        """广播通达信看盘插件事件"""
+        await self.broadcast(
+            data,
+            message_type,
+            stock_code,
         )
     
     @property
