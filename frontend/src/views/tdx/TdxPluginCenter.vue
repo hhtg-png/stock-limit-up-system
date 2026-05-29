@@ -26,6 +26,7 @@ const plugins = [
   { name: '股票异动解析联动', desc: '综合口径解析个股异动原因', path: '/tdx/yidong/001259/dark' },
   { name: '实时板块强度', desc: '按涨停、封板率、核心股计算强度', path: '/tdx/strong/dark' },
   { name: '聚合快讯', desc: '市场快讯聚合与语音播报', path: '/tdx/news/dark' },
+  { name: '聚合快讯语音', desc: '极简语音开关，只负责聚合资讯播报', path: '/tdx/news-voice/dark' },
   { name: '异动解析（同花顺版）', desc: '同花顺口径个股解析', path: '/tdx/thsyd/001259/dark' }
 ]
 

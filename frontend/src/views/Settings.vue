@@ -249,6 +249,7 @@ const tdxPlugins = [
   { name: '股票异动解析联动', desc: '综合口径展示个股最近涨停与异动原因', path: '/tdx/yidong/600589/dark' },
   { name: '实时板块强度', desc: '板块轮动、强度、量能和核心股入口', path: '/tdx/strong/dark' },
   { name: '聚合快讯', desc: '市场快讯、韭研社识别区和题材库', path: '/tdx/news/dark' },
+  { name: '聚合快讯语音', desc: '极简语音开关，只负责聚合资讯播报', path: '/tdx/news-voice/dark' },
   { name: '异动解析（同花顺版）', desc: '同花顺口径的概念和异动解析', path: '/tdx/thsyd/600589/dark' }
 ]
 
