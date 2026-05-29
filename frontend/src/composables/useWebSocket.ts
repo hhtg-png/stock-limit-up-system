@@ -286,12 +286,12 @@ export function useWebSocket() {
         break
 
       case 'tdx_news_event':
-        pushTdxNewsItem(message.data || {}, message.timestamp)
-        if (message.data.title) {
+        const item = pushTdxNewsItem(message.data || {}, message.timestamp)
+        if (item.title) {
           const { enqueuePluginSpeech } = useSpeech()
           enqueuePluginSpeech(
-            message.data.speech_text || message.data.title,
-            message.data.news_id || `news-${message.timestamp}`,
+            message.data.speech_text || item.title,
+            `news-${item.news_id || message.timestamp}`,
             { force: true }
           )
         }

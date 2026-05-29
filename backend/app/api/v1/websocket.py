@@ -10,9 +10,12 @@ import uuid
 
 from app.core.websocket_manager import manager
 from app.services.continuous_ladder_service import continuous_ladder_service
+from app.services.edge_tts_service import edge_tts_service
 from app.services.realtime_limit_up_service import realtime_limit_up_service
 from app.services.realtime_limit_up_alert_tracker import RealtimeLimitUpAlertTracker
 from app.services.realtime_limit_up_stream_tracker import RealtimeLimitUpStreamTracker
+from app.services.tdx_news_realtime_tracker import TdxNewsRealtimeTracker
+from app.services.tdx_news_sources import public_market_news_provider
 from loguru import logger
 
 router = APIRouter()
@@ -20,10 +23,17 @@ router = APIRouter()
 # 实时涨停列表/播报 watcher
 realtime_alert_tracker = RealtimeLimitUpAlertTracker()
 realtime_stream_tracker = RealtimeLimitUpStreamTracker()
+tdx_news_realtime_tracker = TdxNewsRealtimeTracker()
 realtime_sync_task: Optional[asyncio.Task] = None
+tdx_news_sync_task: Optional[asyncio.Task] = None
 REALTIME_SYNC_INTERVAL = 1
 REALTIME_SYNC_IDLE_INTERVAL = 30
 REALTIME_POOL_MAX_CACHE_AGE = 1
+TDX_NEWS_SYNC_INTERVAL = 5
+TDX_NEWS_SYNC_LIMIT = 80
+TDX_NEWS_BROADCAST_LIMIT = 10
+TDX_NEWS_TTS_WARM_LIMIT = 3
+TDX_NEWS_TTS_WARM_TIMEOUT = 3
 
 
 @router.websocket("/ws/realtime")
@@ -38,6 +48,7 @@ async def websocket_endpoint(
     
     await manager.connect(websocket, client_id)
     await ensure_realtime_sync_watcher()
+    await ensure_tdx_news_sync_watcher()
     
     try:
         # 发送连接成功消息
@@ -84,6 +95,7 @@ async def websocket_endpoint(
     finally:
         await manager.disconnect(client_id)
         await stop_realtime_sync_watcher_if_idle()
+        await stop_tdx_news_sync_watcher_if_idle()
 
 
 async def handle_client_message(client_id: str, message: dict):
@@ -143,6 +155,35 @@ async def stop_realtime_sync_watcher_if_idle():
             pass
         logger.info("Realtime sync watcher stopped")
     realtime_sync_task = None
+
+
+async def ensure_tdx_news_sync_watcher():
+    """确保聚合快讯 watcher 已启动，提供低延迟 tdx_news_event 推送。"""
+    global tdx_news_sync_task
+
+    if tdx_news_sync_task and not tdx_news_sync_task.done():
+        return
+
+    tdx_news_realtime_tracker.reset()
+    tdx_news_sync_task = asyncio.create_task(tdx_news_sync_loop())
+    logger.info("TDX news sync watcher started")
+
+
+async def stop_tdx_news_sync_watcher_if_idle():
+    """没有连接时停止聚合快讯 watcher，避免持续请求外部源。"""
+    global tdx_news_sync_task
+
+    if manager.connection_count > 0:
+        return
+
+    if tdx_news_sync_task and not tdx_news_sync_task.done():
+        tdx_news_sync_task.cancel()
+        try:
+            await tdx_news_sync_task
+        except asyncio.CancelledError:
+            pass
+        logger.info("TDX news sync watcher stopped")
+    tdx_news_sync_task = None
 
 
 async def send_realtime_limit_up_snapshot(client_id: str):
@@ -211,6 +252,33 @@ async def realtime_sync_loop():
             await asyncio.sleep(REALTIME_SYNC_INTERVAL)
 
 
+async def tdx_news_sync_loop():
+    """轮询公开快讯源并用 WebSocket 低延迟广播新增聚合快讯。"""
+    while True:
+        try:
+            if manager.connection_count == 0:
+                await asyncio.sleep(1)
+                continue
+
+            items, _source_status, _warnings = await public_market_news_provider.get_latest_news(
+                limit=TDX_NEWS_SYNC_LIMIT,
+                force_refresh=True,
+            )
+            new_items = tdx_news_realtime_tracker.collect_new_items(items)
+            if new_items:
+                publish_items = new_items[:TDX_NEWS_BROADCAST_LIMIT]
+                await warm_tdx_news_speech_cache(publish_items[:TDX_NEWS_TTS_WARM_LIMIT])
+                for item in publish_items:
+                    await broadcast_tdx_news_event(item)
+
+            await asyncio.sleep(TDX_NEWS_SYNC_INTERVAL)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"TDX news sync watcher error: {e}")
+            await asyncio.sleep(TDX_NEWS_SYNC_INTERVAL)
+
+
 async def broadcast_realtime_sync_message(message: dict):
     """广播实时涨停列表快照或增量更新"""
     msg_type = message.get("type")
@@ -245,6 +313,38 @@ async def broadcast_tdx_limit_up_event(alert: dict):
             "speech_text": f"{stock_name}封死涨停",
         },
         stock_code=stock_code,
+    )
+
+
+def tdx_news_speech_text(item: dict) -> str:
+    source = str(item.get("source") or "").strip()
+    title = " ".join(str(item.get("title") or "").split()).strip()
+    if source == "韭研公社":
+        return f"{source}新帖，{title}".strip("，")[:120]
+    return title[:120]
+
+
+async def warm_tdx_news_speech_cache(items: list[dict]):
+    """提前生成新增快讯的 TTS 缓存，避免前端收到事件后再等待首次合成。"""
+    tasks = []
+    for item in items:
+        text = tdx_news_speech_text(item)
+        if not text:
+            continue
+        tasks.append(asyncio.wait_for(edge_tts_service.synthesize_to_file(text), timeout=TDX_NEWS_TTS_WARM_TIMEOUT))
+    if not tasks:
+        return
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def broadcast_tdx_news_event(item: dict):
+    """广播通达信插件聚合快讯事件。"""
+    payload = dict(item)
+    payload["speech_text"] = tdx_news_speech_text(payload)
+    await manager.broadcast_tdx_plugin_event(
+        "tdx_news_event",
+        payload,
+        stock_code=None,
     )
 
 

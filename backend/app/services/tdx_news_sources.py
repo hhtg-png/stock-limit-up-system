@@ -34,14 +34,19 @@ class PublicMarketNewsProvider:
     JYGS_URL = "https://app.jiuyangongshe.com/jystock-app/api/v2/article/community"
     GLH_URL = "https://www.gelonghui.com/api/live-channels/all/lives"
 
-    def __init__(self, *, timeout: float = 8.0, cache_ttl: int = 45):
+    def __init__(self, *, timeout: float = 8.0, cache_ttl: int = 5):
         self.timeout = timeout
         self.cache_ttl = cache_ttl
         self._cache: Tuple[float, List[Dict[str, Any]], Dict[str, str], List[str]] | None = None
 
-    async def get_latest_news(self, limit: int = 80) -> Tuple[List[Dict[str, Any]], Dict[str, str], List[str]]:
+    async def get_latest_news(
+        self,
+        limit: int = 80,
+        *,
+        force_refresh: bool = False,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, str], List[str]]:
         cached = self.get_cached_news(limit)
-        if cached:
+        if cached and not force_refresh:
             return cached
 
         fetch_limit = max(limit, 80)

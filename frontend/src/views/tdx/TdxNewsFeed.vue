@@ -102,6 +102,7 @@ const { realtimeNewsItems } = useTdxPluginRealtime()
 const spokenNewsKeys = new Set<string>()
 const knownNewsKeys = new Set<string>()
 const VISIBLE_SPEECH_LIMIT = 3
+const NEWS_REFRESH_MS = 10000
 let refreshTimer = 0
 let hasLoadedInitialSnapshot = false
 
@@ -245,7 +246,7 @@ onMounted(() => {
   loadData().then(() => {
     if (speechUnlocked.value) speakVisibleNews()
   })
-  refreshTimer = window.setInterval(loadData, 30000)
+  refreshTimer = window.setInterval(loadData, NEWS_REFRESH_MS)
 })
 
 watch(realtimeNewsItems, (nextItems, previousItems) => {

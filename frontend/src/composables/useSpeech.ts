@@ -4,8 +4,8 @@ import { useAlertStore } from '@/stores/alert'
 
 const targetSpeechProfile = {
   lang: 'zh-CN',
-  rate: 0.9,
-  pitch: 1,
+  rate: 1.08,
+  pitch: 1.05,
   volume: 0.92,
   voiceKeywords: [
     'Microsoft Xiaoxiao',
@@ -19,7 +19,7 @@ const targetSpeechProfile = {
 
 const targetTtsAudioId = 'tdx-target-tts-audio'
 const targetNeuralTtsEndpoint = '/api/v1/tts/speech'
-const targetNeuralTtsVoice = 'zh-CN-XiaoxiaoNeural'
+const targetNeuralTtsVoice = 'zh-CN-XiaoyiNeural'
 const targetAudioFallbackVolume = 0.9
 
 // 通达信插件播报配置：优先播放后端 edge-tts 神经音频，失败时降级为浏览器中文语音

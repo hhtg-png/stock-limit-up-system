@@ -36,7 +36,7 @@ class EdgeTtsServiceTests(unittest.TestCase):
                 calls.append(path)
                 Path(path).write_bytes(b"mp3-bytes")
 
-        service = EdgeTtsService(cache_dir=self.cache_dir, voice="zh-CN-XiaoxiaoNeural")
+        service = EdgeTtsService(cache_dir=self.cache_dir)
 
         with patch(
             "app.services.edge_tts_service.edge_tts",
@@ -49,9 +49,10 @@ class EdgeTtsServiceTests(unittest.TestCase):
         self.assertEqual(first.read_bytes(), b"mp3-bytes")
         self.assertEqual(len(calls), 1)
         self.assertEqual(created[0]["text"], "聚合快讯标题")
-        self.assertEqual(created[0]["voice"], "zh-CN-XiaoxiaoNeural")
-        self.assertEqual(created[0]["rate"], "+0%")
+        self.assertEqual(created[0]["voice"], "zh-CN-XiaoyiNeural")
+        self.assertEqual(created[0]["rate"], "+18%")
         self.assertEqual(created[0]["volume"], "+0%")
+        self.assertEqual(created[0]["pitch"], "+2Hz")
 
 
 if __name__ == "__main__":

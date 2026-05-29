@@ -21,6 +21,8 @@ assert.doesNotMatch(limitUp, /setInterval\(loadData,\s*5000\)/, '涨停播报 sh
 const news = read('src/views/tdx/TdxNewsFeed.vue')
 assert.match(news, /useTdxPluginRealtime/, '聚合快讯 should consume plugin WebSocket realtime news')
 assert.match(news, /realtimeNewsItems/, '聚合快讯 should place realtime WebSocket news into the rendered feed')
+assert.match(news, /NEWS_REFRESH_MS\s*=\s*10000/, '聚合快讯 should use faster polling only as a WebSocket fallback')
+assert.doesNotMatch(news, /setInterval\(loadData,\s*30000\)/, '聚合快讯 should not rely on 30 second polling for voice news')
 
 const ws = read('src/composables/useWebSocket.ts')
 assert.match(ws, /tdxNewsItems/, 'WebSocket composable should keep shared TDX news events')
@@ -28,5 +30,6 @@ assert.match(ws, /tdxLimitUpEvents/, 'WebSocket composable should keep shared TD
 assert.match(ws, /useTdxPluginRealtime/, 'WebSocket composable should expose TDX plugin realtime state')
 assert.match(ws, /pushTdxNewsItem/, 'tdx_news_event messages should be normalized into realtime news state')
 assert.match(ws, /pushTdxLimitUpEvent/, 'tdx_limit_up_event messages should be normalized into realtime limit-up state')
+assert.match(ws, /`news-\$\{item\.news_id \|\| message\.timestamp\}`/, 'tdx_news_event speech keys should match the news page dedupe key')
 
 console.log('tdx realtime hybrid strategy checks passed')

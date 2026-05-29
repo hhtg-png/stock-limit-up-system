@@ -334,6 +334,41 @@ class TdxNewsSourcesTests(unittest.TestCase):
         self.assertEqual([item["news_id"] for item in items], ["ths-0", "ths-1"])
         self.assertEqual(len(provider._cache[1]), 3)
 
+    def test_force_refresh_bypasses_cached_news_for_realtime_watcher(self):
+        provider = PublicMarketNewsProvider()
+        provider._cache = (
+            time.time(),
+            [{"news_id": "cached-1", "source": "缓存", "title": "旧快讯"}],
+            {"cached": "ok"},
+            [],
+        )
+
+        async def fake_stcn(_client):
+            return [
+                MarketNewsItem(
+                    news_id="stcn-new",
+                    source="时报快讯",
+                    title="实时新增快讯",
+                    content="正文",
+                    published_at=1780050000,
+                )
+            ]
+
+        async def fake_empty(_client):
+            return []
+
+        provider._fetch_stcn = fake_stcn
+        provider._fetch_ths = fake_empty
+        provider._fetch_gelonghui = fake_empty
+        provider._fetch_jygs = fake_empty
+        provider._fetch_cls = fake_empty
+
+        items, status, warnings = asyncio.run(provider.get_latest_news(limit=80, force_refresh=True))
+
+        self.assertEqual([item["news_id"] for item in items], ["stcn-new"])
+        self.assertEqual(status["stcn"], "ok")
+        self.assertEqual(warnings, [])
+
 
 if __name__ == "__main__":
     unittest.main()
