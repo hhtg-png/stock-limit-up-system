@@ -4,6 +4,10 @@ export interface TdxPluginPayload<T> {
   source_status: Record<string, string>
   is_cache: boolean
   warnings: string[]
+  plate_filters?: Array<{
+    name: string
+    count: number
+  }>
 }
 
 export interface TdxLimitUpEvent {
@@ -16,12 +20,17 @@ export interface TdxLimitUpEvent {
   board: number
   reason: string
   reason_category: string
+  change_pct: number
   seal_amount: number
   amount: number
   turnover_rate: number
   is_sealed: boolean
   open_count: number
   sources: string[]
+  target_status_label: string
+  target_plate: string
+  target_reason_summary: string
+  target_seal_amount: string
 }
 
 export interface TdxStockMove {

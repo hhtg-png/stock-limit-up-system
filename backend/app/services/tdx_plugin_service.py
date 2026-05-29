@@ -5,21 +5,26 @@ from collections import defaultdict
 from datetime import date, datetime, time
 from typing import Any, Dict, Iterable, List, Optional
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.intelligence import KnowledgeDocument
+from app.models.limit_up import LimitUpRecord
+from app.models.stock import Stock
+from app.services.tdx_external_sources import ExternalStockMove, lwwhy_stock_move_provider
 from app.services.realtime_limit_up_service import realtime_limit_up_service
 
 
 class TdxPluginService:
     """Build stable payloads for the Tongdaxin embedded plugin pages."""
 
-    def __init__(self):
+    def __init__(self, *, external_move_provider=None, enable_external_sources: bool = False):
         self.realtime_limit_up_service = realtime_limit_up_service
+        self.external_move_provider = external_move_provider
+        self.enable_external_sources = enable_external_sources
 
-    async def get_limit_up_live(self, trade_date: Optional[date] = None) -> Dict[str, Any]:
-        target_date = trade_date or date.today()
+    async def get_limit_up_live(self, trade_date: Optional[date] = None, db: Optional[AsyncSession] = None) -> Dict[str, Any]:
+        target_date = await self._resolve_trade_date(trade_date, db)
         warnings: List[str] = []
         source_status = {"limit_up_pool": "ok", "ths_reason": "ok", "tencent_quote": "ok"}
 
@@ -30,10 +35,23 @@ class TdxPluginService:
             source_status["limit_up_pool"] = "error"
             warnings.append(f"涨停池获取失败: {exc}")
 
-        items = [self._build_limit_up_event(item, target_date) for item in raw_items]
-        items.sort(key=lambda item: (item.get("event_time") or "99:99:99", -item.get("board", 0)))
+        external_moves = await self._load_external_review_moves(target_date, source_status, warnings)
+        external_by_code = {move.stock_code: move for move in external_moves}
+        history_labels = await self._load_historical_status_labels(raw_items, target_date, db)
+        items = [
+            self._build_limit_up_event(
+                item,
+                target_date,
+                status_label=history_labels.get(item.get("stock_code", "")),
+                external_move=external_by_code.get(item.get("stock_code", "")),
+            )
+            for item in raw_items
+        ]
+        items.sort(key=lambda item: (item.get("event_time") or "00:00:00", item.get("board", 0)), reverse=True)
 
-        return self._plugin_payload(items, target_date, source_status, is_cache=False, warnings=warnings)
+        payload = self._plugin_payload(items, target_date, source_status, is_cache=False, warnings=warnings)
+        payload["plate_filters"] = self._build_plate_filters(items)
+        return payload
 
     async def get_stock_move(
         self,
@@ -41,11 +59,15 @@ class TdxPluginService:
         trade_date: Optional[date] = None,
         *,
         source_scope: str = "mixed",
+        db: Optional[AsyncSession] = None,
     ) -> Dict[str, Any]:
-        target_date = trade_date or date.today()
+        target_date = await self._resolve_trade_date(trade_date, db)
         normalized_code = self._normalize_code(stock_code)
         warnings: List[str] = []
         source_status = {"stock_move": "ok"}
+        external_move = None
+        if source_scope != "ths":
+            external_move = await self._load_external_stock_move(normalized_code, target_date, source_status, warnings)
 
         try:
             limit_up_item = await self.realtime_limit_up_service.get_realtime_limit_up_item(normalized_code, target_date)
@@ -54,7 +76,7 @@ class TdxPluginService:
             source_status["stock_move"] = "error"
             warnings.append(f"个股异动获取失败: {exc}")
 
-        if not limit_up_item:
+        if not limit_up_item and not external_move:
             source_status["stock_move"] = "empty"
             warnings.append(f"{normalized_code} 暂无异动解析数据")
             return self._plugin_payload(
@@ -65,11 +87,15 @@ class TdxPluginService:
                 warnings=warnings,
             )
 
-        item = self._build_stock_move_item(limit_up_item, normalized_code, source_scope, target_date)
+        if not limit_up_item and external_move:
+            item = self._build_stock_move_from_external(external_move, normalized_code, source_scope, target_date)
+            return self._plugin_payload([item], external_move.trade_date or target_date, source_status, is_cache=False, warnings=warnings)
+
+        item = self._build_stock_move_item(limit_up_item, normalized_code, source_scope, target_date, external_move=external_move)
         return self._plugin_payload([item], target_date, source_status, is_cache=False, warnings=warnings)
 
-    async def get_plate_strength(self, trade_date: Optional[date] = None) -> Dict[str, Any]:
-        target_date = trade_date or date.today()
+    async def get_plate_strength(self, trade_date: Optional[date] = None, db: Optional[AsyncSession] = None) -> Dict[str, Any]:
+        target_date = await self._resolve_trade_date(trade_date, db)
         warnings: List[str] = []
         source_status = {"limit_up_pool": "ok", "plate_strength": "ok"}
 
@@ -166,7 +192,51 @@ class TdxPluginService:
             "updated_at": datetime.now().isoformat(),
         }
 
-    def _build_limit_up_event(self, item: Dict[str, Any], trade_date: date) -> Dict[str, Any]:
+    async def _load_external_review_moves(
+        self,
+        target_date: date,
+        source_status: Dict[str, str],
+        warnings: List[str],
+    ) -> List[ExternalStockMove]:
+        if not self.enable_external_sources or not self.external_move_provider:
+            return []
+        try:
+            moves = await self.external_move_provider.get_review_moves(target_date)
+        except Exception as exc:
+            source_status["lwwhy_review"] = "error"
+            warnings.append(f"芦苇复盘异动源获取失败: {exc}")
+            return []
+
+        source_status["lwwhy_review"] = "ok" if moves else "empty"
+        return moves
+
+    async def _load_external_stock_move(
+        self,
+        stock_code: str,
+        target_date: date,
+        source_status: Dict[str, str],
+        warnings: List[str],
+    ) -> Optional[ExternalStockMove]:
+        if not self.enable_external_sources or not self.external_move_provider:
+            return None
+        try:
+            move = await self.external_move_provider.get_stock_move(stock_code, target_date)
+        except Exception as exc:
+            source_status["lwwhy_move"] = "error"
+            warnings.append(f"芦苇复盘个股异动源获取失败: {exc}")
+            return None
+
+        source_status["lwwhy_move"] = "ok" if move else "empty"
+        return move
+
+    def _build_limit_up_event(
+        self,
+        item: Dict[str, Any],
+        trade_date: date,
+        *,
+        status_label: Optional[str] = None,
+        external_move: Optional[ExternalStockMove] = None,
+    ) -> Dict[str, Any]:
         is_sealed = bool(item.get("is_sealed", item.get("is_final_sealed", True)))
         current_status = item.get("current_status") or ("sealed" if is_sealed else "opened")
         open_count = int(item.get("open_count") or 0)
@@ -181,7 +251,12 @@ class TdxPluginService:
             event_type = "limit_up_sealed"
             event_label = "封死涨停"
 
-        event_time = self._format_time(item.get("final_seal_time") or item.get("first_limit_up_time"))
+        event_time = self._format_time(item.get("first_limit_up_time") or item.get("final_seal_time"))
+        reason = external_move.title if external_move and external_move.title else item.get("limit_up_reason") or item.get("reason_category") or ""
+        target_plate = external_move.plate if external_move and external_move.plate else self._target_plate(reason)
+        sources = ["东方财富", "同花顺", "腾讯行情"]
+        if external_move:
+            sources = self._dedupe_sources([external_move.source_name, *sources])
         return {
             "event_id": f"{trade_date:%Y%m%d}-{item.get('stock_code', '')}-{event_type}-{event_time}",
             "event_type": event_type,
@@ -190,14 +265,22 @@ class TdxPluginService:
             "stock_code": item.get("stock_code", ""),
             "stock_name": item.get("stock_name", ""),
             "board": int(item.get("continuous_limit_up_days") or 1),
-            "reason": item.get("limit_up_reason") or item.get("reason_category") or "",
+            "reason": reason,
             "reason_category": item.get("reason_category") or "其他",
+            "change_pct": float(item.get("change_pct") or 0),
             "seal_amount": float(item.get("seal_amount") or 0),
             "amount": float(item.get("amount") or 0),
             "turnover_rate": float(item.get("turnover_rate") or 0),
             "is_sealed": is_sealed,
             "open_count": open_count,
-            "sources": ["东方财富", "同花顺", "腾讯行情"],
+            "sources": sources,
+            "target_status_label": (external_move.board_label if external_move and external_move.board_label else None) or status_label or self._target_status_label(
+                is_sealed,
+                int(item.get("continuous_limit_up_days") or 1),
+            ),
+            "target_plate": target_plate,
+            "target_reason_summary": self._target_reason_summary(reason),
+            "target_seal_amount": self._target_amount(float(item.get("seal_amount") or 0)),
         }
 
     def _build_stock_move_item(
@@ -206,15 +289,22 @@ class TdxPluginService:
         stock_code: str,
         source_scope: str,
         trade_date: date,
+        *,
+        external_move: Optional[ExternalStockMove] = None,
     ) -> Dict[str, Any]:
         reason = item.get("limit_up_reason") or item.get("reason_category") or "暂无异动原因"
         reason_category = item.get("reason_category") or "其他"
         sources = ["同花顺"] if source_scope == "ths" else ["同花顺", "开盘啦", "公告/互动易", "腾讯行情"]
+        if external_move:
+            sources = self._dedupe_sources([external_move.source_name, *sources])
         stock_name = item.get("stock_name") or stock_code
+        target_title = external_move.title if external_move and external_move.title else self._target_reason_summary(reason)
+        reason_content = external_move.content if external_move and external_move.content else reason
+        display_trade_date = external_move.trade_date if external_move and external_move.trade_date else trade_date
         return {
             "stock_code": stock_code,
             "stock_name": stock_name,
-            "trade_date": trade_date.isoformat(),
+            "trade_date": display_trade_date.isoformat(),
             "source_scope": source_scope,
             "sources": sources,
             "latest_limit_up": {
@@ -227,15 +317,43 @@ class TdxPluginService:
             },
             "reasons": [
                 {
-                    "source": "同花顺" if source_scope == "ths" else "综合解析",
-                    "title": reason_category,
-                    "content": reason,
+                    "source": external_move.source_name if external_move else ("同花顺" if source_scope == "ths" else "综合解析"),
+                    "title": target_title,
+                    "content": reason_content,
                 }
             ],
-            "concepts": self._split_concepts(reason_category),
+            "concepts": self._split_concepts(target_title),
             "announcements": [],
             "industry": item.get("industry") or "",
-            "related_plates": [reason_category] if reason_category else [],
+            "related_plates": [target_title] if target_title else [],
+        }
+
+    def _build_stock_move_from_external(
+        self,
+        external_move: ExternalStockMove,
+        stock_code: str,
+        source_scope: str,
+        trade_date: date,
+    ) -> Dict[str, Any]:
+        title = external_move.title or "暂无异动原因"
+        return {
+            "stock_code": stock_code,
+            "stock_name": external_move.stock_name or stock_code,
+            "trade_date": (external_move.trade_date or trade_date).isoformat(),
+            "source_scope": source_scope,
+            "sources": [external_move.source_name],
+            "latest_limit_up": None,
+            "reasons": [
+                {
+                    "source": external_move.source_name,
+                    "title": title,
+                    "content": external_move.content or title,
+                }
+            ],
+            "concepts": self._split_concepts(title),
+            "announcements": [],
+            "industry": external_move.plate,
+            "related_plates": [title],
         }
 
     def _empty_stock_move(self, stock_code: str, source_scope: str) -> Dict[str, Any]:
@@ -289,7 +407,9 @@ class TdxPluginService:
         content = document.abstract or document.introduction or document.content_text or ""
         return {
             "news_id": str(document.id),
-            "time": document.update_time or (document.created_at.isoformat() if getattr(document, "created_at", None) else ""),
+            "time": self._format_news_time(
+                document.update_time or (document.created_at.isoformat() if getattr(document, "created_at", None) else "")
+            ),
             "source": document.source_name or "知识库",
             "title": title,
             "content": content[:300],
@@ -318,6 +438,87 @@ class TdxPluginService:
             "warnings": warnings,
         }
 
+    def _build_plate_filters(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        counts: Dict[str, int] = defaultdict(int)
+        first_seen: Dict[str, int] = {}
+        for index, item in enumerate(items):
+            for plate in self._split_concepts(item.get("target_plate") or item.get("reason_category") or ""):
+                counts[plate] += 1
+                first_seen.setdefault(plate, index)
+        return [
+            {"name": name, "count": count}
+            for name, count in sorted(counts.items(), key=lambda pair: (-pair[1], first_seen[pair[0]], pair[0]))
+        ][:24]
+
+    async def _load_historical_status_labels(
+        self,
+        raw_items: List[Dict[str, Any]],
+        target_date: date,
+        db: Optional[AsyncSession],
+    ) -> Dict[str, str]:
+        if db is None or not raw_items:
+            return {}
+
+        codes = [str(item.get("stock_code", "")) for item in raw_items if item.get("stock_code")]
+        if not codes:
+            return {}
+
+        try:
+            history_result = await db.execute(
+                select(Stock.stock_code, LimitUpRecord.trade_date)
+                .join(Stock, LimitUpRecord.stock_id == Stock.id)
+                .where(Stock.stock_code.in_(codes))
+                .where(LimitUpRecord.trade_date <= target_date)
+                .order_by(Stock.stock_code, LimitUpRecord.trade_date)
+            )
+            date_result = await db.execute(
+                select(LimitUpRecord.trade_date)
+                .where(LimitUpRecord.trade_date <= target_date)
+                .distinct()
+                .order_by(LimitUpRecord.trade_date)
+            )
+        except Exception:
+            return {}
+
+        by_code: Dict[str, List[date]] = defaultdict(list)
+        for row in history_result.all():
+            code = str(row[0])
+            row_date = row[1]
+            if isinstance(row_date, date):
+                by_code[code].append(row_date)
+
+        market_dates = [
+            row[0]
+            for row in date_result.all()
+            if row and isinstance(row[0], date)
+        ]
+
+        labels: Dict[str, str] = {}
+        for item in raw_items:
+            code = str(item.get("stock_code", ""))
+            label = self._target_status_label_from_history(
+                bool(item.get("is_sealed", item.get("is_final_sealed", True))),
+                target_date,
+                by_code.get(code, []),
+                market_dates,
+                int(item.get("continuous_limit_up_days") or 1),
+            )
+            if label:
+                labels[code] = label
+        return labels
+
+    async def _resolve_trade_date(self, trade_date: Optional[date], db: Optional[AsyncSession]) -> date:
+        if trade_date:
+            return trade_date
+        if db is None:
+            return date.today()
+        try:
+            result = await db.execute(select(func.max(LimitUpRecord.trade_date)))
+            latest_trade_date = result.scalar_one_or_none()
+        except Exception:
+            latest_trade_date = None
+        return latest_trade_date or date.today()
+
     @staticmethod
     def _normalize_code(stock_code: str) -> str:
         return "".join(ch for ch in stock_code if ch.isdigit())[-6:]
@@ -333,10 +534,190 @@ class TdxPluginService:
         return ""
 
     @staticmethod
+    def _format_news_time(value: Any) -> str:
+        if isinstance(value, datetime):
+            return value.strftime("%H:%M:%S")
+        if not value:
+            return ""
+        text = str(value).strip()
+        if text.isdigit():
+            timestamp = int(text)
+            if timestamp > 10_000_000_000:
+                timestamp = timestamp / 1000
+            return datetime.fromtimestamp(timestamp).strftime("%H:%M:%S")
+        try:
+            return datetime.fromisoformat(text.replace("Z", "+00:00")).strftime("%H:%M:%S")
+        except ValueError:
+            return text[-8:] if len(text) >= 8 else text
+
+    @staticmethod
     def _split_concepts(reason_category: str) -> List[str]:
         if not reason_category:
             return []
-        return [part.strip() for part in reason_category.replace("/", "+").replace("，", "+").split("+") if part.strip()]
+        return [part.strip() for part in reason_category.replace("/", "+").replace("，", "+").replace("、", "+").split("+") if part.strip()]
+
+    @staticmethod
+    def _dedupe_sources(sources: List[str]) -> List[str]:
+        result: List[str] = []
+        for source in sources:
+            if source and source not in result:
+                result.append(source)
+        return result
+
+    @staticmethod
+    def _target_plate(reason: str) -> str:
+        text = reason or ""
+        theme_rules = [
+            ("锂电池", ["BOPP", "新能源膜"]),
+            ("智能电网", ["特高压", "电网设备", "智能电网", "电气设备", "变压器", "逆变器", "HVDC", "固态变压器"]),
+            ("元器件", ["电阻", "电容", "超级电容", "MLCC", "磁性材料", "电感", "元器件", "元件"]),
+            ("商业航天", ["商业航天"]),
+            ("通信", ["光器件", "光模块", "CPO", "电子布", "PCB", "覆铜板", "印制电路板"]),
+            ("芯片", ["芯片IP", "先进封装", "半导体设备", "半导体材料", "磷化铟", "芯片", "半导体", "光刻胶", "IGBT", "玻璃基板"]),
+            ("通信", ["铜箔", "光纤", "通信"]),
+            ("金刚石概念", ["金刚石", "培育钻石", "CVD"]),
+            ("消费电子", ["消费电子", "折叠屏"]),
+            ("端侧AI", ["端侧AI", "AI手机", "AI眼镜"]),
+            ("储能", ["储能", "空气储能", "压缩空气储能"]),
+            ("锂电池", ["锂电", "固态电池", "电池"]),
+            ("算力", ["算力", "液冷", "数据中心", "IDC", "AI服务器", "AIDC"]),
+            ("电力", ["电力", "绿色电力", "绿电", "热电", "发电", "电源"]),
+            ("汽车零部件", ["汽车零部件", "汽车热管理", "无人驾驶", "智能驾驶"]),
+            ("地产链", ["房地产", "地产链", "物业服务", "城中村"]),
+            ("体育产业", ["体育产业", "体育Ⅱ"]),
+            ("燃气轮机", ["燃气轮机"]),
+            ("宠物经济", ["宠物经济"]),
+            ("外贸", ["跨境电商", "外贸"]),
+            ("黄金", ["黄金"]),
+            ("新型工业化", ["新型工业化", "工业母机"]),
+            ("世界杯概念", ["世界杯"]),
+            ("有色金属", ["有色", "金属", "铜", "钼", "锗", "铂", "钽铌"]),
+            ("医药", ["医药", "兽药", "医疗", "创新药", "原料药"]),
+            ("化工", ["化工", "塑料", "玻璃", "碳酸", "电石"]),
+        ]
+        for theme, keywords in theme_rules:
+            if any(keyword.lower() in text.lower() for keyword in keywords):
+                return theme
+        parts = TdxPluginService._split_concepts(text)
+        return parts[0] if parts else "其他"
+
+    @staticmethod
+    def _target_reason_summary(reason: str) -> str:
+        text = reason or ""
+        if "字节算力" in text and "算力租赁" in text:
+            return "算力(算力租赁)"
+        if "液冷" in text and "算力" in text:
+            return "算力(液冷)"
+        if "电阻电容" in text and "数据中心" in text:
+            return "电阻电容+数据中心"
+        if "稀土永磁" in text and any(keyword in text for keyword in ["HVDC", "元器件", "光伏组件"]):
+            return "稀土永磁+元器件"
+        if "金刚石" in text or "培育钻石" in text or "CVD" in text:
+            return "金刚石概念"
+
+        plate = TdxPluginService._target_plate(reason)
+        secondary = TdxPluginService._target_secondary_concept(reason, plate)
+        return f"{plate}+{secondary}" if secondary and secondary != plate else plate
+
+    @staticmethod
+    def _target_secondary_concept(reason: str, plate: str) -> str:
+        text = reason or ""
+        concept_rules = [
+            ("固态电池", ["固态电池"]),
+            ("电阻电容", ["电阻", "电容", "MLCC", "超级电容"]),
+            ("光模块", ["光模块", "CPO"]),
+            ("印制电路板", ["印制电路板", "PCB", "覆铜板"]),
+            ("PCB铜箔", ["PCB铜箔"]),
+            ("电子布", ["电子布"]),
+            ("液冷", ["液冷"]),
+            ("算力租赁", ["算力租赁"]),
+            ("数据中心", ["数据中心", "IDC", "AIDC"]),
+            ("AI服务器", ["AI服务器"]),
+            ("AI手机", ["AI手机"]),
+            ("AI眼镜", ["AI眼镜"]),
+            ("折叠屏", ["折叠屏"]),
+            ("光伏", ["光伏"]),
+            ("半导体", ["半导体", "芯片IP"]),
+            ("光刻胶", ["光刻胶"]),
+            ("玻璃基板", ["玻璃基板"]),
+            ("空气储能", ["空气储能", "压缩空气储能"]),
+            ("金属铜", ["金属铜", "铜加工"]),
+            ("金属钼", ["金属钼"]),
+            ("热力", ["热力", "热电"]),
+            ("绿色电力", ["绿色电力", "风电"]),
+            ("房地产", ["房地产"]),
+            ("并购重组", ["并购重组", "拟收购"]),
+            ("一季报增长", ["一季报增长", "业绩"]),
+        ]
+        lowered = text.lower()
+        for concept, keywords in concept_rules:
+            if any(keyword.lower() in lowered for keyword in keywords):
+                if concept != plate:
+                    return concept
+
+        for part in TdxPluginService._split_concepts(text):
+            if part and part != plate:
+                return part
+        return ""
+
+    @staticmethod
+    def _target_status_label(is_sealed: bool, board: int) -> str:
+        if not is_sealed:
+            return "炸板"
+        if board <= 1:
+            return "首板"
+        return f"{board}天{board}板"
+
+    @staticmethod
+    def _target_status_label_from_history(
+        is_sealed: bool,
+        target_date: date,
+        limit_dates: List[date],
+        market_dates: List[date],
+        fallback_board: int,
+    ) -> str:
+        if not is_sealed:
+            return "炸板"
+
+        limit_date_set = {item for item in limit_dates if isinstance(item, date) and item <= target_date}
+        if target_date not in limit_date_set:
+            limit_date_set.add(target_date)
+
+        available_market_dates = sorted({item for item in market_dates if isinstance(item, date) and item <= target_date})
+        if target_date not in available_market_dates:
+            available_market_dates.append(target_date)
+            available_market_dates.sort()
+
+        if len(limit_date_set) <= 1 or not available_market_dates:
+            return TdxPluginService._target_status_label(is_sealed, fallback_board)
+
+        recent_market_dates = available_market_dates[-20:]
+        recent_limit_dates = sorted(item for item in limit_date_set if item in set(recent_market_dates))
+        if len(recent_limit_dates) <= 1:
+            return TdxPluginService._target_status_label(is_sealed, fallback_board)
+
+        first_index = recent_market_dates.index(recent_limit_dates[0])
+        current_index = recent_market_dates.index(target_date)
+        span = current_index - first_index + 1
+        count = len(recent_limit_dates)
+        if count <= 1:
+            return TdxPluginService._target_status_label(is_sealed, fallback_board)
+        if span <= 1:
+            return f"{count}天{count}板"
+        return f"{span}天{count}板"
+
+    @staticmethod
+    def _target_amount(value: float) -> str:
+        if not value:
+            return "--"
+        if value >= 10_000_000:
+            wan = value / 10_000
+            if wan >= 10_000:
+                return f"{wan / 10_000:.2f}亿"
+            return f"{wan:.0f}万"
+        if value >= 10_000:
+            return f"{value / 10_000:.2f}亿"
+        return f"{value:.0f}万"
 
     @staticmethod
     def _score_news_importance(title: str, content: str) -> int:
@@ -348,4 +729,7 @@ class TdxPluginService:
         return min(score, 100)
 
 
-tdx_plugin_service = TdxPluginService()
+tdx_plugin_service = TdxPluginService(
+    external_move_provider=lwwhy_stock_move_provider,
+    enable_external_sources=True,
+)

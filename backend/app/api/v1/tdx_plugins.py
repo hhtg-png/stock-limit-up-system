@@ -14,23 +14,26 @@ router = APIRouter()
 @router.get("/limit-up-live", summary="通达信插件：涨停播报")
 async def get_limit_up_live(
     trade_date: Optional[date] = Query(None, description="交易日期，默认今天"),
+    db: AsyncSession = Depends(get_db),
 ):
-    return await tdx_plugin_service.get_limit_up_live(trade_date)
+    return await tdx_plugin_service.get_limit_up_live(trade_date, db=db)
 
 
 @router.get("/stock-move/{stock_code}", summary="通达信插件：股票异动解析联动")
 async def get_stock_move(
     stock_code: str,
     trade_date: Optional[date] = Query(None, description="交易日期，默认今天"),
+    db: AsyncSession = Depends(get_db),
 ):
-    return await tdx_plugin_service.get_stock_move(stock_code, trade_date, source_scope="mixed")
+    return await tdx_plugin_service.get_stock_move(stock_code, trade_date, source_scope="mixed", db=db)
 
 
 @router.get("/plate-strength", summary="通达信插件：实时板块强度")
 async def get_plate_strength(
     trade_date: Optional[date] = Query(None, description="交易日期，默认今天"),
+    db: AsyncSession = Depends(get_db),
 ):
-    return await tdx_plugin_service.get_plate_strength(trade_date)
+    return await tdx_plugin_service.get_plate_strength(trade_date, db=db)
 
 
 @router.get("/news", summary="通达信插件：聚合快讯")
@@ -45,8 +48,9 @@ async def get_news(
 async def get_ths_move(
     stock_code: str,
     trade_date: Optional[date] = Query(None, description="交易日期，默认今天"),
+    db: AsyncSession = Depends(get_db),
 ):
-    return await tdx_plugin_service.get_stock_move(stock_code, trade_date, source_scope="ths")
+    return await tdx_plugin_service.get_stock_move(stock_code, trade_date, source_scope="ths", db=db)
 
 
 @router.post("/calibration/compare", summary="通达信插件：黑盒对照差异报告")

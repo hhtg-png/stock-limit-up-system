@@ -72,6 +72,21 @@
         </div>
       </el-col>
 
+      <!-- 通达信插件入口 -->
+      <el-col :xs="24" :md="12">
+        <div class="card plugin-entry-card">
+          <div class="plugin-entry-content">
+            <div>
+              <h3>通达信看盘插件</h3>
+              <p>黑底嵌入版插件入口，适配通达信小窗口和普通浏览器。</p>
+            </div>
+            <el-button type="primary" @click="tdxPluginDialogVisible = true">
+              打开插件入口
+            </el-button>
+          </div>
+        </div>
+      </el-col>
+
       <!-- 大单设置 -->
       <el-col :xs="24" :md="12">
         <div class="card">
@@ -158,16 +173,42 @@
         </div>
       </el-col>
     </el-row>
+
+    <el-dialog
+      v-model="tdxPluginDialogVisible"
+      title="通达信看盘插件"
+      width="760px"
+      class="tdx-plugin-modal"
+      destroy-on-close
+    >
+      <div class="plugin-window">
+        <article
+          v-for="plugin in tdxPlugins"
+          :key="plugin.path"
+          class="plugin-window-card"
+        >
+          <div>
+            <strong>{{ plugin.name }}</strong>
+            <p>{{ plugin.desc }}</p>
+          </div>
+          <el-button size="small" type="primary" plain @click="openTdxPlugin(plugin.path)">
+            打开
+          </el-button>
+        </article>
+      </div>
+    </el-dialog>
   </div>
 </template>
 
 <script setup lang="ts">
 import { ref, reactive, onMounted } from 'vue'
+import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { getConfig, updateConfig, type UserConfigUpdate } from '@/api/config'
 import { useConfigStore } from '@/stores/config'
 
 const configStore = useConfigStore()
+const router = useRouter()
 
 const config = reactive({
   big_order_volume: 300,
@@ -190,6 +231,15 @@ const newWatchCode = ref('')
 const deepseekApiKey = ref('')
 const savingDeepSeek = ref(false)
 const notificationPermission = ref(Notification?.permission || 'default')
+const tdxPluginDialogVisible = ref(false)
+
+const tdxPlugins = [
+  { name: '涨停播报', desc: '实时封板、开板、回封和封单变化播报', path: '/tdx/ztlive/dark' },
+  { name: '股票异动解析联动', desc: '综合口径展示个股最近涨停与异动原因', path: '/tdx/yidong/600589/dark' },
+  { name: '实时板块强度', desc: '板块轮动、强度、量能和核心股入口', path: '/tdx/strong/dark' },
+  { name: '聚合快讯', desc: '市场快讯、韭研社识别区和题材库', path: '/tdx/news/dark' },
+  { name: '异动解析（同花顺版）', desc: '同花顺口径的概念和异动解析', path: '/tdx/thsyd/600589/dark' }
+]
 
 // 加载配置
 async function loadConfig() {
@@ -274,6 +324,11 @@ function removeWatch(code: string) {
   }
 }
 
+function openTdxPlugin(path: string) {
+  tdxPluginDialogVisible.value = false
+  router.push(path)
+}
+
 onMounted(() => {
   loadConfig()
 })
@@ -330,6 +385,64 @@ onMounted(() => {
     flex-wrap: wrap;
     align-items: center;
   }
+
+  .plugin-entry-card {
+    min-height: 156px;
+  }
+
+  .plugin-entry-content {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+
+    h3 {
+      margin-bottom: 10px;
+    }
+
+    p {
+      margin: 0;
+      color: #606266;
+      line-height: 1.6;
+    }
+  }
+}
+
+:deep(.tdx-plugin-modal .el-dialog__body) {
+  padding-top: 10px;
+}
+
+.plugin-window {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  padding: 12px;
+  border-radius: 6px;
+  background: #111219;
+}
+
+.plugin-window-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  min-height: 74px;
+  padding: 12px;
+  border: 1px solid #2d3748;
+  background: #161922;
+
+  strong {
+    color: #f0be83;
+    font-size: 14px;
+    font-weight: 600;
+  }
+
+  p {
+    margin: 6px 0 0;
+    color: #b0b0b0;
+    font-size: 12px;
+    line-height: 1.5;
+  }
 }
 
 @media (max-width: 767px) {
@@ -347,6 +460,11 @@ onMounted(() => {
     .card {
       padding: 14px;
       margin-bottom: 10px;
+    }
+
+    .plugin-entry-content {
+      align-items: flex-start;
+      flex-direction: column;
     }
 
     :deep(.el-form-item) {
@@ -367,6 +485,18 @@ onMounted(() => {
     :deep(.el-button) {
       max-width: 100%;
     }
+  }
+
+  :deep(.tdx-plugin-modal) {
+    width: calc(100vw - 24px) !important;
+  }
+
+  .plugin-window {
+    grid-template-columns: 1fr;
+  }
+
+  .plugin-window-card {
+    grid-template-columns: 1fr;
   }
 }
 </style>
