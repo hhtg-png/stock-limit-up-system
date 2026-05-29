@@ -19,7 +19,7 @@ class EdgeTtsService:
         voice: str = "zh-CN-XiaoyiNeural",
         rate: str = "+18%",
         volume: str = "+0%",
-        pitch: str = "+2Hz",
+        pitch: str = "+0Hz",
         max_text_length: int = 180,
     ):
         self.cache_dir = Path(cache_dir or "data/tts-cache")

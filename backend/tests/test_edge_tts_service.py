@@ -52,7 +52,7 @@ class EdgeTtsServiceTests(unittest.TestCase):
         self.assertEqual(created[0]["voice"], "zh-CN-XiaoyiNeural")
         self.assertEqual(created[0]["rate"], "+18%")
         self.assertEqual(created[0]["volume"], "+0%")
-        self.assertEqual(created[0]["pitch"], "+2Hz")
+        self.assertEqual(created[0]["pitch"], "+0Hz")
 
 
 if __name__ == "__main__":
