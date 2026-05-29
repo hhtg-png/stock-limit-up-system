@@ -164,8 +164,12 @@ onUnmounted(() => {
   --text-secondary: #b0b0b0;
   --positive-color: #ff6b6b;
   --stock-name: #f0be83;
-  min-height: 100vh;
-  overflow: auto;
+  height: 100dvh;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
   background: var(--bg-primary);
   color: var(--text-primary);
   font-size: 12px;

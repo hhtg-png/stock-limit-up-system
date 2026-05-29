@@ -3,6 +3,7 @@ from datetime import date, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from app.services.tdx_attribution_sources import PublicStockAttribution
 from app.services.tdx_external_sources import ExternalStockMove
 from app.services.tdx_plugin_service import TdxPluginService
 
@@ -72,6 +73,20 @@ class FakeExternalMoveProvider:
 
     async def get_review_moves(self, trade_date):
         return self.review_moves
+
+
+class FakeAttributionProvider:
+    def __init__(self, attributions=None):
+        self.attributions = attributions or {}
+        self.requested_codes = None
+
+    async def get_attributions(self, codes):
+        self.requested_codes = list(codes)
+        return {
+            code: self.attributions[code]
+            for code in self.requested_codes
+            if code in self.attributions
+        }
 
 
 class FakeNewsProvider:
@@ -342,7 +357,7 @@ class TdxPluginServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["items"][0]["reasons"][0]["title"], "字节算力+算力租赁+数据中心")
         self.assertIn("森华易腾", payload["items"][0]["reasons"][0]["content"])
 
-    async def test_limit_up_live_uses_public_review_source_for_board_and_reason(self):
+    async def test_limit_up_live_keeps_review_source_as_supplement_without_overriding_live_reason(self):
         service = TdxPluginService(
             external_move_provider=FakeExternalMoveProvider(
                 review_moves=[
@@ -368,9 +383,107 @@ class TdxPluginServiceTests(unittest.IsolatedAsyncioTestCase):
             payload = await service.get_limit_up_live(date(2026, 5, 28))
 
         self.assertEqual(payload["source_status"]["lwwhy_review"], "ok")
-        self.assertEqual(payload["items"][0]["target_status_label"], "9天5板")
-        self.assertEqual(payload["items"][0]["reason"], "电阻电容+数据中心（MLPC）+算力+充电桩")
+        self.assertEqual(payload["items"][0]["target_status_label"], "2天2板")
+        self.assertEqual(payload["items"][0]["reason"], "元器件催化")
         self.assertIn("芦苇复盘", payload["items"][0]["sources"])
+
+    async def test_limit_up_live_uses_fupan_and_ths_attribution_for_target_board_text(self):
+        service = TdxPluginService(
+            attribution_provider=FakeAttributionProvider({
+                "605177": PublicStockAttribution(
+                    stock_code="605177",
+                    stock_name="东亚药业",
+                    reason_title="医药(原料药)",
+                    plate="医药",
+                    concepts=["原料药", "医药"],
+                    source_name="复盘网/同花顺F10",
+                )
+            }),
+            enable_external_sources=True,
+        )
+        trade_date = date(2026, 5, 29)
+
+        with patch.object(
+            service.realtime_limit_up_service,
+            "get_realtime_limit_up_list",
+            AsyncMock(return_value=[make_limit_up_item("605177", "东亚药业", "化学制药", board=1)]),
+        ):
+            payload = await service.get_limit_up_live(trade_date)
+
+        self.assertEqual(payload["source_status"]["public_attribution"], "ok")
+        self.assertEqual(payload["items"][0]["reason"], "医药(原料药)")
+        self.assertEqual(payload["items"][0]["target_plate"], "医药")
+        self.assertEqual(payload["items"][0]["target_reason_summary"], "医药+原料药")
+        self.assertIn("复盘网/同花顺F10", payload["items"][0]["sources"])
+
+    async def test_limit_up_live_does_not_let_review_source_override_target_status_label(self):
+        service = TdxPluginService(
+            external_move_provider=FakeExternalMoveProvider(
+                review_moves=[
+                    ExternalStockMove(
+                        stock_code="605177",
+                        stock_name="东亚药业",
+                        trade_date=date(2026, 5, 29),
+                        title="医药(原料药)",
+                        content="公开涨停原因",
+                        board_label="2天2板",
+                        source_name="芦苇复盘",
+                    )
+                ]
+            ),
+            enable_external_sources=True,
+        )
+        trade_date = date(2026, 5, 29)
+
+        with patch.object(
+            service.realtime_limit_up_service,
+            "get_realtime_limit_up_list",
+            AsyncMock(return_value=[make_limit_up_item("605177", "东亚药业", "化学制药", board=1)]),
+        ):
+            payload = await service.get_limit_up_live(trade_date)
+
+        self.assertEqual(payload["items"][0]["target_status_label"], "首板")
+
+    async def test_limit_up_live_falls_back_to_database_records_when_realtime_pool_empty(self):
+        service = TdxPluginService()
+        trade_date = date(2026, 5, 28)
+        db = SequencedSession([
+            FakeRowsResult([
+                (
+                    "001259",
+                    "利仁科技",
+                    "家电",
+                    datetime(2026, 5, 28, 9, 35, 0),
+                    "家电+小家电",
+                    "家电",
+                    7,
+                    0,
+                    True,
+                    "sealed",
+                    datetime(2026, 5, 28, 9, 35, 0),
+                    12345.0,
+                    800000.0,
+                    12.3,
+                    "DB",
+                )
+            ]),
+            FakeRowsResult([("001259", trade_date)]),
+            FakeRowsResult([(trade_date,)]),
+        ])
+
+        with patch.object(
+            service.realtime_limit_up_service,
+            "get_realtime_limit_up_list",
+            AsyncMock(return_value=[]),
+        ):
+            payload = await service.get_limit_up_live(trade_date, db=db)
+
+        self.assertTrue(payload["is_cache"])
+        self.assertEqual(payload["source_status"]["limit_up_pool"], "empty")
+        self.assertEqual(payload["source_status"]["limit_up_db"], "ok")
+        self.assertEqual(payload["items"][0]["stock_code"], "001259")
+        self.assertEqual(payload["items"][0]["stock_name"], "利仁科技")
+        self.assertIn("数据库兜底", payload["warnings"][0])
 
     async def test_stock_move_defaults_to_latest_available_trade_date(self):
         service = TdxPluginService()

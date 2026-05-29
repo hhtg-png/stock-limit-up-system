@@ -71,6 +71,8 @@
             </tr>
           </tbody>
         </table>
+        <div v-if="loading && !events.length" class="state-line">加载中...</div>
+        <div v-else-if="errorText || !visibleEvents.length" class="state-line">{{ emptyText }}</div>
       </div>
     </section>
   </main>
@@ -86,12 +88,20 @@ import type { TdxLimitUpEvent, TdxPluginPayload } from '@/types/tdx-plugins'
 const payload = ref<TdxPluginPayload<TdxLimitUpEvent> | null>(null)
 const activePlate = ref('')
 const hideOpened = ref(false)
+const loading = ref(false)
+const errorText = ref('')
 const { enqueuePluginSpeech, unlockSpeech, speechUnlocked } = useSpeech()
 const { openStock } = useTdxStockLink()
 let refreshTimer = 0
 
 const plateFilters = computed(() => payload.value?.plate_filters || [])
 const events = computed(() => payload.value?.items || [])
+const emptyText = computed(() => {
+  if (errorText.value) return errorText.value
+  if (payload.value?.warnings?.length) return payload.value.warnings[0]
+  if (activePlate.value) return '当前板块暂无涨停播报数据'
+  return '暂无涨停播报数据'
+})
 const visibleEvents = computed(() => events.value.filter(item => {
   if (hideOpened.value && !item.is_sealed) return false
   if (!activePlate.value) return true
@@ -99,10 +109,19 @@ const visibleEvents = computed(() => events.value.filter(item => {
 }))
 
 async function loadData() {
-  const next = await getTdxLimitUpLive()
-  payload.value = next
-  for (const item of next.items.slice(0, 3)) {
-    enqueuePluginSpeech(`${item.stock_name}${item.target_status_label || item.event_label}`, item.event_id)
+  loading.value = true
+  errorText.value = ''
+  try {
+    const next = await getTdxLimitUpLive()
+    payload.value = next
+    for (const item of next.items.slice(0, 3)) {
+      enqueuePluginSpeech(`${item.stock_name}${item.target_status_label || item.event_label}`, item.event_id)
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : '接口请求失败'
+    errorText.value = `涨停播报加载失败：${message}`
+  } finally {
+    loading.value = false
   }
 }
 
@@ -215,6 +234,7 @@ onUnmounted(() => {
 }
 
 .zt-body {
+  position: relative;
   flex: 1;
   min-height: 275px;
   overflow: auto;
@@ -249,6 +269,13 @@ onUnmounted(() => {
 
 .target-table tr:hover td {
   background: #1f2937;
+}
+
+.state-line {
+  padding: 12px 8px;
+  border-bottom: 1px solid var(--border-color);
+  color: #8da3bd;
+  line-height: 1.5;
 }
 
 .stockname {

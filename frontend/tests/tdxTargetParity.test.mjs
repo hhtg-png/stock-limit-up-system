@@ -26,6 +26,8 @@ assert.match(news, /topicItems/, '聚合快讯 should derive a topic-library fee
 assert.match(news, /layui-timeline/, '聚合快讯 should render target-style timeline markup')
 assert.match(news, /展开/, '聚合快讯 should expose target-style expand action')
 assert.match(news, /target-news/, '聚合快讯 should use a dedicated target parity class')
+assert.match(news, /height:\s*100dvh/, '聚合快讯 should own viewport height so its content can scroll inside the TDX iframe/window')
+assert.match(news, /overflow-y:\s*auto/, '聚合快讯 should allow vertical scrolling when body overflow is hidden')
 
 const strong = read('src/views/tdx/TdxPlateStrength.vue')
 assert.match(strong, /target-strong/, '实时板块强度 should use a dedicated target black layout')

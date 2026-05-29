@@ -18,6 +18,8 @@ const limitUp = read('src/views/tdx/TdxLimitUpLive.vue')
 assert.match(limitUp, /封死涨停/, 'limit-up plugin should render sealed labels')
 assert.match(limitUp, /enqueuePluginSpeech/, 'limit-up plugin should enqueue speech')
 assert.match(limitUp, /openStock/, 'limit-up plugin should link stocks through the TDX bridge')
+assert.match(limitUp, /errorText/, 'limit-up plugin should expose request errors instead of rendering a blank table')
+assert.match(limitUp, /emptyText/, 'limit-up plugin should explain empty data instead of rendering a blank table')
 
 const plate = read('src/views/tdx/TdxPlateStrength.vue')
 assert.match(plate, /strength_score/, 'plate plugin should render strength scores')
