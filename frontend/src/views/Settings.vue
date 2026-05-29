@@ -215,8 +215,10 @@ import { ref, reactive, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import { getConfig, updateConfig, type UserConfigUpdate } from '@/api/config'
 import { useConfigStore } from '@/stores/config'
+import { useAlertStore } from '@/stores/alert'
 
 const configStore = useConfigStore()
+const alertStore = useAlertStore()
 
 const config = reactive({
   big_order_volume: 300,
@@ -256,6 +258,9 @@ async function loadConfig() {
     const data = await getConfig()
     Object.assign(config, data)
     configStore.setConfig(data)
+    alertStore.setEnabled(data.alert_limit_up_enabled)
+    alertStore.setSoundEnabled(data.alert_sound_enabled)
+    alertStore.setDesktopEnabled(data.alert_desktop_enabled)
   } catch (e) {
     console.error('Load config error:', e)
   }
@@ -267,6 +272,9 @@ async function saveConfig() {
     const payload = buildUserConfigPayload()
     await updateConfig(payload)
     configStore.setConfig(payload)
+    alertStore.setEnabled(Boolean(payload.alert_limit_up_enabled))
+    alertStore.setSoundEnabled(payload.alert_sound_enabled as boolean)
+    alertStore.setDesktopEnabled(Boolean(payload.alert_desktop_enabled))
     ElMessage.success('保存成功')
   } catch (e) {
     console.error('Save config error:', e)

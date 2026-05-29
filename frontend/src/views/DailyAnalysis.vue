@@ -3,7 +3,6 @@
     <div class="toolbar card">
       <div class="toolbar-title">
         <h3>每日分析</h3>
-        <span>近10日涨停/触板池自动识别，支持人工修正</span>
       </div>
       <div class="toolbar-actions">
         <el-radio-group v-model="analysisSession" class="session-toggle">
@@ -405,33 +404,26 @@ function sessionLabel(session: DailyAnalysisSession): string {
 }
 
 .toolbar {
+  min-height: 52px;
+  padding: 12px 14px;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 16px;
+  gap: 12px;
 
   .toolbar-title {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-
     h3 {
       margin: 0;
       font-size: 16px;
       font-weight: 600;
       color: #1f1f1f;
     }
-
-    span {
-      font-size: 12px;
-      color: #8c8c8c;
-    }
   }
 
   .toolbar-actions {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: 8px;
     flex-wrap: wrap;
   }
 }
@@ -583,7 +575,7 @@ function sessionLabel(session: DailyAnalysisSession): string {
   .toolbar {
     align-items: flex-start;
     flex-direction: column;
-    padding: 12px;
+    padding: 12px 14px;
 
     .toolbar-actions {
       width: 100%;

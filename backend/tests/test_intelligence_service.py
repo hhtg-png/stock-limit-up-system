@@ -603,6 +603,76 @@ class IntelligenceServiceTests(unittest.TestCase):
         self.assertEqual(by_name["美格智能"]["summary"], "高算力AI模组供应商，受益具身智能硬件底座需求。")
         self.assertEqual(by_name["容大感光"]["reason"], "日系龙头提价15-25%，供需紧平衡。")
 
+    def test_changed_daily_sync_refreshes_stale_document_stock_analysis(self):
+        today = today_cn()
+        today_update_time = str(
+            int(datetime(today.year, today.month, today.day, 9, 30, tzinfo=CN_TZ).timestamp() * 1000)
+        )
+        pages = {
+            ("daily", "", ""): {
+                "code": 0,
+                "knowledge_list": [
+                    md_item(
+                        media_id="markdown_changed_stocks",
+                        title=f"{today.isoformat()}-新增个股资讯.md",
+                        md5_sum="changed-stock-md5",
+                        update_time=today_update_time,
+                        jump_url="https://example.com/changed-stock.md",
+                        raw_file_url="https://example.com/changed-stock.md",
+                    )
+                ],
+                "is_end": True,
+                "next_cursor": "",
+                "version": "root-v1",
+                "knowledge_base_info": {"basic_info": {"name": "每日复盘更新"}},
+                "current_path": [{"name": "每日复盘更新", "folder_id": "root"}],
+            }
+        }
+        contents = {
+            "https://example.com/changed-stock.md": "| 板块 | 核心标的 | 催化逻辑 |\n| 物理AI | 美格智能、容大感光 | Figure直播、PCB油墨提价 |"
+        }
+        summary = StockAnalysisSummaryClient()
+        service = IntelligenceService(
+            ima_client=FakeImaClient(pages, contents=contents),
+            summary_client=summary,
+            sources=[ImaKnowledgeSource(key="daily", name="每日复盘更新", kind="daily", share_id="daily")],
+        )
+
+        async def run():
+            async with self.Session() as session:
+                session.add(KnowledgeDocument(
+                    source_key="daily",
+                    source_name="每日复盘更新",
+                    share_id="daily",
+                    media_id="markdown_old_stocks",
+                    title=f"{today.isoformat()}-旧个股资讯.md",
+                    media_type=7,
+                    media_type_name="MD",
+                    md5_sum="old-stock-md5",
+                    update_time=today_update_time,
+                    abstract="核心标的表格。",
+                    content_text="| 板块 | 核心标的 | 催化逻辑 |\n| 物理AI | 美格智能、容大感光 | Figure直播、PCB油墨提价 |",
+                    content_hash="old-stock-hash",
+                    summary_json={"summary": "旧摘要，尚无个股结构化总结。", "model_status": "ready"},
+                    summary_status="ready",
+                    trade_date=today,
+                ))
+                await session.commit()
+                result = await service.sync_all(session, force_daily=False)
+                documents = (await session.execute(select(KnowledgeDocument))).scalars().all()
+                return result, documents
+
+        result, documents = asyncio.run(run())
+        stocks = result["daily_info"]["summary"]["mentioned_stocks"]
+        by_title = {document.title: document for document in documents}
+
+        self.assertEqual(
+            summary.document_calls,
+            [f"{today.isoformat()}-新增个股资讯.md", f"{today.isoformat()}-旧个股资讯.md"],
+        )
+        self.assertEqual(by_title[f"{today.isoformat()}-旧个股资讯.md"].summary_json["stock_analysis_status"], "ready")
+        self.assertTrue(any(item["name"] == "美格智能" for item in stocks))
+
     def test_serialized_stock_mentions_filter_previous_generic_cache(self):
         service = IntelligenceService(
             ima_client=FakeImaClient({}),

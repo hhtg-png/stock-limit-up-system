@@ -4,7 +4,6 @@
       <div class="summary-main">
         <div class="summary-copy">
           <h3>市场复盘统计</h3>
-          <p>用复盘指标跟踪连板高度、晋级率、情绪与量能变化。</p>
         </div>
 
         <div class="summary-controls">
@@ -38,10 +37,7 @@
       <el-col :xs="24" :lg="12">
         <div class="card chart-card">
           <div class="card-header">
-            <div>
-              <h3>连板高度</h3>
-              <p>龙头高度、次高板高度与创业板高度。</p>
-            </div>
+            <h3>连板高度</h3>
           </div>
           <div ref="boardHeightChartRef" class="chart-container review-main-chart"></div>
         </div>
@@ -49,10 +45,7 @@
       <el-col :xs="24" :lg="12">
         <div class="card chart-card">
           <div class="card-header">
-            <div>
-              <h3>晋级率</h3>
-              <p>首板进二板、连板晋级与封板率联动观察。</p>
-            </div>
+            <h3>晋级率</h3>
           </div>
           <div ref="promotionRateChartRef" class="chart-container review-main-chart"></div>
         </div>
@@ -63,10 +56,7 @@
       <el-col :xs="24" :lg="12">
         <div class="card chart-card">
           <div class="card-header">
-            <div>
-              <h3>昨日涨停平均涨幅</h3>
-              <p>昨日涨停与昨日连板次日反馈对比。</p>
-            </div>
+            <h3>昨日涨停平均涨幅</h3>
           </div>
           <div ref="yesterdayChangeChartRef" class="chart-container"></div>
         </div>
@@ -74,10 +64,7 @@
       <el-col :xs="24" :lg="12">
         <div class="card chart-card">
           <div class="card-header">
-            <div>
-              <h3>涨跌停趋势</h3>
-              <p>连板家数、涨停与跌停数量的情绪脉冲。</p>
-            </div>
+            <h3>涨跌停趋势</h3>
           </div>
           <div ref="limitTrendChartRef" class="chart-container"></div>
         </div>
@@ -88,10 +75,7 @@
       <el-col :xs="24" :lg="12">
         <div class="card chart-card">
           <div class="card-header">
-            <div>
-              <h3>沪深量能与涨跌家数</h3>
-              <p>量能与非ST涨跌家数的市场广度对照。</p>
-            </div>
+            <h3>沪深量能与涨跌家数</h3>
           </div>
           <div ref="breadthChartRef" class="chart-container"></div>
         </div>
@@ -99,10 +83,7 @@
       <el-col :xs="24" :lg="12">
         <div class="card chart-card">
           <div class="card-header">
-            <div>
-              <h3>涨停/炸板成交额</h3>
-              <p>封板成交额与炸板成交额的资金去向。</p>
-            </div>
+            <h3>涨停/炸板成交额</h3>
           </div>
           <div ref="amountChartRef" class="chart-container"></div>
         </div>
@@ -113,10 +94,7 @@
       <el-col :xs="24" :lg="9">
         <div class="card detail-card">
           <div class="card-header">
-            <div>
-              <h3>连板梯队</h3>
-              <p>当前复盘日的高标结构与封板状态。</p>
-            </div>
+            <h3>连板梯队</h3>
           </div>
 
           <div v-if="ladderLevels.length" class="ladder-list">
@@ -168,10 +146,7 @@
       <el-col :xs="24" :lg="15">
         <div class="card detail-card">
           <div class="card-header">
-            <div>
-              <h3>复盘明细</h3>
-              <p>按连板高度与成交额排序的个股复盘列表。</p>
-            </div>
+            <h3>复盘明细</h3>
           </div>
 
           <div class="detail-summary">
@@ -1205,26 +1180,26 @@ onUnmounted(() => {
 .statistics {
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 14px;
 }
 
 .card {
   background: #fff;
   border-radius: 8px;
-  padding: 16px;
+  padding: 14px 16px;
 }
 
 .summary-card {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 10px;
 }
 
 .summary-main {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 16px;
+  gap: 12px;
   flex-wrap: wrap;
 }
 
@@ -1235,21 +1210,15 @@ onUnmounted(() => {
     font-weight: 600;
     color: #262626;
   }
-
-  p {
-    margin: 6px 0 0;
-    color: #666;
-    font-size: 13px;
-  }
 }
 
 .summary-meta {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 10px;
   flex-wrap: wrap;
   color: #666;
-  font-size: 13px;
+  font-size: 12px;
 }
 
 .summary-controls {
@@ -1262,26 +1231,20 @@ onUnmounted(() => {
 
 .chart-card,
 .detail-card {
-  margin-bottom: 16px;
+  margin-bottom: 14px;
 }
 
 .card-header {
   display: flex;
   justify-content: space-between;
-  align-items: flex-start;
-  margin-bottom: 16px;
+  align-items: center;
+  margin-bottom: 12px;
 
   h3 {
     margin: 0;
     font-size: 16px;
     font-weight: 600;
     color: #262626;
-  }
-
-  p {
-    margin: 6px 0 0;
-    color: #666;
-    font-size: 13px;
   }
 }
 
@@ -1490,7 +1453,7 @@ onUnmounted(() => {
 
 @media (max-width: 767px) {
   .card {
-    padding: 14px;
+    padding: 12px;
   }
 
   .chart-container {

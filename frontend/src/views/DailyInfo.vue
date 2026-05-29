@@ -3,7 +3,6 @@
     <div class="toolbar">
       <div class="toolbar-title">
         <h3>每日资讯</h3>
-        <span>知识库增量同步后保存每日摘要，最新日期显示在最上方</span>
       </div>
       <div class="toolbar-actions">
         <el-input
@@ -68,11 +67,11 @@
           <aside class="history-panel">
             <div class="section-header">
               <h4>{{ searchKeyword.trim() ? '搜索结果' : '历史摘要' }}</h4>
-              <el-tag size="small" type="info">{{ historyItems.length }}</el-tag>
+              <el-tag size="small" type="info">{{ displayHistoryItems.length }}</el-tag>
             </div>
-            <div v-if="historyItems.length" class="history-list">
+            <div v-if="displayHistoryItems.length" class="history-list">
               <button
-                v-for="item in historyItems"
+                v-for="item in displayHistoryItems"
                 :key="historyKey(item)"
                 class="history-item"
                 :class="{ active: isActiveHistory(item) }"
@@ -136,9 +135,9 @@
             <section class="panel">
               <div class="section-header">
                 <h4>个股提及</h4>
-                <el-tag size="small" type="warning">DeepSeek 总结，不构成推荐</el-tag>
+                <el-tag size="small" type="warning">{{ mentionedStocks.length }} 个 · 不构成推荐</el-tag>
               </div>
-              <el-table v-if="mentionedStocks.length" :data="mentionedStocks" size="small" class="stock-table">
+              <el-table v-if="mentionedStocks.length" :data="mentionedStocks" size="small" class="stock-table desktop-stock-table">
                 <el-table-column label="方向" min-width="130">
                   <template #default="{ row }">
                     <el-tag v-if="row.sector" size="small" effect="plain">{{ row.sector }}</el-tag>
@@ -164,6 +163,20 @@
                 <el-table-column prop="reason" label="催化依据" min-width="220" />
                 <el-table-column prop="source_title" label="来源" min-width="180" />
               </el-table>
+              <div v-if="mentionedStocks.length" class="stock-card-list">
+                <article v-for="stock in mentionedStocks" :key="stockKey(stock)" class="stock-card">
+                  <header>
+                    <strong>{{ stock.name }}</strong>
+                    <span v-if="stock.code">{{ stock.code }}</span>
+                    <el-tag v-if="stock.sector" size="small" effect="plain">{{ stock.sector }}</el-tag>
+                  </header>
+                  <p>{{ stock.summary || stock.reason || '-' }}</p>
+                  <footer>
+                    <span>{{ stock.reason || '暂无催化依据' }}</span>
+                    <em>{{ stock.source_title || '未知来源' }}</em>
+                  </footer>
+                </article>
+              </div>
               <span v-else class="empty-text">暂无个股提及</span>
             </section>
 
@@ -297,9 +310,11 @@ const mainLines = computed(() => stringList(dailyInfo.value?.summary.main_lines)
 const catalysts = computed(() => stringList(dailyInfo.value?.summary.catalysts))
 const risks = computed(() => stringList(dailyInfo.value?.summary.risks))
 const sourceTitles = computed(() => stringList(dailyInfo.value?.summary.source_titles))
-const mentionedStocks = computed<DailyInfoMentionedStock[]>(() => stockList(
-  dailyInfo.value?.summary.mentioned_stocks || dailyInfo.value?.summary.stocks
+const stockMentionSource = computed(() => firstNonEmptyStockList(
+  dailyInfo.value?.summary.mentioned_stocks,
+  dailyInfo.value?.summary.stocks
 ))
+const mentionedStocks = computed<DailyInfoMentionedStock[]>(() => stockList(stockMentionSource.value))
 const sourceRefs = computed<DailyInfoSource[]>(() => {
   if (dailyInfo.value?.sources?.length) return dailyInfo.value.sources
   return sourceTitles.value.map((title, index) => ({
@@ -310,6 +325,7 @@ const sourceRefs = computed<DailyInfoSource[]>(() => {
     media_type_name: '',
   }))
 })
+const displayHistoryItems = computed<DailyInfoResponse[]>(() => latestHistoryByDate(historyItems.value))
 const sameDateVersions = computed<DailyInfoResponse[]>(() => {
   const current = dailyInfo.value
   if (!current) return []
@@ -596,6 +612,16 @@ function isActiveHistory(item: DailyInfoResponse): boolean {
   return Boolean(dailyInfo.value && historyKey(item) === historyKey(dailyInfo.value))
 }
 
+function latestHistoryByDate(items: DailyInfoResponse[]): DailyInfoResponse[] {
+  const latestHistoryByDate = new Map<string, DailyInfoResponse>()
+  for (const item of items.slice().sort(compareHistoryItems)) {
+    if (!latestHistoryByDate.has(item.trade_date)) {
+      latestHistoryByDate.set(item.trade_date, item)
+    }
+  }
+  return Array.from(latestHistoryByDate.values()).sort(compareHistoryItems)
+}
+
 function historyKey(item: DailyInfoResponse): string {
   if (item.version_id) return `version-${item.version_id}`
   return `digest-${item.trade_date}-${item.digest_id || item.id || 'latest'}-${item.generated_at || ''}`
@@ -627,6 +653,17 @@ function stockList(value: unknown): DailyInfoMentionedStock[] {
     .filter(item => Boolean(item.name))
 }
 
+function firstNonEmptyStockList(...values: unknown[]): unknown[] {
+  for (const value of values) {
+    if (Array.isArray(value) && value.length) return value
+  }
+  return []
+}
+
+function stockKey(stock: DailyInfoMentionedStock): string {
+  return `${stock.code || stock.name}-${stock.source_title || ''}-${stock.summary || stock.reason || ''}`
+}
+
 function changedCount(sources: Record<string, { changed_documents: number }>): number {
   return Object.values(sources).reduce((total, source) => total + source.changed_documents, 0)
 }
@@ -645,29 +682,24 @@ function formatTime(value?: string | null): string {
 }
 
 .toolbar {
-  min-height: 64px;
-  padding: 14px 16px;
+  min-height: 52px;
+  padding: 12px 14px;
   background: #fff;
   border: 1px solid #e5e7eb;
   border-radius: 6px;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 16px;
+  gap: 12px;
 }
 
 .toolbar-title {
   min-width: 0;
 
   h3 {
-    margin: 0 0 4px;
+    margin: 0;
     font-size: 18px;
     color: #1f2937;
-  }
-
-  span {
-    color: #6b7280;
-    font-size: 13px;
   }
 }
 
@@ -708,6 +740,8 @@ function formatTime(value?: string | null): string {
 .history-panel {
   position: sticky;
   top: 12px;
+  max-height: calc(100dvh - 120px);
+  overflow: hidden;
   padding: 14px;
   background: #fff;
   border: 1px solid #e5e7eb;
@@ -718,6 +752,9 @@ function formatTime(value?: string | null): string {
   display: flex;
   flex-direction: column;
   gap: 8px;
+  max-height: calc(100dvh - 190px);
+  overflow-y: auto;
+  padding-right: 3px;
 }
 
 .history-item {
@@ -910,6 +947,55 @@ function formatTime(value?: string | null): string {
   }
 }
 
+.stock-card-list {
+  display: none;
+}
+
+.stock-card {
+  padding: 12px;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  background: #fff;
+
+  header {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 8px;
+  }
+
+  strong {
+    color: #111827;
+    font-size: 15px;
+  }
+
+  header span {
+    color: #6b7280;
+    font-size: 12px;
+  }
+
+  p {
+    margin: 0;
+    color: #374151;
+    line-height: 1.7;
+  }
+
+  footer {
+    display: grid;
+    gap: 4px;
+    margin-top: 8px;
+    color: #6b7280;
+    font-size: 12px;
+    line-height: 1.5;
+  }
+
+  em {
+    color: #9ca3af;
+    font-style: normal;
+  }
+}
+
 .stock-name {
   color: #111827;
   font-weight: 600;
@@ -996,6 +1082,25 @@ function formatTime(value?: string | null): string {
 
   .history-panel {
     position: static;
+    max-height: none;
+    overflow: visible;
+  }
+
+  .history-list {
+    flex-direction: row;
+    max-height: none;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 0 0 2px;
+    scroll-snap-type: x proximity;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .history-item {
+    flex: 0 0 220px;
+    width: 220px;
+    min-height: 96px;
+    scroll-snap-align: start;
   }
 
   .overview-actions {
@@ -1006,6 +1111,15 @@ function formatTime(value?: string | null): string {
   .summary-row,
   .two-column {
     grid-template-columns: 1fr;
+  }
+
+  .desktop-stock-table {
+    display: none;
+  }
+
+  .stock-card-list {
+    display: grid;
+    gap: 10px;
   }
 }
 </style>

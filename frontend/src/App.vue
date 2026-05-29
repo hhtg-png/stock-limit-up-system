@@ -30,7 +30,7 @@
               <span>每日分析</span>
             </el-menu-item>
             <el-menu-item index="/daily-info">
-              <el-icon><Calendar /></el-icon>
+              <el-icon><Document /></el-icon>
               <span>每日资讯</span>
             </el-menu-item>
             <el-menu-item index="/jiege-mode">
@@ -127,7 +127,7 @@ import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRoute } from 'vue-router'
 import {
   DataBoard, PieChart, Setting,
-  Fold, Expand, Bell, TrendCharts, Calendar
+  Fold, Expand, Bell, TrendCharts, Calendar, Document
 } from '@element-plus/icons-vue'
 import zhCn from 'element-plus/dist/locale/zh-cn.mjs'
 import AlertPanel from '@/components/alert/AlertPanel.vue'
@@ -152,7 +152,7 @@ const mobileNavItems = [
   { path: '/', label: '监控', icon: DataBoard },
   { path: '/statistics', label: '报表', icon: PieChart },
   { path: '/daily-analysis', label: '分析', icon: Calendar },
-  { path: '/daily-info', label: '资讯', icon: Calendar },
+  { path: '/daily-info', label: '资讯', icon: Document },
   { path: '/jiege-mode', label: '杰哥', icon: TrendCharts },
   { path: '/continuous', label: '连板', icon: TrendCharts },
   { path: '/settings', label: '设置', icon: Setting }
@@ -214,9 +214,9 @@ const loadAlertConfig = async () => {
 const toggleAlert = async (enabled: boolean) => {
   alertStore.setEnabled(enabled)
   configStore.setConfig({ alert_limit_up_enabled: enabled })
-  const { announceEnabled, announceDisabled } = useSpeech()
+  const { announceDisabled } = useSpeech()
   if (enabled) {
-    announceEnabled()
+    unlockSpeech({ silent: true })
   } else {
     announceDisabled()
   }
@@ -229,7 +229,7 @@ const toggleAlert = async (enabled: boolean) => {
 }
 
 const enableMobileSpeech = () => {
-  unlockSpeech()
+  unlockSpeech({ silent: true })
 }
 
 // 更新时间

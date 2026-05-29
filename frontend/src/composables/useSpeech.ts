@@ -38,12 +38,26 @@ const speechVoiceName = ref('')
 const speechUnlocked = ref(false)
 let voicesListenerReady = false
 
+type UnlockSpeechOptions = {
+  silent?: boolean
+}
+
+function normalizeUnlockSpeechOptions(options: UnlockSpeechOptions | Event): UnlockSpeechOptions {
+  if (typeof Event !== 'undefined' && options instanceof Event) return {}
+  return options as UnlockSpeechOptions
+}
+
 // 动态获取开关状态
 function getSpeechEnabled(): boolean {
   try {
     const configStore = useConfigStore()
     const alertStore = useAlertStore()
-    return alertStore.enabled && configStore.config.alert_limit_up_enabled
+    return Boolean(
+      alertStore.enabled &&
+      alertStore.soundEnabled &&
+      configStore.config.alert_limit_up_enabled &&
+      configStore.config.alert_sound_enabled
+    )
   } catch {
     return false
   }
@@ -174,20 +188,22 @@ function speakInternal(text: string, force = false) {
 }
 
 // 播报函数（检查开关）
-function speak(text: string) {
-  if (!getSpeechEnabled() || !text) return
-  if (!canSpeakNow()) return
+function speak(text: string): boolean {
+  if (!getSpeechEnabled() || !text) return false
+  if (!canSpeakNow()) return false
   
   speechQueue.push(text)
   processQueue()
+  return true
 }
 
-function enqueuePluginSpeech(text: string, key?: string) {
-  if (!getSpeechEnabled() || !text) return
+function enqueuePluginSpeech(text: string, key?: string): boolean {
+  if (!getSpeechEnabled() || !text) return false
+  if (!canSpeakNow()) return false
   const speechKey = key || `plugin-${text}-${new Date().toDateString()}`
-  if (pluginSpeechKeys.has(speechKey)) return
+  if (pluginSpeechKeys.has(speechKey)) return false
   pluginSpeechKeys.add(speechKey)
-  speak(text)
+  return speak(text)
 }
 
 function processQueue() {
@@ -220,8 +236,9 @@ function processQueue() {
   }
 }
 
-function unlockSpeech(): boolean {
+function unlockSpeech(options: UnlockSpeechOptions | Event = {}): boolean {
   if (!hasSpeechSupport()) return false
+  normalizeUnlockSpeechOptions(options)
 
   speechUnlocked.value = true
   setupSpeechVoices()
@@ -229,7 +246,6 @@ function unlockSpeech(): boolean {
   if (hasWebSpeechSupport()) {
     window.speechSynthesis.resume()
   }
-  speakInternal('语音播报已启用', true)
   return true
 }
 
@@ -269,7 +285,7 @@ function clearAnnounced() {
 
 // 测试播报
 function testSpeech() {
-  speakInternal('语音播报功能正常')
+  speakInternal('语音播报功能正常', true)
 }
 
 // 播报回封

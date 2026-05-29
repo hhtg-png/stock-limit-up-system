@@ -674,7 +674,7 @@ class IntelligenceService:
                 target_date,
                 allow_latest_fallback=target_date == today,
                 force=should_rebuild_daily,
-                refresh_stale_documents=force_daily,
+                refresh_stale_documents=force_daily or should_rebuild_daily,
             )
         jiege = await self.build_jiege_mode(db, today, allow_latest_fallback=True)
         return {"sources": results, "daily_info": daily, "jiege_mode": jiege}

@@ -11,7 +11,7 @@ test('board height chart displays stock labels from daily rows', () => {
   assert.match(source, /function getBoardLabelFormatter/, 'chart point labels should have a formatter')
   assert.match(source, /function shouldShowBoardHeightLabel/, 'labels should be filtered to avoid crowding')
   assert.match(source, /function formatBoardHeightTooltip/, 'full labels should remain available in tooltip')
-  assert.match(source, /tooltip:\s*\{\s*trigger: 'axis',\s*formatter: formatBoardHeightTooltip/s)
+  assert.match(source, /tooltip:\s*\{[\s\S]*trigger: 'axis'[\s\S]*formatter: formatBoardHeightTooltip/s)
   assert.match(source, /label:\s*getBoardHeightLabelOption\('max_board_label', 'top', \[0, -6\]\)/)
   assert.match(source, /label:\s*getBoardHeightLabelOption\('second_board_label', 'bottom', \[0, 16\]\)/)
   assert.match(source, /label:\s*getBoardHeightLabelOption\('gem_board_label', 'bottom', \[0, 28\]\)/)

@@ -3,7 +3,6 @@
     <div class="toolbar">
       <div class="toolbar-title">
         <h3>杰哥交易模式</h3>
-        <span>从核心知识库规则和项目复盘数据生成交易预判、验证和风险否决</span>
       </div>
       <div class="toolbar-actions">
         <el-date-picker
@@ -323,27 +322,22 @@ function formatTime(value?: string | null): string {
 }
 
 .toolbar {
-  min-height: 64px;
-  padding: 14px 16px;
+  min-height: 52px;
+  padding: 12px 14px;
   background: #fff;
   border: 1px solid #e5e7eb;
   border-radius: 6px;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 16px;
+  gap: 12px;
 }
 
 .toolbar-title {
   h3 {
-    margin: 0 0 4px;
+    margin: 0;
     font-size: 18px;
     color: #1f2937;
-  }
-
-  span {
-    color: #6b7280;
-    font-size: 13px;
   }
 }
 

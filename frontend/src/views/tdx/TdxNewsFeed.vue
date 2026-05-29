@@ -6,7 +6,7 @@
       <label class="audiotext">
         语音
         <span class="switch">
-          <input type="checkbox" :checked="speechUnlocked" @change="unlockSpeech" />
+          <input type="checkbox" :checked="speechUnlocked" @change="handleSpeechToggle" />
           <span class="slider round"></span>
         </span>
       </label>
@@ -88,7 +88,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { getTdxNews } from '@/api/tdx-plugins'
 import { useSpeech } from '@/composables/useSpeech'
 import { useTdxPluginRealtime } from '@/composables/useWebSocket'
@@ -99,7 +99,12 @@ const loading = ref(false)
 const expandedNewsIds = ref<Set<string>>(new Set())
 const { enqueuePluginSpeech, unlockSpeech, speechUnlocked } = useSpeech()
 const { realtimeNewsItems } = useTdxPluginRealtime()
+const spokenNewsKeys = new Set<string>()
+const knownNewsKeys = new Set<string>()
+const IMPORTANT_NEWS_THRESHOLD = 70
+const VISIBLE_SPEECH_LIMIT = 3
 let refreshTimer = 0
+let hasLoadedInitialSnapshot = false
 
 const items = computed(() => mergeRealtimeNews(realtimeNewsItems.value, payload.value?.items || []))
 const identifyItems = computed(() => items.value.slice(0, 8))
@@ -127,16 +132,82 @@ function mergeRealtimeNews(realtimeItems: readonly TdxNewsItem[], snapshotItems:
 async function loadData() {
   loading.value = true
   try {
-    payload.value = await getTdxNews({ limit: 80 })
-    const important = payload.value.items.find(item => item.importance >= 80)
-    if (important) speakNews(important)
+    const nextPayload = await getTdxNews({ limit: 80 })
+    payload.value = nextPayload
+    if (!hasLoadedInitialSnapshot) {
+      markKnownNews(nextPayload.items)
+      hasLoadedInitialSnapshot = true
+    } else {
+      speakNewNews(nextPayload.items)
+    }
   } finally {
     loading.value = false
   }
 }
 
+function newsKey(item: TdxNewsItem) {
+  return `news-${item.news_id || `${item.time}-${item.title}`}`
+}
+
+function normalizeSpeechPart(value?: string) {
+  return (value || '').replace(/\s+/g, ' ').trim()
+}
+
+function newsSpeechText(item: TdxNewsItem) {
+  const source = normalizeSpeechPart(item.source)
+  const title = normalizeSpeechPart(item.title)
+  const content = normalizeSpeechPart(item.content)
+  const digest = content && content !== title ? `，${content.slice(0, 90)}` : ''
+  return `${source ? `${source}，` : ''}${title}${digest}`.slice(0, 180)
+}
+
+function shouldSpeakNews(item: TdxNewsItem) {
+  return Boolean(item.news_id && item.title && (item.importance || 0) >= IMPORTANT_NEWS_THRESHOLD)
+}
+
+function markKnownNews(newsItems: readonly TdxNewsItem[]) {
+  for (const item of newsItems) {
+    knownNewsKeys.add(newsKey(item))
+  }
+}
+
 function speakNews(item: TdxNewsItem) {
-  enqueuePluginSpeech(item.title, `news-${item.news_id}`)
+  if (!shouldSpeakNews(item)) return false
+  const key = newsKey(item)
+  if (spokenNewsKeys.has(key)) return false
+  const queued = enqueuePluginSpeech(newsSpeechText(item), key)
+  if (queued) {
+    spokenNewsKeys.add(key)
+    knownNewsKeys.add(key)
+  }
+  return queued
+}
+
+function speakVisibleNews(limit = VISIBLE_SPEECH_LIMIT) {
+  let spokenCount = 0
+  for (const item of items.value.filter(shouldSpeakNews)) {
+    if (speakNews(item)) spokenCount += 1
+    if (spokenCount >= limit) break
+  }
+}
+
+function speakNewNews(newsItems: readonly TdxNewsItem[], limit = VISIBLE_SPEECH_LIMIT) {
+  let spokenCount = 0
+  for (const item of newsItems) {
+    const key = newsKey(item)
+    const wasKnown = knownNewsKeys.has(key)
+    knownNewsKeys.add(key)
+    if (!wasKnown && speakNews(item)) spokenCount += 1
+    if (spokenCount >= limit) break
+  }
+}
+
+function handleSpeechToggle(event: Event) {
+  const input = event.target as HTMLInputElement | null
+  if (input && !input.checked) return
+  if (unlockSpeech({ silent: true })) {
+    window.setTimeout(() => speakVisibleNews(), 0)
+  }
 }
 
 function openUrl(url?: string) {
@@ -163,8 +234,15 @@ function topicTitle(item: TdxNewsItem) {
 }
 
 onMounted(() => {
-  loadData()
+  loadData().then(() => {
+    if (speechUnlocked.value) speakVisibleNews()
+  })
   refreshTimer = window.setInterval(loadData, 30000)
+})
+
+watch(realtimeNewsItems, (nextItems, previousItems) => {
+  const previousKeys = new Set(previousItems.map(newsKey))
+  speakNewNews(nextItems.filter(item => !previousKeys.has(newsKey(item))))
 })
 
 onUnmounted(() => {
