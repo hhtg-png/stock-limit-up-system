@@ -29,8 +29,10 @@ class PublicMarketNewsProvider:
     """Fetch the public feeds that match the target Tongdaxin news plugin sources."""
 
     THS_URL = "https://news.10jqka.com.cn/tapp/news/push/stock"
+    STCN_URL = "https://www.stcn.com/article/list.html"
     CLS_URL = "https://api3.cls.cn/v1/roll/get_roll_list"
     JYGS_URL = "https://app.jiuyangongshe.com/jystock-app/api/v2/article/community"
+    GLH_URL = "https://www.gelonghui.com/api/live-channels/all/lives"
 
     def __init__(self, *, timeout: float = 8.0, cache_ttl: int = 45):
         self.timeout = timeout
@@ -45,7 +47,7 @@ class PublicMarketNewsProvider:
         fetch_limit = max(limit, 80)
         source_status: Dict[str, str] = {}
         warnings: List[str] = []
-        source_items: Dict[str, List[MarketNewsItem]] = {"ths": [], "cls": [], "jygs": []}
+        source_items: Dict[str, List[MarketNewsItem]] = {"stcn": [], "ths": [], "glh": [], "jygs": [], "cls": []}
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
             "Accept": "application/json, text/plain, */*",
@@ -53,9 +55,11 @@ class PublicMarketNewsProvider:
 
         async with httpx.AsyncClient(timeout=self.timeout, headers=headers, follow_redirects=True) as client:
             fetchers = {
+                "stcn": self._fetch_stcn(client),
                 "ths": self._fetch_ths(client),
-                "cls": self._fetch_cls(client),
+                "glh": self._fetch_gelonghui(client),
                 "jygs": self._fetch_jygs(client),
+                "cls": self._fetch_cls(client),
             }
             for source, fetcher in fetchers.items():
                 try:
@@ -65,7 +69,7 @@ class PublicMarketNewsProvider:
                     source_status[source] = "error"
                     warnings.append(f"{self._source_label(source)}快讯获取失败: {exc}")
 
-        merged = self.merge_sources(source_items["ths"], source_items["cls"], source_items["jygs"], limit=fetch_limit)
+        merged = self.merge_market_feeds(source_items, limit=fetch_limit)
         items = [self.to_plugin_item(item) for item in merged]
         self._cache = (time.time(), items, dict(source_status), list(warnings))
         return items[:limit], source_status, warnings
@@ -84,6 +88,18 @@ class PublicMarketNewsProvider:
         )
         response.raise_for_status()
         return self.parse_ths_response(response.json())
+
+    async def _fetch_stcn(self, client: httpx.AsyncClient) -> List[MarketNewsItem]:
+        response = await client.get(
+            self.STCN_URL,
+            params={"type": "kx", "page": 1, "per-page": 30},
+            headers={
+                "Referer": "https://www.stcn.com/article/list/kx.html",
+                "X-Requested-With": "XMLHttpRequest",
+            },
+        )
+        response.raise_for_status()
+        return self.parse_stcn_response(response.json())
 
     async def _fetch_cls(self, client: httpx.AsyncClient) -> List[MarketNewsItem]:
         params = {
@@ -105,10 +121,10 @@ class PublicMarketNewsProvider:
         timestamp = str(int(time.time() * 1000))
         response = await client.post(
             self.JYGS_URL,
-            json={"type": 1, "category_id": "", "limit": 20, "start": 1, "order": 0},
+            json={"type": 0, "category_id": "", "limit": 30, "start": 1, "order": 0, "back_garden": 0},
             headers={
                 "Origin": "https://www.jiuyangongshe.com",
-                "Referer": "https://www.jiuyangongshe.com/square_publish/none_none",
+                "Referer": "https://www.jiuyangongshe.com/study_publish",
                 "Content-Type": "application/json",
                 "platform": "3",
                 "timestamp": timestamp,
@@ -118,6 +134,17 @@ class PublicMarketNewsProvider:
         )
         response.raise_for_status()
         return self.parse_jygs_response(response.json())
+
+    async def _fetch_gelonghui(self, client: httpx.AsyncClient) -> List[MarketNewsItem]:
+        response = await client.get(
+            self.GLH_URL,
+            headers={
+                "Referer": "https://www.gelonghui.com/live/",
+                "Accept": "application/json, text/plain, */*",
+            },
+        )
+        response.raise_for_status()
+        return self.parse_gelonghui_response(response.json())
 
     def parse_ths_response(self, payload: Dict[str, Any]) -> List[MarketNewsItem]:
         raw_items = (payload.get("data") or {}).get("list") or payload.get("list") or []
@@ -166,11 +193,38 @@ class PublicMarketNewsProvider:
             ))
         return items
 
+    def parse_stcn_response(self, payload: Dict[str, Any]) -> List[MarketNewsItem]:
+        raw_items = payload.get("data") or []
+        items: List[MarketNewsItem] = []
+        for raw in raw_items:
+            if raw.get("isAdd"):
+                continue
+            title = self._clean_text(raw.get("title") or "")
+            content = self._clean_text(raw.get("content") or raw.get("content_full") or title)
+            if not title and not content:
+                continue
+            source_id = raw.get("id") or raw.get("pageTime") or self._stable_id(title, content)
+            related_stocks, related_plates = self._extract_stcn_tags(raw.get("tags") or [])
+            items.append(MarketNewsItem(
+                news_id=f"stcn-{source_id}",
+                source="时报快讯",
+                title=title or content[:36],
+                content=content,
+                published_at=raw.get("time") or raw.get("show_time") or raw.get("pageTime") or 0,
+                importance=max(72, self._score_importance(title, content, raw.get("isRed") or raw.get("red"))),
+                related_stocks=related_stocks,
+                related_plates=related_plates,
+                jump_url=self._absolute_stcn_url(raw.get("share_url") or raw.get("web_url") or raw.get("url") or ""),
+            ))
+        return items
+
     def parse_jygs_response(self, payload: Dict[str, Any]) -> List[MarketNewsItem]:
         data = payload.get("data") or {}
         raw_items = data.get("result") or data.get("list") or []
         items: List[MarketNewsItem] = []
         for raw in raw_items:
+            if str(raw.get("is_top") or raw.get("isTop") or raw.get("top") or "0") == "1":
+                continue
             title = self._clean_text(raw.get("title") or "")
             content = self._clean_text(raw.get("content") or raw.get("subtitle") or title)
             if not title and not content:
@@ -186,6 +240,31 @@ class PublicMarketNewsProvider:
                 related_stocks=self._extract_stock_codes(raw.get("stock_list") or []),
                 related_plates=self._extract_names(raw.get("plate_list") or raw.get("field_list") or [], key="name"),
                 jump_url=f"https://www.jiuyangongshe.com/a/{article_id}" if article_id else "",
+            ))
+        return items
+
+    def parse_gelonghui_response(self, payload: Dict[str, Any]) -> List[MarketNewsItem]:
+        raw_items = payload.get("result") or payload.get("data") or []
+        items: List[MarketNewsItem] = []
+        for raw in raw_items:
+            title = self._clean_text(raw.get("title") or "")
+            content = self._clean_text(raw.get("content") or raw.get("summary") or title)
+            if not title:
+                title = self._gelonghui_title_from_content(content)
+            if not title and not content:
+                continue
+            source_id = raw.get("id") or raw.get("liveId") or self._stable_id(title, content)
+            level = "B" if str(raw.get("level") or "0") not in {"", "0", "None"} else raw.get("level")
+            items.append(MarketNewsItem(
+                news_id=f"glh-{source_id}",
+                source="格隆汇",
+                title=title or content[:36],
+                content=content,
+                published_at=raw.get("createTime") or raw.get("createTimestamp") or raw.get("time") or 0,
+                importance=self._score_importance(title, content, level),
+                related_stocks=self._extract_stock_codes(raw.get("stockList") or raw.get("relatedStocks") or []),
+                related_plates=self._extract_names(raw.get("subjects") or raw.get("relatedInfos") or [], key="name"),
+                jump_url=str(raw.get("route") or raw.get("link") or f"https://www.gelonghui.com/live/{source_id}"),
             ))
         return items
 
@@ -208,6 +287,16 @@ class PublicMarketNewsProvider:
             reverse=True,
         )[:limit]
 
+    def merge_market_feeds(self, source_items: Dict[str, List[MarketNewsItem]], limit: int = 80) -> List[MarketNewsItem]:
+        primary_sources = [
+            source_items.get("stcn", []),
+            source_items.get("ths", []),
+            source_items.get("glh", []),
+            source_items.get("jygs", []),
+        ]
+        fallback_sources = [] if any(primary_sources) else [source_items.get("cls", [])[:10]]
+        return self.merge_sources(*primary_sources, *fallback_sources, limit=limit)
+
     def to_plugin_item(self, item: MarketNewsItem) -> Dict[str, Any]:
         return {
             "news_id": item.news_id,
@@ -228,7 +317,13 @@ class PublicMarketNewsProvider:
 
     @staticmethod
     def _source_label(source: str) -> str:
-        return {"ths": "同花顺", "cls": "财联社", "jygs": "韭研公社"}.get(source, source)
+        return {
+            "stcn": "时报快讯",
+            "ths": "同花顺",
+            "glh": "格隆汇",
+            "cls": "财联社",
+            "jygs": "韭研公社",
+        }.get(source, source)
 
     @staticmethod
     def _clean_text(value: Any) -> str:
@@ -242,7 +337,11 @@ class PublicMarketNewsProvider:
         if isinstance(values, str):
             values = re.findall(r"[A-Za-z]{0,2}\d{5,6}", values)
         for value in values or []:
-            raw_code = value.get("stockCode") or value.get("code") if isinstance(value, dict) else value
+            raw_code = (
+                value.get("stockCode") or value.get("stock_code") or value.get("code")
+                if isinstance(value, dict)
+                else value
+            )
             raw_text = str(raw_code or "").upper()
             if raw_text.startswith("HK"):
                 continue
@@ -253,6 +352,44 @@ class PublicMarketNewsProvider:
             if code not in result:
                 result.append(code)
         return result
+
+    @classmethod
+    def _extract_stcn_tags(cls, values: Any) -> Tuple[List[str], List[str]]:
+        stocks: List[str] = []
+        plates: List[str] = []
+        rows = values if isinstance(values, list) else []
+        for row in rows:
+            tag_items = row if isinstance(row, list) else [row]
+            for tag in tag_items:
+                if not isinstance(tag, dict):
+                    continue
+                stock_code = tag.get("stock_code") or tag.get("stockCode")
+                if stock_code:
+                    for code in cls._extract_stock_codes([tag]):
+                        if code not in stocks:
+                            stocks.append(code)
+                    continue
+                name = cls._clean_text(tag.get("title") or tag.get("name") or "")
+                if name and name not in plates:
+                    plates.append(name)
+        return stocks[:12], plates[:8]
+
+    @staticmethod
+    def _absolute_stcn_url(url: Any) -> str:
+        text = str(url or "").strip()
+        if not text:
+            return ""
+        if text.startswith("http://") or text.startswith("https://"):
+            return text
+        if not text.startswith("/"):
+            text = f"/{text}"
+        return f"https://www.stcn.com{text}"
+
+    @classmethod
+    def _gelonghui_title_from_content(cls, content: str) -> str:
+        text = re.sub(r"^格隆汇\d+月\d+日[丨｜]\s*", "", cls._clean_text(content))
+        first_sentence = re.split(r"[。；;]", text, maxsplit=1)[0].strip()
+        return first_sentence[:48]
 
     @staticmethod
     def _extract_names(values: Any, *, key: str) -> List[str]:

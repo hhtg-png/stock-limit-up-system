@@ -22,7 +22,7 @@
       </div>
 
       <ul class="layui-timeline">
-        <li v-for="item in items" :key="item.news_id" class="layui-timeline-item">
+        <li v-for="item in aggregateItems" :key="item.news_id" class="layui-timeline-item">
           <i class="layui-icon layui-timeline-axis"></i>
           <article class="layui-timeline-content" :class="{ importnews: item.importance >= 80 }">
             <div class="news-meta">
@@ -83,7 +83,7 @@
     </section>
 
     <div v-if="loading" class="state-line">加载中...</div>
-    <div v-else-if="!items.length" class="state-line">{{ emptyText }}</div>
+    <div v-else-if="!aggregateItems.length" class="state-line">{{ emptyText }}</div>
   </main>
 </template>
 
@@ -101,13 +101,16 @@ const { enqueuePluginSpeech, unlockSpeech, speechUnlocked } = useSpeech()
 const { realtimeNewsItems } = useTdxPluginRealtime()
 const spokenNewsKeys = new Set<string>()
 const knownNewsKeys = new Set<string>()
-const IMPORTANT_NEWS_THRESHOLD = 70
 const VISIBLE_SPEECH_LIMIT = 3
 let refreshTimer = 0
 let hasLoadedInitialSnapshot = false
 
 const items = computed(() => mergeRealtimeNews(realtimeNewsItems.value, payload.value?.items || []))
-const identifyItems = computed(() => items.value.slice(0, 8))
+const aggregateItems = computed(() => items.value.filter(isAggregateNewsItem))
+const identifyItems = computed(() => {
+  const jygsItems = items.value.filter(item => item.source === '韭研公社')
+  return (jygsItems.length ? jygsItems : items.value).slice(0, 8)
+})
 const topicItems = computed(() => {
   const withPlates = items.value.filter(item => item.related_plates?.length)
   return (withPlates.length ? withPlates : items.value).slice(0, 8)
@@ -153,16 +156,31 @@ function normalizeSpeechPart(value?: string) {
   return (value || '').replace(/\s+/g, ' ').trim()
 }
 
+function normalizeNewsSpeechContent(item: TdxNewsItem) {
+  const content = normalizeSpeechPart(item.content)
+  if (item.source === '格隆汇') {
+    return content.replace(/^格隆汇\d+月\d+日[丨｜]\s*/, '')
+  }
+  return content
+}
+
 function newsSpeechText(item: TdxNewsItem) {
   const source = normalizeSpeechPart(item.source)
   const title = normalizeSpeechPart(item.title)
-  const content = normalizeSpeechPart(item.content)
-  const digest = content && content !== title ? `，${content.slice(0, 90)}` : ''
+  if (item.source === '韭研公社') {
+    return `${source ? `${source}新帖，` : '新帖，'}${title}`.slice(0, 120)
+  }
+  const content = normalizeNewsSpeechContent(item)
+  const digest = content && content !== title && !content.includes(title) ? `，${content.slice(0, 90)}` : ''
   return `${source ? `${source}，` : ''}${title}${digest}`.slice(0, 180)
 }
 
 function shouldSpeakNews(item: TdxNewsItem) {
-  return Boolean(item.news_id && item.title && (item.importance || 0) >= IMPORTANT_NEWS_THRESHOLD)
+  return Boolean(item.news_id && item.title)
+}
+
+function isAggregateNewsItem(item: TdxNewsItem) {
+  return item.source !== '韭研公社'
 }
 
 function markKnownNews(newsItems: readonly TdxNewsItem[]) {
@@ -175,7 +193,7 @@ function speakNews(item: TdxNewsItem) {
   if (!shouldSpeakNews(item)) return false
   const key = newsKey(item)
   if (spokenNewsKeys.has(key)) return false
-  const queued = enqueuePluginSpeech(newsSpeechText(item), key)
+  const queued = enqueuePluginSpeech(newsSpeechText(item), key, { force: true })
   if (queued) {
     spokenNewsKeys.add(key)
     knownNewsKeys.add(key)
@@ -206,7 +224,7 @@ function handleSpeechToggle(event: Event) {
   const input = event.target as HTMLInputElement | null
   if (input && !input.checked) return
   if (unlockSpeech({ silent: true })) {
-    window.setTimeout(() => speakVisibleNews(), 0)
+    speakVisibleNews()
   }
 }
 

@@ -48,7 +48,7 @@ async function loadData() {
     payload.value = await getTdxStockMove(stockCode.value)
     const item = payload.value.items[0]
     if (item?.reasons?.[0]) {
-      enqueuePluginSpeech(`${item.stock_name}异动，${item.reasons[0].title}`, `stock-move-${item.stock_code}-${item.reasons[0].title}`)
+      enqueuePluginSpeech(`${item.stock_name}异动，${item.reasons[0].title}`, `stock-move-${item.stock_code}-${item.reasons[0].title}`, { force: true })
     }
   } finally {
     loading.value = false

@@ -268,7 +268,8 @@ export function useWebSocket() {
           const { enqueuePluginSpeech } = useSpeech()
           enqueuePluginSpeech(
             message.data.speech_text || `${message.data.stock_name}${message.data.event_label || '涨停异动'}`,
-            message.data.event_id
+            message.data.event_id,
+            { force: true }
           )
         }
         break
@@ -278,7 +279,8 @@ export function useWebSocket() {
           const { enqueuePluginSpeech } = useSpeech()
           enqueuePluginSpeech(
             message.data.speech_text || `${message.data.stock_name}出现异动解析更新`,
-            message.data.event_id || `stock-move-${message.data.stock_code}-${message.timestamp}`
+            message.data.event_id || `stock-move-${message.data.stock_code}-${message.timestamp}`,
+            { force: true }
           )
         }
         break
@@ -289,7 +291,8 @@ export function useWebSocket() {
           const { enqueuePluginSpeech } = useSpeech()
           enqueuePluginSpeech(
             message.data.speech_text || message.data.title,
-            message.data.news_id || `news-${message.timestamp}`
+            message.data.news_id || `news-${message.timestamp}`,
+            { force: true }
           )
         }
         break
@@ -299,7 +302,8 @@ export function useWebSocket() {
           const { enqueuePluginSpeech } = useSpeech()
           enqueuePluginSpeech(
             message.data.speech_text,
-            message.data.event_id || `plate-strength-${message.timestamp}`
+            message.data.event_id || `plate-strength-${message.timestamp}`,
+            { force: true }
           )
         }
         break

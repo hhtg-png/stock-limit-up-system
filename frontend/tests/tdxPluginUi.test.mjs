@@ -28,5 +28,7 @@ assert.match(plate, /core_stocks/, 'plate plugin should render core stocks')
 const news = read('src/views/tdx/TdxNewsFeed.vue')
 assert.match(news, /importance/, 'news plugin should render importance')
 assert.match(news, /enqueuePluginSpeech/, 'news plugin should support speech')
+assert.match(news, /v-for="item in aggregateItems"/, 'aggregate news panel should render the target-like quick-news stream')
+assert.match(news, /item\.source !== '韭研公社'/, 'aggregate news panel should keep JYGS recognition posts out of the main stream')
 
 console.log('tdx plugin UI structure checks passed')

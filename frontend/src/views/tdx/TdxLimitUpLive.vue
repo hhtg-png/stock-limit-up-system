@@ -165,7 +165,7 @@ function announceNewStatusEvents(items: TdxLimitUpEvent[]) {
     const key = item.stock_code || item.event_id
     if (!key || seenSpeechKeys.has(key)) continue
     seenSpeechKeys.add(key)
-    enqueuePluginSpeech(`${item.stock_name}${item.target_status_label || item.event_label}`, item.event_id)
+    enqueuePluginSpeech(`${item.stock_name}${item.target_status_label || item.event_label}`, item.event_id, { force: true })
   }
 }
 

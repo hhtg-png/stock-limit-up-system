@@ -42,6 +42,10 @@ type UnlockSpeechOptions = {
   silent?: boolean
 }
 
+type PluginSpeechOptions = {
+  force?: boolean
+}
+
 function normalizeUnlockSpeechOptions(options: UnlockSpeechOptions | Event): UnlockSpeechOptions {
   if (typeof Event !== 'undefined' && options instanceof Event) return {}
   return options as UnlockSpeechOptions
@@ -197,13 +201,15 @@ function speak(text: string): boolean {
   return true
 }
 
-function enqueuePluginSpeech(text: string, key?: string): boolean {
-  if (!getSpeechEnabled() || !text) return false
+function enqueuePluginSpeech(text: string, key?: string, options: PluginSpeechOptions = {}): boolean {
+  if (!(options.force || getSpeechEnabled()) || !text) return false
   if (!canSpeakNow()) return false
   const speechKey = key || `plugin-${text}-${new Date().toDateString()}`
   if (pluginSpeechKeys.has(speechKey)) return false
   pluginSpeechKeys.add(speechKey)
-  return speak(text)
+  speechQueue.push(text)
+  processQueue()
+  return true
 }
 
 function processQueue() {

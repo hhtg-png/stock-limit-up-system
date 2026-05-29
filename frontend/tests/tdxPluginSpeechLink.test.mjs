@@ -24,5 +24,6 @@ for (const type of ['tdx_limit_up_event', 'tdx_stock_move_event', 'tdx_news_even
   assert.match(websocket, new RegExp(`case '${type}':`), `WebSocket should handle ${type}`)
 }
 assert.match(websocket, /enqueuePluginSpeech/, 'TDX WebSocket events should enter the plugin speech queue')
+assert.match(websocket, /enqueuePluginSpeech\([\s\S]*\{\s*force:\s*true\s*\}/, 'TDX WebSocket plugin events should bypass the original app alert switch after the plugin voice switch is unlocked')
 
 console.log('tdx plugin speech and stock link checks passed')
