@@ -18,20 +18,11 @@ const targetSpeechProfile = {
 }
 
 const targetTtsAudioId = 'tdx-target-tts-audio'
-const targetTtsEndpoint = 'https://tts.baidu.com/text2audio'
-const targetAudioFallbackVolume = 0.82
-const targetTtsParams = {
-  cuid: 'baike',
-  lan: 'ZH',
-  ctp: '3',
-  pdt: '301',
-  vol: '8',
-  spd: '5',
-  rate: '32',
-  per: '0'
-}
+const targetNeuralTtsEndpoint = '/api/v1/tts/speech'
+const targetNeuralTtsVoice = 'zh-CN-XiaoxiaoNeural'
+const targetAudioFallbackVolume = 0.9
 
-// 通达信插件播报配置：优先使用浏览器中文语音，不支持时降级为外部 TTS 音频播放
+// 通达信插件播报配置：优先播放后端 edge-tts 神经音频，失败时降级为浏览器中文语音
 const speechRate = ref(targetSpeechProfile.rate)
 const speechPitch = ref(targetSpeechProfile.pitch)
 const speechVolume = ref(targetSpeechProfile.volume)
@@ -156,13 +147,15 @@ function ensureTargetTtsAudio(): HTMLAudioElement | null {
 }
 
 function shouldUseTargetAudioPlayback(): boolean {
-  return !hasWebSpeechSupport() && speechUnlocked.value && hasAudioFallbackSupport()
+  return speechUnlocked.value && hasAudioFallbackSupport()
 }
 
 function buildTargetTtsUrl(text: string) {
-  const params = new URLSearchParams(targetTtsParams)
-  params.set('tex', text.trim().slice(0, 180))
-  return `${targetTtsEndpoint}?${params.toString()}`
+  const params = new URLSearchParams({
+    text: text.trim().slice(0, 180),
+    voice: targetNeuralTtsVoice
+  })
+  return `${targetNeuralTtsEndpoint}?${params.toString()}`
 }
 
 function finishSpeechItem() {
@@ -170,22 +163,61 @@ function finishSpeechItem() {
   processQueue()
 }
 
-function playWithAudioFallback(text: string) {
-  const audio = ensureTargetTtsAudio()
-  if (!audio) {
+function playWithWebSpeech(text: string) {
+  if (!hasWebSpeechSupport()) {
     finishSpeechItem()
     return
   }
 
-  audio.onended = finishSpeechItem
-  audio.onerror = finishSpeechItem
+  try {
+    const utterance = new SpeechSynthesisUtterance(text)
+    applyTargetSpeechProfile(utterance)
+    utterance.onend = () => {
+      finishSpeechItem()
+    }
+
+    utterance.onerror = () => {
+      finishSpeechItem()
+    }
+
+    window.speechSynthesis.speak(utterance)
+  } catch {
+    finishSpeechItem()
+  }
+}
+
+function playWithAudioFallback(text: string, onFailure: () => void = finishSpeechItem) {
+  const audio = ensureTargetTtsAudio()
+  if (!audio) {
+    onFailure()
+    return
+  }
+
+  let settled = false
+  const finishOnce = () => {
+    if (settled) return
+    settled = true
+    finishSpeechItem()
+  }
+  const failOnce = () => {
+    if (settled) return
+    settled = true
+    onFailure()
+  }
+
+  audio.onended = finishOnce
+  audio.onerror = failOnce
   audio.src = buildTargetTtsUrl(text)
   const playPromise = audio.play()
   if (playPromise?.catch) {
-    playPromise.catch(() => {
-      finishSpeechItem()
-    })
+    playPromise.catch(failOnce)
   }
+}
+
+function playWithNeuralTts(text: string) {
+  playWithAudioFallback(text, () => {
+    playWithWebSpeech(text)
+  })
 }
 
 // 播报函数（内部使用，不检查开关）
@@ -227,24 +259,14 @@ function processQueue() {
   isSpeaking = true
 
   try {
-    if (shouldUseTargetAudioPlayback() || !hasWebSpeechSupport()) {
-      playWithAudioFallback(text)
+    if (shouldUseTargetAudioPlayback()) {
+      playWithNeuralTts(text)
       return
     }
 
-    const utterance = new SpeechSynthesisUtterance(text)
-    applyTargetSpeechProfile(utterance)
-    utterance.onend = () => {
-      finishSpeechItem()
-    }
-
-    utterance.onerror = () => {
-      playWithAudioFallback(text)
-    }
-
-    window.speechSynthesis.speak(utterance)
+    playWithWebSpeech(text)
   } catch {
-    playWithAudioFallback(text)
+    finishSpeechItem()
   }
 }
 

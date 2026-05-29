@@ -18,6 +18,7 @@ ENV/
 
 # 数据库和日志
 backend/data/*.db
+backend/data/tts-cache/
 backend/logs/*.log
 *.log
 *.sqlite3

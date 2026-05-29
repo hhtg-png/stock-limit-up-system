@@ -1,7 +1,7 @@
 # API v1 package
 from fastapi import APIRouter
 
-from app.api.v1 import config, daily_analysis, intelligence, limit_up, market, review, statistics, tdx_plugins, websocket
+from app.api.v1 import config, daily_analysis, intelligence, limit_up, market, review, statistics, tdx_plugins, tts, websocket
 
 api_router = APIRouter()
 
@@ -13,3 +13,4 @@ api_router.include_router(intelligence.router, prefix="/intelligence", tags=["�
 api_router.include_router(market.router, prefix="/market", tags=["行情"])
 api_router.include_router(config.router, prefix="/config", tags=["配置"])
 api_router.include_router(tdx_plugins.router, prefix="/tdx-plugins", tags=["通达信插件"])
+api_router.include_router(tts.router, prefix="/tts", tags=["语音播报"])

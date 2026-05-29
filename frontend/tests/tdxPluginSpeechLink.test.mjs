@@ -20,7 +20,8 @@ assert.match(speech, /enqueuePluginSpeech/, 'useSpeech should expose a plugin sp
 assert.match(speech, /pluginSpeechKeys/, 'plugin speech should dedupe events by stable keys')
 assert.doesNotMatch(speech, /vol:\s*'99'/, 'audio fallback should not use clipping-prone max volume')
 assert.match(speech, /targetAudioFallbackVolume/, 'audio fallback should apply a controlled element volume')
-assert.match(speech, /function shouldUseTargetAudioPlayback\(\)[\s\S]*!hasWebSpeechSupport\(\)/, 'clear browser speech should be preferred over compressed audio fallback')
+assert.match(speech, /function shouldUseTargetAudioPlayback\(\)[\s\S]*speechUnlocked\.value[\s\S]*hasAudioFallbackSupport\(\)/, 'unlocked plugin speech should prefer backend neural audio playback')
+assert.match(speech, /playWithAudioFallback\([\s\S]*playWithWebSpeech/, 'speech should fall back to Web Speech if neural audio fails')
 
 const websocket = read('src/composables/useWebSocket.ts')
 for (const type of ['tdx_limit_up_event', 'tdx_stock_move_event', 'tdx_news_event', 'tdx_plate_strength_update']) {

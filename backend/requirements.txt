@@ -37,6 +37,9 @@ numpy==1.26.3
 # WebSocket
 websockets==12.0
 
+# 神经语音播报
+edge-tts==7.2.8
+
 # 日志
 loguru==0.7.2
 
