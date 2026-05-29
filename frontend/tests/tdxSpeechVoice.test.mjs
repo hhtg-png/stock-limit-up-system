@@ -14,5 +14,10 @@ assert.match(speech, /utterance\.pitch\s*=\s*speechPitch\.value/, 'speech uttera
 assert.match(speech, /utterance\.voice\s*=/, 'speech utterance should pin a selected Mandarin voice when available')
 assert.match(speech, /getVoices\(\)/, 'speech voice selection should inspect browser voices')
 assert.match(speech, /voiceschanged/, 'speech voice selection should handle async browser voice loading')
+assert.match(speech, /targetTtsAudioId/, 'useSpeech should create a target-style hidden audio fallback')
+assert.match(speech, /tts\.baidu\.com\/text2audio/, 'audio fallback should use target-like Baidu TTS playback')
+assert.match(speech, /playWithAudioFallback/, 'useSpeech should play by audio when Web Speech is unavailable')
+assert.match(speech, /ensureTargetTtsAudio/, 'useSpeech should reuse a hidden audio element for WebView playback')
+assert.match(speech, /document\.createElement\('audio'\)/, 'audio fallback should not rely on WebView exposing HTMLAudioElement')
 
 console.log('tdx speech voice checks passed')

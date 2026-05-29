@@ -11,6 +11,9 @@ assert.match(settings, /<el-dialog[\s\S]*tdxPluginDialogVisible/, 'Settings shou
 assert.match(settings, /通达信地址/, 'Settings should describe TDX plugin URLs instead of normal page navigation')
 assert.match(settings, /复制插件地址/, 'Settings should copy plugin URLs for Tongdaxin embedding')
 assert.match(settings, /buildTdxPluginUrl/, 'Settings should build absolute plugin URLs for Tongdaxin')
+assert.match(settings, /fallbackCopyText/, 'Settings should fallback when Clipboard API is unavailable or denied')
+assert.match(settings, /document\.execCommand\('copy'\)/, 'Settings should support legacy WebView copy commands')
+assert.match(settings, /selectedPluginUrl/, 'Settings should expose the plugin URL for manual selection after copy failures')
 assert.doesNotMatch(settings, /router\.push\(path\)/, 'Settings should not navigate away from settings when configuring TDX plugins')
 assert.doesNotMatch(settings, /打开插件入口/, 'Settings should not present TDX plugins as normal in-app pages')
 

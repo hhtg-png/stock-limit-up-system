@@ -17,7 +17,20 @@ const targetSpeechProfile = {
   ]
 }
 
-// 通达信插件播报配置：目标页使用服务端音频，这里固定成接近的中文女声口径
+const targetTtsAudioId = 'tdx-target-tts-audio'
+const targetTtsEndpoint = 'https://tts.baidu.com/text2audio'
+const targetTtsParams = {
+  cuid: 'baike',
+  lan: 'ZH',
+  ctp: '3',
+  pdt: '301',
+  vol: '99',
+  spd: '6',
+  rate: '32',
+  per: '0'
+}
+
+// 通达信插件播报配置：优先使用浏览器中文语音，不支持时降级为目标站同类 TTS 音频播放
 const speechRate = ref(targetSpeechProfile.rate)
 const speechPitch = ref(targetSpeechProfile.pitch)
 const speechVolume = ref(targetSpeechProfile.volume)
@@ -44,14 +57,24 @@ let isSpeaking = false
 const announcedStocks = new Set<string>()
 const pluginSpeechKeys = new Set<string>()
 
-function hasSpeechSupport(): boolean {
+function hasWebSpeechSupport(): boolean {
   return typeof window !== 'undefined' &&
     'speechSynthesis' in window &&
     'SpeechSynthesisUtterance' in window
 }
 
+function hasAudioFallbackSupport(): boolean {
+  return typeof window !== 'undefined' &&
+    typeof document !== 'undefined' &&
+    typeof document.createElement === 'function'
+}
+
+function hasSpeechSupport(): boolean {
+  return hasWebSpeechSupport() || hasAudioFallbackSupport()
+}
+
 function setupSpeechVoices() {
-  if (!hasSpeechSupport() || voicesListenerReady) return
+  if (!hasWebSpeechSupport() || voicesListenerReady) return
   voicesListenerReady = true
   window.speechSynthesis.getVoices()
   window.speechSynthesis.addEventListener?.('voiceschanged', () => {
@@ -60,7 +83,7 @@ function setupSpeechVoices() {
 }
 
 function selectTargetSpeechVoice(): SpeechSynthesisVoice | null {
-  if (!hasSpeechSupport()) return null
+  if (!hasWebSpeechSupport()) return null
   const voices = window.speechSynthesis.getVoices()
   const zhVoices = voices.filter(voice => /^zh/i.test(voice.lang) || /Chinese|Mandarin|普通话|中文/i.test(voice.name))
   const matched = targetSpeechProfile.voiceKeywords
@@ -89,7 +112,56 @@ function requiresSpeechUnlock(): boolean {
 }
 
 function canSpeakNow(): boolean {
-  return hasSpeechSupport() && (!requiresSpeechUnlock() || speechUnlocked.value)
+  if (!hasSpeechSupport()) return false
+  if (!hasWebSpeechSupport()) return speechUnlocked.value
+  return !requiresSpeechUnlock() || speechUnlocked.value
+}
+
+function ensureTargetTtsAudio(): HTMLAudioElement | null {
+  if (!hasAudioFallbackSupport()) return null
+  const existing = document.getElementById(targetTtsAudioId)
+  if (existing?.tagName?.toLowerCase() === 'audio') return existing as HTMLAudioElement
+
+  const audio = document.createElement('audio')
+  audio.id = targetTtsAudioId
+  audio.hidden = true
+  audio.autoplay = true
+  audio.preload = 'auto'
+  document.body.appendChild(audio)
+  return audio
+}
+
+function shouldUseTargetAudioPlayback(): boolean {
+  return speechUnlocked.value && hasAudioFallbackSupport()
+}
+
+function buildTargetTtsUrl(text: string) {
+  const params = new URLSearchParams(targetTtsParams)
+  params.set('tex', text.trim().slice(0, 180))
+  return `${targetTtsEndpoint}?${params.toString()}`
+}
+
+function finishSpeechItem() {
+  isSpeaking = false
+  processQueue()
+}
+
+function playWithAudioFallback(text: string) {
+  const audio = ensureTargetTtsAudio()
+  if (!audio) {
+    finishSpeechItem()
+    return
+  }
+
+  audio.onended = finishSpeechItem
+  audio.onerror = finishSpeechItem
+  audio.src = buildTargetTtsUrl(text)
+  const playPromise = audio.play()
+  if (playPromise?.catch) {
+    playPromise.catch(() => {
+      finishSpeechItem()
+    })
+  }
 }
 
 // 播报函数（内部使用，不检查开关）
@@ -127,23 +199,24 @@ function processQueue() {
   isSpeaking = true
 
   try {
+    if (shouldUseTargetAudioPlayback() || !hasWebSpeechSupport()) {
+      playWithAudioFallback(text)
+      return
+    }
+
     const utterance = new SpeechSynthesisUtterance(text)
     applyTargetSpeechProfile(utterance)
-
     utterance.onend = () => {
-      isSpeaking = false
-      processQueue()
+      finishSpeechItem()
     }
 
     utterance.onerror = () => {
-      isSpeaking = false
-      processQueue()
+      playWithAudioFallback(text)
     }
 
     window.speechSynthesis.speak(utterance)
   } catch {
-    isSpeaking = false
-    speechQueue.length = 0
+    playWithAudioFallback(text)
   }
 }
 
@@ -152,7 +225,10 @@ function unlockSpeech(): boolean {
 
   speechUnlocked.value = true
   setupSpeechVoices()
-  window.speechSynthesis.resume()
+  ensureTargetTtsAudio()
+  if (hasWebSpeechSupport()) {
+    window.speechSynthesis.resume()
+  }
   speakInternal('语音播报已启用', true)
   return true
 }

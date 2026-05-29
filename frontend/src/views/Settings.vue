@@ -198,6 +198,14 @@
           </el-button>
         </article>
       </div>
+      <div v-if="selectedPluginUrl" class="plugin-manual-copy">
+        <span>当前地址</span>
+        <el-input
+          :model-value="selectedPluginUrl"
+          readonly
+          @focus="selectManualPluginUrl"
+        />
+      </div>
     </el-dialog>
   </div>
 </template>
@@ -232,6 +240,7 @@ const deepseekApiKey = ref('')
 const savingDeepSeek = ref(false)
 const notificationPermission = ref(Notification?.permission || 'default')
 const tdxPluginDialogVisible = ref(false)
+const selectedPluginUrl = ref('')
 
 const tdxPlugins = [
   { name: '涨停播报', desc: '实时封板、开板、回封和封单变化播报', path: '/tdx/ztlive/dark' },
@@ -328,15 +337,50 @@ function buildTdxPluginUrl(path: string) {
   return `${window.location.origin}${path}`
 }
 
+function fallbackCopyText(text: string) {
+  const textarea = document.createElement('textarea')
+  textarea.value = text
+  textarea.setAttribute('readonly', 'readonly')
+  textarea.style.position = 'fixed'
+  textarea.style.left = '-9999px'
+  textarea.style.top = '0'
+  document.body.appendChild(textarea)
+  textarea.focus()
+  textarea.select()
+  textarea.setSelectionRange(0, text.length)
+  try {
+    return document.execCommand('copy')
+  } finally {
+    document.body.removeChild(textarea)
+  }
+}
+
+function selectManualPluginUrl(event: FocusEvent) {
+  const target = event.target
+  if (target instanceof HTMLInputElement) {
+    target.select()
+  }
+}
+
 async function copyTdxPluginUrl(path: string) {
   const url = buildTdxPluginUrl(path)
+  selectedPluginUrl.value = url
   try {
-    await navigator.clipboard.writeText(url)
-    ElMessage.success('已复制插件地址')
+    if (navigator.clipboard?.writeText && window.isSecureContext) {
+      await navigator.clipboard.writeText(url)
+      ElMessage.success('已复制插件地址')
+      return
+    }
   } catch (e) {
     console.error('Copy TDX plugin url error:', e)
-    ElMessage.error('复制失败，请手动复制地址')
   }
+
+  if (fallbackCopyText(url)) {
+    ElMessage.success('已复制插件地址')
+    return
+  }
+
+  ElMessage.warning('复制失败，请手动复制下方地址')
 }
 
 onMounted(() => {
@@ -472,6 +516,20 @@ onMounted(() => {
   }
 }
 
+.plugin-manual-copy {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+  color: #606266;
+  font-size: 13px;
+
+  :deep(.el-input__inner) {
+    font-family: Consolas, 'Courier New', monospace;
+  }
+}
+
 @media (max-width: 767px) {
   .settings {
     :deep(.el-row) {
@@ -523,6 +581,10 @@ onMounted(() => {
   }
 
   .plugin-window-card {
+    grid-template-columns: 1fr;
+  }
+
+  .plugin-manual-copy {
     grid-template-columns: 1fr;
   }
 }
