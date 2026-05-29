@@ -91,21 +91,38 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { getTdxNews } from '@/api/tdx-plugins'
 import { useSpeech } from '@/composables/useSpeech'
+import { useTdxPluginRealtime } from '@/composables/useWebSocket'
 import type { TdxNewsItem, TdxPluginPayload } from '@/types/tdx-plugins'
 
 const payload = ref<TdxPluginPayload<TdxNewsItem> | null>(null)
 const loading = ref(false)
 const expandedNewsIds = ref<Set<string>>(new Set())
 const { enqueuePluginSpeech, unlockSpeech, speechUnlocked } = useSpeech()
+const { realtimeNewsItems } = useTdxPluginRealtime()
 let refreshTimer = 0
 
-const items = computed(() => payload.value?.items || [])
+const items = computed(() => mergeRealtimeNews(realtimeNewsItems.value, payload.value?.items || []))
 const identifyItems = computed(() => items.value.slice(0, 8))
 const topicItems = computed(() => {
   const withPlates = items.value.filter(item => item.related_plates?.length)
   return (withPlates.length ? withPlates : items.value).slice(0, 8)
 })
 const emptyText = computed(() => payload.value?.warnings?.[0] || '暂无聚合快讯数据')
+
+function mergeRealtimeNews(realtimeItems: readonly TdxNewsItem[], snapshotItems: TdxNewsItem[]) {
+  const byId = new Map<string, TdxNewsItem>()
+  for (const item of snapshotItems) {
+    byId.set(item.news_id, item)
+  }
+  for (const item of realtimeItems) {
+    byId.delete(item.news_id)
+    byId.set(item.news_id, item)
+  }
+  return Array.from(byId.values()).sort((a, b) => {
+    const timeOrder = (b.time || '').localeCompare(a.time || '')
+    return timeOrder || (b.importance || 0) - (a.importance || 0)
+  })
+}
 
 async function loadData() {
   loading.value = true

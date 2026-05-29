@@ -36,6 +36,25 @@ class TdxPluginsApiTests(unittest.TestCase):
         self.assertEqual(response.json()["items"][0]["stock_code"], "001259")
         self.assertEqual(response.json()["source_status"]["limit_up_pool"], "ok")
 
+    def test_limit_up_live_status_endpoint_returns_lightweight_payload(self):
+        payload = {
+            "items": [{"stock_code": "605177", "stock_name": "东亚药业"}],
+            "updated_at": datetime(2026, 5, 29, 14, 25, 0).isoformat(),
+            "source_status": {"limit_up_status": "ok", "public_attribution": "skipped"},
+            "is_cache": False,
+            "warnings": [],
+        }
+
+        with patch(
+            "app.api.v1.tdx_plugins.tdx_plugin_service.get_limit_up_live_status",
+            AsyncMock(return_value=payload),
+        ):
+            response = self.client.get("/tdx-plugins/limit-up-live/status")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["items"][0]["stock_code"], "605177")
+        self.assertEqual(response.json()["source_status"]["public_attribution"], "skipped")
+
     def test_calibration_compare_endpoint_returns_diff_report(self):
         response = self.client.post(
             "/tdx-plugins/calibration/compare",

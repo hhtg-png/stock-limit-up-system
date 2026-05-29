@@ -88,6 +88,43 @@ class TdxPluginService:
         payload["plate_filters"] = self._build_plate_filters(items)
         return payload
 
+    async def get_limit_up_live_status(self, trade_date: Optional[date] = None) -> Dict[str, Any]:
+        """Return fast-changing limit-up status without slow attribution enrichment.
+
+        This mirrors the target plugin split: rich list data is a slower snapshot,
+        while seal/open/amount fields are refreshed through a lightweight path.
+        """
+        target_date = trade_date or date.today()
+        warnings: List[str] = []
+        source_status = {
+            "limit_up_pool": "ok",
+            "limit_up_status": "ok",
+            "public_attribution": "skipped",
+            "review_source": "skipped",
+        }
+
+        try:
+            raw_items = await self.realtime_limit_up_service.get_realtime_limit_up_list(target_date)
+        except Exception as exc:
+            raw_items = []
+            source_status["limit_up_pool"] = "error"
+            source_status["limit_up_status"] = "error"
+            warnings.append(f"实时涨停状态获取失败: {exc}")
+
+        if not raw_items and source_status["limit_up_pool"] == "ok":
+            source_status["limit_up_pool"] = "empty"
+            source_status["limit_up_status"] = "empty"
+            warnings.append(f"{target_date.isoformat()} 暂无实时涨停状态数据")
+
+        items = [
+            self._build_limit_up_event(item, target_date)
+            for item in raw_items
+        ]
+        items.sort(key=lambda item: (item.get("event_time") or "00:00:00", item.get("board", 0)), reverse=True)
+        payload = self._plugin_payload(items, target_date, source_status, is_cache=False, warnings=warnings)
+        payload["plate_filters"] = self._build_plate_filters(items)
+        return payload
+
     async def get_stock_move(
         self,
         stock_code: str,

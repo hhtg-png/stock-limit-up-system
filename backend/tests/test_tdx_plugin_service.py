@@ -187,6 +187,37 @@ class TdxPluginServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([item["stock_code"] for item in payload["items"]], ["600589", "001259"])
 
+    async def test_limit_up_live_status_skips_slow_attribution_for_fast_refresh(self):
+        attribution_provider = FakeAttributionProvider({
+            "605177": PublicStockAttribution(
+                stock_code="605177",
+                stock_name="东亚药业",
+                reason_title="医药(原料药)",
+                plate="医药",
+                concepts=["原料药", "医药"],
+                source_name="复盘网/同花顺F10",
+            )
+        })
+        service = TdxPluginService(
+            attribution_provider=attribution_provider,
+            enable_external_sources=True,
+        )
+        trade_date = date(2026, 5, 29)
+
+        with patch.object(
+            service.realtime_limit_up_service,
+            "get_realtime_limit_up_list",
+            AsyncMock(return_value=[make_limit_up_item("605177", "东亚药业", "化学制药", board=1)]),
+        ):
+            payload = await service.get_limit_up_live_status(trade_date)
+
+        self.assertEqual(attribution_provider.requested_codes, None)
+        self.assertEqual(payload["source_status"]["limit_up_status"], "ok")
+        self.assertEqual(payload["source_status"]["public_attribution"], "skipped")
+        self.assertEqual(payload["items"][0]["stock_code"], "605177")
+        self.assertEqual(payload["items"][0]["reason"], "化学制药催化")
+        self.assertNotEqual(payload["items"][0]["target_reason_summary"], "医药+原料药")
+
     async def test_limit_up_live_uses_first_seal_time_for_target_first_seal_column(self):
         service = TdxPluginService()
         trade_date = date(2026, 5, 28)

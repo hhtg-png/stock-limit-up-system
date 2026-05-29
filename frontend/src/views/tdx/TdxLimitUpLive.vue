@@ -80,49 +80,229 @@
 
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from 'vue'
-import { getTdxLimitUpLive } from '@/api/tdx-plugins'
+import { storeToRefs } from 'pinia'
+import { getTdxLimitUpLive, getTdxLimitUpLiveStatus } from '@/api/tdx-plugins'
 import { useSpeech } from '@/composables/useSpeech'
 import { useTdxStockLink } from '@/composables/useTdxStockLink'
+import { useTdxPluginRealtime } from '@/composables/useWebSocket'
+import { useLimitUpStore } from '@/stores/limit-up'
+import type { LimitUpRealtime } from '@/types/limit-up'
 import type { TdxLimitUpEvent, TdxPluginPayload } from '@/types/tdx-plugins'
 
+const QUOTE_REFRESH_MS = 3000
+const SNAPSHOT_REFRESH_MS = 30000
+
 const payload = ref<TdxPluginPayload<TdxLimitUpEvent> | null>(null)
+const statusPayload = ref<TdxPluginPayload<TdxLimitUpEvent> | null>(null)
 const activePlate = ref('')
 const hideOpened = ref(false)
 const loading = ref(false)
 const errorText = ref('')
+const seenSpeechKeys = new Set<string>()
 const { enqueuePluginSpeech, unlockSpeech, speechUnlocked } = useSpeech()
 const { openStock } = useTdxStockLink()
-let refreshTimer = 0
+const { realtimeLimitUpEvents } = useTdxPluginRealtime()
+const limitUpStore = useLimitUpStore()
+const { realtimeList } = storeToRefs(limitUpStore)
+let snapshotTimer = 0
+let quoteTimer = 0
+let snapshotInFlight = false
+let statusInFlight = false
 
-const plateFilters = computed(() => payload.value?.plate_filters || [])
-const events = computed(() => payload.value?.items || [])
+const events = computed(() => buildMergedEvents())
+const plateFilters = computed(() => buildPlateFilters(events.value))
 const emptyText = computed(() => {
   if (errorText.value) return errorText.value
   if (payload.value?.warnings?.length) return payload.value.warnings[0]
+  if (statusPayload.value?.warnings?.length) return statusPayload.value.warnings[0]
   if (activePlate.value) return '当前板块暂无涨停播报数据'
   return '暂无涨停播报数据'
 })
 const visibleEvents = computed(() => events.value.filter(item => {
   if (hideOpened.value && !item.is_sealed) return false
   if (!activePlate.value) return true
-  return (item.target_plate || item.reason || '').includes(activePlate.value)
+  return (item.target_plate || item.target_reason_summary || item.reason || '').includes(activePlate.value)
 }))
 
-async function loadData() {
-  loading.value = true
+async function loadData(options: { silent?: boolean } = {}) {
+  if (snapshotInFlight) return
+  snapshotInFlight = true
+  if (!options.silent && !payload.value) loading.value = true
   errorText.value = ''
   try {
     const next = await getTdxLimitUpLive()
     payload.value = next
-    for (const item of next.items.slice(0, 3)) {
-      enqueuePluginSpeech(`${item.stock_name}${item.target_status_label || item.event_label}`, item.event_id)
-    }
+    rememberExistingEvents(next.items)
   } catch (error) {
     const message = error instanceof Error ? error.message : '接口请求失败'
     errorText.value = `涨停播报加载失败：${message}`
   } finally {
+    snapshotInFlight = false
     loading.value = false
   }
+}
+
+async function loadQuoteStatus() {
+  if (statusInFlight) return
+  statusInFlight = true
+  try {
+    const next = await getTdxLimitUpLiveStatus()
+    statusPayload.value = next
+    announceNewStatusEvents(next.items)
+  } finally {
+    statusInFlight = false
+  }
+}
+
+function rememberExistingEvents(items: TdxLimitUpEvent[]) {
+  for (const item of items) {
+    seenSpeechKeys.add(item.stock_code || item.event_id)
+  }
+}
+
+function announceNewStatusEvents(items: TdxLimitUpEvent[]) {
+  for (const item of items) {
+    const key = item.stock_code || item.event_id
+    if (!key || seenSpeechKeys.has(key)) continue
+    seenSpeechKeys.add(key)
+    enqueuePluginSpeech(`${item.stock_name}${item.target_status_label || item.event_label}`, item.event_id)
+  }
+}
+
+function buildMergedEvents() {
+  const byCode = new Map<string, TdxLimitUpEvent>()
+  for (const item of payload.value?.items || []) {
+    upsertEvent(byCode, item)
+  }
+  for (const item of statusPayload.value?.items || []) {
+    upsertEvent(byCode, item)
+  }
+  for (const item of realtimeList.value || []) {
+    upsertEvent(byCode, realtimeToTdxEvent(item))
+  }
+  for (const item of realtimeLimitUpEvents.value || []) {
+    upsertEvent(byCode, item)
+  }
+  return Array.from(byCode.values()).sort((a, b) => {
+    const timeOrder = (b.event_time || '').localeCompare(a.event_time || '')
+    return timeOrder || (b.board || 0) - (a.board || 0)
+  })
+}
+
+function upsertEvent(map: Map<string, TdxLimitUpEvent>, next: TdxLimitUpEvent) {
+  const code = next.stock_code
+  if (!code) return
+  const previous = map.get(code)
+  map.set(code, previous ? mergeLimitUpEvent(previous, next) : normalizeTdxEvent(next))
+}
+
+function mergeLimitUpEvent(previous: TdxLimitUpEvent, next: TdxLimitUpEvent) {
+  const merged = { ...previous, ...next }
+  return {
+    ...merged,
+    reason: next.reason || previous.reason,
+    reason_category: next.reason_category && next.reason_category !== '其他' ? next.reason_category : previous.reason_category,
+    sources: next.sources?.length ? next.sources : previous.sources,
+    target_plate: next.target_plate || previous.target_plate,
+    target_reason_summary: next.target_reason_summary || previous.target_reason_summary,
+    target_status_label: next.target_status_label || previous.target_status_label,
+    target_seal_amount: next.target_seal_amount || previous.target_seal_amount,
+    event_id: next.event_id || previous.event_id,
+    event_time: next.event_time || previous.event_time
+  }
+}
+
+function normalizeTdxEvent(item: TdxLimitUpEvent): TdxLimitUpEvent {
+  return {
+    event_id: item.event_id || `tdx-${item.stock_code}-${item.event_time}`,
+    event_type: item.event_type || (item.is_sealed ? 'limit_up_sealed' : 'limit_up_opened'),
+    event_label: item.event_label || (item.is_sealed ? '封死涨停' : '涨停打开'),
+    event_time: item.event_time || '',
+    stock_code: item.stock_code,
+    stock_name: item.stock_name || item.stock_code,
+    board: Number(item.board || 1),
+    reason: item.reason || '',
+    reason_category: item.reason_category || '其他',
+    change_pct: Number(item.change_pct || 0),
+    seal_amount: Number(item.seal_amount || 0),
+    amount: Number(item.amount || 0),
+    turnover_rate: Number(item.turnover_rate || 0),
+    is_sealed: Boolean(item.is_sealed),
+    open_count: Number(item.open_count || 0),
+    sources: item.sources || [],
+    target_status_label: item.target_status_label || '',
+    target_plate: item.target_plate || '',
+    target_reason_summary: item.target_reason_summary || '',
+    target_seal_amount: item.target_seal_amount || ''
+  }
+}
+
+function realtimeToTdxEvent(item: LimitUpRealtime): TdxLimitUpEvent {
+  const isSealed = Boolean(item.is_sealed ?? item.is_final_sealed)
+  const status = String(item.current_status || (isSealed ? 'sealed' : 'opened'))
+  const openCount = Number(item.open_count || 0)
+  const eventLabel = !isSealed || status === 'opened'
+    ? '涨停打开'
+    : status === 'resealed' || openCount > 0
+      ? '涨停回封'
+      : '封死涨停'
+  const eventType = !isSealed || status === 'opened'
+    ? 'limit_up_opened'
+    : status === 'resealed' || openCount > 0
+      ? 'limit_up_resealed'
+      : 'limit_up_sealed'
+  const eventTime = formatEventTime(item.first_limit_up_time || item.final_seal_time)
+  return {
+    event_id: `realtime-${item.trade_date || ''}-${item.stock_code}-${eventType}-${eventTime}`,
+    event_type: eventType,
+    event_label: eventLabel,
+    event_time: eventTime,
+    stock_code: item.stock_code,
+    stock_name: item.stock_name,
+    board: Number(item.continuous_limit_up_days || 1),
+    reason: item.limit_up_reason || item.reason_category || '',
+    reason_category: item.reason_category || '其他',
+    change_pct: Number((item as LimitUpRealtime & { change_pct?: number }).change_pct || 0),
+    seal_amount: Number(item.seal_amount || 0),
+    amount: Number(item.amount || 0),
+    turnover_rate: Number(item.turnover_rate || 0),
+    is_sealed: isSealed,
+    open_count: openCount,
+    sources: ['实时涨停池'],
+    target_status_label: targetStatusLabel(isSealed, Number(item.continuous_limit_up_days || 1)),
+    target_plate: item.reason_category || item.industry || '',
+    target_reason_summary: item.limit_up_reason || item.reason_category || '',
+    target_seal_amount: formatAmount(Number(item.seal_amount || 0))
+  }
+}
+
+function buildPlateFilters(items: TdxLimitUpEvent[]) {
+  const counts = new Map<string, number>()
+  for (const item of items) {
+    if (!item.is_sealed) continue
+    const plate = item.target_plate || item.reason_category || ''
+    if (!plate) continue
+    for (const name of plate.split(/[+、,，]/).map(value => value.trim()).filter(Boolean)) {
+      counts.set(name, (counts.get(name) || 0) + 1)
+    }
+  }
+  return Array.from(counts.entries())
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, 24)
+    .map(([name, count]) => ({ name, count }))
+}
+
+function targetStatusLabel(isSealed: boolean, board: number) {
+  if (!isSealed) return '炸板'
+  return board > 1 ? `${board}板` : '首板'
+}
+
+function formatEventTime(value?: string | Date | null) {
+  if (!value) return ''
+  if (value instanceof Date) return value.toTimeString().slice(0, 8)
+  const text = String(value)
+  const match = text.match(/(\d{2}:\d{2}:\d{2})/)
+  return match ? match[1] : text
 }
 
 function togglePlate(name: string) {
@@ -146,11 +326,14 @@ function displayStatus(item: TdxLimitUpEvent) {
 
 onMounted(() => {
   loadData()
-  refreshTimer = window.setInterval(loadData, 5000)
+  loadQuoteStatus()
+  snapshotTimer = window.setInterval(() => loadData({ silent: true }), SNAPSHOT_REFRESH_MS)
+  quoteTimer = window.setInterval(loadQuoteStatus, QUOTE_REFRESH_MS)
 })
 
 onUnmounted(() => {
-  window.clearInterval(refreshTimer)
+  window.clearInterval(snapshotTimer)
+  window.clearInterval(quoteTimer)
 })
 </script>
 

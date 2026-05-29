@@ -20,6 +20,13 @@ export async function getTdxLimitUpLive(params?: {
   return data
 }
 
+export async function getTdxLimitUpLiveStatus(params?: {
+  trade_date?: string
+}): Promise<TdxPluginPayload<TdxLimitUpEvent>> {
+  const { data } = await api.get('/tdx-plugins/limit-up-live/status', { params })
+  return data
+}
+
 export async function getTdxStockMove(
   stockCode: string,
   params?: { trade_date?: string }

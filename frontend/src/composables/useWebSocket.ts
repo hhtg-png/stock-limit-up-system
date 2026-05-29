@@ -2,11 +2,119 @@ import { ref, onUnmounted } from 'vue'
 import { useAlertStore } from '@/stores/alert'
 import { useLimitUpStore } from '@/stores/limit-up'
 import { useSpeech } from '@/composables/useSpeech'
+import type { TdxLimitUpEvent, TdxNewsItem } from '@/types/tdx-plugins'
 
 interface WebSocketMessage {
   type: string
   data: any
   timestamp: string
+}
+
+const MAX_TDX_REALTIME_ITEMS = 120
+const tdxNewsItems = ref<TdxNewsItem[]>([])
+const tdxLimitUpEvents = ref<TdxLimitUpEvent[]>([])
+
+function formatWsClock(timestamp: string) {
+  const date = new Date(timestamp)
+  if (Number.isNaN(date.getTime())) return ''
+  return date.toLocaleTimeString('zh-CN', {
+    hour12: false,
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit'
+  })
+}
+
+function normalizeStringList(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  return value
+    .map(item => {
+      if (typeof item === 'string') return item
+      if (item && typeof item === 'object') {
+        const record = item as Record<string, unknown>
+        return String(record.name || record.stock_name || record.code || '').trim()
+      }
+      return ''
+    })
+    .filter(Boolean)
+}
+
+function pushUniqueById<T extends Record<string, any>>(
+  list: T[],
+  item: T,
+  idKey: keyof T,
+  limit = MAX_TDX_REALTIME_ITEMS
+) {
+  const id = String(item[idKey] || '')
+  const next = id ? list.filter(existing => String(existing[idKey] || '') !== id) : [...list]
+  next.unshift(item)
+  return next.slice(0, limit)
+}
+
+function normalizeTdxNewsItem(data: Record<string, any>, timestamp: string): TdxNewsItem {
+  const title = String(data.title || data.msg || data.speech_text || '实时快讯')
+  const content = String(data.content || data.digest || data.msg || title)
+  const newsId = String(data.news_id || data.event_id || `ws-news-${timestamp}-${title}`)
+  return {
+    news_id: newsId,
+    time: String(data.time || data.event_time || formatWsClock(timestamp)),
+    source: String(data.source || data.from || '实时快讯'),
+    title,
+    content,
+    importance: Number(data.importance ?? data.import ?? 70),
+    related_stocks: normalizeStringList(data.related_stocks || data.codes || data.stocks),
+    related_plates: normalizeStringList(data.related_plates || data.plates || data.concepts),
+    jump_url: String(data.jump_url || data.url || data.readurl || '')
+  }
+}
+
+function normalizeTdxLimitUpEvent(data: Record<string, any>, timestamp: string): TdxLimitUpEvent {
+  const stockCode = String(data.stock_code || data.code || '')
+  const eventTime = String(data.event_time || data.time || formatWsClock(timestamp))
+  const isSealed = data.is_sealed ?? data.event_type !== 'limit_up_opened'
+  const eventLabel = String(data.event_label || (isSealed ? '封死涨停' : '涨停打开'))
+  const eventType = String(data.event_type || (isSealed ? 'limit_up_sealed' : 'limit_up_opened'))
+  return {
+    event_id: String(data.event_id || `tdx-ws-${stockCode}-${eventTime}-${eventType}`),
+    event_type: eventType,
+    event_label: eventLabel,
+    event_time: eventTime,
+    stock_code: stockCode,
+    stock_name: String(data.stock_name || data.name || stockCode),
+    board: Number(data.board || data.continuous_days || data.ztnum || 1),
+    reason: String(data.reason || data.limit_up_reason || ''),
+    reason_category: String(data.reason_category || data.target_plate || '其他'),
+    change_pct: Number(data.change_pct || 0),
+    seal_amount: Number(data.seal_amount || 0),
+    amount: Number(data.amount || 0),
+    turnover_rate: Number(data.turnover_rate || 0),
+    is_sealed: Boolean(isSealed),
+    open_count: Number(data.open_count || 0),
+    sources: normalizeStringList(data.sources),
+    target_status_label: String(data.target_status_label || eventLabel),
+    target_plate: String(data.target_plate || data.reason_category || ''),
+    target_reason_summary: String(data.target_reason_summary || data.reason || ''),
+    target_seal_amount: String(data.target_seal_amount || '')
+  }
+}
+
+function pushTdxNewsItem(data: Record<string, any>, timestamp: string) {
+  const item = normalizeTdxNewsItem(data, timestamp)
+  tdxNewsItems.value = pushUniqueById(tdxNewsItems.value, item, 'news_id')
+  return item
+}
+
+function pushTdxLimitUpEvent(data: Record<string, any>, timestamp: string) {
+  const item = normalizeTdxLimitUpEvent(data, timestamp)
+  tdxLimitUpEvents.value = pushUniqueById(tdxLimitUpEvents.value, item, 'event_id')
+  return item
+}
+
+export function useTdxPluginRealtime() {
+  return {
+    realtimeNewsItems: tdxNewsItems,
+    realtimeLimitUpEvents: tdxLimitUpEvents
+  }
 }
 
 export function useWebSocket() {
@@ -155,6 +263,7 @@ export function useWebSocket() {
         break
 
       case 'tdx_limit_up_event':
+        pushTdxLimitUpEvent(message.data || {}, message.timestamp)
         if (message.data.stock_name) {
           const { enqueuePluginSpeech } = useSpeech()
           enqueuePluginSpeech(
@@ -175,6 +284,7 @@ export function useWebSocket() {
         break
 
       case 'tdx_news_event':
+        pushTdxNewsItem(message.data || {}, message.timestamp)
         if (message.data.title) {
           const { enqueuePluginSpeech } = useSpeech()
           enqueuePluginSpeech(

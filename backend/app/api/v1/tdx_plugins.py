@@ -19,6 +19,13 @@ async def get_limit_up_live(
     return await tdx_plugin_service.get_limit_up_live(trade_date, db=db)
 
 
+@router.get("/limit-up-live/status", summary="通达信插件：涨停播报轻量状态")
+async def get_limit_up_live_status(
+    trade_date: Optional[date] = Query(None, description="交易日期，默认今天"),
+):
+    return await tdx_plugin_service.get_limit_up_live_status(trade_date)
+
+
 @router.get("/stock-move/{stock_code}", summary="通达信插件：股票异动解析联动")
 async def get_stock_move(
     stock_code: str,
