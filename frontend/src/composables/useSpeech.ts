@@ -2,10 +2,28 @@ import { ref } from 'vue'
 import { useConfigStore } from '@/stores/config'
 import { useAlertStore } from '@/stores/alert'
 
-// 语音播报配置 - 从config store获取设置
-const speechRate = ref(1.2) // 语速
-const speechVolume = ref(0.8) // 音量
+const targetSpeechProfile = {
+  lang: 'zh-CN',
+  rate: 0.95,
+  pitch: 1.08,
+  volume: 1,
+  voiceKeywords: [
+    'Microsoft Xiaoxiao',
+    'Microsoft Huihui',
+    'Google 普通话',
+    'Google Mandarin',
+    '普通话',
+    'Chinese'
+  ]
+}
+
+// 通达信插件播报配置：目标页使用服务端音频，这里固定成接近的中文女声口径
+const speechRate = ref(targetSpeechProfile.rate)
+const speechPitch = ref(targetSpeechProfile.pitch)
+const speechVolume = ref(targetSpeechProfile.volume)
+const speechVoiceName = ref('')
 const speechUnlocked = ref(false)
+let voicesListenerReady = false
 
 // 动态获取开关状态
 function getSpeechEnabled(): boolean {
@@ -30,6 +48,39 @@ function hasSpeechSupport(): boolean {
   return typeof window !== 'undefined' &&
     'speechSynthesis' in window &&
     'SpeechSynthesisUtterance' in window
+}
+
+function setupSpeechVoices() {
+  if (!hasSpeechSupport() || voicesListenerReady) return
+  voicesListenerReady = true
+  window.speechSynthesis.getVoices()
+  window.speechSynthesis.addEventListener?.('voiceschanged', () => {
+    selectTargetSpeechVoice()
+  })
+}
+
+function selectTargetSpeechVoice(): SpeechSynthesisVoice | null {
+  if (!hasSpeechSupport()) return null
+  const voices = window.speechSynthesis.getVoices()
+  const zhVoices = voices.filter(voice => /^zh/i.test(voice.lang) || /Chinese|Mandarin|普通话|中文/i.test(voice.name))
+  const matched = targetSpeechProfile.voiceKeywords
+    .map(keyword => zhVoices.find(voice => voice.name.includes(keyword)))
+    .find(Boolean)
+  const selected = matched || zhVoices[0] || null
+  speechVoiceName.value = selected?.name || ''
+  return selected
+}
+
+function applyTargetSpeechProfile(utterance: SpeechSynthesisUtterance) {
+  setupSpeechVoices()
+  const voice = selectTargetSpeechVoice()
+  utterance.lang = voice?.lang || targetSpeechProfile.lang
+  utterance.rate = speechRate.value
+  utterance.pitch = speechPitch.value
+  utterance.volume = speechVolume.value
+  if (voice) {
+    utterance.voice = voice
+  }
 }
 
 function requiresSpeechUnlock(): boolean {
@@ -77,9 +128,7 @@ function processQueue() {
 
   try {
     const utterance = new SpeechSynthesisUtterance(text)
-    utterance.lang = 'zh-CN'
-    utterance.rate = speechRate.value
-    utterance.volume = speechVolume.value
+    applyTargetSpeechProfile(utterance)
 
     utterance.onend = () => {
       isSpeaking = false
@@ -102,6 +151,7 @@ function unlockSpeech(): boolean {
   if (!hasSpeechSupport()) return false
 
   speechUnlocked.value = true
+  setupSpeechVoices()
   window.speechSynthesis.resume()
   speakInternal('语音播报已启用', true)
   return true
@@ -174,7 +224,10 @@ function announceDisabled() {
 export function useSpeech() {
   return {
     speechRate,
+    speechPitch,
     speechVolume,
+    speechVoiceName,
+    targetSpeechProfile,
     speechUnlocked,
     speak,
     enqueuePluginSpeech,

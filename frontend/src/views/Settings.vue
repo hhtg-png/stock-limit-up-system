@@ -78,10 +78,10 @@
           <div class="plugin-entry-content">
             <div>
               <h3>通达信看盘插件</h3>
-              <p>黑底嵌入版插件入口，适配通达信小窗口和普通浏览器。</p>
+              <p>复制通达信地址后，在通达信自定义面板或网页插件中粘贴使用。</p>
             </div>
             <el-button type="primary" @click="tdxPluginDialogVisible = true">
-              打开插件入口
+              通达信地址
             </el-button>
           </div>
         </div>
@@ -176,11 +176,12 @@
 
     <el-dialog
       v-model="tdxPluginDialogVisible"
-      title="通达信看盘插件"
+      title="通达信插件地址"
       width="760px"
       class="tdx-plugin-modal"
       destroy-on-close
     >
+      <p class="plugin-window-tip">这些地址用于嵌入通达信，不会在当前系统内跳转。</p>
       <div class="plugin-window">
         <article
           v-for="plugin in tdxPlugins"
@@ -190,9 +191,10 @@
           <div>
             <strong>{{ plugin.name }}</strong>
             <p>{{ plugin.desc }}</p>
+            <div class="plugin-url">{{ buildTdxPluginUrl(plugin.path) }}</div>
           </div>
-          <el-button size="small" type="primary" plain @click="openTdxPlugin(plugin.path)">
-            打开
+          <el-button size="small" type="primary" plain @click="copyTdxPluginUrl(plugin.path)">
+            复制插件地址
           </el-button>
         </article>
       </div>
@@ -202,13 +204,11 @@
 
 <script setup lang="ts">
 import { ref, reactive, onMounted } from 'vue'
-import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { getConfig, updateConfig, type UserConfigUpdate } from '@/api/config'
 import { useConfigStore } from '@/stores/config'
 
 const configStore = useConfigStore()
-const router = useRouter()
 
 const config = reactive({
   big_order_volume: 300,
@@ -324,9 +324,19 @@ function removeWatch(code: string) {
   }
 }
 
-function openTdxPlugin(path: string) {
-  tdxPluginDialogVisible.value = false
-  router.push(path)
+function buildTdxPluginUrl(path: string) {
+  return `${window.location.origin}${path}`
+}
+
+async function copyTdxPluginUrl(path: string) {
+  const url = buildTdxPluginUrl(path)
+  try {
+    await navigator.clipboard.writeText(url)
+    ElMessage.success('已复制插件地址')
+  } catch (e) {
+    console.error('Copy TDX plugin url error:', e)
+    ElMessage.error('复制失败，请手动复制地址')
+  }
 }
 
 onMounted(() => {
@@ -412,6 +422,12 @@ onMounted(() => {
   padding-top: 10px;
 }
 
+.plugin-window-tip {
+  margin: 0 0 10px;
+  color: #606266;
+  font-size: 13px;
+}
+
 .plugin-window {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -442,6 +458,17 @@ onMounted(() => {
     color: #b0b0b0;
     font-size: 12px;
     line-height: 1.5;
+  }
+
+  .plugin-url {
+    margin-top: 8px;
+    padding: 6px 8px;
+    border: 1px solid #263142;
+    background: #0b0d12;
+    color: #7dd3fc;
+    font-size: 12px;
+    line-height: 1.4;
+    word-break: break-all;
   }
 }
 

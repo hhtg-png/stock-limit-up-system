@@ -212,7 +212,8 @@ class LwwhyStockMoveProvider:
 
     @staticmethod
     def normalize_code(stock_code: str) -> str:
-        return "".join(ch for ch in str(stock_code or "") if ch.isdigit())[-6:]
+        digits = "".join(ch for ch in str(stock_code or "") if ch.isdigit())
+        return digits[-6:].zfill(6) if digits else ""
 
     @staticmethod
     def market_prefix(stock_code: str) -> str:

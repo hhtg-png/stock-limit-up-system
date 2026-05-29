@@ -8,7 +8,11 @@ const settings = readFileSync(resolve(root, 'src/views/Settings.vue'), 'utf8')
 assert.match(settings, /通达信看盘插件/, 'Settings should expose a TDX plugin entry')
 assert.match(settings, /tdxPluginDialogVisible/, 'Settings should control the TDX plugin modal state')
 assert.match(settings, /<el-dialog[\s\S]*tdxPluginDialogVisible/, 'Settings should open TDX plugins inside an Element Plus dialog')
-assert.match(settings, /打开插件入口/, 'Settings should include a button that opens the plugin entry modal')
+assert.match(settings, /通达信地址/, 'Settings should describe TDX plugin URLs instead of normal page navigation')
+assert.match(settings, /复制插件地址/, 'Settings should copy plugin URLs for Tongdaxin embedding')
+assert.match(settings, /buildTdxPluginUrl/, 'Settings should build absolute plugin URLs for Tongdaxin')
+assert.doesNotMatch(settings, /router\.push\(path\)/, 'Settings should not navigate away from settings when configuring TDX plugins')
+assert.doesNotMatch(settings, /打开插件入口/, 'Settings should not present TDX plugins as normal in-app pages')
 
 for (const path of [
   '/tdx/ztlive/dark',

@@ -8,20 +8,21 @@ from typing import Any, Dict, Iterable, List, Optional
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.intelligence import KnowledgeDocument
 from app.models.limit_up import LimitUpRecord
 from app.models.stock import Stock
 from app.services.tdx_external_sources import ExternalStockMove, lwwhy_stock_move_provider
+from app.services.tdx_news_sources import public_market_news_provider
 from app.services.realtime_limit_up_service import realtime_limit_up_service
 
 
 class TdxPluginService:
     """Build stable payloads for the Tongdaxin embedded plugin pages."""
 
-    def __init__(self, *, external_move_provider=None, enable_external_sources: bool = False):
+    def __init__(self, *, external_move_provider=None, enable_external_sources: bool = False, news_provider=None):
         self.realtime_limit_up_service = realtime_limit_up_service
         self.external_move_provider = external_move_provider
         self.enable_external_sources = enable_external_sources
+        self.news_provider = news_provider
 
     async def get_limit_up_live(self, trade_date: Optional[date] = None, db: Optional[AsyncSession] = None) -> Dict[str, Any]:
         target_date = await self._resolve_trade_date(trade_date, db)
@@ -116,25 +117,24 @@ class TdxPluginService:
         items.sort(key=lambda item: item["strength_score"], reverse=True)
         return self._plugin_payload(items, target_date, source_status, is_cache=False, warnings=warnings)
 
-    async def get_news(self, db: AsyncSession, limit: int = 80) -> Dict[str, Any]:
+    async def get_news(self, db: Optional[AsyncSession] = None, limit: int = 80) -> Dict[str, Any]:
         warnings: List[str] = []
-        source_status = {"knowledge_news": "ok"}
+        source_status: Dict[str, str] = {}
+        items: List[Dict[str, Any]] = []
 
-        try:
-            result = await db.execute(
-                select(KnowledgeDocument)
-                .order_by(KnowledgeDocument.trade_date.desc(), KnowledgeDocument.id.desc())
-                .limit(limit)
-            )
-            documents = result.scalars().all()
-        except Exception as exc:
-            documents = []
-            source_status["knowledge_news"] = "error"
-            warnings.append(f"聚合快讯获取失败: {exc}")
+        if self.news_provider:
+            try:
+                items, provider_status, provider_warnings = await self.news_provider.get_latest_news(limit=limit)
+                source_status.update(provider_status)
+                warnings.extend(provider_warnings)
+            except Exception as exc:
+                source_status["market_news"] = "error"
+                warnings.append(f"聚合快讯获取失败: {exc}")
+        else:
+            source_status["market_news"] = "empty"
 
-        items = [self._build_news_item(doc) for doc in documents]
         if not items:
-            source_status["knowledge_news"] = "empty"
+            source_status.setdefault("market_news", "empty")
             warnings.append("暂无聚合快讯数据")
 
         return self._plugin_payload(items, date.today(), source_status, is_cache=False, warnings=warnings)
@@ -402,7 +402,7 @@ class TdxPluginService:
             "trend": "up" if sealed_count == limit_up_count else "mixed",
         }
 
-    def _build_news_item(self, document: KnowledgeDocument) -> Dict[str, Any]:
+    def _build_news_item(self, document: Any) -> Dict[str, Any]:
         title = document.title or document.source_name or "市场快讯"
         content = document.abstract or document.introduction or document.content_text or ""
         return {
@@ -521,7 +521,8 @@ class TdxPluginService:
 
     @staticmethod
     def _normalize_code(stock_code: str) -> str:
-        return "".join(ch for ch in stock_code if ch.isdigit())[-6:]
+        digits = "".join(ch for ch in str(stock_code or "") if ch.isdigit())
+        return digits[-6:].zfill(6) if digits else ""
 
     @staticmethod
     def _format_time(value: Any) -> str:
@@ -732,4 +733,5 @@ class TdxPluginService:
 tdx_plugin_service = TdxPluginService(
     external_move_provider=lwwhy_stock_move_provider,
     enable_external_sources=True,
+    news_provider=public_market_news_provider,
 )

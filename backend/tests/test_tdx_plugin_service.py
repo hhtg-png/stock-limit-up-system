@@ -74,7 +74,31 @@ class FakeExternalMoveProvider:
         return self.review_moves
 
 
+class FakeNewsProvider:
+    def __init__(self, items=None, status=None, warnings=None):
+        self.items = items or []
+        self.status = status or {}
+        self.warnings = warnings or []
+        self.called_limit = None
+
+    async def get_latest_news(self, limit=80):
+        self.called_limit = limit
+        return self.items, self.status, self.warnings
+
+
+class ExplodingKnowledgeSession:
+    async def execute(self, _query):
+        raise AssertionError("TDX聚合快讯不应该读取项目每日资讯知识库")
+
+
 class TdxPluginServiceTests(unittest.IsolatedAsyncioTestCase):
+    def test_normalize_code_pads_short_tdx_stock_code(self):
+        service = TdxPluginService()
+
+        self.assertEqual(service._normalize_code("00090"), "000090")
+        self.assertEqual(service._normalize_code("90"), "000090")
+        self.assertEqual(service._normalize_code("CODE_000090"), "000090")
+
     async def test_limit_up_live_normalizes_events_and_response_shape(self):
         service = TdxPluginService()
         trade_date = date(2026, 5, 28)
@@ -362,6 +386,20 @@ class TdxPluginServiceTests(unittest.IsolatedAsyncioTestCase):
         mocked_get_item.assert_awaited_once_with("600589", date(2026, 5, 28))
         self.assertEqual(payload["items"][0]["trade_date"], "2026-05-28")
 
+    async def test_stock_move_pads_short_code_before_lookup(self):
+        service = TdxPluginService()
+
+        with patch.object(
+            service.realtime_limit_up_service,
+            "get_realtime_limit_up_item",
+            AsyncMock(return_value=make_limit_up_item("000090", "天健集团", "深圳国资+房地产", board=1)),
+        ) as mocked_get_item:
+            payload = await service.get_stock_move("00090", date(2026, 5, 28), source_scope="mixed")
+
+        mocked_get_item.assert_awaited_once_with("000090", date(2026, 5, 28))
+        self.assertEqual(payload["items"][0]["stock_code"], "000090")
+        self.assertEqual(payload["items"][0]["stock_name"], "天健集团")
+
     async def test_ths_move_marks_ths_only_scope(self):
         service = TdxPluginService()
 
@@ -390,6 +428,32 @@ class TdxPluginServiceTests(unittest.IsolatedAsyncioTestCase):
         ))
 
         self.assertRegex(item["time"], r"^\d{2}:\d{2}:\d{2}$")
+
+    async def test_news_uses_public_market_news_provider_instead_of_knowledge_documents(self):
+        provider = FakeNewsProvider(
+            items=[
+                {
+                    "news_id": "ths-1",
+                    "time": "10:08:09",
+                    "source": "同花顺",
+                    "title": "A股异动",
+                    "content": "市场消息",
+                    "importance": 74,
+                    "related_stocks": ["000090"],
+                    "related_plates": ["房地产"],
+                    "jump_url": "https://news.10jqka.com.cn/",
+                }
+            ],
+            status={"ths": "ok", "cls": "empty", "jygs": "ok"},
+        )
+        service = TdxPluginService(news_provider=provider)
+
+        payload = await service.get_news(ExplodingKnowledgeSession(), limit=10)
+
+        self.assertEqual(provider.called_limit, 10)
+        self.assertEqual(payload["items"][0]["source"], "同花顺")
+        self.assertNotIn("knowledge_news", payload["source_status"])
+        self.assertEqual(payload["source_status"]["ths"], "ok")
 
     def test_compare_samples_reports_missing_extra_field_and_order_differences(self):
         service = TdxPluginService()

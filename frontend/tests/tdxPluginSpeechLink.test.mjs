@@ -11,7 +11,9 @@ function read(path) {
 const stockLink = read('src/composables/useTdxStockLink.ts')
 assert.match(stockLink, /TdxW\|hong/i, 'TDX stock link should detect Tongdaxin user agents')
 assert.match(stockLink, /www\.treeid\/CODE_/, 'TDX stock link should emit treeid CODE URL')
-assert.match(stockLink, /router\.push\(\{ name: 'StockDetail'/, 'normal browsers should open internal stock detail')
+assert.match(stockLink, /padStart\(6,\s*'0'\)/, 'TDX stock link should pad short stock codes before linking')
+assert.doesNotMatch(stockLink, /router\.push/, 'TDX plugin stock clicks should not open internal stock detail')
+assert.doesNotMatch(stockLink, /StockDetail/, 'TDX plugin stock clicks should not reference the project stock detail route')
 
 const speech = read('src/composables/useSpeech.ts')
 assert.match(speech, /enqueuePluginSpeech/, 'useSpeech should expose a plugin speech queue entrypoint')
