@@ -1,23 +1,7 @@
-import { createApp } from 'vue'
-import { createPinia } from 'pinia'
-import ElementPlus from 'element-plus'
-import 'element-plus/dist/index.css'
-import zhCn from 'element-plus/dist/locale/zh-cn.mjs'
-import * as ElementPlusIconsVue from '@element-plus/icons-vue'
+const isTdxRuntime = window.location.pathname.startsWith('/tdx')
 
-import App from './App.vue'
-import router from './router'
-import './styles/main.scss'
-
-const app = createApp(App)
-
-// 注册Element Plus图标
-for (const [key, component] of Object.entries(ElementPlusIconsVue)) {
-  app.component(key, component)
+if (isTdxRuntime) {
+  import('./tdx-main')
+} else {
+  import('./main-full')
 }
-
-app.use(createPinia())
-app.use(router)
-app.use(ElementPlus, { locale: zhCn })
-
-app.mount('#app')
