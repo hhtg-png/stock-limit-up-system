@@ -30,6 +30,6 @@ assert.match(ws, /tdxLimitUpEvents/, 'WebSocket composable should keep shared TD
 assert.match(ws, /useTdxPluginRealtime/, 'WebSocket composable should expose TDX plugin realtime state')
 assert.match(ws, /pushTdxNewsItem/, 'tdx_news_event messages should be normalized into realtime news state')
 assert.match(ws, /pushTdxLimitUpEvent/, 'tdx_limit_up_event messages should be normalized into realtime limit-up state')
-assert.match(ws, /`news-\$\{item\.news_id \|\| message\.timestamp\}`/, 'tdx_news_event speech keys should match the news page dedupe key')
+assert.doesNotMatch(ws, /`news-\$\{item\.news_id \|\| message\.timestamp\}`/, 'tdx_news_event speech should be owned by news pages, not the websocket handler')
 
 console.log('tdx realtime hybrid strategy checks passed')

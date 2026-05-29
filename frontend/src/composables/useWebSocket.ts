@@ -286,15 +286,7 @@ export function useWebSocket() {
         break
 
       case 'tdx_news_event':
-        const item = pushTdxNewsItem(message.data || {}, message.timestamp)
-        if (item.title) {
-          const { enqueuePluginSpeech } = useSpeech()
-          enqueuePluginSpeech(
-            message.data.speech_text || item.title,
-            `news-${item.news_id || message.timestamp}`,
-            { force: true }
-          )
-        }
+        pushTdxNewsItem(message.data || {}, message.timestamp)
         break
 
       case 'tdx_plate_strength_update':

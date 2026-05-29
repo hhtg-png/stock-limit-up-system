@@ -21,6 +21,8 @@ const targetTtsAudioId = 'tdx-target-tts-audio'
 const targetNeuralTtsEndpoint = '/api/v1/tts/speech'
 const targetNeuralTtsVoice = 'zh-CN-XiaoyiNeural'
 const targetAudioFallbackVolume = 0.9
+const NEWS_SPEECH_SIMILARITY_WINDOW_MS = 60 * 1000
+const NEWS_SPEECH_SIMILARITY_THRESHOLD = 0.8
 
 // 通达信插件播报配置：优先播放后端 edge-tts 神经音频，失败时降级为浏览器中文语音
 const speechRate = ref(targetSpeechProfile.rate)
@@ -66,6 +68,7 @@ let isSpeaking = false
 // 已播报的股票记录（防止重复播报）
 const announcedStocks = new Set<string>()
 const pluginSpeechKeys = new Set<string>()
+const recentNewsSpeechItems: Array<{ text: string; timestamp: number }> = []
 
 function hasWebSpeechSupport(): boolean {
   return typeof window !== 'undefined' &&
@@ -158,6 +161,76 @@ function buildTargetTtsUrl(text: string) {
   return `${targetNeuralTtsEndpoint}?${params.toString()}`
 }
 
+function isNewsSpeechKey(speechKey: string) {
+  return speechKey.startsWith('news-')
+}
+
+function normalizeNewsSpeechForSimilarity(text: string) {
+  return text
+    .toLowerCase()
+    .replace(/韭研公社新帖|新帖/g, '')
+    .replace(/[\s!-/:-@[-`{-~，。！？；：、“”‘’（）()【】[\]《》<>·…—￥]+/g, '')
+}
+
+function buildCharacterPairs(text: string) {
+  if (text.length <= 1) return text ? [text] : []
+  const pairs: string[] = []
+  for (let index = 0; index < text.length - 1; index += 1) {
+    pairs.push(text.slice(index, index + 2))
+  }
+  return pairs
+}
+
+function calculateTitleSimilarity(first: string, second: string) {
+  if (first === second) return first ? 1 : 0
+  const firstPairs = buildCharacterPairs(first)
+  const secondPairs = buildCharacterPairs(second)
+  if (!firstPairs.length || !secondPairs.length) return 0
+
+  const secondCounts = new Map<string, number>()
+  for (const pair of secondPairs) {
+    secondCounts.set(pair, (secondCounts.get(pair) || 0) + 1)
+  }
+
+  let intersection = 0
+  for (const pair of firstPairs) {
+    const count = secondCounts.get(pair) || 0
+    if (count <= 0) continue
+    intersection += 1
+    if (count === 1) {
+      secondCounts.delete(pair)
+    } else {
+      secondCounts.set(pair, count - 1)
+    }
+  }
+
+  return (2 * intersection) / (firstPairs.length + secondPairs.length)
+}
+
+function pruneRecentNewsSpeech(now: number) {
+  for (let index = recentNewsSpeechItems.length - 1; index >= 0; index -= 1) {
+    if (now - recentNewsSpeechItems[index].timestamp > NEWS_SPEECH_SIMILARITY_WINDOW_MS) {
+      recentNewsSpeechItems.splice(index, 1)
+    }
+  }
+}
+
+function isSimilarRecentNewsSpeech(text: string, speechKey: string, now = Date.now()) {
+  if (!isNewsSpeechKey(speechKey)) return false
+  pruneRecentNewsSpeech(now)
+
+  const normalizedText = normalizeNewsSpeechForSimilarity(text)
+  if (!normalizedText) return false
+
+  const shouldSkip = recentNewsSpeechItems.some(item =>
+    calculateTitleSimilarity(normalizedText, item.text) >= NEWS_SPEECH_SIMILARITY_THRESHOLD
+  )
+  if (!shouldSkip) {
+    recentNewsSpeechItems.push({ text: normalizedText, timestamp: now })
+  }
+  return shouldSkip
+}
+
 function finishSpeechItem() {
   isSpeaking = false
   processQueue()
@@ -245,6 +318,7 @@ function enqueuePluginSpeech(text: string, key?: string, options: PluginSpeechOp
   const speechKey = key || `plugin-${text}-${new Date().toDateString()}`
   if (pluginSpeechKeys.has(speechKey)) return false
   pluginSpeechKeys.add(speechKey)
+  if (isSimilarRecentNewsSpeech(text, speechKey)) return false
   speechQueue.push(text)
   processQueue()
   return true
@@ -315,6 +389,7 @@ function announceNewStocks(stocks: Array<{ stock_name: string; limit_up_reason?:
 function clearAnnounced() {
   announcedStocks.clear()
   pluginSpeechKeys.clear()
+  recentNewsSpeechItems.splice(0)
 }
 
 // 测试播报
