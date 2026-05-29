@@ -18,6 +18,9 @@ assert.doesNotMatch(stockLink, /StockDetail/, 'TDX plugin stock clicks should no
 const speech = read('src/composables/useSpeech.ts')
 assert.match(speech, /enqueuePluginSpeech/, 'useSpeech should expose a plugin speech queue entrypoint')
 assert.match(speech, /pluginSpeechKeys/, 'plugin speech should dedupe events by stable keys')
+assert.doesNotMatch(speech, /vol:\s*'99'/, 'audio fallback should not use clipping-prone max volume')
+assert.match(speech, /targetAudioFallbackVolume/, 'audio fallback should apply a controlled element volume')
+assert.match(speech, /function shouldUseTargetAudioPlayback\(\)[\s\S]*!hasWebSpeechSupport\(\)/, 'clear browser speech should be preferred over compressed audio fallback')
 
 const websocket = read('src/composables/useWebSocket.ts')
 for (const type of ['tdx_limit_up_event', 'tdx_stock_move_event', 'tdx_news_event', 'tdx_plate_strength_update']) {

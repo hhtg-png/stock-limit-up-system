@@ -156,23 +156,13 @@ function normalizeSpeechPart(value?: string) {
   return (value || '').replace(/\s+/g, ' ').trim()
 }
 
-function normalizeNewsSpeechContent(item: TdxNewsItem) {
-  const content = normalizeSpeechPart(item.content)
-  if (item.source === '格隆汇') {
-    return content.replace(/^格隆汇\d+月\d+日[丨｜]\s*/, '')
-  }
-  return content
-}
-
 function newsSpeechText(item: TdxNewsItem) {
   const source = normalizeSpeechPart(item.source)
   const title = normalizeSpeechPart(item.title)
   if (item.source === '韭研公社') {
     return `${source ? `${source}新帖，` : '新帖，'}${title}`.slice(0, 120)
   }
-  const content = normalizeNewsSpeechContent(item)
-  const digest = content && content !== title && !content.includes(title) ? `，${content.slice(0, 90)}` : ''
-  return `${source ? `${source}，` : ''}${title}${digest}`.slice(0, 180)
+  return title.slice(0, 120)
 }
 
 function shouldSpeakNews(item: TdxNewsItem) {

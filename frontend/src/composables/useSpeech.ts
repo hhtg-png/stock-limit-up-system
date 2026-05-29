@@ -4,9 +4,9 @@ import { useAlertStore } from '@/stores/alert'
 
 const targetSpeechProfile = {
   lang: 'zh-CN',
-  rate: 0.95,
-  pitch: 1.08,
-  volume: 1,
+  rate: 0.9,
+  pitch: 1,
+  volume: 0.92,
   voiceKeywords: [
     'Microsoft Xiaoxiao',
     'Microsoft Huihui',
@@ -19,18 +19,19 @@ const targetSpeechProfile = {
 
 const targetTtsAudioId = 'tdx-target-tts-audio'
 const targetTtsEndpoint = 'https://tts.baidu.com/text2audio'
+const targetAudioFallbackVolume = 0.82
 const targetTtsParams = {
   cuid: 'baike',
   lan: 'ZH',
   ctp: '3',
   pdt: '301',
-  vol: '99',
-  spd: '6',
+  vol: '8',
+  spd: '5',
   rate: '32',
   per: '0'
 }
 
-// 通达信插件播报配置：优先使用浏览器中文语音，不支持时降级为目标站同类 TTS 音频播放
+// 通达信插件播报配置：优先使用浏览器中文语音，不支持时降级为外部 TTS 音频播放
 const speechRate = ref(targetSpeechProfile.rate)
 const speechPitch = ref(targetSpeechProfile.pitch)
 const speechVolume = ref(targetSpeechProfile.volume)
@@ -138,19 +139,24 @@ function canSpeakNow(): boolean {
 function ensureTargetTtsAudio(): HTMLAudioElement | null {
   if (!hasAudioFallbackSupport()) return null
   const existing = document.getElementById(targetTtsAudioId)
-  if (existing?.tagName?.toLowerCase() === 'audio') return existing as HTMLAudioElement
+  if (existing?.tagName?.toLowerCase() === 'audio') {
+    const audio = existing as HTMLAudioElement
+    audio.volume = targetAudioFallbackVolume
+    return audio
+  }
 
   const audio = document.createElement('audio')
   audio.id = targetTtsAudioId
   audio.hidden = true
   audio.autoplay = true
   audio.preload = 'auto'
+  audio.volume = targetAudioFallbackVolume
   document.body.appendChild(audio)
   return audio
 }
 
 function shouldUseTargetAudioPlayback(): boolean {
-  return speechUnlocked.value && hasAudioFallbackSupport()
+  return !hasWebSpeechSupport() && speechUnlocked.value && hasAudioFallbackSupport()
 }
 
 function buildTargetTtsUrl(text: string) {
