@@ -5,6 +5,15 @@ import assert from 'node:assert/strict'
 const root = resolve(import.meta.dirname, '..')
 const news = readFileSync(resolve(root, 'src/views/tdx/TdxNewsFeed.vue'), 'utf8')
 const speech = readFileSync(resolve(root, 'src/composables/useSpeech.ts'), 'utf8')
+const voice = readFileSync(resolve(root, 'src/views/tdx/TdxNewsVoice.vue'), 'utf8')
+
+assert.match(voice, /useTdxPluginRealtime/, 'voice-only plugin should listen to realtime aggregate news')
+assert.match(voice, /useSpeech/, 'voice-only plugin should use the shared speech queue')
+assert.match(voice, /getTdxNews\(\{\s*limit:\s*20\s*\}\)/, 'voice-only plugin should load a small initial news snapshot')
+assert.match(voice, /handleSpeechToggle/, 'voice-only plugin should expose a user gesture speech toggle')
+assert.match(voice, /recentTitle/, 'voice-only plugin should show the latest spoken title')
+assert.match(voice, /spokenCount/, 'voice-only plugin should show the spoken count')
+assert.doesNotMatch(voice, /v-for="item in items"/, 'voice-only plugin should not render a large news list')
 
 assert.match(news, /import\s*\{\s*computed,\s*onMounted,\s*onUnmounted,\s*ref,\s*watch\s*\}/, 'news feed should watch realtime and unlock state changes')
 assert.match(news, /@change="handleSpeechToggle"/, 'news speech switch should unlock through a handler that can replay visible news')
