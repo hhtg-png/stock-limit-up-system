@@ -3,6 +3,11 @@ function isTdxRuntime(): boolean {
   return /TdxW|hong/i.test(navigator.userAgent)
 }
 
+function isDxxRuntime(): boolean {
+  if (typeof navigator === 'undefined') return false
+  return /dxx/i.test(navigator.userAgent)
+}
+
 function normalizeCode(code: string): string {
   const digits = code.replace(/\D/g, '').slice(-6)
   return digits ? digits.padStart(6, '0') : ''
@@ -15,6 +20,7 @@ export function useTdxStockLink() {
     const stockCode = normalizeCode(code)
     if (!stockCode) return
 
+    if (isDxxRuntime() && callParentStockLink(stockCode)) return
     openTreeIdLink(`http://www.treeid/CODE_${stockCode}`)
   }
 
@@ -25,6 +31,11 @@ export function useTdxStockLink() {
 }
 
 function openTreeIdLink(url: string) {
+  if (isTdxRuntime()) {
+    window.location.href = url
+    return
+  }
+
   if (typeof document === 'undefined') {
     window.open(url, 'tdx-stock-link')
     return
@@ -32,6 +43,18 @@ function openTreeIdLink(url: string) {
 
   const iframe = getOrCreateTreeIdIframe()
   iframe.src = url
+}
+
+function callParentStockLink(stockCode: string) {
+  try {
+    if (!window.parent || window.parent === window) return false
+    const parentWindow = window.parent as Window & { stocklink?: (code: string) => void }
+    if (typeof parentWindow.stocklink !== 'function') return false
+    parentWindow.stocklink(stockCode)
+    return true
+  } catch {
+    return false
+  }
 }
 
 function getOrCreateTreeIdIframe() {

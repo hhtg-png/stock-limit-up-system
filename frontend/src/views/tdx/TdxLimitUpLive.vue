@@ -233,6 +233,22 @@ async function loadQuoteStatus() {
   }
 }
 
+async function refreshSnapshotWhenStructureChanged() {
+  if (!payload.value || snapshotInFlight) return
+  const statusItems = statusPayload.value?.items || []
+  if (!hasSnapshotStructureChanged(statusItems, payload.value.items || [])) return
+  await loadData({ silent: true })
+}
+
+function hasSnapshotStructureChanged(statusItems: readonly TdxLimitUpEvent[], snapshotItems: readonly TdxLimitUpEvent[]) {
+  if (!statusItems.length || !snapshotItems.length) return false
+  if (statusItems.length !== snapshotItems.length) return true
+
+  const snapshotCodes = new Set(snapshotItems.map(item => item.stock_code).filter(Boolean))
+  if (snapshotCodes.size !== statusItems.length) return true
+  return statusItems.some(item => !snapshotCodes.has(item.stock_code))
+}
+
 function rememberExistingEvents(items: TdxLimitUpEvent[]) {
   for (const item of items) {
     seenSpeechKeys.add(item.stock_code || item.event_id)
@@ -629,7 +645,7 @@ onMounted(() => {
   loadData()
   loadQuoteStatus()
   loadInitialNewsSnapshot()
-  snapshotTimer = window.setInterval(() => loadData({ silent: true }), SNAPSHOT_REFRESH_MS)
+  snapshotTimer = window.setInterval(refreshSnapshotWhenStructureChanged, SNAPSHOT_REFRESH_MS)
   quoteTimer = window.setInterval(loadQuoteStatus, QUOTE_REFRESH_MS)
 })
 

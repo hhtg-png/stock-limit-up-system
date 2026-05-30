@@ -36,6 +36,8 @@ assert.match(limitUp, /--move-panel-flex/, 'embedded stock move panel should use
 assert.match(limitUp, /cursor:\s*row-resize/, 'resize handle should use vertical resize cursor')
 assert.match(limitUp, /STOCK_MOVE_CACHE_TTL_MS/, 'embedded stock move panel should cache arbitrary TDX-linked stock analysis')
 assert.match(limitUp, /readCachedStockMove/, 'embedded stock move panel should reuse cached stock analysis immediately')
+assert.match(limitUp, /refreshSnapshotWhenStructureChanged/, 'limit-up plugin should only refresh the full snapshot when the list structure changes')
+assert.doesNotMatch(limitUp, /setInterval\(\(\)\s*=>\s*loadData\(\{\s*silent:\s*true\s*\}\)/, 'limit-up plugin should not replace the whole table on a fixed timer')
 assert.doesNotMatch(limitUp, />\s*异动解析\s*</, 'embedded stock move panel should not show a redundant analysis label')
 assert.doesNotMatch(limitUp, /点击股票查看异动解析|异动解析加载/, 'embedded stock move panel should not use verbose analysis placeholder text')
 assert.doesNotMatch(limitUp, /stockMoveLoading[\s\S]{0,120}>加载中|查询中/, 'embedded stock move panel should not show a query/loading state')
