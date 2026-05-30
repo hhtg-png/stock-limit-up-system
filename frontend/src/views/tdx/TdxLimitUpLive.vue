@@ -123,6 +123,7 @@ import { storeToRefs } from 'pinia'
 import { getTdxLimitUpLive, getTdxLimitUpLiveStatus, getTdxNews, getTdxStockMove } from '@/api/tdx-plugins'
 import { useSpeech } from '@/composables/useSpeech'
 import { useTdxStockLink } from '@/composables/useTdxStockLink'
+import { installTdxStockSelectionBridge } from '@/composables/useTdxStockSelection'
 import { useTdxPluginRealtime } from '@/composables/useWebSocket'
 import { useLimitUpStore } from '@/stores/limit-up'
 import type { LimitUpRealtime } from '@/types/limit-up'
@@ -176,6 +177,7 @@ let hasPrimedLimitUpSpeech = false
 let stockMoveRequestId = 0
 let plateDragStartX = 0
 let plateDragStartLeft = 0
+let tdxSelectionCleanup: (() => void) | null = null
 
 const events = computed(() => buildMergedEvents())
 const plateFilters = computed(() => buildPlateFilters(events.value))
@@ -321,6 +323,10 @@ function primeStockMove(items: readonly TdxLimitUpEvent[]) {
 function handleStockClick(item: TdxLimitUpEvent) {
   selectStockMove(item.stock_code)
   openStock(item.stock_code)
+}
+
+function handleExternalStockSelection(code: string) {
+  selectStockMove(code)
 }
 
 function selectStockMove(code: string) {
@@ -619,6 +625,7 @@ function displayStatus(item: TdxLimitUpEvent) {
 }
 
 onMounted(() => {
+  tdxSelectionCleanup = installTdxStockSelectionBridge(handleExternalStockSelection)
   loadData()
   loadQuoteStatus()
   loadInitialNewsSnapshot()
@@ -646,6 +653,8 @@ onUnmounted(() => {
   window.clearInterval(snapshotTimer)
   window.clearInterval(quoteTimer)
   stopMovePanelResize()
+  tdxSelectionCleanup?.()
+  tdxSelectionCleanup = null
 })
 </script>
 

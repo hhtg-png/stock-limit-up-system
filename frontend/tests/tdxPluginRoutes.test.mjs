@@ -8,7 +8,7 @@ const app = readFileSync(resolve(root, 'src/App.vue'), 'utf8')
 
 for (const path of [
   '/tdx',
-  '/tdx/ztlive/dark',
+  '/tdx/ztlive/:code?/dark',
   '/tdx/yidong/:code?/dark',
   '/tdx/strong/dark',
   '/tdx/news/dark',

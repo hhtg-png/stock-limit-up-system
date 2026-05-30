@@ -58,7 +58,7 @@ const router = createRouter({
       meta: { title: '通达信看盘插件', tdx: true }
     },
     {
-      path: '/tdx/ztlive/dark',
+      path: '/tdx/ztlive/:code?/dark',
       name: 'TdxLimitUpLive',
       component: () => import('@/views/tdx/TdxLimitUpLive.vue'),
       meta: { title: '涨停播报', tdx: true }
