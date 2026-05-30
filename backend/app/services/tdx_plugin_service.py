@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import copy
+import contextlib
+import asyncio
 import time as time_module
 from collections import defaultdict
 from datetime import date, datetime, time
@@ -16,7 +18,7 @@ from app.services.tdx_attribution_sources import (
     PublicStockAttribution,
     public_attribution_provider,
 )
-from app.services.tdx_external_sources import ExternalStockMove, lwwhy_stock_move_provider
+from app.services.tdx_external_sources import ExternalStockMove, public_stock_move_provider
 from app.services.tdx_news_sources import public_market_news_provider
 from app.services.realtime_limit_up_service import realtime_limit_up_service
 
@@ -33,6 +35,7 @@ class TdxPluginService:
         news_provider=None,
         stock_move_cache_ttl: int = 300,
         stock_move_cache_max: int = 500,
+        stock_move_live_timeout: float = 0.9,
     ):
         self.realtime_limit_up_service = realtime_limit_up_service
         self.external_move_provider = external_move_provider
@@ -41,6 +44,7 @@ class TdxPluginService:
         self.news_provider = news_provider
         self.stock_move_cache_ttl = stock_move_cache_ttl
         self.stock_move_cache_max = stock_move_cache_max
+        self.stock_move_live_timeout = stock_move_live_timeout
         self._stock_move_payload_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 
     async def get_limit_up_live(self, trade_date: Optional[date] = None, db: Optional[AsyncSession] = None) -> Dict[str, Any]:
@@ -151,16 +155,22 @@ class TdxPluginService:
 
         warnings: List[str] = []
         source_status = {"stock_move": "ok"}
-        external_move = None
-        if source_scope != "ths":
-            external_move = await self._load_external_stock_move(normalized_code, target_date, source_status, warnings)
-
-        try:
-            limit_up_item = await self.realtime_limit_up_service.get_realtime_limit_up_item(normalized_code, target_date)
-        except Exception as exc:
-            limit_up_item = None
-            source_status["stock_move"] = "error"
-            warnings.append(f"个股异动获取失败: {exc}")
+        external_task = asyncio.create_task(
+            self._load_external_stock_move(normalized_code, target_date, source_status, warnings)
+            if source_scope != "ths"
+            else self._empty_external_stock_move()
+        )
+        limit_task = asyncio.create_task(
+            self._load_realtime_stock_move_item(normalized_code, target_date, source_status, warnings)
+        )
+        limit_task_started_at = time_module.monotonic()
+        external_move = await external_task
+        limit_up_item = await self._await_stock_move_live_item(
+            limit_task,
+            has_external_move=external_move is not None,
+            source_status=source_status,
+            started_at=limit_task_started_at,
+        )
 
         if not limit_up_item and not external_move:
             source_status["stock_move"] = "empty"
@@ -319,6 +329,46 @@ class TdxPluginService:
 
         source_status["lwwhy_move"] = "ok" if move else "empty"
         return move
+
+    async def _empty_external_stock_move(self) -> Optional[ExternalStockMove]:
+        return None
+
+    async def _load_realtime_stock_move_item(
+        self,
+        stock_code: str,
+        target_date: date,
+        source_status: Dict[str, str],
+        warnings: List[str],
+    ) -> Optional[Dict[str, Any]]:
+        try:
+            return await self.realtime_limit_up_service.get_realtime_limit_up_item(stock_code, target_date)
+        except Exception as exc:
+            source_status["stock_move"] = "error"
+            warnings.append(f"个股异动获取失败: {exc}")
+            return None
+
+    async def _await_stock_move_live_item(
+        self,
+        task: asyncio.Task,
+        *,
+        has_external_move: bool,
+        source_status: Dict[str, str],
+        started_at: float,
+    ) -> Optional[Dict[str, Any]]:
+        if not has_external_move or self.stock_move_live_timeout <= 0:
+            return await task
+
+        try:
+            timeout = max(0.0, self.stock_move_live_timeout - (time_module.monotonic() - started_at))
+            if timeout <= 0 and not task.done():
+                raise asyncio.TimeoutError
+            return await asyncio.wait_for(task, timeout=timeout)
+        except asyncio.TimeoutError:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            source_status["stock_move_live"] = "timeout"
+            return None
 
     async def _load_public_attributions(
         self,
@@ -983,7 +1033,7 @@ class TdxPluginService:
 
 
 tdx_plugin_service = TdxPluginService(
-    external_move_provider=lwwhy_stock_move_provider,
+    external_move_provider=public_stock_move_provider,
     attribution_provider=public_attribution_provider,
     enable_external_sources=True,
     news_provider=public_market_news_provider,

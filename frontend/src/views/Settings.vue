@@ -245,7 +245,7 @@ const tdxPluginDialogVisible = ref(false)
 const selectedPluginUrl = ref('')
 
 const tdxPlugins = [
-  { name: '涨停播报', desc: '实时封板、开板、回封和封单变化播报', path: '/tdx/ztlive/xxxxxx/dark' },
+  { name: '涨停播报', desc: '实时封板、开板、回封和封单变化播报', path: '/tdx/ztlive/dark#xxxxxx' },
   { name: '股票异动解析联动', desc: '综合口径展示个股最近涨停与异动原因', path: '/tdx/yidong/xxxxxx/dark' },
   { name: '实时板块强度', desc: '板块轮动、强度、量能和核心股入口', path: '/tdx/strong/dark' },
   { name: '聚合快讯', desc: '市场快讯、韭研社识别区和题材库', path: '/tdx/news/dark' },

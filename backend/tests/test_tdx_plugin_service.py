@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from datetime import date, datetime
 from types import SimpleNamespace
@@ -428,6 +429,34 @@ class TdxPluginServiceTests(unittest.IsolatedAsyncioTestCase):
         mocked_get_item.assert_awaited_once_with("603677", date(2026, 5, 29))
         self.assertEqual(second["source_status"]["stock_move_cache"], "hit")
         self.assertEqual(second["items"][0]["reasons"][0]["title"], "机器人+宁波国资+家电零部件+冷锻工艺")
+
+    async def test_stock_move_does_not_block_external_result_on_slow_live_metadata(self):
+        provider = FakeExternalMoveProvider(
+            stock_move=ExternalStockMove(
+                stock_code="002576",
+                stock_name="通达动力",
+                trade_date=date(2025, 8, 20),
+                title="机器人+核心客户比亚迪+驱动电机铁芯+新能源汽车",
+                content="1、公司生产的伺服电机铁芯可适用于机器人领域。",
+                source_name="打板客/同花顺F10",
+            )
+        )
+        service = TdxPluginService(
+            external_move_provider=provider,
+            enable_external_sources=True,
+            stock_move_live_timeout=0.01,
+        )
+
+        async def slow_live_item(*args, **kwargs):
+            await asyncio.sleep(1)
+            return make_limit_up_item("002576", "通达动力", "机器人", board=1)
+
+        with patch.object(service.realtime_limit_up_service, "get_realtime_limit_up_item", slow_live_item):
+            payload = await service.get_stock_move("002576", date(2026, 5, 30), source_scope="mixed")
+
+        self.assertIsNone(payload["items"][0]["latest_limit_up"])
+        self.assertEqual(payload["items"][0]["reasons"][0]["title"], "机器人+核心客户比亚迪+驱动电机铁芯+新能源汽车")
+        self.assertEqual(payload["source_status"]["stock_move_live"], "timeout")
 
     async def test_limit_up_live_keeps_review_source_as_supplement_without_overriding_live_reason(self):
         service = TdxPluginService(

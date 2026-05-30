@@ -32,6 +32,10 @@ assert.match(limitUp, /installTdxStockSelectionBridge/, 'limit-up plugin should 
 assert.match(limitUp, /handleExternalStockSelection/, 'limit-up plugin should route external stock selection into the embedded move panel')
 assert.doesNotMatch(limitUp, /handleExternalStockSelection[\s\S]{0,220}openStock/, 'external TDX selection should not trigger treeid navigation back to TDX')
 
+const stockLink = read('src/composables/useTdxStockLink.ts')
+assert.match(stockLink, /createElement\('iframe'\)/, 'TDX stock linking should use an offscreen iframe so the plugin window does not reload')
+assert.doesNotMatch(stockLink, /window\.location\.href\s*=/, 'TDX stock linking should not navigate the plugin window itself')
+
 const stockMove = read('src/views/tdx/TdxStockMove.vue')
 assert.match(stockMove, /installTdxStockSelectionBridge/, 'standalone stock-move plugin should subscribe to TDX external stock selection')
 assert.match(stockMove, /handleExternalStockSelection/, 'standalone stock-move plugin should reload when Tongdaxin selects a different stock')
