@@ -1,9 +1,11 @@
 """Tongdaxin black-theme watch plugin aggregation service."""
 from __future__ import annotations
 
+import copy
+import time as time_module
 from collections import defaultdict
 from datetime import date, datetime, time
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -29,12 +31,17 @@ class TdxPluginService:
         attribution_provider=None,
         enable_external_sources: bool = False,
         news_provider=None,
+        stock_move_cache_ttl: int = 300,
+        stock_move_cache_max: int = 500,
     ):
         self.realtime_limit_up_service = realtime_limit_up_service
         self.external_move_provider = external_move_provider
         self.attribution_provider = attribution_provider
         self.enable_external_sources = enable_external_sources
         self.news_provider = news_provider
+        self.stock_move_cache_ttl = stock_move_cache_ttl
+        self.stock_move_cache_max = stock_move_cache_max
+        self._stock_move_payload_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 
     async def get_limit_up_live(self, trade_date: Optional[date] = None, db: Optional[AsyncSession] = None) -> Dict[str, Any]:
         target_date = await self._resolve_trade_date(trade_date, db)
@@ -135,6 +142,13 @@ class TdxPluginService:
     ) -> Dict[str, Any]:
         target_date = await self._resolve_trade_date(trade_date, db)
         normalized_code = self._normalize_code(stock_code)
+        cache_key = self._stock_move_cache_key(normalized_code, source_scope, target_date)
+        cached_payload = self._read_stock_move_payload_cache(cache_key)
+        if cached_payload:
+            cached_payload["is_cache"] = True
+            cached_payload.setdefault("source_status", {})["stock_move_cache"] = "hit"
+            return cached_payload
+
         warnings: List[str] = []
         source_status = {"stock_move": "ok"}
         external_move = None
@@ -151,20 +165,26 @@ class TdxPluginService:
         if not limit_up_item and not external_move:
             source_status["stock_move"] = "empty"
             warnings.append(f"{normalized_code} 暂无异动解析数据")
-            return self._plugin_payload(
+            payload = self._plugin_payload(
                 [self._empty_stock_move(normalized_code, source_scope)],
                 target_date,
                 source_status,
                 is_cache=False,
                 warnings=warnings,
             )
+            self._store_stock_move_payload_cache(cache_key, payload)
+            return payload
 
         if not limit_up_item and external_move:
             item = self._build_stock_move_from_external(external_move, normalized_code, source_scope, target_date)
-            return self._plugin_payload([item], external_move.trade_date or target_date, source_status, is_cache=False, warnings=warnings)
+            payload = self._plugin_payload([item], external_move.trade_date or target_date, source_status, is_cache=False, warnings=warnings)
+            self._store_stock_move_payload_cache(cache_key, payload)
+            return payload
 
         item = self._build_stock_move_item(limit_up_item, normalized_code, source_scope, target_date, external_move=external_move)
-        return self._plugin_payload([item], target_date, source_status, is_cache=False, warnings=warnings)
+        payload = self._plugin_payload([item], target_date, source_status, is_cache=False, warnings=warnings)
+        self._store_stock_move_payload_cache(cache_key, payload)
+        return payload
 
     async def get_plate_strength(self, trade_date: Optional[date] = None, db: Optional[AsyncSession] = None) -> Dict[str, Any]:
         target_date = await self._resolve_trade_date(trade_date, db)
@@ -604,6 +624,31 @@ class TdxPluginService:
             "is_cache": is_cache,
             "warnings": warnings,
         }
+
+    def _stock_move_cache_key(self, stock_code: str, source_scope: str, target_date: date) -> str:
+        return f"{target_date.isoformat()}:{source_scope}:{stock_code}"
+
+    def _read_stock_move_payload_cache(self, cache_key: str) -> Optional[Dict[str, Any]]:
+        cached = self._stock_move_payload_cache.get(cache_key)
+        if not cached:
+            return None
+        cached_at, payload = cached
+        if time_module.time() - cached_at > self.stock_move_cache_ttl:
+            self._stock_move_payload_cache.pop(cache_key, None)
+            return None
+        return copy.deepcopy(payload)
+
+    def _store_stock_move_payload_cache(self, cache_key: str, payload: Dict[str, Any]) -> None:
+        if not cache_key:
+            return
+        self._stock_move_payload_cache[cache_key] = (time_module.time(), copy.deepcopy(payload))
+        if len(self._stock_move_payload_cache) <= self.stock_move_cache_max:
+            return
+        oldest_key = min(
+            self._stock_move_payload_cache,
+            key=lambda key: self._stock_move_payload_cache[key][0],
+        )
+        self._stock_move_payload_cache.pop(oldest_key, None)
 
     def _build_plate_filters(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         counts: Dict[str, int] = defaultdict(int)

@@ -49,3 +49,53 @@ class LwwhyStockMoveProviderTests(unittest.TestCase):
         self.assertEqual(move.title, "字节算力+算力租赁+数据中心")
         self.assertIn("森华易腾", move.content)
 
+    def test_parse_stock_detail_html_skips_latest_move_metadata_before_real_title(self):
+        html = """
+        <div class="border rounded">
+          <div class="border-b px-4 py-3">
+            <span class="font-bold text-primary">最新异动解析</span>
+            <span class="text-secondary text-sm ml-2">(2026-05-15)</span>
+          </div>
+          <div class="p-4 space-y-1">
+            <p>板块:</p>
+            <p>机器人</p>
+            <p>异动时间:</p>
+            <p>10:50:53</p>
+            <p>机器人+宁波国资+家电零部件+冷锻工艺</p>
+            <p class="text-secondary" title="1、机器人零部件小批交样。\n2、实控人是宁波国资委。">省略内容</p>
+          </div>
+        </div>
+        """
+
+        move = LwwhyStockMoveProvider.parse_stock_detail_html(html, "603677")
+
+        self.assertIsInstance(move, ExternalStockMove)
+        self.assertEqual(move.plate, "机器人")
+        self.assertEqual(move.title, "机器人+宁波国资+家电零部件+冷锻工艺")
+        self.assertIn("宁波国资委", move.content)
+
+    def test_parse_stock_detail_html_skips_inline_board_count_metadata(self):
+        html = """
+        <div class="border rounded">
+          <div class="border-b px-4 py-3">
+            <span class="font-bold text-primary">最新异动解析</span>
+            <span class="text-secondary text-sm ml-2">(2026-05-06)</span>
+          </div>
+          <div class="p-4 space-y-1">
+            <p>板块: 电池产业链</p>
+            <p>异动时间: 09:25:00</p>
+            <p>连板: 4天4板</p>
+            <p>锂矿+一季度业绩扭亏</p>
+            <p class="text-secondary" title="1、锂盐产品价格上涨。\n2、年产2.2万吨高纯度锂盐项目已开工。">省略内容</p>
+          </div>
+        </div>
+        """
+
+        move = LwwhyStockMoveProvider.parse_stock_detail_html(html, "603399")
+
+        self.assertIsInstance(move, ExternalStockMove)
+        self.assertEqual(move.plate, "电池产业链")
+        self.assertEqual(move.board_label, "4天4板")
+        self.assertEqual(move.title, "锂矿+一季度业绩扭亏")
+        self.assertIn("锂盐产品价格上涨", move.content)
+

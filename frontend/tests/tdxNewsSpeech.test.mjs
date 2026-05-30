@@ -4,6 +4,7 @@ import assert from 'node:assert/strict'
 
 const root = resolve(import.meta.dirname, '..')
 const news = readFileSync(resolve(root, 'src/views/tdx/TdxNewsFeed.vue'), 'utf8')
+const limitUp = readFileSync(resolve(root, 'src/views/tdx/TdxLimitUpLive.vue'), 'utf8')
 const speech = readFileSync(resolve(root, 'src/composables/useSpeech.ts'), 'utf8')
 const voice = readFileSync(resolve(root, 'src/views/tdx/TdxNewsVoice.vue'), 'utf8')
 
@@ -16,11 +17,11 @@ assert.match(voice, /spokenCount/, 'voice-only plugin should show the spoken cou
 assert.doesNotMatch(voice, /v-for="item in items"/, 'voice-only plugin should not render a large news list')
 
 assert.match(news, /import\s*\{\s*computed,\s*onMounted,\s*onUnmounted,\s*ref,\s*watch\s*\}/, 'news feed should watch realtime and unlock state changes')
-assert.match(news, /@change="handleSpeechToggle"/, 'news speech switch should unlock through a handler that can replay visible news')
-assert.doesNotMatch(news, /setTimeout\(\(\) => speakVisibleNews/, 'speech replay should stay inside the user gesture so browser audio playback is not blocked')
-assert.match(news, /spokenNewsKeys/, 'news feed should keep its own spoken-key guard for visible and realtime items')
+assert.match(news, /@change="handleSpeechToggle"/, 'news speech switch should unlock through a handler')
+assert.doesNotMatch(news, /speakVisibleNews/, 'news feed should not replay existing visible news when opened or enabled')
+assert.doesNotMatch(news, /speechUnlocked\.value\)\s*speak/, 'news feed should not speak existing items after initial load')
+assert.match(news, /spokenNewsKeys/, 'news feed should keep its own spoken-key guard for realtime items')
 assert.match(news, /markKnownNews/, 'news feed should mark the initial snapshot as known before realtime speech starts')
-assert.match(news, /speakVisibleNews/, 'news feed should speak currently visible news after the user enables voice')
 assert.match(news, /newsSpeechText/, 'news feed should build speech text from the aggregate news title')
 assert.match(news, /item\.source === '韭研公社'/, 'JYGS study-publish posts should get a shorter new-post speech format')
 assert.doesNotMatch(news, /normalizeNewsSpeechContent/, 'aggregate news speech should not read source content')
@@ -32,6 +33,18 @@ assert.doesNotMatch(news, /newsItems\.filter\(isAggregateNewsItem\)/, 'JYGS late
 assert.match(news, /watch\(\s*realtimeNewsItems/, 'news feed should enqueue new realtime aggregate news')
 assert.match(news, /enqueuePluginSpeech\(newsSpeechText\(item\),\s*key,\s*\{\s*force:\s*true\s*\}\)/, 'news feed speech should use the plugin voice switch instead of global limit-up alert settings')
 assert.doesNotMatch(news, /const important = payload\.value\.items\.find/, 'news feed should not only attempt one load-time important item')
+
+assert.doesNotMatch(limitUp, /news-voice-strip/, 'limit-up live plugin should not render an aggregate news voice status strip')
+assert.doesNotMatch(limitUp, />\s*聚合快讯语音\s*</, 'limit-up live plugin should not display a verbose aggregate voice title')
+assert.doesNotMatch(limitUp, /待开启|已播|等待新快讯|newsVoiceStatusText|newsSpokenCount/, 'limit-up live plugin should not show aggregate voice status text')
+assert.match(limitUp, /NEWS_SNAPSHOT_LIMIT = 20/, 'limit-up live plugin should keep the aggregate news snapshot small')
+assert.match(limitUp, /getTdxNews\(\{\s*limit:\s*NEWS_SNAPSHOT_LIMIT\s*\}\)/, 'limit-up live plugin should load a small aggregate news snapshot')
+assert.match(limitUp, /watch\(\s*realtimeNewsItems/, 'limit-up live plugin should listen to realtime aggregate news')
+assert.match(limitUp, /@change="handleSpeechToggle"/, 'limit-up live plugin should use one shared speech switch handler')
+assert.doesNotMatch(limitUp, /@change="unlockSpeech"/, 'limit-up live plugin should not expose a separate direct speech switch')
+assert.match(limitUp, /hasPrimedLimitUpSpeech/, 'limit-up live plugin should prime status events before speaking')
+assert.match(limitUp, /function handleStatusEvents/, 'limit-up live plugin should route status events through a priming guard')
+assert.match(limitUp, /rememberExistingEvents\(items\)[\s\S]*hasPrimedLimitUpSpeech = true[\s\S]*return/, 'first status payload should be remembered without sequential speech')
 
 assert.match(speech, /type PluginSpeechOptions/, 'plugin speech should have its own options')
 assert.match(speech, /function enqueuePluginSpeech\(text: string,\s*key\?: string,\s*options: PluginSpeechOptions = \{\}\)/, 'plugin speech should accept options')

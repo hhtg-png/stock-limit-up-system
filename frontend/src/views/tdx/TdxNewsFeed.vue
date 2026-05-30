@@ -101,7 +101,7 @@ const { enqueuePluginSpeech, unlockSpeech, speechUnlocked } = useSpeech()
 const { realtimeNewsItems } = useTdxPluginRealtime()
 const spokenNewsKeys = new Set<string>()
 const knownNewsKeys = new Set<string>()
-const VISIBLE_SPEECH_LIMIT = 3
+const NEW_SPEECH_LIMIT = 3
 const NEWS_REFRESH_MS = 10000
 let refreshTimer = 0
 let hasLoadedInitialSnapshot = false
@@ -192,15 +192,7 @@ function speakNews(item: TdxNewsItem) {
   return queued
 }
 
-function speakVisibleNews(limit = VISIBLE_SPEECH_LIMIT) {
-  let spokenCount = 0
-  for (const item of items.value.filter(shouldSpeakNews)) {
-    if (speakNews(item)) spokenCount += 1
-    if (spokenCount >= limit) break
-  }
-}
-
-function speakNewNews(newsItems: readonly TdxNewsItem[], limit = VISIBLE_SPEECH_LIMIT) {
+function speakNewNews(newsItems: readonly TdxNewsItem[], limit = NEW_SPEECH_LIMIT) {
   let spokenCount = 0
   for (const item of newsItems) {
     const key = newsKey(item)
@@ -214,9 +206,7 @@ function speakNewNews(newsItems: readonly TdxNewsItem[], limit = VISIBLE_SPEECH_
 function handleSpeechToggle(event: Event) {
   const input = event.target as HTMLInputElement | null
   if (input && !input.checked) return
-  if (unlockSpeech({ silent: true })) {
-    speakVisibleNews()
-  }
+  unlockSpeech({ silent: true })
 }
 
 function openUrl(url?: string) {
@@ -243,9 +233,7 @@ function topicTitle(item: TdxNewsItem) {
 }
 
 onMounted(() => {
-  loadData().then(() => {
-    if (speechUnlocked.value) speakVisibleNews()
-  })
+  loadData()
   refreshTimer = window.setInterval(loadData, NEWS_REFRESH_MS)
 })
 

@@ -21,6 +21,7 @@ const targetTtsAudioId = 'tdx-target-tts-audio'
 const targetNeuralTtsEndpoint = '/api/v1/tts/speech'
 const targetNeuralTtsVoice = 'zh-CN-XiaoyiNeural'
 const targetAudioFallbackVolume = 0.9
+const SPEECH_UNLOCK_STORAGE_KEY = 'tdx-plugin-speech-unlocked'
 const NEWS_SPEECH_SIMILARITY_WINDOW_MS = 60 * 1000
 const NEWS_SPEECH_SIMILARITY_THRESHOLD = 0.8
 
@@ -29,7 +30,7 @@ const speechRate = ref(targetSpeechProfile.rate)
 const speechPitch = ref(targetSpeechProfile.pitch)
 const speechVolume = ref(targetSpeechProfile.volume)
 const speechVoiceName = ref('')
-const speechUnlocked = ref(false)
+const speechUnlocked = ref(readStoredSpeechUnlocked())
 let voicesListenerReady = false
 
 type UnlockSpeechOptions = {
@@ -84,6 +85,24 @@ function hasAudioFallbackSupport(): boolean {
 
 function hasSpeechSupport(): boolean {
   return hasWebSpeechSupport() || hasAudioFallbackSupport()
+}
+
+function readStoredSpeechUnlocked(): boolean {
+  if (typeof window === 'undefined') return false
+  try {
+    return window.localStorage.getItem(SPEECH_UNLOCK_STORAGE_KEY) === '1'
+  } catch {
+    return false
+  }
+}
+
+function persistSpeechUnlocked(enabled: boolean) {
+  if (typeof window === 'undefined') return
+  try {
+    window.localStorage.setItem(SPEECH_UNLOCK_STORAGE_KEY, enabled ? '1' : '0')
+  } catch {
+    // 本地存储不可用时只保持当前页面状态。
+  }
 }
 
 function setupSpeechVoices() {
@@ -314,6 +333,7 @@ function speak(text: string): boolean {
 
 function enqueuePluginSpeech(text: string, key?: string, options: PluginSpeechOptions = {}): boolean {
   if (!(options.force || getSpeechEnabled()) || !text) return false
+  if (!speechUnlocked.value) return false
   if (!canSpeakNow()) return false
   const speechKey = key || `plugin-${text}-${new Date().toDateString()}`
   if (pluginSpeechKeys.has(speechKey)) return false
@@ -349,12 +369,34 @@ function unlockSpeech(options: UnlockSpeechOptions | Event = {}): boolean {
   normalizeUnlockSpeechOptions(options)
 
   speechUnlocked.value = true
+  persistSpeechUnlocked(true)
   setupSpeechVoices()
   ensureTargetTtsAudio()
   if (hasWebSpeechSupport()) {
     window.speechSynthesis.resume()
   }
   return true
+}
+
+function lockSpeech() {
+  speechUnlocked.value = false
+  persistSpeechUnlocked(false)
+  speechQueue.splice(0)
+  isSpeaking = false
+
+  if (hasWebSpeechSupport()) {
+    window.speechSynthesis.cancel()
+  }
+
+  if (hasAudioFallbackSupport()) {
+    const audio = document.getElementById(targetTtsAudioId)
+    if (audio?.tagName?.toLowerCase() === 'audio') {
+      const target = audio as HTMLAudioElement
+      target.pause()
+      target.removeAttribute('src')
+      target.load?.()
+    }
+  }
 }
 
 // 播报涨停股票
@@ -433,6 +475,7 @@ export function useSpeech() {
     speak,
     enqueuePluginSpeech,
     unlockSpeech,
+    lockSpeech,
     announceStock,
     announceNewStocks,
     announceReseal,

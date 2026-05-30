@@ -148,7 +148,7 @@ class LwwhyStockMoveProvider:
             parsed_date = date.fromisoformat(date_match.group(1))
 
         paragraphs = container.find_all("p")
-        title_tag = next((p for p in paragraphs if "text-secondary" not in (p.get("class") or [])), None)
+        title_tag = LwwhyStockMoveProvider._find_latest_move_title_tag(paragraphs)
         content_tag = next((p for p in paragraphs if "text-secondary" in (p.get("class") or [])), None)
         title = title_tag.get_text(" ", strip=True) if title_tag else ""
         content = (content_tag.get("title") or content_tag.get_text("\n", strip=True)) if content_tag else ""
@@ -186,6 +186,51 @@ class LwwhyStockMoveProvider:
         return None
 
     @staticmethod
+    def _find_latest_move_title_tag(paragraphs):
+        metadata_labels = {
+            "板块",
+            "板块:",
+            "板块：",
+            "异动时间",
+            "异动时间:",
+            "异动时间：",
+            "连板",
+            "连板:",
+            "连板：",
+        }
+        inline_metadata_prefixes = tuple(
+            label for label in metadata_labels
+            if label.endswith(":") or label.endswith("：")
+        )
+        previous_text = ""
+        for tag in paragraphs:
+            classes = set(tag.get("class") or [])
+            text = tag.get_text(" ", strip=True)
+            normalized = re.sub(r"\s+", "", text)
+            previous_normalized = re.sub(r"\s+", "", previous_text)
+
+            if "text-secondary" in classes:
+                continue
+            if not normalized:
+                previous_text = text
+                continue
+            if normalized in metadata_labels:
+                previous_text = text
+                continue
+            if normalized.startswith(inline_metadata_prefixes):
+                previous_text = text
+                continue
+            if previous_normalized in metadata_labels:
+                previous_text = text
+                continue
+            if re.fullmatch(r"\d{1,2}:\d{2}(?::\d{2})?", normalized):
+                previous_text = text
+                continue
+
+            return tag
+        return None
+
+    @staticmethod
     def _find_parent_with_classes(tag, required_classes):
         for parent in tag.parents:
             classes = set(parent.get("class") or [])
@@ -195,9 +240,13 @@ class LwwhyStockMoveProvider:
 
     @staticmethod
     def _line_value_after(lines: List[str], label: str) -> str:
+        alternate_label = label[:-1] + "：" if label.endswith(":") else label
         for index, line in enumerate(lines):
             if line == label and index + 1 < len(lines):
                 return lines[index + 1]
+            for current_label in (label, alternate_label):
+                if line.startswith(current_label):
+                    return line[len(current_label):].strip()
         return ""
 
     @staticmethod

@@ -264,14 +264,6 @@ export function useWebSocket() {
 
       case 'tdx_limit_up_event':
         pushTdxLimitUpEvent(message.data || {}, message.timestamp)
-        if (message.data.stock_name) {
-          const { enqueuePluginSpeech } = useSpeech()
-          enqueuePluginSpeech(
-            message.data.speech_text || `${message.data.stock_name}${message.data.event_label || '涨停异动'}`,
-            message.data.event_id,
-            { force: true }
-          )
-        }
         break
 
       case 'tdx_stock_move_event':

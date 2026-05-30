@@ -67,8 +67,10 @@ class FakeExternalMoveProvider:
     def __init__(self, stock_move=None, review_moves=None):
         self.stock_move = stock_move
         self.review_moves = review_moves or []
+        self.stock_move_calls = 0
 
     async def get_stock_move(self, stock_code, trade_date=None):
+        self.stock_move_calls += 1
         return self.stock_move
 
     async def get_review_moves(self, trade_date):
@@ -387,6 +389,45 @@ class TdxPluginServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("芦苇复盘", payload["items"][0]["sources"])
         self.assertEqual(payload["items"][0]["reasons"][0]["title"], "字节算力+算力租赁+数据中心")
         self.assertIn("森华易腾", payload["items"][0]["reasons"][0]["content"])
+
+    async def test_stock_move_reuses_payload_cache_for_arbitrary_tdx_stock(self):
+        provider = FakeExternalMoveProvider(
+            stock_move=ExternalStockMove(
+                stock_code="603677",
+                stock_name="奇精机械",
+                trade_date=date(2026, 5, 29),
+                title="机器人+宁波国资+家电零部件+冷锻工艺",
+                content="1、公司机器人零部件获得定点。",
+                source_name="芦苇复盘",
+            )
+        )
+        service = TdxPluginService(
+            external_move_provider=provider,
+            enable_external_sources=True,
+        )
+
+        with patch.object(
+            service.realtime_limit_up_service,
+            "get_realtime_limit_up_item",
+            AsyncMock(return_value=None),
+        ) as mocked_get_item:
+            first = await service.get_stock_move("603677", date(2026, 5, 29), source_scope="mixed")
+            provider.stock_move = ExternalStockMove(
+                stock_code="603677",
+                stock_name="奇精机械",
+                trade_date=date(2026, 5, 29),
+                title="不应该二次阻塞刷新",
+                content="二次请求应直接使用缓存。",
+                source_name="芦苇复盘",
+            )
+            second = await service.get_stock_move("603677", date(2026, 5, 29), source_scope="mixed")
+
+        self.assertFalse(first["is_cache"])
+        self.assertTrue(second["is_cache"])
+        self.assertEqual(provider.stock_move_calls, 1)
+        mocked_get_item.assert_awaited_once_with("603677", date(2026, 5, 29))
+        self.assertEqual(second["source_status"]["stock_move_cache"], "hit")
+        self.assertEqual(second["items"][0]["reasons"][0]["title"], "机器人+宁波国资+家电零部件+冷锻工艺")
 
     async def test_limit_up_live_keeps_review_source_as_supplement_without_overriding_live_reason(self):
         service = TdxPluginService(

@@ -13,8 +13,7 @@
 
     </article>
 
-    <div v-if="loading" class="state-line">加载中...</div>
-    <div v-else-if="!items.length" class="state-line">{{ emptyText }}</div>
+    <div v-if="!loading && !items.length" class="state-line">{{ emptyText }}</div>
   </main>
 </template>
 
@@ -25,6 +24,16 @@ import { getTdxStockMove } from '@/api/tdx-plugins'
 import { useSpeech } from '@/composables/useSpeech'
 import { useTdxStockLink } from '@/composables/useTdxStockLink'
 import type { TdxPluginPayload, TdxStockMove } from '@/types/tdx-plugins'
+
+const STOCK_MOVE_CACHE_TTL_MS = 5 * 60 * 1000
+const STOCK_MOVE_CACHE_MAX = 160
+
+type StockMoveCacheEntry = {
+  payload: TdxPluginPayload<TdxStockMove>
+  cachedAt: number
+}
+
+const stockMoveCache = new Map<string, StockMoveCacheEntry>()
 
 const route = useRoute()
 const payload = ref<TdxPluginPayload<TdxStockMove> | null>(null)
@@ -43,9 +52,17 @@ function routeCode() {
 
 async function loadData() {
   if (!stockCode.value) return
+  const cached = readCachedStockMove(stockCode.value)
+  if (cached) {
+    payload.value = cached
+  } else {
+    payload.value = null
+  }
   loading.value = true
   try {
-    payload.value = await getTdxStockMove(stockCode.value)
+    const next = await getTdxStockMove(stockCode.value)
+    rememberCachedStockMove(stockCode.value, next)
+    payload.value = next
     const item = payload.value.items[0]
     if (item?.reasons?.[0]) {
       enqueuePluginSpeech(`${item.stock_name}异动，${item.reasons[0].title}`, `stock-move-${item.stock_code}-${item.reasons[0].title}`, { force: true })
@@ -53,6 +70,31 @@ async function loadData() {
   } finally {
     loading.value = false
   }
+}
+
+function readCachedStockMove(stockCode: string) {
+  const key = normalizeStockCode(stockCode)
+  const entry = stockMoveCache.get(key)
+  if (!entry) return null
+  if (Date.now() - entry.cachedAt > STOCK_MOVE_CACHE_TTL_MS) {
+    stockMoveCache.delete(key)
+    return null
+  }
+  return entry.payload
+}
+
+function rememberCachedStockMove(stockCode: string, next: TdxPluginPayload<TdxStockMove>) {
+  const key = normalizeStockCode(stockCode)
+  if (!key) return
+  stockMoveCache.set(key, { payload: next, cachedAt: Date.now() })
+  if (stockMoveCache.size <= STOCK_MOVE_CACHE_MAX) return
+  const oldestKey = stockMoveCache.keys().next().value
+  if (oldestKey) stockMoveCache.delete(oldestKey)
+}
+
+function normalizeStockCode(code: string) {
+  const digits = String(code || '').replace(/\D/g, '').slice(-6)
+  return digits ? digits.padStart(6, '0') : ''
 }
 
 function reasonTitle(item: TdxStockMove) {

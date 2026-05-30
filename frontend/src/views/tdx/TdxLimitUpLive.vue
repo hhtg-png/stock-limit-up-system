@@ -1,7 +1,15 @@
 <template>
   <main class="target-ztlive" id="dark">
     <div id="plates">
-      <div class="scroll-container">
+      <div
+        ref="plateScroller"
+        class="scroll-container"
+        :class="{ dragging: isPlateDragging }"
+        @mousedown="startPlateDrag"
+        @mousemove="dragPlateScroller"
+        @mouseup="stopPlateDrag"
+        @mouseleave="stopPlateDrag"
+      >
         <div class="dates-container">
           <button
             v-for="plate in plateFilters"
@@ -21,7 +29,12 @@
       </label>
     </div>
 
-    <section class="zt-panel">
+    <section
+      ref="ztPanel"
+      class="zt-panel"
+      :class="{ resizing: isMovePanelResizing }"
+      :style="panelLayoutStyle"
+    >
       <table class="target-table zt-head">
         <thead>
           <tr>
@@ -36,7 +49,7 @@
               <span class="audio-control">
                 语音
                 <label class="switch">
-                  <input type="checkbox" :checked="speechUnlocked" @change="unlockSpeech" />
+                  <input type="checkbox" :checked="speechUnlocked" @change="handleSpeechToggle" />
                   <span class="slider round"></span>
                 </label>
               </span>
@@ -53,7 +66,7 @@
               :key="item.event_id"
               class="kline"
               :code="item.stock_code"
-              @click="openStock(item.stock_code)"
+              @click="handleStockClick(item)"
             >
               <td class="stockname" style="width: 60px;">{{ item.stock_name }}</td>
               <td style="width: 50px;">{{ item.stock_code }}</td>
@@ -74,23 +87,63 @@
         <div v-if="loading && !events.length" class="state-line">加载中...</div>
         <div v-else-if="errorText || !visibleEvents.length" class="state-line">{{ emptyText }}</div>
       </div>
+
+      <div
+        class="move-panel-resizer"
+        title="拖拽调整高度"
+        @pointerdown="startMovePanelResize"
+      ></div>
+
+      <section class="embedded-move-panel">
+        <header class="embedded-move-head" @click="selectedMoveItem && openStock(selectedMoveItem.stock_code)">
+          <strong v-if="selectedMoveItem">{{ selectedMoveItem.stock_name }}（{{ selectedMoveItem.stock_code }}）</strong>
+          <small v-if="selectedMoveItem">最近涨停：{{ selectedMoveItem.trade_date || '-' }}</small>
+          <small v-else>{{ stockMoveEmptyText }}</small>
+        </header>
+        <div class="embedded-move-body">
+          <template v-if="selectedMoveItem">
+            <p class="embedded-reason-title">{{ stockMoveReasonTitle(selectedMoveItem) }}</p>
+            <p v-for="line in stockMoveReasonLines(selectedMoveItem)" :key="line" class="embedded-reason-line">
+              {{ line }}
+            </p>
+            <div v-if="stockMoveTags(selectedMoveItem).length" class="embedded-move-tags">
+              <span v-for="tag in stockMoveTags(selectedMoveItem)" :key="tag">{{ tag }}</span>
+            </div>
+          </template>
+          <div v-else class="state-line">{{ stockMoveEmptyText }}</div>
+        </div>
+      </section>
     </section>
   </main>
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
-import { getTdxLimitUpLive, getTdxLimitUpLiveStatus } from '@/api/tdx-plugins'
+import { getTdxLimitUpLive, getTdxLimitUpLiveStatus, getTdxNews, getTdxStockMove } from '@/api/tdx-plugins'
 import { useSpeech } from '@/composables/useSpeech'
 import { useTdxStockLink } from '@/composables/useTdxStockLink'
 import { useTdxPluginRealtime } from '@/composables/useWebSocket'
 import { useLimitUpStore } from '@/stores/limit-up'
 import type { LimitUpRealtime } from '@/types/limit-up'
-import type { TdxLimitUpEvent, TdxPluginPayload } from '@/types/tdx-plugins'
+import type { TdxLimitUpEvent, TdxNewsItem, TdxPluginPayload, TdxStockMove } from '@/types/tdx-plugins'
 
 const QUOTE_REFRESH_MS = 3000
 const SNAPSHOT_REFRESH_MS = 30000
+const NEWS_SNAPSHOT_LIMIT = 20
+const MOVE_PANEL_DEFAULT_PERCENT = 33
+const MOVE_PANEL_MIN_PERCENT = 18
+const MOVE_PANEL_MAX_PERCENT = 62
+const MOVE_PANEL_STORAGE_KEY = 'tdx-limit-up-move-panel-percent'
+const STOCK_MOVE_CACHE_TTL_MS = 5 * 60 * 1000
+const STOCK_MOVE_CACHE_MAX = 160
+
+type StockMoveCacheEntry = {
+  payload: TdxPluginPayload<TdxStockMove>
+  cachedAt: number
+}
+
+const stockMoveCache = new Map<string, StockMoveCacheEntry>()
 
 const payload = ref<TdxPluginPayload<TdxLimitUpEvent> | null>(null)
 const statusPayload = ref<TdxPluginPayload<TdxLimitUpEvent> | null>(null)
@@ -99,15 +152,30 @@ const hideOpened = ref(false)
 const loading = ref(false)
 const errorText = ref('')
 const seenSpeechKeys = new Set<string>()
-const { enqueuePluginSpeech, unlockSpeech, speechUnlocked } = useSpeech()
+const knownNewsKeys = new Set<string>()
+const spokenNewsKeys = new Set<string>()
+const stockMovePayload = ref<TdxPluginPayload<TdxStockMove> | null>(null)
+const stockMoveLoading = ref(false)
+const stockMoveErrorText = ref('')
+const selectedMoveCode = ref('')
+const plateScroller = ref<HTMLElement | null>(null)
+const isPlateDragging = ref(false)
+const ztPanel = ref<HTMLElement | null>(null)
+const movePanelPercent = ref(readStoredMovePanelPercent())
+const isMovePanelResizing = ref(false)
+const { enqueuePluginSpeech, unlockSpeech, lockSpeech, speechUnlocked } = useSpeech()
 const { openStock } = useTdxStockLink()
-const { realtimeLimitUpEvents } = useTdxPluginRealtime()
+const { realtimeLimitUpEvents, realtimeNewsItems } = useTdxPluginRealtime()
 const limitUpStore = useLimitUpStore()
 const { realtimeList } = storeToRefs(limitUpStore)
 let snapshotTimer = 0
 let quoteTimer = 0
 let snapshotInFlight = false
 let statusInFlight = false
+let hasPrimedLimitUpSpeech = false
+let stockMoveRequestId = 0
+let plateDragStartX = 0
+let plateDragStartLeft = 0
 
 const events = computed(() => buildMergedEvents())
 const plateFilters = computed(() => buildPlateFilters(events.value))
@@ -123,6 +191,13 @@ const visibleEvents = computed(() => events.value.filter(item => {
   if (!activePlate.value) return true
   return (item.target_plate || item.target_reason_summary || item.reason || '').includes(activePlate.value)
 }))
+const stockMoveItems = computed(() => stockMovePayload.value?.items || [])
+const selectedMoveItem = computed(() => stockMoveItems.value[0] || null)
+const stockMoveEmptyText = computed(() => stockMoveErrorText.value || stockMovePayload.value?.warnings?.[0] || '点击股票查看详情')
+const panelLayoutStyle = computed(() => ({
+  '--zt-table-flex': String(100 - movePanelPercent.value),
+  '--move-panel-flex': String(movePanelPercent.value)
+}))
 
 async function loadData(options: { silent?: boolean } = {}) {
   if (snapshotInFlight) return
@@ -133,6 +208,7 @@ async function loadData(options: { silent?: boolean } = {}) {
     const next = await getTdxLimitUpLive()
     payload.value = next
     rememberExistingEvents(next.items)
+    primeStockMove(next.items)
   } catch (error) {
     const message = error instanceof Error ? error.message : '接口请求失败'
     errorText.value = `涨停播报加载失败：${message}`
@@ -148,7 +224,8 @@ async function loadQuoteStatus() {
   try {
     const next = await getTdxLimitUpLiveStatus()
     statusPayload.value = next
-    announceNewStatusEvents(next.items)
+    handleStatusEvents(next.items)
+    primeStockMove(next.items)
   } finally {
     statusInFlight = false
   }
@@ -167,6 +244,223 @@ function announceNewStatusEvents(items: TdxLimitUpEvent[]) {
     seenSpeechKeys.add(key)
     enqueuePluginSpeech(`${item.stock_name}${item.target_status_label || item.event_label}`, item.event_id, { force: true })
   }
+}
+
+function handleStatusEvents(items: TdxLimitUpEvent[]) {
+  if (!hasPrimedLimitUpSpeech) {
+    rememberExistingEvents(items)
+    hasPrimedLimitUpSpeech = true
+    return
+  }
+  announceNewStatusEvents(items)
+}
+
+function newsKey(item: TdxNewsItem) {
+  return `news-${item.news_id || `${item.time}-${item.title}`}`
+}
+
+function normalizeSpeechPart(value?: string) {
+  return (value || '').replace(/\s+/g, ' ').trim()
+}
+
+function newsSpeechText(item: TdxNewsItem) {
+  const source = normalizeSpeechPart(item.source)
+  const title = normalizeSpeechPart(item.title)
+  if (item.source === '韭研公社') {
+    return `${source ? `${source}新帖，` : '新帖，'}${title}`.slice(0, 120)
+  }
+  return title.slice(0, 120)
+}
+
+function rememberKnownNews(items: readonly TdxNewsItem[]) {
+  for (const item of items) {
+    if (item.news_id && item.title) knownNewsKeys.add(newsKey(item))
+  }
+}
+
+function speakNews(item: TdxNewsItem) {
+  if (!item.news_id || !item.title || !speechUnlocked.value) return false
+  const key = newsKey(item)
+  if (spokenNewsKeys.has(key)) return false
+  const queued = enqueuePluginSpeech(newsSpeechText(item), key, { force: true })
+  if (!queued) return false
+  spokenNewsKeys.add(key)
+  knownNewsKeys.add(key)
+  return true
+}
+
+async function loadInitialNewsSnapshot() {
+  try {
+    const next = await getTdxNews({ limit: NEWS_SNAPSHOT_LIMIT })
+    rememberKnownNews(next.items || [])
+  } catch {
+    // 快讯语音不再显示状态；失败时保持静默，等待后续实时消息。
+  }
+}
+
+function handleSpeechToggle(event: Event) {
+  const input = event.target as HTMLInputElement | null
+  if (input && !input.checked) {
+    lockSpeech()
+    return
+  }
+  unlockSpeech({ silent: true })
+}
+
+function normalizeStockCode(code: string) {
+  const digits = code.replace(/\D/g, '').slice(-6)
+  return digits ? digits.padStart(6, '0') : ''
+}
+
+function primeStockMove(items: readonly TdxLimitUpEvent[]) {
+  if (selectedMoveCode.value) return
+  const first = items.find(item => item.stock_code)
+  if (first?.stock_code) selectStockMove(first.stock_code)
+}
+
+function handleStockClick(item: TdxLimitUpEvent) {
+  selectStockMove(item.stock_code)
+  openStock(item.stock_code)
+}
+
+function selectStockMove(code: string) {
+  const stockCode = normalizeStockCode(code)
+  if (!stockCode) return
+  if (selectedMoveCode.value === stockCode && stockMovePayload.value) return
+  selectedMoveCode.value = stockCode
+  const cached = readCachedStockMove(stockCode)
+  if (cached) {
+    stockMovePayload.value = cached
+    stockMoveErrorText.value = ''
+  } else {
+    stockMovePayload.value = null
+  }
+  loadStockMove(stockCode)
+}
+
+async function loadStockMove(stockCode = selectedMoveCode.value) {
+  if (!stockCode) return
+  const requestId = ++stockMoveRequestId
+  const cached = readCachedStockMove(stockCode)
+  if (cached) {
+    stockMovePayload.value = cached
+    stockMoveErrorText.value = ''
+  }
+  stockMoveLoading.value = true
+  stockMoveErrorText.value = ''
+  try {
+    const next = await getTdxStockMove(stockCode)
+    if (requestId !== stockMoveRequestId) return
+    rememberCachedStockMove(stockCode, next)
+    stockMovePayload.value = next
+  } catch (error) {
+    if (requestId !== stockMoveRequestId) return
+    const message = error instanceof Error ? error.message : '接口请求失败'
+    stockMoveErrorText.value = `加载失败：${message}`
+  } finally {
+    if (requestId === stockMoveRequestId) stockMoveLoading.value = false
+  }
+}
+
+function readCachedStockMove(stockCode: string) {
+  const entry = stockMoveCache.get(stockCode)
+  if (!entry) return null
+  if (Date.now() - entry.cachedAt > STOCK_MOVE_CACHE_TTL_MS) {
+    stockMoveCache.delete(stockCode)
+    return null
+  }
+  return entry.payload
+}
+
+function rememberCachedStockMove(stockCode: string, next: TdxPluginPayload<TdxStockMove>) {
+  stockMoveCache.set(stockCode, { payload: next, cachedAt: Date.now() })
+  if (stockMoveCache.size <= STOCK_MOVE_CACHE_MAX) return
+  const oldestKey = stockMoveCache.keys().next().value
+  if (oldestKey) stockMoveCache.delete(oldestKey)
+}
+
+function stockMoveReasonTitle(item: TdxStockMove) {
+  return item.reasons?.[0]?.title || item.related_plates?.join('+') || item.industry || '暂无异动原因'
+}
+
+function stockMoveReasonLines(item: TdxStockMove) {
+  const lines: string[] = []
+  for (const reason of item.reasons || []) {
+    const numbered = numberedParagraphs(reason.content)
+    const chunks = reason.content.split(/[。；;]/).map(part => part.trim()).filter(Boolean)
+    if (numbered.length) lines.push(...numbered)
+    else if (chunks.length) lines.push(...chunks)
+    else if (reason.content) lines.push(reason.content)
+  }
+  if (item.announcements?.length) lines.push(...item.announcements)
+  return lines.length ? lines : ['暂无解析数据']
+}
+
+function stockMoveTags(item: TdxStockMove) {
+  return Array.from(new Set([...(item.related_plates || []), ...(item.concepts || []), item.industry].filter(Boolean))).slice(0, 10)
+}
+
+function numberedParagraphs(content: string) {
+  const paragraphs = content.split(/\n+/).map(part => part.trim()).filter(Boolean)
+  if (paragraphs.length > 1 && paragraphs.every(part => /^\d+、/.test(part))) {
+    return paragraphs
+  }
+  return []
+}
+
+function startPlateDrag(event: MouseEvent) {
+  const element = plateScroller.value
+  if (!element) return
+  isPlateDragging.value = true
+  plateDragStartX = event.clientX
+  plateDragStartLeft = element.scrollLeft
+  event.preventDefault()
+}
+
+function dragPlateScroller(event: MouseEvent) {
+  const element = plateScroller.value
+  if (!element || !isPlateDragging.value) return
+  element.scrollLeft = plateDragStartLeft - (event.clientX - plateDragStartX)
+  event.preventDefault()
+}
+
+function stopPlateDrag() {
+  isPlateDragging.value = false
+}
+
+function readStoredMovePanelPercent() {
+  if (typeof window === 'undefined') return MOVE_PANEL_DEFAULT_PERCENT
+  const saved = Number(window.localStorage.getItem(MOVE_PANEL_STORAGE_KEY))
+  return clampMovePanelPercent(Number.isFinite(saved) ? saved : MOVE_PANEL_DEFAULT_PERCENT)
+}
+
+function clampMovePanelPercent(value: number) {
+  return Math.min(MOVE_PANEL_MAX_PERCENT, Math.max(MOVE_PANEL_MIN_PERCENT, value))
+}
+
+function startMovePanelResize(event: PointerEvent) {
+  isMovePanelResizing.value = true
+  window.addEventListener('pointermove', resizeMovePanel)
+  window.addEventListener('pointerup', stopMovePanelResize)
+  window.addEventListener('pointercancel', stopMovePanelResize)
+  event.preventDefault()
+}
+
+function resizeMovePanel(event: PointerEvent) {
+  const element = ztPanel.value
+  if (!element || !isMovePanelResizing.value) return
+  const rect = element.getBoundingClientRect()
+  const distanceFromBottom = rect.bottom - event.clientY
+  const nextPercent = clampMovePanelPercent((distanceFromBottom / rect.height) * 100)
+  movePanelPercent.value = Number(nextPercent.toFixed(1))
+  window.localStorage.setItem(MOVE_PANEL_STORAGE_KEY, String(movePanelPercent.value))
+}
+
+function stopMovePanelResize() {
+  isMovePanelResizing.value = false
+  window.removeEventListener('pointermove', resizeMovePanel)
+  window.removeEventListener('pointerup', stopMovePanelResize)
+  window.removeEventListener('pointercancel', stopMovePanelResize)
 }
 
 function buildMergedEvents() {
@@ -327,13 +621,31 @@ function displayStatus(item: TdxLimitUpEvent) {
 onMounted(() => {
   loadData()
   loadQuoteStatus()
+  loadInitialNewsSnapshot()
   snapshotTimer = window.setInterval(() => loadData({ silent: true }), SNAPSHOT_REFRESH_MS)
   quoteTimer = window.setInterval(loadQuoteStatus, QUOTE_REFRESH_MS)
+})
+
+watch(realtimeNewsItems, (nextItems, previousItems) => {
+  const previousKeys = new Set(previousItems.map(newsKey))
+  for (const item of nextItems) {
+    const key = newsKey(item)
+    const wasKnown = knownNewsKeys.has(key) || previousKeys.has(key)
+    knownNewsKeys.add(key)
+    if (!wasKnown) speakNews(item)
+  }
+})
+
+watch(realtimeLimitUpEvents, (nextItems, previousItems) => {
+  const previousKeys = new Set(previousItems.map(item => item.event_id))
+  const newRealtimeItems = nextItems.filter(item => !previousKeys.has(item.event_id))
+  handleStatusEvents(newRealtimeItems)
 })
 
 onUnmounted(() => {
   window.clearInterval(snapshotTimer)
   window.clearInterval(quoteTimer)
+  stopMovePanelResize()
 })
 </script>
 
@@ -371,6 +683,18 @@ onUnmounted(() => {
   flex: 1;
   overflow-x: auto;
   white-space: nowrap;
+  cursor: grab;
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+  user-select: none;
+}
+
+.scroll-container::-webkit-scrollbar {
+  display: none;
+}
+
+.scroll-container.dragging {
+  cursor: grabbing;
 }
 
 .dates-container {
@@ -414,13 +738,107 @@ onUnmounted(() => {
   flex: 1;
   flex-direction: column;
   overflow: hidden;
+  --zt-table-flex: 67;
+  --move-panel-flex: 33;
 }
 
 .zt-body {
   position: relative;
-  flex: 1;
-  min-height: 275px;
+  flex: var(--zt-table-flex) 1 0;
+  min-height: 0;
   overflow: auto;
+}
+
+.move-panel-resizer {
+  flex: 0 0 6px;
+  border-top: 1px solid #30394a;
+  border-bottom: 1px solid #30394a;
+  background: linear-gradient(#171d29, #121722);
+  cursor: row-resize;
+}
+
+.move-panel-resizer::before {
+  display: block;
+  width: 34px;
+  height: 2px;
+  margin: 2px auto;
+  border-radius: 2px;
+  background: #65748a;
+  content: "";
+}
+
+.zt-panel.resizing,
+.zt-panel.resizing * {
+  cursor: row-resize !important;
+  user-select: none;
+}
+
+.embedded-move-panel {
+  display: flex;
+  flex: var(--move-panel-flex) 1 0;
+  min-height: 0;
+  flex-direction: column;
+  background: #111219;
+}
+
+.embedded-move-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 30px;
+  padding: 5px 8px;
+  border-bottom: 1px solid #2d3748;
+  background: #212433;
+  color: #8da3bd;
+  cursor: pointer;
+}
+
+.embedded-move-head span {
+  color: #f0be83;
+}
+
+.embedded-move-head strong {
+  color: #ff6b6b;
+  font-size: 13px;
+  font-weight: 400;
+}
+
+.embedded-move-head small {
+  color: #b0b0b0;
+}
+
+.embedded-move-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 7px 8px 10px;
+  color: #ddd;
+  line-height: 1.55;
+}
+
+.embedded-reason-title {
+  margin: 0 0 8px;
+  color: #f0be83;
+  font-size: 13px;
+}
+
+.embedded-reason-line {
+  margin: 0 0 6px;
+  white-space: normal;
+  word-break: break-word;
+}
+
+.embedded-move-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+.embedded-move-tags span {
+  padding: 1px 5px;
+  border: 1px solid #4a5568;
+  color: #f0be83;
 }
 
 .target-table {
