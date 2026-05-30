@@ -181,7 +181,7 @@
       class="tdx-plugin-modal"
       destroy-on-close
     >
-      <p class="plugin-window-tip">这些地址用于嵌入通达信，不会在当前系统内跳转。</p>
+      <p class="plugin-window-tip">带 xxxxxx 的地址用于通达信当前股票联动，通达信会替换为选中的股票代码。</p>
       <div class="plugin-window">
         <article
           v-for="plugin in tdxPlugins"
@@ -245,11 +245,11 @@ const tdxPluginDialogVisible = ref(false)
 const selectedPluginUrl = ref('')
 
 const tdxPlugins = [
-  { name: '涨停播报', desc: '实时封板、开板、回封和封单变化播报', path: '/tdx/ztlive/dark' },
-  { name: '股票异动解析联动', desc: '综合口径展示个股最近涨停与异动原因', path: '/tdx/yidong/600589/dark' },
+  { name: '涨停播报', desc: '实时封板、开板、回封和封单变化播报', path: '/tdx/ztlive/xxxxxx/dark' },
+  { name: '股票异动解析联动', desc: '综合口径展示个股最近涨停与异动原因', path: '/tdx/yidong/xxxxxx/dark' },
   { name: '实时板块强度', desc: '板块轮动、强度、量能和核心股入口', path: '/tdx/strong/dark' },
   { name: '聚合快讯', desc: '市场快讯、韭研社识别区和题材库', path: '/tdx/news/dark' },
-  { name: '异动解析（同花顺版）', desc: '同花顺口径的概念和异动解析', path: '/tdx/thsyd/600589/dark' }
+  { name: '异动解析（同花顺版）', desc: '同花顺口径的概念和异动解析', path: '/tdx/thsyd/xxxxxx/dark' }
 ]
 
 // 加载配置

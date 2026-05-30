@@ -22,19 +22,22 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { getTdxThsMove } from '@/api/tdx-plugins'
 import { useSpeech } from '@/composables/useSpeech'
 import { useTdxStockLink } from '@/composables/useTdxStockLink'
+import { installTdxStockSelectionBridge } from '@/composables/useTdxStockSelection'
 import type { TdxPluginPayload, TdxStockMove } from '@/types/tdx-plugins'
 
 const route = useRoute()
 const payload = ref<TdxPluginPayload<TdxStockMove> | null>(null)
 const loading = ref(false)
-const stockCode = ref(routeCode() || '600589')
+const stockCode = ref(routeStockCode() || '600589')
 const { enqueuePluginSpeech } = useSpeech()
 const { openStock } = useTdxStockLink()
+let thsMoveRequestId = 0
+let tdxSelectionCleanup: (() => void) | null = null
 
 const items = computed(() => payload.value?.items || [])
 const emptyText = computed(() => payload.value?.warnings?.[0] || '暂无同花顺异动解析数据')
@@ -44,18 +47,37 @@ function routeCode() {
   return Array.isArray(value) ? value[0] : value
 }
 
+function routeStockCode() {
+  return normalizeStockCode(routeCode() || '')
+}
+
 async function loadData() {
   if (!stockCode.value) return
+  const requestId = ++thsMoveRequestId
   loading.value = true
   try {
-    payload.value = await getTdxThsMove(stockCode.value)
+    const next = await getTdxThsMove(stockCode.value)
+    if (requestId !== thsMoveRequestId) return
+    payload.value = next
     const item = payload.value.items[0]
     if (item?.reasons?.[0]) {
       enqueuePluginSpeech(`${item.stock_name}同花顺异动，${item.reasons[0].title}`, `ths-move-${item.stock_code}-${item.reasons[0].title}`, { force: true })
     }
   } finally {
-    loading.value = false
+    if (requestId === thsMoveRequestId) loading.value = false
   }
+}
+
+function handleExternalStockSelection(code: string) {
+  const nextCode = normalizeStockCode(code)
+  if (!nextCode || (nextCode === stockCode.value && payload.value)) return
+  stockCode.value = nextCode
+  loadData()
+}
+
+function normalizeStockCode(code: string) {
+  const digits = String(code || '').replace(/\D/g, '').slice(-6)
+  return digits ? digits.padStart(6, '0') : ''
 }
 
 function reasonTitle(item: TdxStockMove) {
@@ -83,11 +105,19 @@ function numberedParagraphs(content: string) {
 }
 
 watch(() => route.params.code, () => {
-  stockCode.value = routeCode() || stockCode.value
-  loadData()
+  const nextCode = routeStockCode()
+  if (nextCode) handleExternalStockSelection(nextCode)
 })
 
-onMounted(loadData)
+onMounted(() => {
+  tdxSelectionCleanup = installTdxStockSelectionBridge(handleExternalStockSelection)
+  if (!thsMoveRequestId) loadData()
+})
+
+onUnmounted(() => {
+  tdxSelectionCleanup?.()
+  tdxSelectionCleanup = null
+})
 </script>
 
 <style scoped>

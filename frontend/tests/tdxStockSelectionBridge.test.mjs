@@ -24,11 +24,21 @@ assert.match(bridge, /onTdxStockChange/, 'bridge should expose an alternate glob
 assert.match(bridge, /stocklink/, 'bridge should accept target-site-style stocklink callback input')
 assert.match(bridge, /CODE_000090/, 'bridge should document CODE_ style extraction')
 assert.match(bridge, /gpdm=SH600589/, 'bridge should document gpdm-style extraction')
+assert.match(bridge, /window\.parent/, 'bridge should also register callbacks on a same-origin parent frame when embedded')
+assert.match(bridge, /xxxxxx/, 'bridge documentation should cover Tongdaxin placeholder URLs')
 
 const limitUp = read('src/views/tdx/TdxLimitUpLive.vue')
 assert.match(limitUp, /installTdxStockSelectionBridge/, 'limit-up plugin should subscribe to TDX external stock selection')
 assert.match(limitUp, /handleExternalStockSelection/, 'limit-up plugin should route external stock selection into the embedded move panel')
 assert.doesNotMatch(limitUp, /handleExternalStockSelection[\s\S]{0,220}openStock/, 'external TDX selection should not trigger treeid navigation back to TDX')
+
+const stockMove = read('src/views/tdx/TdxStockMove.vue')
+assert.match(stockMove, /installTdxStockSelectionBridge/, 'standalone stock-move plugin should subscribe to TDX external stock selection')
+assert.match(stockMove, /handleExternalStockSelection/, 'standalone stock-move plugin should reload when Tongdaxin selects a different stock')
+
+const thsMove = read('src/views/tdx/TdxThsMove.vue')
+assert.match(thsMove, /installTdxStockSelectionBridge/, 'THS stock-move plugin should subscribe to TDX external stock selection')
+assert.match(thsMove, /routeStockCode/, 'THS stock-move plugin should ignore unresolved xxxxxx placeholders until TDX supplies a real code')
 
 const tdxRouter = read('src/router/tdx.ts')
 const appRouter = read('src/router/index.ts')

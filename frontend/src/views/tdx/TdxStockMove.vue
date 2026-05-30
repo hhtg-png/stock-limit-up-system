@@ -18,11 +18,12 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { getTdxStockMove } from '@/api/tdx-plugins'
 import { useSpeech } from '@/composables/useSpeech'
 import { useTdxStockLink } from '@/composables/useTdxStockLink'
+import { installTdxStockSelectionBridge } from '@/composables/useTdxStockSelection'
 import type { TdxPluginPayload, TdxStockMove } from '@/types/tdx-plugins'
 
 const STOCK_MOVE_CACHE_TTL_MS = 5 * 60 * 1000
@@ -38,9 +39,11 @@ const stockMoveCache = new Map<string, StockMoveCacheEntry>()
 const route = useRoute()
 const payload = ref<TdxPluginPayload<TdxStockMove> | null>(null)
 const loading = ref(false)
-const stockCode = ref(routeCode() || '600589')
+const stockCode = ref(routeStockCode() || '600589')
 const { enqueuePluginSpeech } = useSpeech()
 const { openStock } = useTdxStockLink()
+let stockMoveRequestId = 0
+let tdxSelectionCleanup: (() => void) | null = null
 
 const items = computed(() => payload.value?.items || [])
 const emptyText = computed(() => payload.value?.warnings?.[0] || '暂无异动解析数据')
@@ -50,8 +53,13 @@ function routeCode() {
   return Array.isArray(value) ? value[0] : value
 }
 
+function routeStockCode() {
+  return normalizeStockCode(routeCode() || '')
+}
+
 async function loadData() {
   if (!stockCode.value) return
+  const requestId = ++stockMoveRequestId
   const cached = readCachedStockMove(stockCode.value)
   if (cached) {
     payload.value = cached
@@ -61,6 +69,7 @@ async function loadData() {
   loading.value = true
   try {
     const next = await getTdxStockMove(stockCode.value)
+    if (requestId !== stockMoveRequestId) return
     rememberCachedStockMove(stockCode.value, next)
     payload.value = next
     const item = payload.value.items[0]
@@ -68,8 +77,15 @@ async function loadData() {
       enqueuePluginSpeech(`${item.stock_name}异动，${item.reasons[0].title}`, `stock-move-${item.stock_code}-${item.reasons[0].title}`, { force: true })
     }
   } finally {
-    loading.value = false
+    if (requestId === stockMoveRequestId) loading.value = false
   }
+}
+
+function handleExternalStockSelection(code: string) {
+  const nextCode = normalizeStockCode(code)
+  if (!nextCode || (nextCode === stockCode.value && payload.value)) return
+  stockCode.value = nextCode
+  loadData()
 }
 
 function readCachedStockMove(stockCode: string) {
@@ -123,11 +139,19 @@ function numberedParagraphs(content: string) {
 }
 
 watch(() => route.params.code, () => {
-  stockCode.value = routeCode() || stockCode.value
-  loadData()
+  const nextCode = routeStockCode()
+  if (nextCode) handleExternalStockSelection(nextCode)
 })
 
-onMounted(loadData)
+onMounted(() => {
+  tdxSelectionCleanup = installTdxStockSelectionBridge(handleExternalStockSelection)
+  if (!stockMoveRequestId) loadData()
+})
+
+onUnmounted(() => {
+  tdxSelectionCleanup?.()
+  tdxSelectionCleanup = null
+})
 </script>
 
 <style scoped>

@@ -7,7 +7,7 @@ type StockSelectionWindow = Window & {
 type LocationLike = Pick<Location, 'href' | 'pathname' | 'search' | 'hash'>
 
 const TDX_LOCATION_POLL_MS = 500
-export const TDX_STOCK_SELECTION_EXAMPLES = ['CODE_000090', 'gpdm=SH600589']
+export const TDX_STOCK_SELECTION_EXAMPLES = ['CODE_000090', 'gpdm=SH600589', '/tdx/yidong/xxxxxx/dark']
 const STOCK_CODE_PARAM_NAMES = [
   'code',
   'stock_code',
@@ -83,13 +83,8 @@ export function installTdxStockSelectionBridge(onSelect: (stockCode: string) => 
   }
 
   const bridgeWindow = window as StockSelectionWindow
-  const previousTdxSelectStock = bridgeWindow.tdxSelectStock
-  const previousOnTdxStockChange = bridgeWindow.onTdxStockChange
-  const previousStocklink = bridgeWindow.stocklink
-
-  bridgeWindow.tdxSelectStock = emitIfChanged
-  bridgeWindow.onTdxStockChange = emitIfChanged
-  bridgeWindow.stocklink = emitIfChanged
+  const cleanupWindowCallbacks = installStockSelectionCallbacks(bridgeWindow, emitIfChanged)
+  const cleanupParentCallbacks = installParentStockSelectionCallbacks(emitIfChanged)
 
   window.addEventListener('hashchange', handleLocationEvent)
   window.addEventListener('popstate', handleLocationEvent)
@@ -103,9 +98,36 @@ export function installTdxStockSelectionBridge(onSelect: (stockCode: string) => 
     window.removeEventListener('hashchange', handleLocationEvent)
     window.removeEventListener('popstate', handleLocationEvent)
     window.removeEventListener('message', handleMessage)
-    bridgeWindow.tdxSelectStock = previousTdxSelectStock
-    bridgeWindow.onTdxStockChange = previousOnTdxStockChange
-    bridgeWindow.stocklink = previousStocklink
+    cleanupWindowCallbacks()
+    cleanupParentCallbacks()
+  }
+}
+
+function installParentStockSelectionCallbacks(emitIfChanged: (rawCode: unknown) => void): () => void {
+  try {
+    if (!window.parent || window.parent === window) return () => {}
+    return installStockSelectionCallbacks(window.parent as unknown as StockSelectionWindow, emitIfChanged)
+  } catch {
+    return () => {}
+  }
+}
+
+function installStockSelectionCallbacks(
+  bridgeWindow: StockSelectionWindow,
+  emitIfChanged: (rawCode: unknown) => void
+): () => void {
+  const previousTdxSelectStock = bridgeWindow.tdxSelectStock
+  const previousOnTdxStockChange = bridgeWindow.onTdxStockChange
+  const previousStocklink = bridgeWindow.stocklink
+
+  bridgeWindow.tdxSelectStock = emitIfChanged
+  bridgeWindow.onTdxStockChange = emitIfChanged
+  bridgeWindow.stocklink = emitIfChanged
+
+  return () => {
+    if (bridgeWindow.tdxSelectStock === emitIfChanged) bridgeWindow.tdxSelectStock = previousTdxSelectStock
+    if (bridgeWindow.onTdxStockChange === emitIfChanged) bridgeWindow.onTdxStockChange = previousOnTdxStockChange
+    if (bridgeWindow.stocklink === emitIfChanged) bridgeWindow.stocklink = previousStocklink
   }
 }
 

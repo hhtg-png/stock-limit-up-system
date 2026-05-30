@@ -22,11 +22,11 @@ import { useSpeech } from '@/composables/useSpeech'
 const { unlockSpeech } = useSpeech()
 
 const plugins = [
-  { name: '涨停播报', desc: '实时封板、开板、回封事件', path: '/tdx/ztlive/dark' },
-  { name: '股票异动解析联动', desc: '综合口径解析个股异动原因', path: '/tdx/yidong/001259/dark' },
+  { name: '涨停播报', desc: '实时封板、开板、回封事件', path: '/tdx/ztlive/xxxxxx/dark' },
+  { name: '股票异动解析联动', desc: '综合口径解析个股异动原因', path: '/tdx/yidong/xxxxxx/dark' },
   { name: '实时板块强度', desc: '按涨停、封板率、核心股计算强度', path: '/tdx/strong/dark' },
   { name: '聚合快讯', desc: '市场快讯聚合与语音播报', path: '/tdx/news/dark' },
-  { name: '异动解析（同花顺版）', desc: '同花顺口径个股解析', path: '/tdx/thsyd/001259/dark' }
+  { name: '异动解析（同花顺版）', desc: '同花顺口径个股解析', path: '/tdx/thsyd/xxxxxx/dark' }
 ]
 
 function refresh() {
