@@ -2,7 +2,7 @@
   <div class="jiege-mode">
     <div class="toolbar">
       <div class="toolbar-title">
-        <h3>杰哥交易模式</h3>
+        <h3>交易模式</h3>
       </div>
       <div class="toolbar-actions">
         <el-date-picker
@@ -65,12 +65,22 @@
           <span v-else class="empty-text">暂无市场环境依据</span>
         </section>
 
-        <section class="panel">
+        <section class="panel rules-panel" :class="{ 'is-expanded': rulesExpanded }">
           <div class="section-header">
             <h4>规则体系</h4>
-            <span>{{ signalData.rules.length }} 条规则</span>
+            <div class="section-actions">
+              <span>{{ signalData.rules.length }} 条规则</span>
+              <el-button
+                size="small"
+                text
+                :icon="rulesExpanded ? ArrowUp : ArrowDown"
+                @click="rulesExpanded = !rulesExpanded"
+              >
+                {{ rulesExpanded ? '收起' : '展开' }}
+              </el-button>
+            </div>
           </div>
-          <div v-if="signalData.rules.length" class="rule-grid">
+          <div v-if="rulesExpanded && signalData.rules.length" class="rule-grid">
             <article v-for="rule in signalData.rules" :key="rule.rule_key" class="rule-item">
               <div class="rule-title">
                 <el-tag size="small" type="info">{{ rule.category || '规则' }}</el-tag>
@@ -82,7 +92,7 @@
               </div>
             </article>
           </div>
-          <el-empty v-else description="暂无规则" />
+          <el-empty v-else-if="rulesExpanded" description="暂无规则" />
         </section>
 
         <section class="panel yesterday-panel">
@@ -201,7 +211,7 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import { Files, Refresh } from '@element-plus/icons-vue'
+import { ArrowDown, ArrowUp, Files, Refresh } from '@element-plus/icons-vue'
 import dayjs from 'dayjs'
 import { getJiegeMode, rebuildJiegeMode } from '@/api/intelligence'
 import type { JiegeCandidate, JiegeModeResponse } from '@/types/intelligence'
@@ -212,6 +222,7 @@ const jiegeMode = ref<JiegeModeResponse | null>(null)
 const loading = ref(false)
 const rebuilding = ref(false)
 const errorMessage = ref('')
+const rulesExpanded = ref(false)
 
 const signalData = computed(() => jiegeMode.value?.data || null)
 const candidates = computed<JiegeCandidate[]>(() => signalData.value?.prediction.candidates || [])
@@ -246,8 +257,8 @@ async function fetchData() {
   try {
     jiegeMode.value = await getJiegeMode(selectedDate.value)
   } catch (error) {
-    console.error('获取杰哥交易模式失败:', error)
-    errorMessage.value = '获取杰哥交易模式失败'
+    console.error('获取交易模式失败:', error)
+    errorMessage.value = '获取交易模式失败'
     ElMessage.error(errorMessage.value)
   } finally {
     loading.value = false
@@ -261,8 +272,8 @@ async function rebuildData() {
     jiegeMode.value = await rebuildJiegeMode(selectedDate.value)
     ElMessage.success('模式重算完成')
   } catch (error) {
-    console.error('重算杰哥交易模式失败:', error)
-    errorMessage.value = '重算杰哥交易模式失败'
+    console.error('重算交易模式失败:', error)
+    errorMessage.value = '重算交易模式失败'
     ElMessage.error(errorMessage.value)
   } finally {
     rebuilding.value = false
@@ -437,6 +448,18 @@ function formatTime(value?: string | null): string {
     color: #6b7280;
     font-size: 12px;
     line-height: 1.5;
+  }
+}
+
+.section-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.rules-panel:not(.is-expanded) {
+  .section-header {
+    margin-bottom: 0;
   }
 }
 

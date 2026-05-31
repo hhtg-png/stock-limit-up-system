@@ -28,9 +28,12 @@ assert.match(bridge, /window\.parent/, 'bridge should also register callbacks on
 assert.match(bridge, /xxxxxx/, 'bridge documentation should cover Tongdaxin placeholder URLs')
 
 const limitUp = read('src/views/tdx/TdxLimitUpLive.vue')
-assert.match(limitUp, /installTdxStockSelectionBridge/, 'limit-up plugin should subscribe to TDX external stock selection')
-assert.match(limitUp, /handleExternalStockSelection/, 'limit-up plugin should route external stock selection into the embedded move panel')
-assert.doesNotMatch(limitUp, /handleExternalStockSelection[\s\S]{0,220}openStock/, 'external TDX selection should not trigger treeid navigation back to TDX')
+assert.doesNotMatch(limitUp, /installTdxStockSelectionBridge|handleExternalStockSelection/, 'pure limit-up plugin should not subscribe to external stock selection')
+
+const composite = read('src/views/tdx/TdxCompositeWatch.vue')
+assert.match(composite, /installTdxStockSelectionBridge/, 'composite plugin should subscribe to TDX external stock selection')
+assert.match(composite, /handleExternalStockSelection/, 'composite plugin should route external stock selection into the embedded move panel')
+assert.doesNotMatch(composite, /handleExternalStockSelection[\s\S]{0,220}openStock/, 'external TDX selection should not trigger treeid navigation back to TDX')
 
 const stockLink = read('src/composables/useTdxStockLink.ts')
 assert.match(stockLink, /isTdxRuntime\(\)[\s\S]{0,220}window\.location\.href\s*=\s*url/, 'TDX runtime should use the target-site top-level treeid navigation so Tongdaxin can intercept it without a frame reload')
@@ -49,6 +52,7 @@ const tdxRouter = read('src/router/tdx.ts')
 const appRouter = read('src/router/index.ts')
 for (const router of [tdxRouter, appRouter]) {
   assert.match(router, /\/tdx\/ztlive\/:code\?\/dark/, 'router should support TDX ztlive URLs that include the active stock code')
+  assert.match(router, /\/tdx\/composite\/:code\?\/dark/, 'router should support TDX composite URLs that include the active stock code')
 }
 
 console.log('tdx stock selection bridge checks passed')

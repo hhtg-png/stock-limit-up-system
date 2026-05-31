@@ -18,7 +18,8 @@ assert.doesNotMatch(settings, /router\.push\(path\)/, 'Settings should not navig
 assert.doesNotMatch(settings, /打开插件入口/, 'Settings should not present TDX plugins as normal in-app pages')
 
 for (const path of [
-  '/tdx/ztlive/dark#xxxxxx',
+  '/tdx/ztlive/dark',
+  '/tdx/composite/dark#xxxxxx',
   '/tdx/yidong/xxxxxx/dark',
   '/tdx/strong/dark',
   '/tdx/news/dark',
@@ -29,6 +30,7 @@ for (const path of [
 
 assert.match(settings, /xxxxxx/, 'TDX stock-linked plugin URLs should use the Tongdaxin current-stock placeholder')
 assert.doesNotMatch(settings, /\/tdx\/ztlive\/xxxxxx\/dark/, 'combined ztlive plugin should keep current-stock placeholder in hash to avoid a full page navigation')
+assert.doesNotMatch(settings, /\/tdx\/ztlive\/dark#xxxxxx/, 'pure limit-up broadcast should not carry the current-stock placeholder')
 assert.doesNotMatch(settings, /\/tdx\/yidong\/600589\/dark/, 'Settings should not copy a fixed stock code for stock move linkage')
 
 assert.match(settings, /tdx-plugin-modal/, 'Settings should style the modal plugin entry')

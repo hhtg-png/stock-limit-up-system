@@ -7,7 +7,8 @@ const router = readFileSync(resolve(root, 'src/router/tdx.ts'), 'utf8')
 
 for (const path of [
   '/tdx',
-  '/tdx/ztlive/dark',
+  '/tdx/ztlive/:code?/dark',
+  '/tdx/composite/:code?/dark',
   '/tdx/yidong/:code?/dark',
   '/tdx/strong/dark',
   '/tdx/news/dark',

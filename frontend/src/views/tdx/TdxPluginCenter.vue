@@ -22,7 +22,8 @@ import { useSpeech } from '@/composables/useSpeech'
 const { unlockSpeech } = useSpeech()
 
 const plugins = [
-  { name: '涨停播报', desc: '实时封板、开板、回封事件', path: '/tdx/ztlive/dark#xxxxxx' },
+  { name: '涨停播报', desc: '纯涨停、炸板、回封事件播报', path: '/tdx/ztlive/dark' },
+  { name: '复合看盘', desc: '涨停播报叠加个股异动解析联动', path: '/tdx/composite/dark#xxxxxx' },
   { name: '股票异动解析联动', desc: '综合口径解析个股异动原因', path: '/tdx/yidong/xxxxxx/dark' },
   { name: '实时板块强度', desc: '按涨停、封板率、核心股计算强度', path: '/tdx/strong/dark' },
   { name: '聚合快讯', desc: '市场快讯聚合与语音播报', path: '/tdx/news/dark' },

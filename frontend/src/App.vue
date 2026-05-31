@@ -35,7 +35,7 @@
             </el-menu-item>
             <el-menu-item index="/jiege-mode">
               <el-icon><TrendCharts /></el-icon>
-              <span>杰哥交易模式</span>
+              <span>交易模式</span>
             </el-menu-item>
             <el-menu-item index="/continuous">
               <el-icon><TrendCharts /></el-icon>
@@ -153,7 +153,7 @@ const mobileNavItems = [
   { path: '/statistics', label: '报表', icon: PieChart },
   { path: '/daily-analysis', label: '分析', icon: Calendar },
   { path: '/daily-info', label: '资讯', icon: Document },
-  { path: '/jiege-mode', label: '杰哥', icon: TrendCharts },
+  { path: '/jiege-mode', label: '交易', icon: TrendCharts },
   { path: '/continuous', label: '连板', icon: TrendCharts },
   { path: '/settings', label: '设置', icon: Setting }
 ]

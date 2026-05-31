@@ -43,7 +43,7 @@ const router = createRouter({
       path: '/jiege-mode',
       name: 'JiegeMode',
       component: () => import('@/views/JiegeMode.vue'),
-      meta: { title: '杰哥交易模式' }
+      meta: { title: '交易模式' }
     },
     {
       path: '/continuous',
@@ -62,6 +62,12 @@ const router = createRouter({
       name: 'TdxLimitUpLive',
       component: () => import('@/views/tdx/TdxLimitUpLive.vue'),
       meta: { title: '涨停播报', tdx: true }
+    },
+    {
+      path: '/tdx/composite/:code?/dark',
+      name: 'TdxCompositeWatch',
+      component: () => import('@/views/tdx/TdxCompositeWatch.vue'),
+      meta: { title: '复合看盘', tdx: true }
     },
     {
       path: '/tdx/yidong/:code?/dark',

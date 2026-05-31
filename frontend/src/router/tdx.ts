@@ -16,6 +16,12 @@ const tdxRouter = createRouter({
       meta: { title: '涨停播报', tdx: true }
     },
     {
+      path: '/tdx/composite/:code?/dark',
+      name: 'TdxCompositeWatch',
+      component: () => import('@/views/tdx/TdxCompositeWatch.vue'),
+      meta: { title: '复合看盘', tdx: true }
+    },
+    {
       path: '/tdx/yidong/:code?/dark',
       name: 'TdxStockMove',
       component: () => import('@/views/tdx/TdxStockMove.vue'),

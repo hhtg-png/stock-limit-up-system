@@ -9,6 +9,7 @@ const app = readFileSync(resolve(root, 'src/App.vue'), 'utf8')
 for (const path of [
   '/tdx',
   '/tdx/ztlive/:code?/dark',
+  '/tdx/composite/:code?/dark',
   '/tdx/yidong/:code?/dark',
   '/tdx/strong/dark',
   '/tdx/news/dark',
@@ -20,6 +21,7 @@ for (const path of [
 for (const file of [
   'src/views/tdx/TdxPluginCenter.vue',
   'src/views/tdx/TdxLimitUpLive.vue',
+  'src/views/tdx/TdxCompositeWatch.vue',
   'src/views/tdx/TdxStockMove.vue',
   'src/views/tdx/TdxPlateStrength.vue',
   'src/views/tdx/TdxNewsFeed.vue',

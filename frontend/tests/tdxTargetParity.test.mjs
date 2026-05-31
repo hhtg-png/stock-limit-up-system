@@ -9,6 +9,7 @@ function read(path) {
 }
 
 const ztlive = read('src/views/tdx/TdxLimitUpLive.vue')
+const composite = read('src/views/tdx/TdxCompositeWatch.vue')
 assert.match(ztlive, /id="plates"/, '涨停播报 should expose target-style plate filter bar')
 for (const label of ['名称', '代码', '涨幅', '状态', '首封', '封单', '板块']) {
   assert.match(ztlive, new RegExp(label), `涨停播报 should use target column ${label}`)
@@ -16,12 +17,13 @@ for (const label of ['名称', '代码', '涨幅', '状态', '首封', '封单',
 assert.doesNotMatch(ztlive, /title="涨停播报"/, '涨停播报 should not use the generic shell title chrome')
 assert.match(ztlive, /target-ztlive/, '涨停播报 should use a dedicated target parity class')
 assert.match(ztlive, /dates-container/, '涨停播报 plate filter should keep the target draggable dates-container wrapper')
-assert.match(ztlive, /embedded-move-body/, '涨停播报 should include an independently scrollable stock move analysis body')
-assert.match(ztlive, /overflow:\s*auto/, '涨停播报 table and embedded analysis should scroll independently')
+assert.doesNotMatch(ztlive, /embedded-move-body|move-panel-resizer|getTdxStockMove/, '涨停播报 should stay as a pure broadcast table')
+assert.match(composite, /embedded-move-body/, '复合看盘 should include an independently scrollable stock move analysis body')
+assert.match(composite, /overflow:\s*auto/, '复合看盘 table and embedded analysis should scroll independently')
 assert.doesNotMatch(ztlive, />\s*聚合快讯语音\s*</, '涨停播报 should not display the aggregate voice label text')
 assert.doesNotMatch(ztlive, /待开启|已播|等待新快讯/, '涨停播报 should not display aggregate voice status placeholder text')
-assert.match(ztlive, /move-panel-resizer/, '涨停播报 should allow vertical resizing between table and stock move analysis')
-assert.doesNotMatch(ztlive, />\s*异动解析\s*</, '涨停播报 embedded stock move panel should not add a redundant title label')
+assert.match(composite, /move-panel-resizer/, '复合看盘 should allow vertical resizing between table and stock move analysis')
+assert.doesNotMatch(composite, />\s*异动解析\s*</, '复合看盘 embedded stock move panel should not add a redundant title label')
 
 const news = read('src/views/tdx/TdxNewsFeed.vue')
 assert.match(news, /语音资讯/, '聚合快讯 should expose target top speech title')
