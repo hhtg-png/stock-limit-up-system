@@ -39,6 +39,15 @@ type UnlockSpeechOptions = {
 
 type PluginSpeechOptions = {
   force?: boolean
+  urgent?: boolean
+}
+
+type SpeechPlaybackMode = 'auto' | 'web-speech'
+
+type SpeechQueueItem = {
+  text: string
+  mode: SpeechPlaybackMode
+  urgent?: boolean
 }
 
 function normalizeUnlockSpeechOptions(options: UnlockSpeechOptions | Event): UnlockSpeechOptions {
@@ -63,8 +72,10 @@ function getSpeechEnabled(): boolean {
 }
 
 // 播报队列
-const speechQueue: string[] = []
+const speechQueue: SpeechQueueItem[] = []
 let isSpeaking = false
+let currentSpeechToken = 0
+let currentSpeechUrgent = false
 
 // 已播报的股票记录（防止重复播报）
 const announcedStocks = new Set<string>()
@@ -250,14 +261,16 @@ function isSimilarRecentNewsSpeech(text: string, speechKey: string, now = Date.n
   return shouldSkip
 }
 
-function finishSpeechItem() {
+function finishSpeechItem(token = currentSpeechToken) {
+  if (token !== currentSpeechToken) return
   isSpeaking = false
+  currentSpeechUrgent = false
   processQueue()
 }
 
-function playWithWebSpeech(text: string) {
+function playWithWebSpeech(text: string, token = currentSpeechToken) {
   if (!hasWebSpeechSupport()) {
-    finishSpeechItem()
+    finishSpeechItem(token)
     return
   }
 
@@ -265,23 +278,24 @@ function playWithWebSpeech(text: string) {
     const utterance = new SpeechSynthesisUtterance(text)
     applyTargetSpeechProfile(utterance)
     utterance.onend = () => {
-      finishSpeechItem()
+      finishSpeechItem(token)
     }
 
     utterance.onerror = () => {
-      finishSpeechItem()
+      finishSpeechItem(token)
     }
 
     window.speechSynthesis.speak(utterance)
   } catch {
-    finishSpeechItem()
+    finishSpeechItem(token)
   }
 }
 
-function playWithAudioFallback(text: string, onFailure: () => void = finishSpeechItem) {
+function playWithAudioFallback(text: string, onFailure?: () => void, token = currentSpeechToken) {
   const audio = ensureTargetTtsAudio()
   if (!audio) {
-    onFailure()
+    if (onFailure) onFailure()
+    else finishSpeechItem(token)
     return
   }
 
@@ -289,12 +303,13 @@ function playWithAudioFallback(text: string, onFailure: () => void = finishSpeec
   const finishOnce = () => {
     if (settled) return
     settled = true
-    finishSpeechItem()
+    finishSpeechItem(token)
   }
   const failOnce = () => {
     if (settled) return
     settled = true
-    onFailure()
+    if (onFailure) onFailure()
+    else finishSpeechItem(token)
   }
 
   audio.onended = finishOnce
@@ -306,10 +321,48 @@ function playWithAudioFallback(text: string, onFailure: () => void = finishSpeec
   }
 }
 
-function playWithNeuralTts(text: string) {
+function playWithNeuralTts(text: string, token = currentSpeechToken) {
   playWithAudioFallback(text, () => {
-    playWithWebSpeech(text)
-  })
+    playWithWebSpeech(text, token)
+  }, token)
+}
+
+function stopCurrentSpeechPlayback() {
+  currentSpeechToken += 1
+  isSpeaking = false
+  currentSpeechUrgent = false
+
+  if (hasWebSpeechSupport()) {
+    window.speechSynthesis.cancel()
+  }
+
+  if (hasAudioFallbackSupport()) {
+    const audio = document.getElementById(targetTtsAudioId)
+    if (audio?.tagName?.toLowerCase() === 'audio') {
+      const target = audio as HTMLAudioElement
+      target.pause()
+      target.removeAttribute('src')
+      target.load?.()
+    }
+  }
+}
+
+function queueSpeechItem(text: string, options: { urgent?: boolean; mode?: SpeechPlaybackMode } = {}) {
+  const item: SpeechQueueItem = {
+    text,
+    mode: options.mode || 'auto',
+    urgent: options.urgent
+  }
+
+  if (options.urgent) {
+    speechQueue.unshift(item)
+    if (isSpeaking && !currentSpeechUrgent) {
+      stopCurrentSpeechPlayback()
+    }
+  } else {
+    speechQueue.push(item)
+  }
+  processQueue()
 }
 
 // 播报函数（内部使用，不检查开关）
@@ -317,8 +370,7 @@ function speakInternal(text: string, force = false) {
   if (!text) return
   if (!force && !canSpeakNow()) return
   
-  speechQueue.push(text)
-  processQueue()
+  queueSpeechItem(text)
 }
 
 // 播报函数（检查开关）
@@ -326,8 +378,7 @@ function speak(text: string): boolean {
   if (!getSpeechEnabled() || !text) return false
   if (!canSpeakNow()) return false
   
-  speechQueue.push(text)
-  processQueue()
+  queueSpeechItem(text)
   return true
 }
 
@@ -339,28 +390,33 @@ function enqueuePluginSpeech(text: string, key?: string, options: PluginSpeechOp
   if (pluginSpeechKeys.has(speechKey)) return false
   pluginSpeechKeys.add(speechKey)
   if (isSimilarRecentNewsSpeech(text, speechKey)) return false
-  speechQueue.push(text)
-  processQueue()
+  if (options.urgent) {
+    queueSpeechItem(text, { urgent: true, mode: 'web-speech' })
+  } else {
+    queueSpeechItem(text)
+  }
   return true
 }
 
 function processQueue() {
   if (isSpeaking || speechQueue.length === 0 || !canSpeakNow()) return
   
-  const text = speechQueue.shift()
-  if (!text) return
+  const item = speechQueue.shift()
+  if (!item?.text) return
   
   isSpeaking = true
+  currentSpeechUrgent = Boolean(item.urgent)
+  const token = ++currentSpeechToken
 
   try {
-    if (shouldUseTargetAudioPlayback()) {
-      playWithNeuralTts(text)
+    if (item.mode !== 'web-speech' && shouldUseTargetAudioPlayback()) {
+      playWithNeuralTts(item.text, token)
       return
     }
 
-    playWithWebSpeech(text)
+    playWithWebSpeech(item.text, token)
   } catch {
-    finishSpeechItem()
+    finishSpeechItem(token)
   }
 }
 
@@ -382,21 +438,7 @@ function lockSpeech() {
   speechUnlocked.value = false
   persistSpeechUnlocked(false)
   speechQueue.splice(0)
-  isSpeaking = false
-
-  if (hasWebSpeechSupport()) {
-    window.speechSynthesis.cancel()
-  }
-
-  if (hasAudioFallbackSupport()) {
-    const audio = document.getElementById(targetTtsAudioId)
-    if (audio?.tagName?.toLowerCase() === 'audio') {
-      const target = audio as HTMLAudioElement
-      target.pause()
-      target.removeAttribute('src')
-      target.load?.()
-    }
-  }
+  stopCurrentSpeechPlayback()
 }
 
 // 播报涨停股票

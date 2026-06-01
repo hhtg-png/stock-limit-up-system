@@ -298,6 +298,7 @@ async def broadcast_tdx_limit_up_event(alert: dict):
     stock_name = alert.get("stock_name", "")
     event_time = alert.get("time", "")
     continuous_days = alert.get("continuous_days", 1)
+    status_label = tdx_limit_up_status_label(continuous_days)
     event_id = f"tdx-limit-up-{stock_code}-{event_time}"
     await manager.broadcast_tdx_plugin_event(
         "tdx_limit_up_event",
@@ -310,10 +311,19 @@ async def broadcast_tdx_limit_up_event(alert: dict):
             "stock_name": stock_name,
             "board": continuous_days,
             "reason": alert.get("reason"),
-            "speech_text": f"{stock_name}封死涨停",
+            "target_status_label": status_label,
+            "speech_text": f"{stock_name}{status_label}",
         },
         stock_code=stock_code,
     )
+
+
+def tdx_limit_up_status_label(continuous_days: object) -> str:
+    try:
+        board = int(continuous_days or 1)
+    except (TypeError, ValueError):
+        board = 1
+    return f"{board}板" if board > 1 else "首板"
 
 
 def tdx_news_speech_text(item: dict) -> str:

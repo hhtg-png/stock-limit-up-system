@@ -44,10 +44,6 @@ async def get_daily_info(
         return await intelligence_service.serialize_daily_digest_with_sources(db, version, cache_hit=True)
 
     target_date = trade_date or today_cn()
-    latest_version = await intelligence_service.get_latest_daily_digest_version(db, target_date)
-    if latest_version is not None:
-        return await intelligence_service.serialize_daily_digest_with_sources(db, latest_version, cache_hit=True)
-
     existing = await _get_daily_digest(db, target_date)
     if existing is not None:
         return await intelligence_service.serialize_daily_digest_with_sources(db, existing, cache_hit=True)

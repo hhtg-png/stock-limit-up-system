@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
 from app.database import Base
-from app.models.intelligence import DailyInfoDigest, KnowledgeDocument
+from app.models.intelligence import DailyInfoDigest, DailyInfoDigestVersion, KnowledgeDocument
 from app.services.intelligence_service import (
     DeepSeekSummaryClient,
     ImaKnowledgeSource,
@@ -341,16 +341,33 @@ class IntelligenceServiceTests(unittest.TestCase):
         self.assertEqual(service.summary_client.daily_calls, [(date(2026, 5, 18), ["2026-05-18-复盘.md"])])
         self.assertEqual(digest.source_count, 1)
 
-    def test_force_daily_digest_keeps_same_day_versions_in_history(self):
+    def test_force_daily_digest_merges_same_day_updates_in_history(self):
         class SequentialDailySummaryClient(FakeSummaryClient):
             async def summarize_daily_info(self, trade_date, documents):
                 self.daily_calls.append((trade_date, [doc.title for doc in documents]))
+                if len(self.daily_calls) == 1:
+                    return {
+                        "overview": "盘中机器人方向走强",
+                        "main_lines": ["机器人", "AI"],
+                        "catalysts": ["订单验证", "国产替代"],
+                        "risks": ["高位分歧"],
+                        "plan": "盘中关注承接",
+                        "stock_analysis_status": "ready",
+                        "mentioned_stocks": [
+                            {"name": "通达动力", "code": "002576", "summary": "机器人方向走强"},
+                        ],
+                    }
                 return {
-                    "overview": f"第{len(self.daily_calls)}次生成",
-                    "main_lines": ["人工智能"],
-                    "catalysts": ["订单验证"],
-                    "risks": ["高位分歧"],
-                    "plan": "观察承接",
+                    "overview": "盘后算力补充，机器人方向继续活跃",
+                    "main_lines": ["机器人", "算力"],
+                    "catalysts": ["订单验证", "业绩预增"],
+                    "risks": ["高位分歧", "监管风险"],
+                    "plan": "盘后关注算力补涨",
+                    "stock_analysis_status": "ready",
+                    "mentioned_stocks": [
+                        {"name": "通达动力", "code": "002576", "summary": "盘后机器人原因更新"},
+                        {"name": "新易盛", "code": "300502", "summary": "算力链补涨"},
+                    ],
                 }
 
         service = IntelligenceService(
@@ -381,12 +398,24 @@ class IntelligenceServiceTests(unittest.TestCase):
                 await session.commit()
                 await service.build_daily_info(session, date(2026, 5, 18), force=True)
                 await service.build_daily_info(session, date(2026, 5, 18), force=True)
-                return await service.list_daily_digests(session, limit=10)
+                history = await service.list_daily_digests(session, limit=10)
+                digest = (await session.execute(select(DailyInfoDigest))).scalar_one()
+                versions = (await session.execute(select(DailyInfoDigestVersion))).scalars().all()
+                return history, digest, versions
 
-        history = asyncio.run(run())
+        history, digest, versions = asyncio.run(run())
 
-        self.assertEqual([item["summary"]["overview"] for item in history], ["第2次生成", "第1次生成"])
-        self.assertEqual([item["trade_date"] for item in history], ["2026-05-18", "2026-05-18"])
+        self.assertEqual([item["trade_date"] for item in history], ["2026-05-18"])
+        summary = history[0]["summary"]
+        self.assertIn("盘后算力补充", summary["overview"])
+        self.assertIn("盘中机器人方向走强", summary["overview"])
+        self.assertEqual(summary["main_lines"], ["机器人", "算力", "AI"])
+        self.assertEqual(summary["catalysts"], ["订单验证", "业绩预增", "国产替代"])
+        self.assertEqual(summary["risks"], ["高位分歧", "监管风险"])
+        self.assertEqual(summary["plan"], "盘后关注算力补涨\n\n盘中关注承接")
+        self.assertEqual([item["code"] for item in summary["mentioned_stocks"]], ["002576", "300502"])
+        self.assertEqual(digest.summary_json["overview"], summary["overview"])
+        self.assertEqual(len(versions), 2)
 
     def test_daily_digest_force_refreshes_document_summaries_after_key_is_configured(self):
         summary = FakeSummaryClient()

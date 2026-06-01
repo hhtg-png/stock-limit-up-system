@@ -218,8 +218,8 @@ class IntelligenceApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         self.assertEqual(payload["trade_date"], "2026-05-18")
-        self.assertEqual(payload["summary"]["overview"], "盘后第二版")
-        self.assertIsNotNone(payload["version_id"])
+        self.assertEqual(payload["summary"]["overview"], "市场修复")
+        self.assertIsNone(payload["version_id"])
         self.assertEqual(payload["source_count"], 2)
         self.assertEqual(payload["sources"][0]["title"], "复盘.md")
         self.assertEqual(payload["sources"][0]["jump_url"], "https://example.test/review.md")
@@ -236,20 +236,25 @@ class IntelligenceApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()
-        self.assertEqual([item["trade_date"] for item in payload["items"]], ["2026-05-18", "2026-05-18", "2026-05-17"])
-        self.assertEqual([item["summary"]["overview"] for item in payload["items"][:2]], ["盘后第二版", "盘中第一版"])
+        self.assertEqual([item["trade_date"] for item in payload["items"]], ["2026-05-18", "2026-05-17"])
+        self.assertEqual([item["summary"]["overview"] for item in payload["items"]], ["市场修复", "AI 主线扩散"])
         self.assertEqual(payload["items"][0]["sources"][0]["title"], "复盘.md")
 
-    def test_get_daily_info_can_return_selected_same_day_version(self):
-        history_response = self.client.get("/intelligence/daily-info/history", params={"limit": 10})
-        first_version = next(
-            item for item in history_response.json()["items"]
-            if item["trade_date"] == "2026-05-18" and item["summary"]["overview"] == "盘中第一版"
-        )
+    def test_get_daily_info_can_return_hidden_same_day_version_by_id(self):
+        async def get_intraday_version_id():
+            async with self.Session() as session:
+                result = await session.execute(
+                    select(DailyInfoDigestVersion)
+                    .where(DailyInfoDigestVersion.summary_json["overview"].as_string() == "盘中第一版")
+                    .limit(1)
+                )
+                return result.scalar_one().id
+
+        version_id = asyncio.run(get_intraday_version_id())
 
         response = self.client.get(
             "/intelligence/daily-info",
-            params={"trade_date": "2026-05-18", "version_id": first_version["version_id"]},
+            params={"trade_date": "2026-05-18", "version_id": version_id},
         )
 
         self.assertEqual(response.status_code, 200)
@@ -269,7 +274,7 @@ class IntelligenceApiTests(unittest.TestCase):
 
         self.assertEqual(summary_response.status_code, 200)
         self.assertEqual(content_response.status_code, 200)
-        self.assertEqual([item["trade_date"] for item in summary_response.json()["items"]], ["2026-05-18", "2026-05-18"])
+        self.assertEqual([item["trade_date"] for item in summary_response.json()["items"]], ["2026-05-18"])
         self.assertEqual([item["trade_date"] for item in content_response.json()["items"]], ["2026-05-17"])
 
     def test_get_daily_info_returns_cached_digest_without_model_refresh(self):

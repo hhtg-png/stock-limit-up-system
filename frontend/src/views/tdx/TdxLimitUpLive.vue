@@ -194,7 +194,7 @@ function announceNewStatusEvents(items: TdxLimitUpEvent[]) {
     const key = item.stock_code || item.event_id
     if (!key || seenSpeechKeys.has(key)) continue
     seenSpeechKeys.add(key)
-    enqueuePluginSpeech(`${item.stock_name}${item.target_status_label || item.event_label}`, item.event_id, { force: true })
+    enqueuePluginSpeech(limitUpSpeechText(item), item.event_id, { force: true, urgent: true })
   }
 }
 
@@ -366,6 +366,18 @@ function buildPlateFilters(items: TdxLimitUpEvent[]) {
 function targetStatusLabel(isSealed: boolean, board: number) {
   if (!isSealed) return '炸板'
   return board > 1 ? `${board}板` : '首板'
+}
+
+function limitUpStatusSpeechLabel(item: TdxLimitUpEvent) {
+  const rawLabel = item.target_status_label || item.event_label || ''
+  if (rawLabel && !rawLabel.includes('封死涨停')) return rawLabel
+  if (item.event_type === 'limit_up_opened' || !item.is_sealed) return '炸板'
+  if (item.event_type === 'limit_up_resealed') return '回封'
+  return targetStatusLabel(true, Number(item.board || 1))
+}
+
+function limitUpSpeechText(item: TdxLimitUpEvent) {
+  return `${item.stock_name}${limitUpStatusSpeechLabel(item)}`
 }
 
 function formatEventTime(value?: string | Date | null) {

@@ -109,25 +109,9 @@
             <section class="panel overview-panel">
               <div class="section-header overview-header">
                 <h4>每日复盘</h4>
-                <div class="overview-actions">
-                  <el-pagination
-                    v-if="sameDateVersions.length > 1"
-                    small
-                    background
-                    layout="prev, pager, next"
-                    :page-size="1"
-                    :total="sameDateVersions.length"
-                    :current-page="currentVersionPage"
-                    @current-change="handleVersionPageChange"
-                  />
-                  <el-tag size="small" :type="dailyInfo.cache_hit ? 'info' : 'success'">
-                    {{ dailyInfo.cache_hit ? '缓存命中' : '已更新' }}
-                  </el-tag>
-                </div>
-              </div>
-              <div v-if="sameDateVersions.length > 1" class="version-meta">
-                <span>同日版本 {{ currentVersionPage }} / {{ sameDateVersions.length }}</span>
-                <span>{{ formatTime(dailyInfo.generated_at) }}</span>
+                <el-tag size="small" :type="dailyInfo.cache_hit ? 'info' : 'success'">
+                  {{ dailyInfo.cache_hit ? '缓存命中' : '已更新' }}
+                </el-tag>
               </div>
               <p>{{ dailyInfo.summary.overview || '-' }}</p>
             </section>
@@ -326,20 +310,6 @@ const sourceRefs = computed<DailyInfoSource[]>(() => {
   }))
 })
 const displayHistoryItems = computed<DailyInfoResponse[]>(() => latestHistoryByDate(historyItems.value))
-const sameDateVersions = computed<DailyInfoResponse[]>(() => {
-  const current = dailyInfo.value
-  if (!current) return []
-  return historyItems.value
-    .filter(item => item.trade_date === current.trade_date)
-    .slice()
-    .sort(compareHistoryItems)
-})
-const currentVersionPage = computed(() => {
-  const current = dailyInfo.value
-  if (!current) return 1
-  const index = sameDateVersions.value.findIndex(item => historyKey(item) === historyKey(current))
-  return index >= 0 ? index + 1 : 1
-})
 const modelStatus = computed(() => dailyInfo.value?.summary.model_status || '')
 const statusText = computed(() => {
   const statusMap: Record<string, string> = {
@@ -575,13 +545,6 @@ function selectHistory(item: DailyInfoResponse) {
   selectedDate.value = item.trade_date
 }
 
-function handleVersionPageChange(page: number) {
-  const target = sameDateVersions.value[page - 1]
-  if (target) {
-    selectHistory(target)
-  }
-}
-
 async function openSource(source: DailyInfoSource) {
   if (source.id <= 0) {
     ElMessage.warning('该来源暂无缓存原文')
@@ -601,8 +564,7 @@ async function openSource(source: DailyInfoSource) {
 }
 
 function upsertHistory(item: DailyInfoResponse) {
-  const itemKey = historyKey(item)
-  const next = historyItems.value.filter(history => historyKey(history) !== itemKey)
+  const next = historyItems.value.filter(history => history.trade_date !== item.trade_date)
   next.push(item)
   next.sort(compareHistoryItems)
   historyItems.value = next
@@ -623,8 +585,7 @@ function latestHistoryByDate(items: DailyInfoResponse[]): DailyInfoResponse[] {
 }
 
 function historyKey(item: DailyInfoResponse): string {
-  if (item.version_id) return `version-${item.version_id}`
-  return `digest-${item.trade_date}-${item.digest_id || item.id || 'latest'}-${item.generated_at || ''}`
+  return `digest-${item.trade_date}`
 }
 
 function compareHistoryItems(a: DailyInfoResponse, b: DailyInfoResponse): number {
@@ -852,30 +813,6 @@ function formatTime(value?: string | null): string {
   flex-wrap: wrap;
 }
 
-.overview-actions {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 8px;
-  flex-wrap: wrap;
-  min-width: 0;
-
-  :deep(.el-pagination) {
-    --el-pagination-button-width: 26px;
-    --el-pagination-button-height: 24px;
-    margin: 0;
-  }
-}
-
-.version-meta {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px 12px;
-  margin: -4px 0 10px;
-  color: #6b7280;
-  font-size: 12px;
-}
-
 .risk-panel {
   border-left: 4px solid #f59e0b;
 }
@@ -1101,11 +1038,6 @@ function formatTime(value?: string | null): string {
     width: 220px;
     min-height: 96px;
     scroll-snap-align: start;
-  }
-
-  .overview-actions {
-    width: 100%;
-    justify-content: flex-start;
   }
 
   .summary-row,

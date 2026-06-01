@@ -312,6 +312,109 @@ def _dedupe_stock_mentions(items: Iterable[Dict[str, Any]], *, limit: int = 30) 
     return result
 
 
+def _summary_text_blocks(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        raw_blocks = [str(item or "") for item in value]
+    else:
+        raw_blocks = re.split(r"\n{2,}", str(value or ""))
+    return [re.sub(r"\s+", " ", block).strip() for block in raw_blocks if str(block or "").strip()]
+
+
+def _text_dedupe_key(value: str) -> str:
+    return re.sub(r"[\s，。！？!?；;：:、,.()（）【】\[\]\"'“”‘’]+", "", value or "").lower()
+
+
+def _similar_summary_text(left: str, right: str) -> bool:
+    left_key = _text_dedupe_key(left)
+    right_key = _text_dedupe_key(right)
+    if not left_key or not right_key:
+        return False
+    if left_key in right_key or right_key in left_key:
+        return True
+    overlap = len(set(left_key) & set(right_key))
+    return overlap / max(len(set(left_key)), len(set(right_key)), 1) >= 0.86
+
+
+def _merge_summary_text(existing: Any, incoming: Any, *, limit: int = 6) -> str:
+    result: List[str] = []
+    for block in [*_summary_text_blocks(incoming), *_summary_text_blocks(existing)]:
+        if any(_similar_summary_text(block, current) for current in result):
+            continue
+        result.append(block)
+        if len(result) >= limit:
+            break
+    return "\n\n".join(result)
+
+
+def _dedupe_summary_list(items: Iterable[Any], *, limit: int = 20) -> List[str]:
+    result: List[str] = []
+    for item in items:
+        text = re.sub(r"\s+", " ", str(item or "")).strip()
+        if not text:
+            continue
+        if any(_similar_summary_text(text, current) for current in result):
+            continue
+        result.append(text)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def _summary_items(value: Any) -> List[Any]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return list(value)
+    return [value]
+
+
+def _stock_summary_items(value: Any) -> List[Dict[str, Any]]:
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    if isinstance(value, dict):
+        return [value]
+    return []
+
+
+def _merge_daily_summary(existing: Optional[Dict[str, Any]], incoming: Dict[str, Any]) -> Dict[str, Any]:
+    if not existing:
+        return dict(incoming or {})
+
+    existing_payload = dict(existing or {})
+    incoming_payload = dict(incoming or {})
+    merged = {**existing_payload, **incoming_payload}
+
+    for key in ("overview", "plan"):
+        merged_text = _merge_summary_text(existing_payload.get(key), incoming_payload.get(key))
+        if merged_text:
+            merged[key] = merged_text
+
+    for key in ("main_lines", "catalysts", "risks", "source_titles"):
+        merged_items = _dedupe_summary_list([
+            *_summary_items(incoming_payload.get(key)),
+            *_summary_items(existing_payload.get(key)),
+        ])
+        if merged_items:
+            merged[key] = merged_items
+
+    for key in ("mentioned_stocks", "stocks"):
+        combined = _dedupe_stock_mentions([
+            *_stock_summary_items(incoming_payload.get(key)),
+            *_stock_summary_items(existing_payload.get(key)),
+        ])
+        if combined:
+            merged[key] = combined
+
+    if (
+        incoming_payload.get("stock_analysis_status") == "ready"
+        or existing_payload.get("stock_analysis_status") == "ready"
+    ):
+        merged["stock_analysis_status"] = "ready"
+    return merged
+
+
 class ImaWikiClient:
     def __init__(self, timeout: Optional[float] = None):
         self.timeout = timeout or settings.CRAWLER_REQUEST_TIMEOUT
@@ -879,14 +982,16 @@ class IntelligenceService:
         )
         with db.no_autoflush:
             existing = await self._get_daily_digest(db, actual_date)
+        existing_summary = dict(existing.summary_json or {}) if existing is not None else None
         if existing and existing.content_hash == content_hash and not force:
-            latest_version = await self.get_latest_daily_digest_version(db, actual_date)
             await db.commit()
-            return self.serialize_daily_digest(latest_version or existing, cache_hit=True, sources=document_snapshots)
+            return self.serialize_daily_digest(existing, cache_hit=True, sources=document_snapshots)
 
         await db.commit()
         summary = await self.summary_client.summarize_daily_info(actual_date, document_snapshots)
         summary = _merge_stock_mentions(summary, document_snapshots)
+        if existing_summary is not None:
+            summary = _merge_daily_summary(existing_summary, summary)
         existing = await self._write_daily_digest_with_retry(
             db,
             actual_date,
@@ -1018,8 +1123,8 @@ class IntelligenceService:
                 )
                 db.add(version)
                 await db.commit()
-                await db.refresh(version)
-                return version
+                await db.refresh(existing)
+                return existing
             except OperationalError as exc:
                 await db.rollback()
                 if not self._is_database_locked(exc) or attempt == 4:
@@ -1423,33 +1528,16 @@ class IntelligenceService:
         return result.scalar_one_or_none()
 
     async def list_daily_digests(self, db: AsyncSession, *, limit: int = 30) -> List[Dict[str, Any]]:
-        version_result = await db.execute(
-            select(DailyInfoDigestVersion)
+        result = await db.execute(
+            select(DailyInfoDigest)
             .order_by(
-                DailyInfoDigestVersion.trade_date.desc(),
-                DailyInfoDigestVersion.generated_at.desc(),
-                DailyInfoDigestVersion.id.desc(),
+                DailyInfoDigest.trade_date.desc(),
+                DailyInfoDigest.generated_at.desc(),
+                DailyInfoDigest.id.desc(),
             )
             .limit(limit)
         )
-        records: List[Any] = list(version_result.scalars().all())
-        remaining = max(limit - len(records), 0)
-        if remaining:
-            version_dates = {record.trade_date for record in records}
-            digest_stmt = (
-                select(DailyInfoDigest)
-                .order_by(
-                    DailyInfoDigest.trade_date.desc(),
-                    DailyInfoDigest.generated_at.desc(),
-                    DailyInfoDigest.id.desc(),
-                )
-                .limit(remaining)
-            )
-            if version_dates:
-                digest_stmt = digest_stmt.where(DailyInfoDigest.trade_date.notin_(version_dates))
-            digest_result = await db.execute(digest_stmt)
-            records.extend(digest_result.scalars().all())
-        return await self._serialize_daily_digest_records(db, records[:limit])
+        return await self._serialize_daily_digest_records(db, list(result.scalars().all()))
 
     async def search_daily_digests(self, db: AsyncSession, *, keyword: str, limit: int = 50) -> List[Dict[str, Any]]:
         keyword = (keyword or "").strip()
@@ -1473,42 +1561,21 @@ class IntelligenceService:
             .distinct()
         )
         matched_dates = {item for item in document_result.scalars().all() if item is not None}
-        version_conditions = [cast(DailyInfoDigestVersion.summary_json, String).like(pattern)]
+        digest_conditions = [cast(DailyInfoDigest.summary_json, String).like(pattern)]
         if matched_dates:
-            version_conditions.append(DailyInfoDigestVersion.trade_date.in_(matched_dates))
+            digest_conditions.append(DailyInfoDigest.trade_date.in_(matched_dates))
 
-        version_result = await db.execute(
-            select(DailyInfoDigestVersion)
-            .where(or_(*version_conditions))
+        result = await db.execute(
+            select(DailyInfoDigest)
+            .where(or_(*digest_conditions))
             .order_by(
-                DailyInfoDigestVersion.trade_date.desc(),
-                DailyInfoDigestVersion.generated_at.desc(),
-                DailyInfoDigestVersion.id.desc(),
+                DailyInfoDigest.trade_date.desc(),
+                DailyInfoDigest.generated_at.desc(),
+                DailyInfoDigest.id.desc(),
             )
             .limit(limit)
         )
-        records: List[Any] = list(version_result.scalars().all())
-        remaining = max(limit - len(records), 0)
-        if remaining:
-            digest_conditions = [cast(DailyInfoDigest.summary_json, String).like(pattern)]
-            if matched_dates:
-                digest_conditions.append(DailyInfoDigest.trade_date.in_(matched_dates))
-            digest_stmt = (
-                select(DailyInfoDigest)
-                .where(or_(*digest_conditions))
-                .order_by(
-                    DailyInfoDigest.trade_date.desc(),
-                    DailyInfoDigest.generated_at.desc(),
-                    DailyInfoDigest.id.desc(),
-                )
-                .limit(remaining)
-            )
-            version_dates = {record.trade_date for record in records}
-            if version_dates:
-                digest_stmt = digest_stmt.where(DailyInfoDigest.trade_date.notin_(version_dates))
-            digest_result = await db.execute(digest_stmt)
-            records.extend(digest_result.scalars().all())
-        return await self._serialize_daily_digest_records(db, records[:limit])
+        return await self._serialize_daily_digest_records(db, list(result.scalars().all()))
 
     async def get_daily_digest_version(
         self,

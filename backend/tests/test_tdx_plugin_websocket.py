@@ -22,8 +22,12 @@ class TdxPluginWebSocketTests(unittest.IsolatedAsyncioTestCase):
             await websocket_api.broadcast_tdx_limit_up_event(alert)
 
         self.assertEqual(broadcast.await_args.args[0], "tdx_limit_up_event")
-        self.assertEqual(broadcast.await_args.args[1]["event_label"], "封死涨停")
-        self.assertEqual(broadcast.await_args.args[1]["stock_code"], "001259")
+        payload = broadcast.await_args.args[1]
+        self.assertEqual(payload["event_label"], "封死涨停")
+        self.assertEqual(payload["target_status_label"], "7板")
+        self.assertEqual(payload["speech_text"], "利仁科技7板")
+        self.assertNotIn("封死涨停", payload["speech_text"])
+        self.assertEqual(payload["stock_code"], "001259")
         self.assertEqual(broadcast.await_args.kwargs["stock_code"], "001259")
 
     async def test_broadcast_tdx_news_event_uses_plugin_payload_without_stock_filter(self):
