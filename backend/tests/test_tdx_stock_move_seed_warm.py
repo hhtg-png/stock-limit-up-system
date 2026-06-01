@@ -41,6 +41,19 @@ class TdxStockMoveSeedWarmTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    async def test_load_stock_codes_applies_offset_after_sorting(self):
+        with (
+            mock.patch.object(
+                warm_seed,
+                "load_akshare_stock_codes",
+                new=AsyncMock(return_value=[("000003", "三"), ("000001", "一"), ("000002", "二")]),
+            ),
+            mock.patch.object(warm_seed, "load_local_stock_codes", new=AsyncMock(return_value=[])),
+        ):
+            rows = await warm_seed.load_stock_codes(limit=1, universe="all-a", offset=1)
+
+        self.assertEqual(rows, [("000002", "二")])
+
     async def test_build_seed_record_uses_preloaded_limit_up_item(self):
         limit_up_item = {
             "stock_code": "002576",

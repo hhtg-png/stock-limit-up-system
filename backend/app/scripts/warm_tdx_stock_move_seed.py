@@ -89,7 +89,11 @@ async def load_akshare_stock_codes() -> list[tuple[str, str]]:
     return await asyncio.to_thread(fetch_codes)
 
 
-async def load_stock_codes(limit: int | None = None, universe: str = "merged") -> list[tuple[str, str]]:
+async def load_stock_codes(
+    limit: int | None = None,
+    universe: str = "merged",
+    offset: int = 0,
+) -> list[tuple[str, str]]:
     local_codes: list[tuple[str, str]] = []
     akshare_codes: list[tuple[str, str]] = []
 
@@ -111,7 +115,8 @@ async def load_stock_codes(limit: int | None = None, universe: str = "merged") -
         stocks = merge_stock_code_lists(akshare_codes, local_codes)
 
     stocks.sort(key=lambda item: item[0])
-    return stocks[:limit] if limit else stocks
+    sliced = stocks[max(0, offset):]
+    return sliced[:limit] if limit else sliced
 
 
 async def resolve_cache_trade_date(trade_date: date | None) -> date:
@@ -350,10 +355,11 @@ async def warm_seed_file(
     concurrency: int,
     limit: int | None,
     universe: str,
+    offset: int,
 ) -> dict:
     await init_db()
     cache_trade_date = await resolve_cache_trade_date(trade_date)
-    stocks = await load_stock_codes(limit, universe=universe)
+    stocks = await load_stock_codes(limit, universe=universe, offset=offset)
     limit_up_items = await load_limit_up_item_map(cache_trade_date)
     output.parent.mkdir(parents=True, exist_ok=True)
     stats = {
@@ -362,6 +368,7 @@ async def warm_seed_file(
         "failed": 0,
         "trade_date": cache_trade_date.isoformat(),
         "universe": universe,
+        "offset": offset,
         "limit_up_items": len(limit_up_items),
         "output": str(output),
     }
@@ -406,6 +413,7 @@ def main() -> int:
     parser.add_argument("--source-scope", default="mixed", choices=["mixed", "ths"])
     parser.add_argument("--concurrency", type=int, default=3)
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--offset", type=int, default=0)
     parser.add_argument(
         "--universe",
         default="merged",
@@ -421,6 +429,7 @@ def main() -> int:
             concurrency=args.concurrency,
             limit=args.limit,
             universe=args.universe,
+            offset=args.offset,
         )
     )
     print(json.dumps(stats, ensure_ascii=False, sort_keys=True))
