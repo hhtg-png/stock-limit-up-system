@@ -18,6 +18,8 @@ ENV/
 
 # 数据库和日志
 backend/data/*.db
+backend/data/*.jsonl
+backend/data/*.jsonl.gz
 backend/data/tts-cache/
 backend/logs/*.log
 *.log

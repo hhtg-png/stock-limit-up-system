@@ -8,6 +8,7 @@ import asyncio
 from datetime import datetime, date, time as time_type
 import uuid
 
+from app.database import async_session_maker
 from app.core.websocket_manager import manager
 from app.services.continuous_ladder_service import continuous_ladder_service
 from app.services.edge_tts_service import edge_tts_service
@@ -16,6 +17,7 @@ from app.services.realtime_limit_up_alert_tracker import RealtimeLimitUpAlertTra
 from app.services.realtime_limit_up_stream_tracker import RealtimeLimitUpStreamTracker
 from app.services.tdx_news_realtime_tracker import TdxNewsRealtimeTracker
 from app.services.tdx_news_sources import public_market_news_provider
+from app.services.tdx_plugin_service import tdx_plugin_service
 from loguru import logger
 
 router = APIRouter()
@@ -26,6 +28,7 @@ realtime_stream_tracker = RealtimeLimitUpStreamTracker()
 tdx_news_realtime_tracker = TdxNewsRealtimeTracker()
 realtime_sync_task: Optional[asyncio.Task] = None
 tdx_news_sync_task: Optional[asyncio.Task] = None
+tdx_stock_move_cache_tasks: set[asyncio.Task] = set()
 REALTIME_HOT_SYNC_INTERVAL = 0.25
 REALTIME_HOT_POOL_MAX_CACHE_AGE = 0.25
 REALTIME_HOT_FETCH_TIMEOUT = 0.8
@@ -234,8 +237,41 @@ async def process_realtime_hot_limit_up_tick(trade_date: date) -> int:
             alert.get("continuous_days", 1),
         )
         await broadcast_tdx_limit_up_event(alert)
+        schedule_tdx_stock_move_cache_refresh(alert, trade_date)
 
     return len(alerts)
+
+
+def schedule_tdx_stock_move_cache_refresh(alert: dict, trade_date: date) -> None:
+    """Refresh stock movement analysis cache for a new limit-up event."""
+    stock_code = str(alert.get("stock_code") or "")
+    if not stock_code:
+        return
+
+    task = asyncio.create_task(refresh_tdx_stock_move_cache(stock_code, trade_date))
+    tdx_stock_move_cache_tasks.add(task)
+
+    def consume_result(done_task: asyncio.Task):
+        tdx_stock_move_cache_tasks.discard(done_task)
+        _consume_background_task_result(done_task, "TDX stock move cache refresh")
+
+    task.add_done_callback(consume_result)
+
+
+async def refresh_tdx_stock_move_cache(stock_code: str, trade_date: date) -> None:
+    async with async_session_maker() as db:
+        await tdx_plugin_service.refresh_stock_move_cache(
+            stock_code,
+            trade_date,
+            db=db,
+            source_scope="mixed",
+        )
+        await tdx_plugin_service.refresh_stock_move_cache(
+            stock_code,
+            trade_date,
+            db=db,
+            source_scope="ths",
+        )
 
 
 async def process_realtime_rich_limit_up_sync(trade_date: date):

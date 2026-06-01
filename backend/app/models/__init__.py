@@ -18,6 +18,7 @@ from .market_review import (  # noqa: F401
 )
 from .order_flow import OrderBookSnapshot  # noqa: F401
 from .stock import Stock  # noqa: F401
+from .tdx_cache import TdxStockMoveCache  # noqa: F401
 
 __all__ = [
     "BigOrder",
@@ -37,5 +38,6 @@ __all__ = [
     "MarketReviewStockDaily",
     "OrderBookSnapshot",
     "Stock",
+    "TdxStockMoveCache",
     "UserConfig",
 ]

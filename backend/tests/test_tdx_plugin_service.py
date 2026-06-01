@@ -4,8 +4,14 @@ from datetime import date, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.pool import StaticPool
+
+from app.database import Base
 from app.services.tdx_attribution_sources import PublicStockAttribution
 from app.services.tdx_external_sources import ExternalStockMove
+from app.models.tdx_cache import TdxStockMoveCache
 from app.services.tdx_plugin_service import TdxPluginService
 
 
@@ -697,6 +703,114 @@ class TdxPluginServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["extra_items"][0]["stock_code"], "603311")
         self.assertEqual(payload["field_diffs"][0]["field"], "event_label")
         self.assertEqual(payload["order_diffs"][0]["key"], "002421")
+
+
+class TdxStockMovePersistentCacheTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.engine = create_async_engine(
+            "sqlite+aiosqlite://",
+            future=True,
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        self.Session = async_sessionmaker(self.engine, expire_on_commit=False)
+        async with self.engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+    async def asyncTearDown(self):
+        await self.engine.dispose()
+
+    async def test_stock_move_reads_persistent_cache_before_external_sources(self):
+        cached_payload = {
+            "items": [
+                {
+                    "stock_code": "603677",
+                    "stock_name": "奇精机械",
+                    "trade_date": "2026-05-29",
+                    "source_scope": "mixed",
+                    "reasons": [{"title": "机器人+宁波国资", "content": "本地种子缓存"}],
+                    "sources": ["seed"],
+                }
+            ],
+            "updated_at": "2026-05-29T18:00:00",
+            "source_status": {"seed": "ok"},
+            "is_cache": False,
+            "warnings": [],
+        }
+        provider = FakeExternalMoveProvider(
+            stock_move=ExternalStockMove(
+                stock_code="603677",
+                stock_name="奇精机械",
+                trade_date=date(2026, 5, 29),
+                title="不应该调用外部源",
+                content="不应该出现",
+            )
+        )
+        service = TdxPluginService(external_move_provider=provider, enable_external_sources=True)
+
+        async with self.Session() as session:
+            session.add(
+                TdxStockMoveCache(
+                    stock_code="603677",
+                    source_scope="mixed",
+                    trade_date=date(2026, 5, 29),
+                    stock_name="奇精机械",
+                    payload_json=cached_payload,
+                    source_status={"seed": "ok"},
+                    warnings=[],
+                    generated_at=datetime(2026, 5, 29, 18, 0, 0),
+                )
+            )
+            await session.commit()
+
+            with patch.object(
+                service.realtime_limit_up_service,
+                "get_realtime_limit_up_item",
+                AsyncMock(),
+            ) as mocked_get_item:
+                payload = await service.get_stock_move("603677", date(2026, 5, 29), source_scope="mixed", db=session)
+
+        self.assertTrue(payload["is_cache"])
+        self.assertEqual(payload["source_status"]["stock_move_cache"], "persistent_hit")
+        self.assertEqual(payload["items"][0]["reasons"][0]["title"], "机器人+宁波国资")
+        self.assertEqual(provider.stock_move_calls, 0)
+        mocked_get_item.assert_not_called()
+
+    async def test_stock_move_persists_successful_payload_for_later_clicks(self):
+        service = TdxPluginService(
+            external_move_provider=FakeExternalMoveProvider(
+                stock_move=ExternalStockMove(
+                    stock_code="002576",
+                    stock_name="通达动力",
+                    trade_date=date(2026, 5, 30),
+                    title="机器人+驱动电机铁芯",
+                    content="公司电机铁芯可用于机器人。",
+                    source_name="打板客/同花顺F10",
+                )
+            ),
+            enable_external_sources=True,
+        )
+
+        async with self.Session() as session:
+            with patch.object(
+                service.realtime_limit_up_service,
+                "get_realtime_limit_up_item",
+                AsyncMock(return_value=None),
+            ):
+                payload = await service.get_stock_move("002576", date(2026, 5, 30), source_scope="mixed", db=session)
+
+            result = await session.execute(
+                select(TdxStockMoveCache).where(
+                    TdxStockMoveCache.stock_code == "002576",
+                    TdxStockMoveCache.source_scope == "mixed",
+                    TdxStockMoveCache.trade_date == date(2026, 5, 30),
+                )
+            )
+            cached = result.scalar_one_or_none()
+
+        self.assertIsNotNone(cached)
+        self.assertEqual(cached.payload_json["items"][0]["reasons"][0]["title"], "机器人+驱动电机铁芯")
+        self.assertFalse(payload["is_cache"])
 
 
 if __name__ == "__main__":

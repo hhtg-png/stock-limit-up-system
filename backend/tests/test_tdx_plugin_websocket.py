@@ -100,7 +100,10 @@ class TdxPluginWebSocketTests(unittest.IsolatedAsyncioTestCase):
             websocket_api,
             "broadcast_tdx_limit_up_event",
             AsyncMock(),
-        ) as broadcast_tdx:
+        ) as broadcast_tdx, patch.object(
+            websocket_api,
+            "schedule_tdx_stock_move_cache_refresh",
+        ) as schedule_cache_refresh:
             alert_count = await websocket_api.process_realtime_hot_limit_up_tick(trade_date)
 
         self.assertLess(websocket_api.REALTIME_HOT_SYNC_INTERVAL, 1)
@@ -116,6 +119,7 @@ class TdxPluginWebSocketTests(unittest.IsolatedAsyncioTestCase):
         collect_alerts.assert_called_once_with([alert], trade_date)
         broadcast_alert.assert_awaited_once()
         broadcast_tdx.assert_awaited_once_with(alert)
+        schedule_cache_refresh.assert_called_once_with(alert, trade_date)
 
 
 if __name__ == "__main__":

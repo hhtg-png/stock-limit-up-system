@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.limit_up import LimitUpRecord
 from app.models.stock import Stock
+from app.models.tdx_cache import TdxStockMoveCache
 from app.services.tdx_attribution_sources import (
     PublicStockAttribution,
     public_attribution_provider,
@@ -147,15 +148,26 @@ class TdxPluginService:
         *,
         source_scope: str = "mixed",
         db: Optional[AsyncSession] = None,
+        force_refresh: bool = False,
     ) -> Dict[str, Any]:
         target_date = await self._resolve_trade_date(trade_date, db)
         normalized_code = self._normalize_code(stock_code)
         cache_key = self._stock_move_cache_key(normalized_code, source_scope, target_date)
-        cached_payload = self._read_stock_move_payload_cache(cache_key)
-        if cached_payload:
-            cached_payload["is_cache"] = True
-            cached_payload.setdefault("source_status", {})["stock_move_cache"] = "hit"
-            return cached_payload
+        if not force_refresh:
+            persistent_payload = await self._read_persistent_stock_move_cache(
+                db,
+                normalized_code,
+                source_scope,
+                target_date,
+            )
+            if persistent_payload:
+                return persistent_payload
+
+            cached_payload = self._read_stock_move_payload_cache(cache_key)
+            if cached_payload:
+                cached_payload["is_cache"] = True
+                cached_payload.setdefault("source_status", {})["stock_move_cache"] = "hit"
+                return cached_payload
 
         warnings: List[str] = []
         source_status = {"stock_move": "ok"}
@@ -187,18 +199,38 @@ class TdxPluginService:
                 warnings=warnings,
             )
             self._store_stock_move_payload_cache(cache_key, payload)
+            await self._store_persistent_stock_move_cache(db, normalized_code, source_scope, target_date, payload)
             return payload
 
         if not limit_up_item and external_move:
             item = self._build_stock_move_from_external(external_move, normalized_code, source_scope, target_date)
             payload = self._plugin_payload([item], external_move.trade_date or target_date, source_status, is_cache=False, warnings=warnings)
             self._store_stock_move_payload_cache(cache_key, payload)
+            await self._store_persistent_stock_move_cache(db, normalized_code, source_scope, target_date, payload)
             return payload
 
         item = self._build_stock_move_item(limit_up_item, normalized_code, source_scope, target_date, external_move=external_move)
         payload = self._plugin_payload([item], target_date, source_status, is_cache=False, warnings=warnings)
         self._store_stock_move_payload_cache(cache_key, payload)
+        await self._store_persistent_stock_move_cache(db, normalized_code, source_scope, target_date, payload)
         return payload
+
+    async def refresh_stock_move_cache(
+        self,
+        stock_code: str,
+        trade_date: date,
+        *,
+        db: AsyncSession,
+        source_scope: str = "mixed",
+    ) -> Dict[str, Any]:
+        """Refresh a stock movement cache entry without serving stale cache first."""
+        return await self.get_stock_move(
+            stock_code,
+            trade_date,
+            source_scope=source_scope,
+            db=db,
+            force_refresh=True,
+        )
 
     async def get_plate_strength(self, trade_date: Optional[date] = None, db: Optional[AsyncSession] = None) -> Dict[str, Any]:
         target_date = await self._resolve_trade_date(trade_date, db)
@@ -703,6 +735,119 @@ class TdxPluginService:
             key=lambda key: self._stock_move_payload_cache[key][0],
         )
         self._stock_move_payload_cache.pop(oldest_key, None)
+
+    async def _read_persistent_stock_move_cache(
+        self,
+        db: Optional[AsyncSession],
+        stock_code: str,
+        source_scope: str,
+        target_date: date,
+    ) -> Optional[Dict[str, Any]]:
+        if db is None:
+            return None
+
+        try:
+            result = await db.execute(
+                select(TdxStockMoveCache)
+                .where(TdxStockMoveCache.stock_code == stock_code)
+                .where(TdxStockMoveCache.source_scope == source_scope)
+                .where(TdxStockMoveCache.trade_date == target_date)
+                .order_by(TdxStockMoveCache.generated_at.desc(), TdxStockMoveCache.id.desc())
+            )
+            cached = result.scalar_one_or_none()
+            if cached is None:
+                result = await db.execute(
+                    select(TdxStockMoveCache)
+                    .where(TdxStockMoveCache.stock_code == stock_code)
+                    .where(TdxStockMoveCache.source_scope == source_scope)
+                    .order_by(TdxStockMoveCache.generated_at.desc(), TdxStockMoveCache.id.desc())
+                    .limit(1)
+                )
+                cached = result.scalar_one_or_none()
+        except Exception:
+            return None
+
+        if cached is None or not self._stock_move_payload_has_analysis(cached.payload_json):
+            return None
+
+        payload = copy.deepcopy(cached.payload_json)
+        payload["is_cache"] = True
+        payload["updated_at"] = cached.generated_at.isoformat()
+        payload.setdefault("source_status", {})
+        payload["source_status"]["stock_move_cache"] = "persistent_hit"
+        return payload
+
+    async def _store_persistent_stock_move_cache(
+        self,
+        db: Optional[AsyncSession],
+        stock_code: str,
+        source_scope: str,
+        target_date: date,
+        payload: Dict[str, Any],
+    ) -> None:
+        if db is None or not self._stock_move_payload_has_analysis(payload):
+            return
+
+        generated_at = self._payload_generated_at(payload)
+        stock_name = self._stock_move_payload_stock_name(payload)
+        try:
+            result = await db.execute(
+                select(TdxStockMoveCache)
+                .where(TdxStockMoveCache.stock_code == stock_code)
+                .where(TdxStockMoveCache.source_scope == source_scope)
+                .where(TdxStockMoveCache.trade_date == target_date)
+            )
+            cached = result.scalar_one_or_none()
+            if cached is None:
+                db.add(
+                    TdxStockMoveCache(
+                        stock_code=stock_code,
+                        source_scope=source_scope,
+                        trade_date=target_date,
+                        stock_name=stock_name,
+                        payload_json=copy.deepcopy(payload),
+                        source_status=copy.deepcopy(payload.get("source_status") or {}),
+                        warnings=copy.deepcopy(payload.get("warnings") or []),
+                        generated_at=generated_at,
+                    )
+                )
+            else:
+                cached.stock_name = stock_name
+                cached.payload_json = copy.deepcopy(payload)
+                cached.source_status = copy.deepcopy(payload.get("source_status") or {})
+                cached.warnings = copy.deepcopy(payload.get("warnings") or [])
+                cached.generated_at = generated_at
+                cached.updated_at = datetime.now()
+            await db.commit()
+        except Exception:
+            with contextlib.suppress(Exception):
+                await db.rollback()
+
+    @staticmethod
+    def _stock_move_payload_has_analysis(payload: Dict[str, Any]) -> bool:
+        for item in payload.get("items") or []:
+            for reason in item.get("reasons") or []:
+                title = str(reason.get("title") or "").strip()
+                content = str(reason.get("content") or "").strip()
+                if title and title != "暂无异动原因" and content:
+                    return True
+        return False
+
+    @staticmethod
+    def _payload_generated_at(payload: Dict[str, Any]) -> datetime:
+        updated_at = str(payload.get("updated_at") or "").strip()
+        if updated_at:
+            with contextlib.suppress(ValueError):
+                return datetime.fromisoformat(updated_at)
+        return datetime.now()
+
+    @staticmethod
+    def _stock_move_payload_stock_name(payload: Dict[str, Any]) -> str:
+        for item in payload.get("items") or []:
+            name = str(item.get("stock_name") or "").strip()
+            if name:
+                return name[:50]
+        return ""
 
     def _build_plate_filters(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         counts: Dict[str, int] = defaultdict(int)
