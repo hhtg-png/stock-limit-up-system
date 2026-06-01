@@ -190,7 +190,7 @@ class TdxPluginServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([item["stock_code"] for item in payload["items"]], ["600589", "001259"])
 
-    async def test_limit_up_live_status_skips_slow_attribution_for_fast_refresh(self):
+    async def test_limit_up_live_status_uses_fast_pool_and_skips_slow_attribution(self):
         attribution_provider = FakeAttributionProvider({
             "605177": PublicStockAttribution(
                 stock_code="605177",
@@ -209,11 +209,18 @@ class TdxPluginServiceTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(
             service.realtime_limit_up_service,
-            "get_realtime_limit_up_list",
+            "get_fast_limit_up_pool",
             AsyncMock(return_value=[make_limit_up_item("605177", "东亚药业", "化学制药", board=1)]),
-        ):
+        ) as fast_pool, patch.object(
+            service.realtime_limit_up_service,
+            "get_realtime_limit_up_list",
+            AsyncMock(),
+        ) as rich_list:
             payload = await service.get_limit_up_live_status(trade_date)
 
+        fast_pool.assert_awaited_once()
+        self.assertFalse(fast_pool.await_args.kwargs["wait_for_refresh"])
+        rich_list.assert_not_called()
         self.assertEqual(attribution_provider.requested_codes, None)
         self.assertEqual(payload["source_status"]["limit_up_status"], "ok")
         self.assertEqual(payload["source_status"]["public_attribution"], "skipped")

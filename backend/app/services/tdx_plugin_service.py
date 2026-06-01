@@ -115,7 +115,11 @@ class TdxPluginService:
         }
 
         try:
-            raw_items = await self.realtime_limit_up_service.get_realtime_limit_up_list(target_date)
+            raw_items = await self.realtime_limit_up_service.get_fast_limit_up_pool(
+                target_date,
+                wait_for_refresh=False,
+                max_cache_age=1,
+            )
         except Exception as exc:
             raw_items = []
             source_status["limit_up_pool"] = "error"

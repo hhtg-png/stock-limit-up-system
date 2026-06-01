@@ -218,7 +218,7 @@ async def process_realtime_hot_limit_up_tick(trade_date: date) -> int:
     realtime_data = await asyncio.wait_for(
         realtime_limit_up_service.get_fast_limit_up_pool(
             trade_date,
-            wait_for_refresh=True,
+            wait_for_refresh=False,
             max_cache_age=REALTIME_HOT_POOL_MAX_CACHE_AGE,
         ),
         timeout=REALTIME_HOT_FETCH_TIMEOUT,

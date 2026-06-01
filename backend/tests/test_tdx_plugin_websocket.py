@@ -70,7 +70,7 @@ class TdxPluginWebSocketTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(synthesize.await_args_list[0].args[0], "第一条标题")
         self.assertEqual(synthesize.await_args_list[1].args[0], "韭研公社新帖，第二条标题")
 
-    async def test_hot_limit_up_tick_uses_fast_pool_for_sub_second_alerts(self):
+    async def test_hot_limit_up_tick_uses_nonblocking_fast_pool_for_sub_second_alerts(self):
         trade_date = date(2026, 6, 1)
         alert = {
             "stock_code": "001259",
@@ -107,7 +107,7 @@ class TdxPluginWebSocketTests(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(websocket_api.REALTIME_HOT_POOL_MAX_CACHE_AGE, 0.3)
         self.assertEqual(alert_count, 1)
         fast_pool.assert_awaited_once()
-        self.assertTrue(fast_pool.await_args.kwargs["wait_for_refresh"])
+        self.assertFalse(fast_pool.await_args.kwargs["wait_for_refresh"])
         self.assertEqual(
             fast_pool.await_args.kwargs["max_cache_age"],
             websocket_api.REALTIME_HOT_POOL_MAX_CACHE_AGE,
