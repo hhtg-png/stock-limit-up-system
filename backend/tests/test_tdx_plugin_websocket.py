@@ -1,4 +1,5 @@
 import unittest
+from datetime import date
 from unittest.mock import AsyncMock, patch
 
 from app.api.v1 import websocket as websocket_api
@@ -68,6 +69,53 @@ class TdxPluginWebSocketTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(synthesize.await_args_list[0].args[0], "第一条标题")
         self.assertEqual(synthesize.await_args_list[1].args[0], "韭研公社新帖，第二条标题")
+
+    async def test_hot_limit_up_tick_uses_fast_pool_for_sub_second_alerts(self):
+        trade_date = date(2026, 6, 1)
+        alert = {
+            "stock_code": "001259",
+            "stock_name": "利仁科技",
+            "time": "09:35:00",
+            "reason": "家电",
+            "continuous_days": 7,
+        }
+
+        with patch.object(
+            websocket_api.realtime_limit_up_service,
+            "get_fast_limit_up_pool",
+            AsyncMock(return_value=[alert]),
+        ) as fast_pool, patch.object(
+            websocket_api.realtime_limit_up_service,
+            "get_realtime_limit_up_list",
+            AsyncMock(),
+        ) as rich_list, patch.object(
+            websocket_api.realtime_alert_tracker,
+            "collect_new_alerts",
+            return_value=[alert],
+        ) as collect_alerts, patch.object(
+            websocket_api.manager,
+            "broadcast_limit_up_alert",
+            AsyncMock(),
+        ) as broadcast_alert, patch.object(
+            websocket_api,
+            "broadcast_tdx_limit_up_event",
+            AsyncMock(),
+        ) as broadcast_tdx:
+            alert_count = await websocket_api.process_realtime_hot_limit_up_tick(trade_date)
+
+        self.assertLess(websocket_api.REALTIME_HOT_SYNC_INTERVAL, 1)
+        self.assertLessEqual(websocket_api.REALTIME_HOT_POOL_MAX_CACHE_AGE, 0.3)
+        self.assertEqual(alert_count, 1)
+        fast_pool.assert_awaited_once()
+        self.assertTrue(fast_pool.await_args.kwargs["wait_for_refresh"])
+        self.assertEqual(
+            fast_pool.await_args.kwargs["max_cache_age"],
+            websocket_api.REALTIME_HOT_POOL_MAX_CACHE_AGE,
+        )
+        rich_list.assert_not_called()
+        collect_alerts.assert_called_once_with([alert], trade_date)
+        broadcast_alert.assert_awaited_once()
+        broadcast_tdx.assert_awaited_once_with(alert)
 
 
 if __name__ == "__main__":

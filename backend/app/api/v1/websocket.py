@@ -26,9 +26,12 @@ realtime_stream_tracker = RealtimeLimitUpStreamTracker()
 tdx_news_realtime_tracker = TdxNewsRealtimeTracker()
 realtime_sync_task: Optional[asyncio.Task] = None
 tdx_news_sync_task: Optional[asyncio.Task] = None
-REALTIME_SYNC_INTERVAL = 1
+REALTIME_HOT_SYNC_INTERVAL = 0.25
+REALTIME_HOT_POOL_MAX_CACHE_AGE = 0.25
+REALTIME_HOT_FETCH_TIMEOUT = 0.8
+REALTIME_RICH_SYNC_INTERVAL = 3
+REALTIME_RICH_POOL_MAX_CACHE_AGE = 2
 REALTIME_SYNC_IDLE_INTERVAL = 30
-REALTIME_POOL_MAX_CACHE_AGE = 1
 TDX_NEWS_SYNC_INTERVAL = 5
 TDX_NEWS_SYNC_LIMIT = 80
 TDX_NEWS_BROADCAST_LIMIT = 10
@@ -210,8 +213,57 @@ async def send_realtime_limit_up_snapshot(client_id: str):
         )
 
 
+async def process_realtime_hot_limit_up_tick(trade_date: date) -> int:
+    """Fast path: detect new limit-up records and broadcast speech events."""
+    realtime_data = await asyncio.wait_for(
+        realtime_limit_up_service.get_fast_limit_up_pool(
+            trade_date,
+            wait_for_refresh=True,
+            max_cache_age=REALTIME_HOT_POOL_MAX_CACHE_AGE,
+        ),
+        timeout=REALTIME_HOT_FETCH_TIMEOUT,
+    )
+    alerts = realtime_alert_tracker.collect_new_alerts(realtime_data, trade_date)
+
+    for alert in alerts:
+        await manager.broadcast_limit_up_alert(
+            alert["stock_code"],
+            alert["stock_name"],
+            alert["time"],
+            alert.get("reason"),
+            alert.get("continuous_days", 1),
+        )
+        await broadcast_tdx_limit_up_event(alert)
+
+    return len(alerts)
+
+
+async def process_realtime_rich_limit_up_sync(trade_date: date):
+    """Slow path: refresh complete list data for table fields and deltas."""
+    realtime_data = await realtime_limit_up_service.get_realtime_limit_up_list(
+        trade_date,
+        wait_for_pool_refresh=False,
+        pool_max_cache_age=REALTIME_RICH_POOL_MAX_CACHE_AGE,
+    )
+    sync_message = realtime_stream_tracker.sync(realtime_data, trade_date)
+    if sync_message:
+        await broadcast_realtime_sync_message(sync_message)
+
+
+def _consume_background_task_result(task: asyncio.Task, task_name: str):
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:
+        logger.error(f"{task_name} error: {exc}")
+
+
 async def realtime_sync_loop():
     """基于实时涨停池的列表同步与新增涨停播报循环"""
+    rich_sync_task: Optional[asyncio.Task] = None
+    last_rich_sync_at = 0.0
+
     while True:
         try:
             if manager.connection_count == 0:
@@ -223,33 +275,35 @@ async def realtime_sync_loop():
                 continue
 
             trade_date = date.today()
-            realtime_data = await realtime_limit_up_service.get_realtime_limit_up_list(
-                trade_date,
-                wait_for_pool_refresh=True,
-                pool_max_cache_age=REALTIME_POOL_MAX_CACHE_AGE,
-            )
-            sync_message = realtime_stream_tracker.sync(realtime_data, trade_date)
-            if sync_message:
-                await broadcast_realtime_sync_message(sync_message)
+            await process_realtime_hot_limit_up_tick(trade_date)
 
-            alerts = realtime_alert_tracker.collect_new_alerts(realtime_data, trade_date)
-
-            for alert in alerts:
-                await manager.broadcast_limit_up_alert(
-                    alert["stock_code"],
-                    alert["stock_name"],
-                    alert["time"],
-                    alert.get("reason"),
-                    alert.get("continuous_days", 1),
+            now = asyncio.get_running_loop().time()
+            rich_due = now - last_rich_sync_at >= REALTIME_RICH_SYNC_INTERVAL
+            rich_done = rich_sync_task is None or rich_sync_task.done()
+            if rich_due and rich_done:
+                last_rich_sync_at = now
+                rich_sync_task = asyncio.create_task(
+                    process_realtime_rich_limit_up_sync(trade_date)
                 )
-                await broadcast_tdx_limit_up_event(alert)
+                rich_sync_task.add_done_callback(
+                    lambda task: _consume_background_task_result(task, "Realtime rich sync")
+                )
 
-            await asyncio.sleep(REALTIME_SYNC_INTERVAL)
+            await asyncio.sleep(REALTIME_HOT_SYNC_INTERVAL)
         except asyncio.CancelledError:
+            if rich_sync_task and not rich_sync_task.done():
+                rich_sync_task.cancel()
+                try:
+                    await rich_sync_task
+                except asyncio.CancelledError:
+                    pass
             raise
+        except asyncio.TimeoutError:
+            logger.warning("Realtime hot limit-up tick timed out")
+            await asyncio.sleep(REALTIME_HOT_SYNC_INTERVAL)
         except Exception as e:
             logger.error(f"Realtime sync watcher error: {e}")
-            await asyncio.sleep(REALTIME_SYNC_INTERVAL)
+            await asyncio.sleep(REALTIME_HOT_SYNC_INTERVAL)
 
 
 async def tdx_news_sync_loop():
