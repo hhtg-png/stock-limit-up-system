@@ -536,7 +536,7 @@ function mergeLimitUpEvent(previous: TdxLimitUpEvent, next: TdxLimitUpEvent) {
     sources: next.sources?.length ? next.sources : previous.sources,
     target_plate: next.target_plate || previous.target_plate,
     target_reason_summary: next.target_reason_summary || previous.target_reason_summary,
-    target_status_label: next.target_status_label || previous.target_status_label,
+    target_status_label: resolvedTargetStatusLabel(merged),
     target_seal_amount: formatTdxSealAmount(sealAmount),
     event_id: next.event_id || previous.event_id,
     event_time: next.event_time || previous.event_time
@@ -631,9 +631,9 @@ function targetStatusLabel(isSealed: boolean, board: number) {
 }
 
 function limitUpStatusSpeechLabel(item: TdxLimitUpEvent) {
+  if (item.event_type === 'limit_up_opened' || !item.is_sealed) return '炸板'
   const rawLabel = item.target_status_label || item.event_label || ''
   if (rawLabel && !rawLabel.includes('封死涨停')) return rawLabel
-  if (item.event_type === 'limit_up_opened' || !item.is_sealed) return '炸板'
   if (item.event_type === 'limit_up_resealed') return '回封'
   return targetStatusLabel(true, Number(item.board || 1))
 }
@@ -704,8 +704,13 @@ function formatAmount(value: number) {
   return formatTdxSealAmount(value)
 }
 
+function resolvedTargetStatusLabel(item: TdxLimitUpEvent) {
+  if (item.event_type === 'limit_up_opened' || !item.is_sealed) return '炸板'
+  return item.target_status_label || item.event_label || targetStatusLabel(true, Number(item.board || 1))
+}
+
 function displayStatus(item: TdxLimitUpEvent) {
-  return item.target_status_label || item.event_label || (item.is_sealed ? '封死涨停' : '涨停打开')
+  return resolvedTargetStatusLabel(item)
 }
 
 onMounted(() => {

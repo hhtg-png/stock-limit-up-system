@@ -91,7 +91,7 @@ function normalizeTdxLimitUpEvent(data: Record<string, any>, timestamp: string):
     is_sealed: Boolean(isSealed),
     open_count: Number(data.open_count || 0),
     sources: normalizeStringList(data.sources),
-    target_status_label: String(data.target_status_label || eventLabel),
+    target_status_label: !isSealed || eventType === 'limit_up_opened' ? '炸板' : String(data.target_status_label || eventLabel),
     target_plate: String(data.target_plate || data.reason_category || ''),
     target_reason_summary: String(data.target_reason_summary || data.reason || ''),
     target_seal_amount: String(data.target_seal_amount || '')
