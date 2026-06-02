@@ -97,14 +97,17 @@ class DataScheduler:
         if self._is_running:
             return
         
-        # 盘中Level-2数据采集（每3秒）
-        self.scheduler.add_job(
-            self._collect_l2_data,
-            IntervalTrigger(seconds=settings.L2_COLLECT_INTERVAL),
-            id="l2_collect",
-            name="Level-2数据采集",
-            max_instances=1
-        )
+        # 盘中Level-2数据采集。线上TDX连接不稳定，默认关闭，按需用环境变量启用。
+        if settings.L2_COLLECT_ENABLED:
+            self.scheduler.add_job(
+                self._collect_l2_data,
+                IntervalTrigger(seconds=settings.L2_COLLECT_INTERVAL),
+                id="l2_collect",
+                name="Level-2数据采集",
+                max_instances=1
+            )
+        else:
+            logger.info("Level-2 data collection disabled")
         
         # 同花顺爬虫（每5分钟）
         self.scheduler.add_job(

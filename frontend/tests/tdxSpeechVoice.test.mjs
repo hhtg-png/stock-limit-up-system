@@ -11,6 +11,7 @@ assert.match(speech, /Microsoft Huihui/, 'voice profile should include common Wi
 assert.match(speech, /Google 普通话/, 'voice profile should include Chrome Mandarin voice fallback')
 assert.match(speech, /targetNeuralTtsEndpoint/, 'useSpeech should define the project neural TTS endpoint')
 assert.match(speech, /\/api\/v1\/tts\/speech/, 'audio playback should use the backend neural TTS proxy')
+assert.match(speech, /NEURAL_TTS_START_TIMEOUT_MS/, 'audio playback should time out cold neural TTS requests')
 assert.match(speech, /edge-tts/, 'comments should document the GitHub neural TTS backend choice')
 assert.match(speech, /targetNeuralTtsVoice\s*=\s*'zh-CN-XiaoyiNeural'/, 'plugin neural TTS should use the faster Xiaoyi voice')
 assert.match(speech, /rate:\s*1\.08/, 'browser fallback speech should be faster for market broadcast')

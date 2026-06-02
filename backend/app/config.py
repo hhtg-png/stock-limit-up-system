@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     CRAWLER_REQUEST_TIMEOUT: int = 30
     
     # Level-2数据采集配置
+    L2_COLLECT_ENABLED: bool = False  # 是否注册后台L2轮询任务；线上默认关闭，避免TDX连接阻塞
     L2_COLLECT_INTERVAL: int = 3  # Level-2采集间隔(秒)
     
     # 大单阈值配置（默认值，用户可自定义）

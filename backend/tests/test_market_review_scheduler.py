@@ -109,6 +109,7 @@ class MarketReviewSchedulerTests(unittest.IsolatedAsyncioTestCase):
 
         with patch("app.data_collectors.scheduler.settings") as mock_settings:
             mock_settings.L2_COLLECT_INTERVAL = 3
+            mock_settings.L2_COLLECT_ENABLED = False
             mock_settings.CRAWLER_INTERVAL_THS = 300
             mock_settings.CRAWLER_INTERVAL_KPL = 600
             mock_settings.MARKET_REVIEW_ENABLED = True
@@ -133,11 +134,58 @@ class MarketReviewSchedulerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("after_close_catchup", job_ids)
 
+    def test_start_registers_l2_collect_when_enabled(self):
+        scheduler = self._create_scheduler()
+
+        with patch("app.data_collectors.scheduler.settings") as mock_settings:
+            mock_settings.L2_COLLECT_INTERVAL = 3
+            mock_settings.L2_COLLECT_ENABLED = True
+            mock_settings.CRAWLER_INTERVAL_THS = 300
+            mock_settings.CRAWLER_INTERVAL_KPL = 600
+            mock_settings.MARKET_REVIEW_ENABLED = False
+            mock_settings.MARKET_REVIEW_BUILD_HOUR = 15
+            mock_settings.MARKET_REVIEW_BUILD_MINUTE = 5
+            mock_settings.MARKET_REVIEW_REPAIR_ENABLED = False
+            mock_settings.MARKET_REVIEW_REPAIR_HOUR = 20
+            mock_settings.MARKET_REVIEW_REPAIR_MINUTE = 15
+            mock_settings.INTELLIGENCE_ENABLED = False
+            mock_settings.DAILY_ANALYSIS_INTRADAY_HOUR = 14
+            mock_settings.DAILY_ANALYSIS_INTRADAY_MINUTE = 50
+
+            scheduler.start()
+
+        job_ids = {job["id"] for job in scheduler.scheduler.jobs}
+        self.assertIn("l2_collect", job_ids)
+
+    def test_start_skips_l2_collect_when_disabled(self):
+        scheduler = self._create_scheduler()
+
+        with patch("app.data_collectors.scheduler.settings") as mock_settings:
+            mock_settings.L2_COLLECT_INTERVAL = 3
+            mock_settings.L2_COLLECT_ENABLED = False
+            mock_settings.CRAWLER_INTERVAL_THS = 300
+            mock_settings.CRAWLER_INTERVAL_KPL = 600
+            mock_settings.MARKET_REVIEW_ENABLED = False
+            mock_settings.MARKET_REVIEW_BUILD_HOUR = 15
+            mock_settings.MARKET_REVIEW_BUILD_MINUTE = 5
+            mock_settings.MARKET_REVIEW_REPAIR_ENABLED = False
+            mock_settings.MARKET_REVIEW_REPAIR_HOUR = 20
+            mock_settings.MARKET_REVIEW_REPAIR_MINUTE = 15
+            mock_settings.INTELLIGENCE_ENABLED = False
+            mock_settings.DAILY_ANALYSIS_INTRADAY_HOUR = 14
+            mock_settings.DAILY_ANALYSIS_INTRADAY_MINUTE = 50
+
+            scheduler.start()
+
+        job_ids = {job["id"] for job in scheduler.scheduler.jobs}
+        self.assertNotIn("l2_collect", job_ids)
+
     def test_start_skips_market_review_jobs_when_disabled(self):
         scheduler = self._create_scheduler()
 
         with patch("app.data_collectors.scheduler.settings") as mock_settings:
             mock_settings.L2_COLLECT_INTERVAL = 3
+            mock_settings.L2_COLLECT_ENABLED = False
             mock_settings.CRAWLER_INTERVAL_THS = 300
             mock_settings.CRAWLER_INTERVAL_KPL = 600
             mock_settings.MARKET_REVIEW_ENABLED = False
@@ -158,6 +206,7 @@ class MarketReviewSchedulerTests(unittest.IsolatedAsyncioTestCase):
 
         with patch("app.data_collectors.scheduler.settings") as mock_settings:
             mock_settings.L2_COLLECT_INTERVAL = 3
+            mock_settings.L2_COLLECT_ENABLED = False
             mock_settings.CRAWLER_INTERVAL_THS = 300
             mock_settings.CRAWLER_INTERVAL_KPL = 600
             mock_settings.MARKET_REVIEW_ENABLED = True

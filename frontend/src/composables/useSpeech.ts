@@ -21,6 +21,7 @@ const targetTtsAudioId = 'tdx-target-tts-audio'
 const targetNeuralTtsEndpoint = '/api/v1/tts/speech'
 const targetNeuralTtsVoice = 'zh-CN-XiaoyiNeural'
 const targetAudioFallbackVolume = 0.9
+const NEURAL_TTS_START_TIMEOUT_MS = 900
 const SPEECH_UNLOCK_STORAGE_KEY = 'tdx-plugin-speech-unlocked'
 const NEWS_SPEECH_SIMILARITY_WINDOW_MS = 60 * 1000
 const NEWS_SPEECH_SIMILARITY_THRESHOLD = 0.8
@@ -300,24 +301,61 @@ function playWithAudioFallback(text: string, onFailure?: () => void, token = cur
   }
 
   let settled = false
+  let startTimeoutId: ReturnType<typeof setTimeout> | undefined
+  const clearStartTimeout = () => {
+    if (startTimeoutId === undefined) return
+    clearTimeout(startTimeoutId)
+    startTimeoutId = undefined
+  }
+  const cleanupAudioHandlers = () => {
+    clearStartTimeout()
+    audio.onended = null
+    audio.onerror = null
+    audio.onplaying = null
+    audio.oncanplay = null
+  }
   const finishOnce = () => {
     if (settled) return
     settled = true
+    cleanupAudioHandlers()
     finishSpeechItem(token)
   }
   const failOnce = () => {
     if (settled) return
     settled = true
+    cleanupAudioHandlers()
+    if (token !== currentSpeechToken) return
     if (onFailure) onFailure()
     else finishSpeechItem(token)
+  }
+  const markStarted = () => {
+    clearStartTimeout()
   }
 
   audio.onended = finishOnce
   audio.onerror = failOnce
+  audio.onplaying = markStarted
+  audio.oncanplay = markStarted
   audio.src = buildTargetTtsUrl(text)
-  const playPromise = audio.play()
-  if (playPromise?.catch) {
-    playPromise.catch(failOnce)
+  startTimeoutId = setTimeout(() => {
+    if (settled) return
+    try {
+      audio.pause()
+      audio.removeAttribute('src')
+      audio.load?.()
+    } catch {
+      // 仅用于让慢速神经音频降级，清理失败时继续走失败路径。
+    }
+    failOnce()
+  }, NEURAL_TTS_START_TIMEOUT_MS)
+
+  try {
+    const playPromise = audio.play()
+    if (playPromise?.catch) {
+      playPromise.catch(failOnce)
+    }
+  } catch {
+    failOnce()
   }
 }
 
