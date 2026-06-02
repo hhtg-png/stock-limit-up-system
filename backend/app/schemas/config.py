@@ -35,6 +35,7 @@ class UserConfigResponse(UserConfigBase):
     id: int
     watch_list: List[str] = Field(default_factory=list)
     display_columns: Optional[List[str]] = None
+    custom_settings: Optional[Dict] = None
     deepseek_api_key_configured: bool = Field(False, description="是否已配置 DeepSeek API Key")
     deepseek_base_url: str = Field("https://api.deepseek.com", description="DeepSeek API 地址")
     deepseek_model: str = Field("deepseek-v4-pro", description="DeepSeek 模型")

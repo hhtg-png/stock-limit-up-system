@@ -82,6 +82,26 @@ class ConfigSecretApiTests(unittest.TestCase):
         self.assertTrue(loaded_payload["deepseek_api_key_configured"])
         self.assertNotIn("deepseek_api_key", loaded_payload)
 
+    def test_custom_settings_temporary_notebook_is_saved_and_returned(self):
+        notebook_html = '<p>盘中备注</p><img src="data:image/png;base64,abc123">'
+
+        response = self.client.put(
+            "/config",
+            json={"custom_settings": {"temporary_notebook": notebook_html, "other": "kept"}},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["custom_settings"]["temporary_notebook"], notebook_html)
+        self.assertEqual(payload["custom_settings"]["other"], "kept")
+
+        loaded = self.client.get("/config")
+
+        self.assertEqual(loaded.status_code, 200)
+        loaded_payload = loaded.json()
+        self.assertEqual(loaded_payload["custom_settings"]["temporary_notebook"], notebook_html)
+        self.assertEqual(loaded_payload["custom_settings"]["other"], "kept")
+
 
 if __name__ == "__main__":
     unittest.main()

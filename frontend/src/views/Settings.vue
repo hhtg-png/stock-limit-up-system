@@ -45,6 +45,35 @@
     </el-row>
 
     <el-row :gutter="16">
+      <el-col :span="24">
+        <div class="card temporary-notebook-card">
+          <div class="card-title-row notebook-title-row">
+            <h3>临时记录本</h3>
+            <div class="notebook-actions">
+              <input
+                ref="notebookFileInput"
+                class="notebook-file-input"
+                type="file"
+                accept="image/*"
+                @change="handleNotebookFileChange"
+              >
+              <el-button size="small" @click="triggerNotebookImageUpload">添加图片</el-button>
+              <el-button size="small" plain @click="clearTemporaryNotebook">清空</el-button>
+            </div>
+          </div>
+          <div
+            ref="notebookEditor"
+            class="notebook-editor"
+            contenteditable="true"
+            aria-label="临时记录本"
+            @input="handleNotebookInput"
+            @paste="handleNotebookPaste"
+          ></div>
+        </div>
+      </el-col>
+    </el-row>
+
+    <el-row :gutter="16">
       <!-- 播报设置 -->
       <el-col :xs="24" :md="12">
         <div class="card">
@@ -211,7 +240,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, onMounted } from 'vue'
+import { ref, reactive, onMounted, onBeforeUnmount } from 'vue'
 import { ElMessage } from 'element-plus'
 import { getConfig, updateConfig, type UserConfigUpdate } from '@/api/config'
 import { useConfigStore } from '@/stores/config'
@@ -219,6 +248,11 @@ import { useAlertStore } from '@/stores/alert'
 
 const configStore = useConfigStore()
 const alertStore = useAlertStore()
+const TEMPORARY_NOTEBOOK_KEY = 'temporary_notebook'
+const MAX_NOTEBOOK_IMAGE_SIZE = 2 * 1024 * 1024
+const NOTEBOOK_SAVE_DELAY = 600
+
+type CustomSettings = Record<string, unknown>
 
 const config = reactive({
   big_order_volume: 300,
@@ -232,6 +266,7 @@ const config = reactive({
   filter_low_price: 0,
   filter_high_price: 0,
   watch_list: [] as string[],
+  custom_settings: {} as CustomSettings,
   deepseek_api_key_configured: false,
   deepseek_base_url: 'https://api.deepseek.com',
   deepseek_model: 'deepseek-v4-pro'
@@ -243,6 +278,9 @@ const savingDeepSeek = ref(false)
 const notificationPermission = ref(Notification?.permission || 'default')
 const tdxPluginDialogVisible = ref(false)
 const selectedPluginUrl = ref('')
+const notebookEditor = ref<HTMLDivElement | null>(null)
+const notebookFileInput = ref<HTMLInputElement | null>(null)
+let notebookSaveTimer: ReturnType<typeof setTimeout> | null = null
 
 const tdxPlugins = [
   { name: '涨停播报', desc: '纯涨停、炸板、回封和封单变化播报', path: '/tdx/ztlive/dark' },
@@ -257,11 +295,13 @@ const tdxPlugins = [
 async function loadConfig() {
   try {
     const data = await getConfig()
-    Object.assign(config, data)
-    configStore.setConfig(data)
+    const customSettings = normalizeCustomSettings(data.custom_settings)
+    Object.assign(config, data, { custom_settings: customSettings })
+    configStore.setConfig({ ...data, custom_settings: customSettings })
     alertStore.setEnabled(data.alert_limit_up_enabled)
     alertStore.setSoundEnabled(data.alert_sound_enabled)
     alertStore.setDesktopEnabled(data.alert_desktop_enabled)
+    renderTemporaryNotebook()
   } catch (e) {
     console.error('Load config error:', e)
   }
@@ -312,6 +352,210 @@ function buildUserConfigPayload(): UserConfigUpdate {
   delete payload.deepseek_base_url
   delete payload.deepseek_model
   return payload
+}
+
+function normalizeCustomSettings(value: unknown): CustomSettings {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    return { ...(value as CustomSettings) }
+  }
+  return {}
+}
+
+function getTemporaryNotebookFromConfig() {
+  const value = normalizeCustomSettings(config.custom_settings)[TEMPORARY_NOTEBOOK_KEY]
+  return typeof value === 'string' ? value : ''
+}
+
+function renderTemporaryNotebook() {
+  if (!notebookEditor.value) return
+  notebookEditor.value.innerHTML = sanitizeNotebookHtml(getTemporaryNotebookFromConfig())
+}
+
+function handleNotebookInput() {
+  scheduleTemporaryNotebookSave()
+}
+
+function triggerNotebookImageUpload() {
+  notebookFileInput.value?.click()
+}
+
+async function handleNotebookFileChange(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (file) {
+    await addNotebookImageFile(file)
+  }
+  input.value = ''
+}
+
+async function handleNotebookPaste(event: ClipboardEvent) {
+  const items = Array.from(event.clipboardData?.items ?? [])
+  const imageItems = items.filter(item => item.kind === 'file' && item.type.startsWith('image/'))
+  if (!imageItems.length) return
+
+  event.preventDefault()
+  for (const item of imageItems) {
+    const file = item.getAsFile()
+    if (file) {
+      await addNotebookImageFile(file)
+    }
+  }
+}
+
+async function addNotebookImageFile(file: File) {
+  if (!validateNotebookImageFile(file)) return
+
+  try {
+    const imageUrl = await readNotebookImageFile(file)
+    insertNotebookImage(imageUrl)
+  } catch (e) {
+    console.error('Read notebook image error:', e)
+    ElMessage.error('图片添加失败')
+  }
+}
+
+function validateNotebookImageFile(file: File) {
+  if (!file.type.startsWith('image/')) {
+    ElMessage.warning('只能添加图片文件')
+    return false
+  }
+  if (file.size > MAX_NOTEBOOK_IMAGE_SIZE) {
+    ElMessage.warning('单张图片不能超过 2MB')
+    return false
+  }
+  return true
+}
+
+function readNotebookImageFile(file: File) {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => {
+      if (typeof reader.result === 'string') {
+        resolve(reader.result)
+      } else {
+        reject(new Error('Invalid image data'))
+      }
+    }
+    reader.onerror = () => reject(reader.error ?? new Error('Read image failed'))
+    reader.readAsDataURL(file)
+  })
+}
+
+function insertNotebookImage(src: string) {
+  const editor = notebookEditor.value
+  if (!editor) return
+
+  const image = document.createElement('img')
+  image.src = src
+  image.alt = '记录图片'
+  image.className = 'notebook-image'
+
+  const selection = window.getSelection()
+  if (selection?.rangeCount && selection.anchorNode && editor.contains(selection.anchorNode)) {
+    const range = selection.getRangeAt(0)
+    range.deleteContents()
+    range.insertNode(image)
+    range.setStartAfter(image)
+    range.collapse(true)
+    selection.removeAllRanges()
+    selection.addRange(range)
+  } else {
+    editor.appendChild(image)
+  }
+
+  image.insertAdjacentText('afterend', ' ')
+  editor.focus()
+  scheduleTemporaryNotebookSave()
+}
+
+function scheduleTemporaryNotebookSave() {
+  clearNotebookSaveTimer()
+  notebookSaveTimer = setTimeout(() => {
+    saveTemporaryNotebook()
+  }, NOTEBOOK_SAVE_DELAY)
+}
+
+function clearNotebookSaveTimer() {
+  if (notebookSaveTimer) {
+    clearTimeout(notebookSaveTimer)
+    notebookSaveTimer = null
+  }
+}
+
+async function saveTemporaryNotebook() {
+  clearNotebookSaveTimer()
+  const editor = notebookEditor.value
+  const notebookHtml = sanitizeNotebookHtml(editor?.innerHTML ?? '')
+  if (editor && editor.innerHTML !== notebookHtml) {
+    editor.innerHTML = notebookHtml
+  }
+
+  const customSettings = {
+    ...normalizeCustomSettings(config.custom_settings),
+    [TEMPORARY_NOTEBOOK_KEY]: notebookHtml
+  }
+  config.custom_settings = customSettings
+
+  try {
+    const data = await updateConfig({ custom_settings: customSettings })
+    const updatedCustomSettings = normalizeCustomSettings(data.custom_settings)
+    Object.assign(config, data, { custom_settings: updatedCustomSettings })
+    configStore.setConfig({ ...data, custom_settings: updatedCustomSettings })
+  } catch (e) {
+    console.error('Save temporary notebook error:', e)
+    ElMessage.error('记录本保存失败')
+  }
+}
+
+function clearTemporaryNotebook() {
+  if (notebookEditor.value) {
+    notebookEditor.value.innerHTML = ''
+  }
+  saveTemporaryNotebook()
+}
+
+function sanitizeNotebookHtml(html: string) {
+  const source = document.createElement('div')
+  const target = document.createElement('div')
+  source.innerHTML = html
+  appendSanitizedNotebookNodes(source, target)
+  return target.innerHTML
+}
+
+function appendSanitizedNotebookNodes(source: Node, target: Node) {
+  Array.from(source.childNodes).forEach(node => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      target.appendChild(document.createTextNode(node.textContent ?? ''))
+      return
+    }
+
+    if (node instanceof HTMLImageElement) {
+      if (node.src.startsWith('data:image/')) {
+        const image = document.createElement('img')
+        image.src = node.src
+        image.alt = node.alt || '记录图片'
+        image.className = 'notebook-image'
+        target.appendChild(image)
+      }
+      return
+    }
+
+    if (node instanceof HTMLBRElement) {
+      target.appendChild(document.createElement('br'))
+      return
+    }
+
+    if (!(node instanceof HTMLElement)) return
+
+    if (node.tagName === 'DIV' || node.tagName === 'P') {
+      const block = document.createElement(node.tagName.toLowerCase())
+      appendSanitizedNotebookNodes(node, block)
+      target.appendChild(block)
+      return
+    }
+
+    appendSanitizedNotebookNodes(node, target)
+  })
 }
 
 // 请求通知权限
@@ -395,6 +639,10 @@ async function copyTdxPluginUrl(path: string) {
 onMounted(() => {
   loadConfig()
 })
+
+onBeforeUnmount(() => {
+  clearNotebookSaveTimer()
+})
 </script>
 
 <style lang="scss" scoped>
@@ -441,6 +689,51 @@ onMounted(() => {
     color: #909399;
     font-size: 12px;
     line-height: 1.5;
+  }
+
+  .notebook-title-row {
+    align-items: flex-start;
+  }
+
+  .notebook-actions {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 8px;
+  }
+
+  .notebook-file-input {
+    display: none;
+  }
+
+  .notebook-editor {
+    min-height: 220px;
+    max-height: 520px;
+    overflow-y: auto;
+    padding: 12px;
+    border: 1px solid #dcdfe6;
+    border-radius: 6px;
+    background: #fff;
+    color: #303133;
+    font-size: 14px;
+    line-height: 1.6;
+    outline: none;
+    white-space: pre-wrap;
+    word-break: break-word;
+
+    &:focus {
+      border-color: #409eff;
+      box-shadow: 0 0 0 2px rgba(64, 158, 255, 0.12);
+    }
+
+    :deep(img) {
+      display: block;
+      max-width: 100%;
+      max-height: 360px;
+      margin: 8px 0;
+      border-radius: 4px;
+      object-fit: contain;
+    }
   }
 
   .watchlist {
@@ -559,6 +852,20 @@ onMounted(() => {
     .plugin-entry-content {
       align-items: flex-start;
       flex-direction: column;
+    }
+
+    .notebook-title-row {
+      align-items: stretch;
+      flex-direction: column;
+    }
+
+    .notebook-actions {
+      justify-content: flex-start;
+    }
+
+    .notebook-editor {
+      min-height: 180px;
+      max-height: 420px;
     }
 
     :deep(.el-form-item) {

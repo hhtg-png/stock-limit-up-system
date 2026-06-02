@@ -15,6 +15,7 @@ export interface UserConfig {
   filter_high_price: number
   chart_theme: string
   watch_list: string[]
+  custom_settings?: Record<string, unknown>
   deepseek_api_key_configured: boolean
   deepseek_base_url: string
   deepseek_model: string
@@ -35,6 +36,7 @@ export const useConfigStore = defineStore('config', () => {
     filter_high_price: 0,
     chart_theme: 'light',
     watch_list: [],
+    custom_settings: {},
     deepseek_api_key_configured: false,
     deepseek_base_url: 'https://api.deepseek.com',
     deepseek_model: 'deepseek-v4-pro'
