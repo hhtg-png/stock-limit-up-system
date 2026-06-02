@@ -387,6 +387,7 @@ async def broadcast_tdx_limit_up_event(alert: dict):
     stock_code = alert.get("stock_code", "")
     stock_name = alert.get("stock_name", "")
     event_time = alert.get("time", "")
+    reason = alert.get("reason")
     continuous_days = alert.get("continuous_days", 1)
     status_label = tdx_limit_up_status_label(continuous_days)
     event_id = f"tdx-limit-up-touch-{stock_code}-{event_time}"
@@ -400,12 +401,32 @@ async def broadcast_tdx_limit_up_event(alert: dict):
             "stock_code": stock_code,
             "stock_name": stock_name,
             "board": continuous_days,
-            "reason": alert.get("reason"),
+            "reason": reason,
             "target_status_label": status_label,
-            "speech_text": f"{stock_name}{status_label}",
+            "speech_text": tdx_limit_up_speech_text(stock_name, status_label, reason),
         },
         stock_code=stock_code,
     )
+
+
+def tdx_limit_up_speech_text(stock_name: str, status_label: str, reason: object = None) -> str:
+    reason_text = short_tdx_limit_up_reason(reason)
+    return f"{stock_name}{status_label}{f'，{reason_text}' if reason_text else ''}"
+
+
+def short_tdx_limit_up_reason(reason: object) -> str:
+    text = " ".join(str(reason or "").split()).strip()
+    if not text or "暂无" in text:
+        return ""
+    for old in ("其他",):
+        text = text.replace(old, "")
+    for separator in ("，", ",", "；", ";"):
+        text = text.split(separator)[0]
+    for separator in ("+", "、", "/"):
+        text = text.replace(separator, "加")
+    while "加加" in text:
+        text = text.replace("加加", "加")
+    return text.strip("加")[:24]
 
 
 def tdx_limit_up_status_label(continuous_days: object) -> str:

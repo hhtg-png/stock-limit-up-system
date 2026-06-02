@@ -27,7 +27,7 @@ class TdxPluginWebSocketTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["event_type"], "limit_up_touched")
         self.assertEqual(payload["event_label"], "摸板")
         self.assertEqual(payload["target_status_label"], "7板")
-        self.assertEqual(payload["speech_text"], "利仁科技7板")
+        self.assertEqual(payload["speech_text"], "利仁科技7板，家电催化")
         self.assertNotIn("封死涨停", payload["speech_text"])
         self.assertEqual(payload["stock_code"], "001259")
         self.assertEqual(broadcast.await_args.kwargs["stock_code"], "001259")

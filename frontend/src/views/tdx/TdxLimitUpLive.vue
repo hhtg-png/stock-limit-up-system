@@ -407,8 +407,31 @@ function isPlainSealedStatusEvent(item: TdxLimitUpEvent) {
   )
 }
 
+function limitUpSpeechReason(item: TdxLimitUpEvent) {
+  if (item.event_type === 'limit_up_opened' || !item.is_sealed) return ''
+  const rawReason = [
+    item.target_reason_summary,
+    item.reason,
+    item.target_plate,
+    item.reason_category
+  ].find(value => normalizeSpeechReason(value))
+  const reason = normalizeSpeechReason(rawReason)
+  return reason ? `，${reason}` : ''
+}
+
+function normalizeSpeechReason(value?: string | null) {
+  return String(value || '')
+    .replace(/暂无[^+、/，,;；]*/g, '')
+    .replace(/其他/g, '')
+    .replace(/[+、/，,;；]+/g, '加')
+    .replace(/\s+/g, '')
+    .replace(/加+/g, '加')
+    .replace(/^加|加$/g, '')
+    .slice(0, 24)
+}
+
 function limitUpSpeechText(item: TdxLimitUpEvent, isFirstTouch = false) {
-  return `${item.stock_name}${isFirstTouch ? limitUpTouchSpeechLabel(item) : limitUpStatusSpeechLabel(item)}`
+  return `${item.stock_name}${isFirstTouch ? limitUpTouchSpeechLabel(item) : limitUpStatusSpeechLabel(item)}${limitUpSpeechReason(item)}`
 }
 
 function limitUpEventSpeechKey(item: TdxLimitUpEvent) {
