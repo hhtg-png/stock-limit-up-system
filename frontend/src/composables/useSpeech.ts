@@ -575,11 +575,6 @@ function announceStatusChange(stockName: string, status: string) {
   }
 }
 
-// 播报开启提示
-function announceEnabled() {
-  speakInternal('播报已开启')
-}
-
 // 播报关闭提示
 function announceDisabled() {
   speakInternal('播报已关闭')
@@ -603,7 +598,6 @@ export function useSpeech() {
     announceStatusChange,
     clearAnnounced,
     testSpeech,
-    announceEnabled,
     announceDisabled
   }
 }

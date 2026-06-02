@@ -33,6 +33,7 @@ assert.match(speech, /audio\.oncanplay\s*=\s*markStarted/, 'neural TTS startup t
 assert.match(speech, /SPEECH_UNLOCK_STORAGE_KEY/, 'plugin speech switch should persist the last enabled state')
 assert.match(speech, /readStoredSpeechUnlocked/, 'plugin speech should restore the last enabled state on reload')
 assert.match(speech, /persistSpeechUnlocked\(true\)/, 'unlocking plugin speech should save the enabled state')
+assert.doesNotMatch(speech, /播报已开启/, 'shared speech module should not include an enable prompt')
 assert.match(speech, /function lockSpeech/, 'plugin speech should expose a way to turn the remembered switch off')
 assert.match(speech, /persistSpeechUnlocked\(false\)/, 'turning plugin speech off should save the disabled state')
 assert.match(speech, /function enqueuePluginSpeech[\s\S]*!speechUnlocked\.value[\s\S]*return false/, 'plugin speech queue should respect the remembered voice switch')
