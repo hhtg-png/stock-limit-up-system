@@ -154,6 +154,7 @@ const hideOpened = ref(false)
 const loading = ref(false)
 const errorText = ref('')
 const seenSpeechKeys = new Set<string>()
+const seenTouchedStockCodes = new Set<string>()
 const knownNewsKeys = new Set<string>()
 const spokenNewsKeys = new Set<string>()
 const stockMovePayload = ref<TdxPluginPayload<TdxStockMove> | null>(null)
@@ -253,6 +254,7 @@ function hasSnapshotStructureChanged(statusItems: readonly TdxLimitUpEvent[], sn
 function rememberExistingEvents(items: TdxLimitUpEvent[]) {
   for (const item of items) {
     seenSpeechKeys.add(limitUpEventSpeechKey(item))
+    rememberTouchedStock(item)
   }
 }
 
@@ -261,8 +263,18 @@ function announceNewStatusEvents(items: TdxLimitUpEvent[]) {
     const key = limitUpEventSpeechKey(item)
     if (!key || seenSpeechKeys.has(key)) continue
     seenSpeechKeys.add(key)
-    enqueuePluginSpeech(limitUpSpeechText(item), key, { force: true, urgent: true })
+    const isFirstTouch = rememberTouchedStock(item)
+    if (!isFirstTouch && isPlainSealedStatusEvent(item)) continue
+    enqueuePluginSpeech(limitUpSpeechText(item, isFirstTouch), key, { force: true, urgent: true })
   }
+}
+
+function rememberTouchedStock(item: TdxLimitUpEvent) {
+  const code = item.stock_code
+  if (!code) return false
+  const isFirstTouch = !seenTouchedStockCodes.has(code)
+  seenTouchedStockCodes.add(code)
+  return isFirstTouch
 }
 
 function handleStatusEvents(items: TdxLimitUpEvent[]) {
@@ -626,8 +638,22 @@ function limitUpStatusSpeechLabel(item: TdxLimitUpEvent) {
   return targetStatusLabel(true, Number(item.board || 1))
 }
 
-function limitUpSpeechText(item: TdxLimitUpEvent) {
-  return `${item.stock_name}${limitUpStatusSpeechLabel(item)}`
+function limitUpTouchSpeechLabel(item: TdxLimitUpEvent) {
+  const rawLabel = item.target_status_label || ''
+  if (rawLabel && !/炸板|涨停打开|回封/.test(rawLabel)) return rawLabel
+  return targetStatusLabel(true, Number(item.board || 1))
+}
+
+function isPlainSealedStatusEvent(item: TdxLimitUpEvent) {
+  return item.event_type === 'limit_up_sealed' || (
+    item.is_sealed &&
+    item.event_type !== 'limit_up_touched' &&
+    item.event_type !== 'limit_up_resealed'
+  )
+}
+
+function limitUpSpeechText(item: TdxLimitUpEvent, isFirstTouch = false) {
+  return `${item.stock_name}${isFirstTouch ? limitUpTouchSpeechLabel(item) : limitUpStatusSpeechLabel(item)}`
 }
 
 function limitUpEventSpeechKey(item: TdxLimitUpEvent) {

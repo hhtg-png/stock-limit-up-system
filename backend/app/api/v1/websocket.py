@@ -389,13 +389,13 @@ async def broadcast_tdx_limit_up_event(alert: dict):
     event_time = alert.get("time", "")
     continuous_days = alert.get("continuous_days", 1)
     status_label = tdx_limit_up_status_label(continuous_days)
-    event_id = f"tdx-limit-up-{stock_code}-{event_time}"
+    event_id = f"tdx-limit-up-touch-{stock_code}-{event_time}"
     await manager.broadcast_tdx_plugin_event(
         "tdx_limit_up_event",
         {
             "event_id": event_id,
-            "event_type": "limit_up_sealed",
-            "event_label": "封死涨停",
+            "event_type": "limit_up_touched",
+            "event_label": "摸板",
             "event_time": event_time,
             "stock_code": stock_code,
             "stock_name": stock_name,

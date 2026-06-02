@@ -24,7 +24,8 @@ class TdxPluginWebSocketTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(broadcast.await_args.args[0], "tdx_limit_up_event")
         payload = broadcast.await_args.args[1]
-        self.assertEqual(payload["event_label"], "封死涨停")
+        self.assertEqual(payload["event_type"], "limit_up_touched")
+        self.assertEqual(payload["event_label"], "摸板")
         self.assertEqual(payload["target_status_label"], "7板")
         self.assertEqual(payload["speech_text"], "利仁科技7板")
         self.assertNotIn("封死涨停", payload["speech_text"])
