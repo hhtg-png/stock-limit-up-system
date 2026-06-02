@@ -21,6 +21,7 @@ const targetTtsAudioId = 'tdx-target-tts-audio'
 const targetNeuralTtsEndpoint = '/api/v1/tts/speech'
 const targetNeuralTtsVoice = 'zh-CN-XiaoyiNeural'
 const targetAudioFallbackVolume = 0.9
+const targetSilentAudioUrl = 'data:audio/wav;base64,UklGRqQCAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YYACAACAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA'
 const NEURAL_TTS_START_TIMEOUT_MS = 900
 const SPEECH_UNLOCK_STORAGE_KEY = 'tdx-plugin-speech-unlocked'
 const NEWS_SPEECH_SIMILARITY_WINDOW_MS = 60 * 1000
@@ -43,11 +44,8 @@ type PluginSpeechOptions = {
   urgent?: boolean
 }
 
-type SpeechPlaybackMode = 'auto' | 'web-speech'
-
 type SpeechQueueItem = {
   text: string
-  mode: SpeechPlaybackMode
   urgent?: boolean
 }
 
@@ -77,6 +75,7 @@ const speechQueue: SpeechQueueItem[] = []
 let isSpeaking = false
 let currentSpeechToken = 0
 let currentSpeechUrgent = false
+let targetAudioPrimeToken = 0
 
 // 已播报的股票记录（防止重复播报）
 const announcedStocks = new Set<string>()
@@ -178,6 +177,46 @@ function ensureTargetTtsAudio(): HTMLAudioElement | null {
   audio.volume = targetAudioFallbackVolume
   document.body.appendChild(audio)
   return audio
+}
+
+function primeTargetTtsAudio() {
+  const audio = ensureTargetTtsAudio()
+  if (!audio) return
+
+  const token = ++targetAudioPrimeToken
+  let cleanupTimer: ReturnType<typeof setTimeout> | undefined
+  const cleanup = () => {
+    if (token !== targetAudioPrimeToken) return
+    if (cleanupTimer !== undefined) {
+      clearTimeout(cleanupTimer)
+      cleanupTimer = undefined
+    }
+    audio.onended = null
+    audio.onerror = null
+    try {
+      audio.pause()
+      audio.removeAttribute('src')
+      audio.load?.()
+    } catch {
+      // 静默预热只用于拿播放权限，失败时保持后续真实播报流程。
+    }
+    audio.volume = targetAudioFallbackVolume
+  }
+
+  audio.onended = cleanup
+  audio.onerror = cleanup
+  audio.volume = targetAudioFallbackVolume
+  audio.src = targetSilentAudioUrl
+  cleanupTimer = setTimeout(cleanup, 300)
+
+  try {
+    const playPromise = audio.play()
+    if (playPromise?.catch) {
+      playPromise.catch(cleanup)
+    }
+  } catch {
+    cleanup()
+  }
 }
 
 function shouldUseTargetAudioPlayback(): boolean {
@@ -300,6 +339,7 @@ function playWithAudioFallback(text: string, onFailure?: () => void, token = cur
     return
   }
 
+  targetAudioPrimeToken += 1
   let settled = false
   let startTimeoutId: ReturnType<typeof setTimeout> | undefined
   const clearStartTimeout = () => {
@@ -367,6 +407,7 @@ function playWithNeuralTts(text: string, token = currentSpeechToken) {
 
 function stopCurrentSpeechPlayback() {
   currentSpeechToken += 1
+  targetAudioPrimeToken += 1
   isSpeaking = false
   currentSpeechUrgent = false
 
@@ -385,10 +426,9 @@ function stopCurrentSpeechPlayback() {
   }
 }
 
-function queueSpeechItem(text: string, options: { urgent?: boolean; mode?: SpeechPlaybackMode } = {}) {
+function queueSpeechItem(text: string, options: { urgent?: boolean } = {}) {
   const item: SpeechQueueItem = {
     text,
-    mode: options.mode || 'auto',
     urgent: options.urgent
   }
 
@@ -429,7 +469,7 @@ function enqueuePluginSpeech(text: string, key?: string, options: PluginSpeechOp
   pluginSpeechKeys.add(speechKey)
   if (isSimilarRecentNewsSpeech(text, speechKey)) return false
   if (options.urgent) {
-    queueSpeechItem(text, { urgent: true, mode: 'web-speech' })
+    queueSpeechItem(text, { urgent: true })
   } else {
     queueSpeechItem(text)
   }
@@ -447,7 +487,7 @@ function processQueue() {
   const token = ++currentSpeechToken
 
   try {
-    if (item.mode !== 'web-speech' && shouldUseTargetAudioPlayback()) {
+    if (shouldUseTargetAudioPlayback()) {
       playWithNeuralTts(item.text, token)
       return
     }
@@ -466,6 +506,7 @@ function unlockSpeech(options: UnlockSpeechOptions | Event = {}): boolean {
   persistSpeechUnlocked(true)
   setupSpeechVoices()
   ensureTargetTtsAudio()
+  primeTargetTtsAudio()
   if (hasWebSpeechSupport()) {
     window.speechSynthesis.resume()
   }

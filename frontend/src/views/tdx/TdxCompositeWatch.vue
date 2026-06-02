@@ -324,7 +324,6 @@ function handleSpeechToggle(event: Event) {
     return
   }
   unlockSpeech({ silent: true })
-  enqueuePluginSpeech('播报已开启', `tdx-limit-up-speech-enabled-${Date.now()}`, { force: true, urgent: true })
 }
 
 function normalizeStockCode(code: string) {
