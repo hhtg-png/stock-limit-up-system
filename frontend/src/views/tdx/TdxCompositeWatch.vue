@@ -126,6 +126,7 @@ import { useTdxStockLink } from '@/composables/useTdxStockLink'
 import { installTdxStockSelectionBridge } from '@/composables/useTdxStockSelection'
 import { useTdxPluginRealtime } from '@/composables/useWebSocket'
 import { useLimitUpStore } from '@/stores/limit-up'
+import { formatTdxSealAmount, pickDisplayChangePct } from '@/utils/tdxLimitUpDisplay'
 import type { LimitUpRealtime } from '@/types/limit-up'
 import type { TdxLimitUpEvent, TdxNewsItem, TdxPluginPayload, TdxStockMove } from '@/types/tdx-plugins'
 
@@ -514,21 +515,24 @@ function upsertEvent(map: Map<string, TdxLimitUpEvent>, next: TdxLimitUpEvent) {
 
 function mergeLimitUpEvent(previous: TdxLimitUpEvent, next: TdxLimitUpEvent) {
   const merged = { ...previous, ...next }
+  const sealAmount = Number(merged.seal_amount || 0)
   return {
     ...merged,
+    change_pct: pickDisplayChangePct(previous.change_pct, next.change_pct),
     reason: next.reason || previous.reason,
     reason_category: next.reason_category && next.reason_category !== '其他' ? next.reason_category : previous.reason_category,
     sources: next.sources?.length ? next.sources : previous.sources,
     target_plate: next.target_plate || previous.target_plate,
     target_reason_summary: next.target_reason_summary || previous.target_reason_summary,
     target_status_label: next.target_status_label || previous.target_status_label,
-    target_seal_amount: next.target_seal_amount || previous.target_seal_amount,
+    target_seal_amount: formatTdxSealAmount(sealAmount),
     event_id: next.event_id || previous.event_id,
     event_time: next.event_time || previous.event_time
   }
 }
 
 function normalizeTdxEvent(item: TdxLimitUpEvent): TdxLimitUpEvent {
+  const sealAmount = Number(item.seal_amount || 0)
   return {
     event_id: item.event_id || `tdx-${item.stock_code}-${item.event_time}`,
     event_type: item.event_type || (item.is_sealed ? 'limit_up_sealed' : 'limit_up_opened'),
@@ -540,7 +544,7 @@ function normalizeTdxEvent(item: TdxLimitUpEvent): TdxLimitUpEvent {
     reason: item.reason || '',
     reason_category: item.reason_category || '其他',
     change_pct: Number(item.change_pct || 0),
-    seal_amount: Number(item.seal_amount || 0),
+    seal_amount: sealAmount,
     amount: Number(item.amount || 0),
     turnover_rate: Number(item.turnover_rate || 0),
     is_sealed: Boolean(item.is_sealed),
@@ -549,7 +553,7 @@ function normalizeTdxEvent(item: TdxLimitUpEvent): TdxLimitUpEvent {
     target_status_label: item.target_status_label || '',
     target_plate: item.target_plate || '',
     target_reason_summary: item.target_reason_summary || '',
-    target_seal_amount: item.target_seal_amount || ''
+    target_seal_amount: item.target_seal_amount || formatTdxSealAmount(sealAmount)
   }
 }
 
@@ -557,6 +561,7 @@ function realtimeToTdxEvent(item: LimitUpRealtime): TdxLimitUpEvent {
   const isSealed = Boolean(item.is_sealed ?? item.is_final_sealed)
   const status = String(item.current_status || (isSealed ? 'sealed' : 'opened'))
   const openCount = Number(item.open_count || 0)
+  const sealAmount = Number(item.seal_amount || 0)
   const eventLabel = !isSealed || status === 'opened'
     ? '涨停打开'
     : status === 'resealed' || openCount > 0
@@ -579,7 +584,7 @@ function realtimeToTdxEvent(item: LimitUpRealtime): TdxLimitUpEvent {
     reason: item.limit_up_reason || item.reason_category || '',
     reason_category: item.reason_category || '其他',
     change_pct: Number((item as LimitUpRealtime & { change_pct?: number }).change_pct || 0),
-    seal_amount: Number(item.seal_amount || 0),
+    seal_amount: sealAmount,
     amount: Number(item.amount || 0),
     turnover_rate: Number(item.turnover_rate || 0),
     is_sealed: isSealed,
@@ -588,7 +593,7 @@ function realtimeToTdxEvent(item: LimitUpRealtime): TdxLimitUpEvent {
     target_status_label: targetStatusLabel(isSealed, Number(item.continuous_limit_up_days || 1)),
     target_plate: item.reason_category || item.industry || '',
     target_reason_summary: item.limit_up_reason || item.reason_category || '',
-    target_seal_amount: formatAmount(Number(item.seal_amount || 0))
+    target_seal_amount: formatTdxSealAmount(sealAmount)
   }
 }
 
@@ -643,9 +648,7 @@ function formatPct(value: number) {
 }
 
 function formatAmount(value: number) {
-  if (!value) return '--'
-  if (value >= 100000000) return `${(value / 100000000).toFixed(2)}亿`
-  return `${(value / 10000).toFixed(0)}万`
+  return formatTdxSealAmount(value)
 }
 
 function displayStatus(item: TdxLimitUpEvent) {
