@@ -252,16 +252,16 @@ function hasSnapshotStructureChanged(statusItems: readonly TdxLimitUpEvent[], sn
 
 function rememberExistingEvents(items: TdxLimitUpEvent[]) {
   for (const item of items) {
-    seenSpeechKeys.add(item.stock_code || item.event_id)
+    seenSpeechKeys.add(limitUpEventSpeechKey(item))
   }
 }
 
 function announceNewStatusEvents(items: TdxLimitUpEvent[]) {
   for (const item of items) {
-    const key = item.stock_code || item.event_id
+    const key = limitUpEventSpeechKey(item)
     if (!key || seenSpeechKeys.has(key)) continue
     seenSpeechKeys.add(key)
-    enqueuePluginSpeech(limitUpSpeechText(item), item.event_id, { force: true, urgent: true })
+    enqueuePluginSpeech(limitUpSpeechText(item), key, { force: true, urgent: true })
   }
 }
 
@@ -324,6 +324,7 @@ function handleSpeechToggle(event: Event) {
     return
   }
   unlockSpeech({ silent: true })
+  enqueuePluginSpeech('播报已开启', `tdx-limit-up-speech-enabled-${Date.now()}`, { force: true, urgent: true })
 }
 
 function normalizeStockCode(code: string) {
@@ -628,6 +629,10 @@ function limitUpStatusSpeechLabel(item: TdxLimitUpEvent) {
 
 function limitUpSpeechText(item: TdxLimitUpEvent) {
   return `${item.stock_name}${limitUpStatusSpeechLabel(item)}`
+}
+
+function limitUpEventSpeechKey(item: TdxLimitUpEvent) {
+  return item.event_id || `${item.stock_code}-${item.event_type}-${item.event_time}`
 }
 
 function formatEventTime(value?: string | Date | null) {
