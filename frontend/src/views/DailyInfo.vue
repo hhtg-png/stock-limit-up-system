@@ -26,6 +26,10 @@
         />
         <el-button :icon="Refresh" @click="refreshData" :loading="loading || probing">刷新</el-button>
         <el-button type="primary" :icon="Files" @click="syncData" :loading="syncing || syncRunning">同步知识库</el-button>
+        <el-button :icon="Files" @click="exportToObsidian" :loading="exportingObsidian" :disabled="!obsidianReady">
+          Obsidian
+        </el-button>
+        <el-button v-if="lastObsidianFile" link type="primary" @click="openObsidianNote">打开笔记</el-button>
       </div>
     </div>
 
@@ -260,7 +264,9 @@ import {
   getDailyInfo,
   getDailyInfoHistory,
   getDailyInfoSyncStatus,
+  getObsidianStatus,
   getIntelligenceDocument,
+  exportObsidianKnowledge,
   probeDailyInfo,
   searchDailyInfo,
   syncDailyInfo
@@ -271,7 +277,8 @@ import type {
   DailyInfoSource,
   DailyInfoSourceDetail,
   IntelligenceSyncResponse,
-  IntelligenceSyncResult
+  IntelligenceSyncResult,
+  ObsidianStatus
 } from '@/types/intelligence'
 
 const selectedDate = ref(dayjs().format('YYYY-MM-DD'))
@@ -287,6 +294,9 @@ const sourceDialogVisible = ref(false)
 const sourceLoading = ref(false)
 const sourceDetail = ref<DailyInfoSourceDetail | null>(null)
 const syncStatus = ref<IntelligenceSyncResponse | null>(null)
+const obsidianStatus = ref<ObsidianStatus | null>(null)
+const exportingObsidian = ref(false)
+const lastObsidianFile = ref('')
 let syncPollTimer: number | null = null
 let appliedSyncFinishedAt = ''
 
@@ -338,6 +348,7 @@ const sourceBody = computed(() => {
   return sourceDetail.value.content_text || sourceDetail.value.introduction || sourceDetail.value.abstract || '暂无原文内容'
 })
 const syncRunning = computed(() => ['queued', 'running'].includes(syncStatus.value?.state || ''))
+const obsidianReady = computed(() => Boolean(obsidianStatus.value?.enabled && obsidianStatus.value?.vault_configured))
 const syncNotice = computed(() => {
   if (probing.value) return '正在检查共享知识库是否有更新'
   if (!syncStatus.value) return ''
@@ -349,6 +360,7 @@ const syncNotice = computed(() => {
 onMounted(async () => {
   await loadInitialData()
   await refreshSyncStatus()
+  await refreshObsidianStatus()
   await probeKnowledgeUpdates()
 })
 
@@ -452,6 +464,43 @@ async function refreshSyncStatus() {
   } catch (error) {
     console.warn('获取知识库同步状态失败:', error)
   }
+}
+
+async function refreshObsidianStatus() {
+  try {
+    obsidianStatus.value = await getObsidianStatus()
+  } catch (error) {
+    console.warn('获取 Obsidian 状态失败:', error)
+    obsidianStatus.value = null
+  }
+}
+
+async function exportToObsidian() {
+  if (!obsidianReady.value) {
+    ElMessage.warning('Obsidian 未启用')
+    return
+  }
+  exportingObsidian.value = true
+  try {
+    const response = await exportObsidianKnowledge(selectedDate.value)
+    lastObsidianFile.value = response.written_files.find(item => item.startsWith('50_Daily/')) || ''
+    ElMessage.success(response.skipped ? 'Obsidian 未写入' : 'Obsidian 已同步')
+  } catch (error) {
+    console.error('同步 Obsidian 失败:', error)
+    ElMessage.error('同步 Obsidian 失败')
+  } finally {
+    exportingObsidian.value = false
+  }
+}
+
+function openObsidianNote() {
+  const filePath = lastObsidianFile.value || `50_Daily/${selectedDate.value.slice(0, 4)}/${selectedDate.value}.md`
+  window.location.href = obsidianUri(filePath)
+}
+
+function obsidianUri(filePath: string): string {
+  const vaultName = (obsidianStatus.value?.vault_path || '').split(/[\\/]/).filter(Boolean).pop() || ''
+  return `obsidian://open?vault=${encodeURIComponent(vaultName)}&file=${encodeURIComponent(filePath)}`
 }
 
 function applySyncStatus(status: IntelligenceSyncResponse) {

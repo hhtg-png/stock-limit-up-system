@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.models.intelligence import DailyInfoDigest, JiegeModeSignal
 from app.services.intelligence_service import intelligence_service
+from app.services.obsidian_knowledge_service import obsidian_knowledge_service
 from app.utils.time_utils import today_cn
 
 router = APIRouter()
@@ -89,6 +90,39 @@ async def probe_daily_info(db: AsyncSession = Depends(get_db)):
         "probe": probe,
         "queued": queued,
         "sync": intelligence_service.get_sync_status(),
+    }
+
+
+@router.get("/obsidian/status", summary="获取 Obsidian 知识库状态")
+async def get_obsidian_status():
+    return obsidian_knowledge_service.get_status()
+
+
+@router.post("/obsidian/export", summary="导出自生长知识库到 Obsidian")
+async def export_obsidian_knowledge(
+    trade_date: Optional[date] = Query(None, description="交易日期，默认今天"),
+    db: AsyncSession = Depends(get_db),
+):
+    return await obsidian_knowledge_service.export_daily_knowledge(db, trade_date or today_cn())
+
+
+@router.get("/trends", summary="获取产业趋势候选")
+async def get_industry_trends(
+    limit: int = Query(30, ge=1, le=100, description="聚合最近摘要数"),
+    db: AsyncSession = Depends(get_db),
+):
+    return {"items": await obsidian_knowledge_service.build_industry_trends(db, limit=limit)}
+
+
+@router.get("/ultra-short/signals", summary="获取超短线提醒候选")
+async def get_ultra_short_signals(
+    trade_date: Optional[date] = Query(None, description="交易日期，默认今天"),
+    db: AsyncSession = Depends(get_db),
+):
+    target_date = trade_date or today_cn()
+    return {
+        "trade_date": target_date.isoformat(),
+        "items": await obsidian_knowledge_service.build_ultra_short_signals(db, target_date),
     }
 
 

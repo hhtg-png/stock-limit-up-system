@@ -3,11 +3,15 @@ import type {
   DailyInfoHistoryResponse,
   DailyInfoResponse,
   DailyInfoSourceDetail,
+  IndustryTrendsResponse,
   IntelligenceProbeResponse,
   IntelligenceSourcesResponse,
   IntelligenceSyncResponse,
   IntelligenceSyncResult,
-  JiegeModeResponse
+  JiegeModeResponse,
+  ObsidianExportResponse,
+  ObsidianStatus,
+  UltraShortSignalsResponse
 } from '@/types/intelligence'
 
 const api = axios.create({
@@ -82,5 +86,31 @@ export async function rebuildJiegeMode(tradeDate: string): Promise<JiegeModeResp
 
 export async function getIntelligenceSources(): Promise<IntelligenceSourcesResponse> {
   const { data } = await api.get('/intelligence/sources')
+  return data
+}
+
+export async function getObsidianStatus(): Promise<ObsidianStatus> {
+  const { data } = await api.get('/intelligence/obsidian/status')
+  return data
+}
+
+export async function exportObsidianKnowledge(tradeDate?: string): Promise<ObsidianExportResponse> {
+  const { data } = await api.post('/intelligence/obsidian/export', null, {
+    params: tradeDate ? { trade_date: tradeDate } : {}
+  })
+  return data
+}
+
+export async function getIndustryTrends(limit = 30): Promise<IndustryTrendsResponse> {
+  const { data } = await api.get('/intelligence/trends', {
+    params: { limit }
+  })
+  return data
+}
+
+export async function getUltraShortSignals(tradeDate: string): Promise<UltraShortSignalsResponse> {
+  const { data } = await api.get('/intelligence/ultra-short/signals', {
+    params: { trade_date: tradeDate }
+  })
   return data
 }

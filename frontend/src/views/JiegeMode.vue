@@ -15,6 +15,10 @@
         />
         <el-button :icon="Refresh" @click="fetchData" :loading="loading">刷新</el-button>
         <el-button type="primary" :icon="Files" @click="rebuildData" :loading="rebuilding">重算模式</el-button>
+        <el-button :icon="Files" @click="exportToObsidian" :loading="exportingObsidian" :disabled="!obsidianReady">
+          Obsidian
+        </el-button>
+        <el-button v-if="lastObsidianFile" link type="primary" @click="openObsidianNote">打开笔记</el-button>
       </div>
     </div>
 
@@ -213,16 +217,19 @@ import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { ArrowDown, ArrowUp, Files, Refresh } from '@element-plus/icons-vue'
 import dayjs from 'dayjs'
-import { getJiegeMode, rebuildJiegeMode } from '@/api/intelligence'
-import type { JiegeCandidate, JiegeModeResponse } from '@/types/intelligence'
+import { exportObsidianKnowledge, getJiegeMode, getObsidianStatus, rebuildJiegeMode } from '@/api/intelligence'
+import type { JiegeCandidate, JiegeModeResponse, ObsidianStatus } from '@/types/intelligence'
 
 const router = useRouter()
 const selectedDate = ref(dayjs().format('YYYY-MM-DD'))
 const jiegeMode = ref<JiegeModeResponse | null>(null)
 const loading = ref(false)
 const rebuilding = ref(false)
+const exportingObsidian = ref(false)
 const errorMessage = ref('')
 const rulesExpanded = ref(false)
+const obsidianStatus = ref<ObsidianStatus | null>(null)
+const lastObsidianFile = ref('')
 
 const signalData = computed(() => jiegeMode.value?.data || null)
 const candidates = computed<JiegeCandidate[]>(() => signalData.value?.prediction.candidates || [])
@@ -242,6 +249,7 @@ const dailyAnalysisItems = computed(() => {
     .map(([key, value]) => ({ key, text: readableCell(value) }))
     .filter(item => item.text)
 })
+const obsidianReady = computed(() => Boolean(obsidianStatus.value?.enabled && obsidianStatus.value?.vault_configured))
 
 watch(selectedDate, () => {
   fetchData()
@@ -249,6 +257,7 @@ watch(selectedDate, () => {
 
 onMounted(() => {
   fetchData()
+  refreshObsidianStatus()
 })
 
 async function fetchData() {
@@ -265,6 +274,15 @@ async function fetchData() {
   }
 }
 
+async function refreshObsidianStatus() {
+  try {
+    obsidianStatus.value = await getObsidianStatus()
+  } catch (error) {
+    console.warn('获取 Obsidian 状态失败:', error)
+    obsidianStatus.value = null
+  }
+}
+
 async function rebuildData() {
   rebuilding.value = true
   errorMessage.value = ''
@@ -278,6 +296,34 @@ async function rebuildData() {
   } finally {
     rebuilding.value = false
   }
+}
+
+async function exportToObsidian() {
+  if (!obsidianReady.value) {
+    ElMessage.warning('Obsidian 未启用')
+    return
+  }
+  exportingObsidian.value = true
+  try {
+    const response = await exportObsidianKnowledge(selectedDate.value)
+    lastObsidianFile.value = response.written_files.find(item => item.startsWith('50_Daily/')) || ''
+    ElMessage.success(response.skipped ? 'Obsidian 未写入' : 'Obsidian 已同步')
+  } catch (error) {
+    console.error('同步 Obsidian 失败:', error)
+    ElMessage.error('同步 Obsidian 失败')
+  } finally {
+    exportingObsidian.value = false
+  }
+}
+
+function openObsidianNote() {
+  const filePath = lastObsidianFile.value || `50_Daily/${selectedDate.value.slice(0, 4)}/${selectedDate.value}.md`
+  window.location.href = obsidianUri(filePath)
+}
+
+function obsidianUri(filePath: string): string {
+  const vaultName = (obsidianStatus.value?.vault_path || '').split(/[\\/]/).filter(Boolean).pop() || ''
+  return `obsidian://open?vault=${encodeURIComponent(vaultName)}&file=${encodeURIComponent(filePath)}`
 }
 
 function goStock(stockCode: string) {

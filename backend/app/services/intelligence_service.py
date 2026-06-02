@@ -780,7 +780,15 @@ class IntelligenceService:
                 refresh_stale_documents=force_daily or should_rebuild_daily,
             )
         jiege = await self.build_jiege_mode(db, today, allow_latest_fallback=True)
-        return {"sources": results, "daily_info": daily, "jiege_mode": jiege}
+        obsidian = None
+        try:
+            from app.services.obsidian_knowledge_service import obsidian_knowledge_service
+
+            obsidian = await obsidian_knowledge_service.export_daily_knowledge(db, today)
+        except Exception as exc:
+            logger.warning(f"Obsidian knowledge export skipped: {exc}")
+            obsidian = {"skipped": True, "error": str(exc)}
+        return {"sources": results, "daily_info": daily, "jiege_mode": jiege, "obsidian": obsidian}
 
     def get_sync_status(self) -> Dict[str, Any]:
         status = dict(self._sync_status)

@@ -46,6 +46,18 @@ const router = createRouter({
       meta: { title: '交易模式' }
     },
     {
+      path: '/industry-trends',
+      name: 'IndustryTrends',
+      component: () => import('@/views/IndustryTrends.vue'),
+      meta: { title: '产业趋势' }
+    },
+    {
+      path: '/ultra-short-signals',
+      name: 'UltraShortSignals',
+      component: () => import('@/views/UltraShortSignals.vue'),
+      meta: { title: '超短信号' }
+    },
+    {
       path: '/continuous',
       name: 'ContinuousBoard',
       component: () => import('@/views/ContinuousBoard.vue'),

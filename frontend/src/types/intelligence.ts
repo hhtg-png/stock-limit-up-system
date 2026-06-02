@@ -106,6 +106,7 @@ export interface IntelligenceSyncResult {
   }>
   daily_info: DailyInfoResponse
   jiege_mode: JiegeModeResponse
+  obsidian?: ObsidianExportResponse | null
 }
 
 export interface JiegeRule {
@@ -164,4 +165,82 @@ export interface JiegeModeResponse {
   data: JiegeSignalData
   generated_at?: string | null
   cache_hit: boolean
+}
+
+export interface ObsidianStatus {
+  enabled: boolean
+  vault_configured: boolean
+  vault_exists: boolean
+  vault_path: string
+  auto_git_enabled: boolean
+  web_research_enabled: boolean
+  web_research_allowlist: string[]
+  required_directories?: string[]
+}
+
+export interface ObsidianExportResponse {
+  trade_date: string
+  vault_path: string
+  written_files: string[]
+  skipped?: boolean
+  reason?: string
+  git?: {
+    enabled: boolean
+    committed?: boolean
+    reason?: string
+    error?: string
+  }
+}
+
+export interface IndustryTrendSource {
+  title: string
+  url: string
+  source_name: string
+  trade_date: string
+}
+
+export interface IndustryTrendStock {
+  name: string
+  code?: string
+  sector?: string
+  summary?: string
+  reason?: string
+  source_title?: string
+}
+
+export interface IndustryTrend {
+  theme: string
+  status: string
+  confidence: string
+  last_seen: string
+  catalysts: string[]
+  risks: string[]
+  stocks: IndustryTrendStock[]
+  sources: IndustryTrendSource[]
+  evidence: string[]
+}
+
+export interface IndustryTrendsResponse {
+  items: IndustryTrend[]
+}
+
+export interface UltraShortSignal {
+  trade_date: string
+  setup: string
+  source: string
+  alert_type: string
+  manual_required: boolean
+  sim_result: string
+  stock_code?: string
+  stock_name?: string
+  label: string
+  tags: string[]
+  reason?: string
+  score: number
+  risk_flags: string[]
+}
+
+export interface UltraShortSignalsResponse {
+  trade_date: string
+  items: UltraShortSignal[]
 }

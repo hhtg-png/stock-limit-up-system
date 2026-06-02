@@ -86,6 +86,13 @@ class Settings(BaseSettings):
     IMA_SYNC_MAX_PAGES: int = 20
     INTELLIGENCE_PROBE_INTERVAL_SECONDS: int = 60
     INTELLIGENCE_PROBE_LIMIT: int = 20
+
+    # Obsidian 自生长知识库配置
+    OBSIDIAN_ENABLED: bool = False
+    OBSIDIAN_VAULT_PATH: str = ""
+    OBSIDIAN_AUTO_GIT_ENABLED: bool = False
+    WEB_RESEARCH_ENABLED: bool = False
+    WEB_RESEARCH_ALLOWLIST: str = ""
     
     # 日志配置
     LOG_LEVEL: str = "INFO"

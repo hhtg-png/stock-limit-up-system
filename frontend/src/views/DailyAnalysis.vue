@@ -27,6 +27,10 @@
         >
           回填本月
         </el-button>
+        <el-button :icon="Files" @click="exportToObsidian" :loading="exportingObsidian" :disabled="!obsidianReady">
+          Obsidian
+        </el-button>
+        <el-button v-if="lastObsidianFile" link type="primary" @click="openObsidianNote">打开笔记</el-button>
       </div>
     </div>
 
@@ -216,6 +220,7 @@ import {
   rebuildDailyAnalysis,
   updateDailyAnalysisOverrides
 } from '@/api/daily-analysis'
+import { exportObsidianKnowledge, getObsidianStatus } from '@/api/intelligence'
 import {
   DAILY_ANALYSIS_COLUMNS,
   type DailyAnalysisCell,
@@ -223,6 +228,7 @@ import {
   type DailyAnalysisRow,
   type DailyAnalysisSession
 } from '@/types/daily-analysis'
+import type { ObsidianStatus } from '@/types/intelligence'
 
 const router = useRouter()
 const analysisColumns = DAILY_ANALYSIS_COLUMNS
@@ -232,6 +238,9 @@ const rows = ref<DailyAnalysisRow[]>([])
 const loading = ref(false)
 const backfilling = ref(false)
 const saving = ref(false)
+const exportingObsidian = ref(false)
+const obsidianStatus = ref<ObsidianStatus | null>(null)
+const lastObsidianFile = ref('')
 
 const editVisible = ref(false)
 const editText = ref('')
@@ -257,6 +266,8 @@ const canRestoreEditingCell = computed(() => {
   if (!editingRow.value || !editingColumn.value) return false
   return Boolean(editingRow.value.columns[editingColumn.value]?.is_manual)
 })
+const obsidianReady = computed(() => Boolean(obsidianStatus.value?.enabled && obsidianStatus.value?.vault_configured))
+const obsidianExportDate = computed(() => rows.value[0]?.trade_date || dayjs().format('YYYY-MM-DD'))
 
 watch([selectedMonth, analysisSession], () => {
   fetchData()
@@ -264,6 +275,7 @@ watch([selectedMonth, analysisSession], () => {
 
 onMounted(() => {
   fetchData()
+  refreshObsidianStatus()
 })
 
 async function fetchData() {
@@ -277,6 +289,43 @@ async function fetchData() {
   } finally {
     loading.value = false
   }
+}
+
+async function refreshObsidianStatus() {
+  try {
+    obsidianStatus.value = await getObsidianStatus()
+  } catch (error) {
+    console.warn('获取 Obsidian 状态失败:', error)
+    obsidianStatus.value = null
+  }
+}
+
+async function exportToObsidian() {
+  if (!obsidianReady.value) {
+    ElMessage.warning('Obsidian 未启用')
+    return
+  }
+  exportingObsidian.value = true
+  try {
+    const response = await exportObsidianKnowledge(obsidianExportDate.value)
+    lastObsidianFile.value = response.written_files.find(item => item.startsWith('50_Daily/')) || ''
+    ElMessage.success(response.skipped ? 'Obsidian 未写入' : 'Obsidian 已同步')
+  } catch (error) {
+    console.error('同步 Obsidian 失败:', error)
+    ElMessage.error('同步 Obsidian 失败')
+  } finally {
+    exportingObsidian.value = false
+  }
+}
+
+function openObsidianNote() {
+  const filePath = lastObsidianFile.value || `50_Daily/${obsidianExportDate.value.slice(0, 4)}/${obsidianExportDate.value}.md`
+  window.location.href = obsidianUri(filePath)
+}
+
+function obsidianUri(filePath: string): string {
+  const vaultName = (obsidianStatus.value?.vault_path || '').split(/[\\/]/).filter(Boolean).pop() || ''
+  return `obsidian://open?vault=${encodeURIComponent(vaultName)}&file=${encodeURIComponent(filePath)}`
 }
 
 async function backfillMonth() {

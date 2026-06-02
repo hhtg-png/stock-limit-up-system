@@ -13,7 +13,7 @@ from app.api.v1 import intelligence as intelligence_api
 from app.api.v1.intelligence import router as intelligence_router
 from app.database import Base, get_db
 from app.models.intelligence import DailyInfoDigest, DailyInfoDigestVersion, JiegeModeSignal, KnowledgeDocument
-from app.models.market_review import MarketReviewDailyMetric, MarketReviewStockDaily
+from app.models.market_review import DailyAnalysisRecord, MarketReviewDailyMetric, MarketReviewStockDaily
 from app.models.stock import Stock
 
 
@@ -208,6 +208,33 @@ class IntelligenceApiTests(unittest.TestCase):
                         amount=500000,
                         limit_up_reason="今日已发生",
                     ),
+                    DailyAnalysisRecord(
+                        trade_date=date(2026, 5, 18),
+                        month="2026-05",
+                        auto_result={
+                            "辨识度": {
+                                "items": [
+                                    {
+                                        "stock_code": "000001",
+                                        "stock_name": "昨日龙头",
+                                        "label": "昨日龙头(000001)",
+                                        "tags": ["5板", "唯一"],
+                                        "reason": "昨日主线",
+                                        "score": 72,
+                                    }
+                                ],
+                                "content": "昨日龙头(000001)",
+                            }
+                        },
+                        manual_overrides={},
+                        calc_version=1,
+                        data_status="ready",
+                        generated_at=datetime(2026, 5, 18, 15, 10, 0),
+                        intraday_auto_result={},
+                        intraday_manual_overrides={},
+                        intraday_calc_version=0,
+                        intraday_data_status="empty",
+                    ),
                 ]
             )
             await session.commit()
@@ -223,6 +250,65 @@ class IntelligenceApiTests(unittest.TestCase):
         self.assertEqual(payload["source_count"], 2)
         self.assertEqual(payload["sources"][0]["title"], "复盘.md")
         self.assertEqual(payload["sources"][0]["jump_url"], "https://example.test/review.md")
+
+    def test_get_obsidian_status_returns_configuration(self):
+        fake_service = Mock()
+        fake_service.get_status.return_value = {
+            "enabled": True,
+            "vault_configured": True,
+            "vault_exists": True,
+            "vault_path": "D:/Obsidian/stock",
+            "auto_git_enabled": False,
+            "web_research_enabled": True,
+            "web_research_allowlist": ["https://example.test"],
+        }
+
+        with patch("app.api.v1.intelligence.obsidian_knowledge_service", fake_service):
+            response = self.client.get("/intelligence/obsidian/status")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["enabled"])
+        self.assertTrue(response.json()["vault_exists"])
+        self.assertEqual(response.json()["web_research_allowlist"], ["https://example.test"])
+
+    def test_post_obsidian_export_returns_written_files(self):
+        fake_service = Mock()
+        fake_service.export_daily_knowledge = AsyncMock(
+            return_value={
+                "trade_date": "2026-05-18",
+                "written_files": [
+                    "50_Daily/2026/2026-05-18.md",
+                    "Dashboards/产业趋势.md",
+                ],
+                "vault_path": "D:/Obsidian/stock",
+            }
+        )
+
+        with patch("app.api.v1.intelligence.obsidian_knowledge_service", fake_service):
+            response = self.client.post("/intelligence/obsidian/export", params={"trade_date": "2026-05-18"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["written_files"][0], "50_Daily/2026/2026-05-18.md")
+        fake_service.export_daily_knowledge.assert_awaited_once()
+
+    def test_get_industry_trends_returns_source_backed_items(self):
+        response = self.client.get("/intelligence/trends", params={"limit": 10})
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["items"])
+        self.assertEqual(payload["items"][0]["status"], "candidate")
+        self.assertTrue(payload["items"][0]["sources"])
+        self.assertTrue(any(stock["code"] == "300456" for stock in payload["items"][0]["stocks"]))
+
+    def test_get_ultra_short_signals_requires_manual_confirmation(self):
+        response = self.client.get("/intelligence/ultra-short/signals", params={"trade_date": "2026-05-18"})
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["items"])
+        self.assertTrue(all(item["manual_required"] is True for item in payload["items"]))
+        self.assertTrue(all("auto_execute" not in item for item in payload["items"]))
 
     def test_get_daily_info_backfills_stock_mentions_from_sources(self):
         response = self.client.get("/intelligence/daily-info", params={"trade_date": "2026-05-18"})

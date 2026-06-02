@@ -37,6 +37,14 @@
               <el-icon><TrendCharts /></el-icon>
               <span>交易模式</span>
             </el-menu-item>
+            <el-menu-item index="/industry-trends">
+              <el-icon><TrendCharts /></el-icon>
+              <span>产业趋势</span>
+            </el-menu-item>
+            <el-menu-item index="/ultra-short-signals">
+              <el-icon><Bell /></el-icon>
+              <span>超短信号</span>
+            </el-menu-item>
             <el-menu-item index="/continuous">
               <el-icon><TrendCharts /></el-icon>
               <span>连板梯队</span>
@@ -154,6 +162,8 @@ const mobileNavItems = [
   { path: '/daily-analysis', label: '分析', icon: Calendar },
   { path: '/daily-info', label: '资讯', icon: Document },
   { path: '/jiege-mode', label: '交易', icon: TrendCharts },
+  { path: '/industry-trends', label: '趋势', icon: TrendCharts },
+  { path: '/ultra-short-signals', label: '超短', icon: Bell },
   { path: '/continuous', label: '连板', icon: TrendCharts },
   { path: '/settings', label: '设置', icon: Setting }
 ]
