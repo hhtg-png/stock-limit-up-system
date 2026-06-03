@@ -126,7 +126,7 @@ import { useTdxStockLink } from '@/composables/useTdxStockLink'
 import { installTdxStockSelectionBridge } from '@/composables/useTdxStockSelection'
 import { useTdxPluginRealtime } from '@/composables/useWebSocket'
 import { useLimitUpStore } from '@/stores/limit-up'
-import { formatTdxSealAmount, pickDisplayChangePct } from '@/utils/tdxLimitUpDisplay'
+import { formatTdxSealAmount, pickDisplayChangePct, resolveTdxMergedDisplayState } from '@/utils/tdxLimitUpDisplay'
 import type { LimitUpRealtime } from '@/types/limit-up'
 import type { TdxLimitUpEvent, TdxNewsItem, TdxPluginPayload, TdxStockMove } from '@/types/tdx-plugins'
 
@@ -526,8 +526,9 @@ function upsertEvent(map: Map<string, TdxLimitUpEvent>, next: TdxLimitUpEvent) {
 }
 
 function mergeLimitUpEvent(previous: TdxLimitUpEvent, next: TdxLimitUpEvent) {
-  const merged = { ...previous, ...next }
-  const sealAmount = Number(merged.seal_amount || 0)
+  const displayState = resolveTdxMergedDisplayState(previous, next)
+  const merged = { ...previous, ...next, ...displayState }
+  const sealAmount = Number(displayState.seal_amount || 0)
   return {
     ...merged,
     change_pct: pickDisplayChangePct(previous.change_pct, next.change_pct),
@@ -537,7 +538,7 @@ function mergeLimitUpEvent(previous: TdxLimitUpEvent, next: TdxLimitUpEvent) {
     target_plate: next.target_plate || previous.target_plate,
     target_reason_summary: next.target_reason_summary || previous.target_reason_summary,
     target_status_label: resolvedTargetStatusLabel(merged),
-    target_seal_amount: formatTdxSealAmount(sealAmount),
+    target_seal_amount: displayState.target_seal_amount || formatTdxSealAmount(sealAmount),
     event_id: next.event_id || previous.event_id,
     event_time: next.event_time || previous.event_time
   }

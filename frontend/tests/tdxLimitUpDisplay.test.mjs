@@ -24,6 +24,54 @@ assert.equal(helper.formatTdxSealAmount(20375.7605), '2.04亿', 'live status wan
 assert.equal(helper.formatTdxSealAmount(131.8935), '132万', 'small wan-yuan seal amount should display as wan')
 assert.equal(helper.formatTdxSealAmount(50_000_000), '5000万', 'yuan seal amount should remain supported for seeded test data')
 
+const openedState = helper.resolveTdxMergedDisplayState(
+  {
+    event_type: 'limit_up_opened',
+    event_label: '涨停打开',
+    is_sealed: false,
+    open_count: 1,
+    seal_amount: 0,
+    target_status_label: '炸板',
+    target_seal_amount: '--'
+  },
+  {
+    event_type: 'limit_up_touched',
+    event_label: '摸板',
+    is_sealed: true,
+    open_count: 0,
+    seal_amount: 0,
+    target_status_label: '2板',
+    target_seal_amount: ''
+  }
+)
+assert.equal(openedState.event_type, 'limit_up_opened', 'touch events should not overwrite a known opened state')
+assert.equal(openedState.is_sealed, false, 'touch events should not make opened stocks look sealed again')
+assert.equal(openedState.target_status_label, '炸板', 'opened stocks should keep the 炸板 display label')
+assert.equal(openedState.target_seal_amount, '--', 'opened stocks should keep an empty seal display')
+
+const sealedState = helper.resolveTdxMergedDisplayState(
+  {
+    event_type: 'limit_up_sealed',
+    event_label: '封死涨停',
+    is_sealed: true,
+    open_count: 0,
+    seal_amount: 44985.3537,
+    target_status_label: '首板',
+    target_seal_amount: '4.50亿'
+  },
+  {
+    event_type: 'limit_up_touched',
+    event_label: '摸板',
+    is_sealed: true,
+    open_count: 0,
+    seal_amount: 0,
+    target_status_label: '首板',
+    target_seal_amount: ''
+  }
+)
+assert.equal(sealedState.seal_amount, 44985.3537, 'touch events without seal amount should not clear a known live seal amount')
+assert.equal(sealedState.target_seal_amount, '4.50亿', 'touch events should not turn a known seal amount into --')
+
 const limitUp = readFileSync(resolve(root, 'src/views/tdx/TdxLimitUpLive.vue'), 'utf8')
 const composite = readFileSync(resolve(root, 'src/views/tdx/TdxCompositeWatch.vue'), 'utf8')
 for (const source of [limitUp, composite]) {
