@@ -234,6 +234,32 @@ class TdxPluginServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["items"][0]["reason"], "化学制药催化")
         self.assertNotEqual(payload["items"][0]["target_reason_summary"], "医药+原料药")
 
+    async def test_limit_up_live_defaults_to_today_not_latest_database_date(self):
+        class FixedDate(date):
+            @classmethod
+            def today(cls):
+                return cls(2026, 6, 3)
+
+        service = TdxPluginService()
+        db = SequencedSession([FakeScalarResult(date(2026, 6, 2))])
+
+        with patch("app.services.tdx_plugin_service.date", FixedDate), patch.object(
+            service.realtime_limit_up_service,
+            "get_realtime_limit_up_list",
+            AsyncMock(return_value=[]),
+        ) as live_pool, patch.object(
+            service,
+            "_load_limit_up_records_from_db",
+            AsyncMock(return_value=[]),
+        ) as load_records:
+            payload = await service.get_limit_up_live(db=db)
+
+        self.assertEqual(payload["updated_at"][:10], "2026-06-03")
+        live_pool.assert_awaited_once_with(date(2026, 6, 3))
+        load_records.assert_awaited_once()
+        self.assertEqual(load_records.await_args.args[0], date(2026, 6, 3))
+        self.assertIn("2026-06-03 暂无涨停播报数据", payload["warnings"])
+
     async def test_limit_up_live_uses_first_seal_time_for_target_first_seal_column(self):
         service = TdxPluginService()
         trade_date = date(2026, 5, 28)
