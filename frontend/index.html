@@ -11,6 +11,28 @@
   </head>
   <body>
     <div id="app"></div>
+    <script nomodule defer src="/tdx-legacy.js"></script>
+    <script>
+      ;(function () {
+        function loadTdxLegacyFallback() {
+          if (!window.location.pathname.startsWith('/tdx')) return
+          var app = document.getElementById('app')
+          if (!app) return
+          var visibleText = (document.body && document.body.innerText ? document.body.innerText : '').replace(/\s+/g, '')
+          if (app.children.length > 0 && visibleText.length > 4) return
+          if (window.__TDX_LEGACY_FALLBACK_LOADING__) return
+          window.__TDX_LEGACY_FALLBACK_LOADING__ = true
+          var script = document.createElement('script')
+          script.src = '/tdx-legacy.js?t=' + Date.now()
+          script.onload = function () {
+            if (window.loadTdxLegacyFallback) window.loadTdxLegacyFallback()
+          }
+          document.head.appendChild(script)
+        }
+
+        window.setTimeout(loadTdxLegacyFallback, 2200)
+      })()
+    </script>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>
