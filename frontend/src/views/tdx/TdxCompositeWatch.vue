@@ -243,11 +243,7 @@ async function refreshSnapshotWhenStructureChanged() {
 }
 
 function hasSnapshotStructureChanged(statusItems: readonly TdxLimitUpEvent[], snapshotItems: readonly TdxLimitUpEvent[]) {
-  if (!statusItems.length) return false
-  if (!snapshotItems.length) return true
-  const statusDate = latestEventDatePrefix(statusItems)
-  const snapshotDate = latestEventDatePrefix(snapshotItems)
-  if (statusDate && snapshotDate && statusDate !== snapshotDate) return true
+  if (!statusItems.length || !snapshotItems.length) return false
   if (statusItems.length !== snapshotItems.length) return true
 
   const snapshotCodes = new Set(snapshotItems.map(item => item.stock_code).filter(Boolean))
@@ -504,7 +500,7 @@ function stopMovePanelResize() {
 
 function buildMergedEvents() {
   const byCode = new Map<string, TdxLimitUpEvent>()
-  for (const item of filterSnapshotItemsByStatusDate(payload.value?.items || [], statusPayload.value?.items || [])) {
+  for (const item of payload.value?.items || []) {
     upsertEvent(byCode, item)
   }
   for (const item of statusPayload.value?.items || []) {
@@ -520,29 +516,6 @@ function buildMergedEvents() {
     const timeOrder = (b.event_time || '').localeCompare(a.event_time || '')
     return timeOrder || (b.board || 0) - (a.board || 0)
   })
-}
-
-function filterSnapshotItemsByStatusDate(snapshotItems: readonly TdxLimitUpEvent[], statusItems: readonly TdxLimitUpEvent[]) {
-  const statusDate = latestEventDatePrefix(statusItems)
-  if (!statusDate) return snapshotItems
-  return snapshotItems.filter(item => {
-    const itemDate = eventDatePrefix(item)
-    return !itemDate || itemDate === statusDate
-  })
-}
-
-function latestEventDatePrefix(items: readonly TdxLimitUpEvent[]) {
-  return items
-    .map(item => eventDatePrefix(item))
-    .filter(Boolean)
-    .sort()
-    .at(-1) || ''
-}
-
-function eventDatePrefix(item: TdxLimitUpEvent) {
-  const text = String(item.event_id || '')
-  const match = text.match(/(\d{4})[-_]?(\d{2})[-_]?(\d{2})/)
-  return match ? `${match[1]}${match[2]}${match[3]}` : ''
 }
 
 function upsertEvent(map: Map<string, TdxLimitUpEvent>, next: TdxLimitUpEvent) {

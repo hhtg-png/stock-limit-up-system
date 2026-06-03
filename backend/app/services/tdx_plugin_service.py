@@ -49,7 +49,7 @@ class TdxPluginService:
         self._stock_move_payload_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 
     async def get_limit_up_live(self, trade_date: Optional[date] = None, db: Optional[AsyncSession] = None) -> Dict[str, Any]:
-        target_date = trade_date or date.today()
+        target_date = await self._resolve_trade_date(trade_date, db)
         warnings: List[str] = []
         source_status = {"limit_up_pool": "ok", "ths_reason": "ok", "tencent_quote": "ok"}
         is_cache = False
