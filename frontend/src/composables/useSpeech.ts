@@ -269,9 +269,15 @@ function finishSpeechItem(token = currentSpeechToken) {
   processQueue()
 }
 
-function playWithWebSpeech(text: string, token = currentSpeechToken) {
+function playWithWebSpeech(text: string, token = currentSpeechToken, onFailure?: () => void) {
+  const failWebSpeech = () => {
+    if (token !== currentSpeechToken) return
+    if (onFailure) onFailure()
+    else finishSpeechItem(token)
+  }
+
   if (!hasWebSpeechSupport()) {
-    finishSpeechItem(token)
+    failWebSpeech()
     return
   }
 
@@ -282,13 +288,11 @@ function playWithWebSpeech(text: string, token = currentSpeechToken) {
       finishSpeechItem(token)
     }
 
-    utterance.onerror = () => {
-      finishSpeechItem(token)
-    }
+    utterance.onerror = failWebSpeech
 
     window.speechSynthesis.speak(utterance)
   } catch {
-    finishSpeechItem(token)
+    failWebSpeech()
   }
 }
 
@@ -447,6 +451,13 @@ function processQueue() {
   const token = ++currentSpeechToken
 
   try {
+    if (item.mode === 'web-speech' && shouldUseTargetAudioPlayback()) {
+      playWithWebSpeech(item.text, token, () => {
+        playWithNeuralTts(item.text, token)
+      })
+      return
+    }
+
     if (item.mode !== 'web-speech' && shouldUseTargetAudioPlayback()) {
       playWithNeuralTts(item.text, token)
       return

@@ -40,6 +40,8 @@ assert.match(speech, /function enqueuePluginSpeech[\s\S]*!speechUnlocked\.value[
 assert.match(speech, /urgent\?: boolean/, 'plugin speech should support an urgent low-latency path')
 assert.match(speech, /mode:\s*'web-speech'/, 'urgent plugin speech should use the original fast Web Speech path')
 assert.match(speech, /item\.mode\s*!==\s*'web-speech'[\s\S]*playWithNeuralTts/, 'non-urgent plugin speech should still use the normal TTS fallback chain')
+assert.match(speech, /function playWithWebSpeech\(text: string, token = currentSpeechToken, onFailure\?: \(\) => void\)/, 'Web Speech playback should accept an audio fallback for TDX embedded browsers')
+assert.match(speech, /item\.mode === 'web-speech' && shouldUseTargetAudioPlayback\(\)[\s\S]*playWithWebSpeech\(item\.text, token, \(\) => \{[\s\S]*playWithNeuralTts\(item\.text, token\)/, 'urgent limit-up speech should fall back to backend neural audio when Web Speech is missing or fails')
 assert.match(speech, /speechQueue\.unshift/, 'urgent plugin speech should be placed before normal queued news')
 assert.match(speech, /stopCurrentSpeechPlayback/, 'urgent plugin speech should be able to interrupt a slower current item')
 assert.doesNotMatch(speech, /primeTargetTtsAudio|targetSilentAudioUrl/, 'speech unlock should match the original implementation without silent audio priming')
