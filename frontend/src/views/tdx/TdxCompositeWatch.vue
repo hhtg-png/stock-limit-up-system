@@ -228,7 +228,7 @@ async function loadQuoteStatus() {
   try {
     const next = await getTdxLimitUpLiveStatus()
     statusPayload.value = next
-    handleStatusEvents(next.items)
+    handleStatusEvents(next.items, { primeOnly: true })
     primeStockMove(next.items)
   } finally {
     statusInFlight = false
@@ -277,8 +277,8 @@ function rememberTouchedStock(item: TdxLimitUpEvent) {
   return isFirstTouch
 }
 
-function handleStatusEvents(items: TdxLimitUpEvent[]) {
-  if (!hasPrimedLimitUpSpeech) {
+function handleStatusEvents(items: TdxLimitUpEvent[], options: { primeOnly?: boolean } = {}) {
+  if (options.primeOnly && !hasPrimedLimitUpSpeech) {
     rememberExistingEvents(items)
     hasPrimedLimitUpSpeech = true
     return
@@ -735,7 +735,7 @@ watch(realtimeNewsItems, (nextItems, previousItems) => {
 watch(realtimeLimitUpEvents, (nextItems, previousItems) => {
   const previousKeys = new Set(previousItems.map(item => item.event_id))
   const newRealtimeItems = nextItems.filter(item => !previousKeys.has(item.event_id))
-  handleStatusEvents(newRealtimeItems)
+  handleStatusEvents(newRealtimeItems, { primeOnly: false })
 })
 
 onUnmounted(() => {
