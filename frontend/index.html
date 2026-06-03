@@ -11,11 +11,11 @@
   </head>
   <body>
     <div id="app"></div>
+    <script nomodule defer src="/tdx-legacy.js"></script>
     <script>
       ;(function () {
         function loadTdxLegacyFallback() {
-          if (!/^\/tdx([\/]|$)/.test(window.location.pathname)) return
-          if (window.__TDX_VUE_MOUNTED__) return
+          if (!window.location.pathname.startsWith('/tdx')) return
           var app = document.getElementById('app')
           if (!app) return
           var visibleText = (document.body && document.body.innerText ? document.body.innerText : '').replace(/\s+/g, '')
