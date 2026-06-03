@@ -11,3 +11,4 @@ app.use(createPinia())
 app.use(tdxRouter)
 
 app.mount('#app')
+;(window as any).__TDX_VUE_MOUNTED__ = true

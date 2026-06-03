@@ -88,7 +88,6 @@
       '<div class="tdx-legacy">' +
         '<div class="tdx-legacy-top">' +
           '<span>' + escapeHtml(title) + '</span>' +
-          '<small>兼容模式</small>' +
           '<span id="tdx-legacy-status" class="tdx-legacy-status">连接中</span>' +
         '</div>' +
         '<div id="tdx-legacy-body" class="tdx-legacy-body"><div class="tdx-legacy-empty">加载中</div></div>' +
@@ -153,8 +152,8 @@
 
   function renderUnsupported() {
     var body = mountShell('通达信插件')
-    if (body) body.innerHTML = '<div class="tdx-legacy-empty">当前内嵌浏览器进入兼容模式。请先使用涨停播报链接，其他插件需要现代浏览器内核。</div>'
-    updateStatus('兼容模式')
+    if (body) body.innerHTML = '<div class="tdx-legacy-empty">当前内嵌浏览器未能启动完整插件。请先使用涨停播报链接。</div>'
+    updateStatus('备用')
   }
 
   function boot() {
