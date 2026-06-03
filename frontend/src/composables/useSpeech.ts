@@ -429,7 +429,7 @@ function enqueuePluginSpeech(text: string, key?: string, options: PluginSpeechOp
   pluginSpeechKeys.add(speechKey)
   if (isSimilarRecentNewsSpeech(text, speechKey)) return false
   if (options.urgent) {
-    queueSpeechItem(text, { urgent: true, mode: 'web-speech' })
+    queueSpeechItem(text, { urgent: true })
   } else {
     queueSpeechItem(text)
   }

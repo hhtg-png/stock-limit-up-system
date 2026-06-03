@@ -180,6 +180,35 @@ class MarketReviewSchedulerTests(unittest.IsolatedAsyncioTestCase):
         job_ids = {job["id"] for job in scheduler.scheduler.jobs}
         self.assertNotIn("l2_collect", job_ids)
 
+    def test_start_registers_tdx_limit_up_broadcast_refresh_at_0900(self):
+        scheduler = self._create_scheduler()
+
+        with patch("app.data_collectors.scheduler.settings") as mock_settings:
+            mock_settings.L2_COLLECT_INTERVAL = 3
+            mock_settings.L2_COLLECT_ENABLED = False
+            mock_settings.CRAWLER_INTERVAL_THS = 300
+            mock_settings.CRAWLER_INTERVAL_KPL = 600
+            mock_settings.MARKET_REVIEW_ENABLED = False
+            mock_settings.MARKET_REVIEW_BUILD_HOUR = 15
+            mock_settings.MARKET_REVIEW_BUILD_MINUTE = 5
+            mock_settings.MARKET_REVIEW_REPAIR_ENABLED = False
+            mock_settings.MARKET_REVIEW_REPAIR_HOUR = 20
+            mock_settings.MARKET_REVIEW_REPAIR_MINUTE = 15
+            mock_settings.INTELLIGENCE_ENABLED = False
+            mock_settings.DAILY_ANALYSIS_INTRADAY_HOUR = 14
+            mock_settings.DAILY_ANALYSIS_INTRADAY_MINUTE = 50
+
+            scheduler.start()
+
+        jobs_by_id = {job["id"]: job for job in scheduler.scheduler.jobs}
+        job = jobs_by_id["tdx_limit_up_broadcast_refresh"]
+        self.assertIs(job["func"].__self__, scheduler)
+        self.assertEqual(job["func"].__name__, "_refresh_tdx_limit_up_broadcast")
+        self.assertEqual(job["trigger"].kwargs["hour"], 9)
+        self.assertEqual(job["trigger"].kwargs["minute"], 0)
+        self.assertIs(job["trigger"].kwargs["timezone"], CN_TZ)
+        self.assertEqual(job["max_instances"], 1)
+
     def test_start_skips_market_review_jobs_when_disabled(self):
         scheduler = self._create_scheduler()
 
@@ -251,6 +280,46 @@ class MarketReviewSchedulerTests(unittest.IsolatedAsyncioTestCase):
             await scheduler._build_market_review()
 
         run_for_date.assert_awaited_once_with(date(2026, 4, 27), calc_version=1)
+
+    async def test_refresh_tdx_limit_up_broadcast_refreshes_today_pool_on_trading_day(self):
+        scheduler = self._create_scheduler()
+
+        with patch(
+            "app.data_collectors.scheduler.today_cn",
+            return_value=date(2026, 5, 29),
+        ), patch(
+            "app.data_collectors.scheduler._resolve_cn_trade_date_for_market_review",
+            return_value=date(2026, 5, 29),
+            create=True,
+        ), patch(
+            "app.services.realtime_limit_up_service.realtime_limit_up_service.get_fast_limit_up_pool",
+            AsyncMock(return_value=[{"stock_code": "001259"}]),
+        ) as get_fast_limit_up_pool:
+            await scheduler._refresh_tdx_limit_up_broadcast()
+
+        get_fast_limit_up_pool.assert_awaited_once_with(
+            date(2026, 5, 29),
+            wait_for_refresh=True,
+            max_cache_age=0,
+        )
+
+    async def test_refresh_tdx_limit_up_broadcast_skips_non_trading_day(self):
+        scheduler = self._create_scheduler()
+
+        with patch(
+            "app.data_collectors.scheduler.today_cn",
+            return_value=date(2026, 5, 30),
+        ), patch(
+            "app.data_collectors.scheduler._resolve_cn_trade_date_for_market_review",
+            return_value=None,
+            create=True,
+        ), patch(
+            "app.services.realtime_limit_up_service.realtime_limit_up_service.get_fast_limit_up_pool",
+            AsyncMock(),
+        ) as get_fast_limit_up_pool:
+            await scheduler._refresh_tdx_limit_up_broadcast()
+
+        get_fast_limit_up_pool.assert_not_awaited()
 
     async def test_build_market_review_propagates_calendar_lookup_failure(self):
         scheduler = self._create_scheduler()

@@ -135,6 +135,15 @@ class DataScheduler:
             name="每日统计计算"
         )
 
+        # 每个交易日9:00主动刷新通达信涨停播报实时池，避免早盘继续沿用昨日兜底数据。
+        self.scheduler.add_job(
+            self._refresh_tdx_limit_up_broadcast,
+            CronTrigger(hour=9, minute=0, timezone=CN_TZ),
+            id="tdx_limit_up_broadcast_refresh",
+            name="通达信涨停播报开盘刷新",
+            max_instances=1,
+        )
+
         # 收盘后每日分析月表：晚于市场复盘 1 分钟，避免读取到盘中快照
         daily_analysis_after_close_time = _daily_analysis_after_close_time()
         self.scheduler.add_job(
@@ -531,6 +540,26 @@ class DataScheduler:
             logger.info(f"Daily analysis calculated: {resolved_trade_date}")
         except Exception as e:
             logger.error(f"Calculate daily analysis error: {e}")
+
+    async def _refresh_tdx_limit_up_broadcast(self):
+        """交易日早盘主动刷新通达信涨停播报实时池。"""
+        try:
+            from app.services.realtime_limit_up_service import realtime_limit_up_service
+
+            current_date = today_cn()
+            resolved_trade_date = _resolve_cn_trade_date_for_market_review(current_date)
+            if resolved_trade_date is None:
+                logger.info("Skipping TDX limit-up broadcast refresh because current China date is not a trading day")
+                return
+
+            items = await realtime_limit_up_service.get_fast_limit_up_pool(
+                resolved_trade_date,
+                wait_for_refresh=True,
+                max_cache_age=0,
+            )
+            logger.info(f"TDX limit-up broadcast refreshed: {resolved_trade_date}, {len(items)} items")
+        except Exception as e:
+            logger.error(f"TDX limit-up broadcast refresh error: {e}")
 
     async def _calculate_intraday_daily_analysis(self):
         """生成每日分析盘中版数据。"""
