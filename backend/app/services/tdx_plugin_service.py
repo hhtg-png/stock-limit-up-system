@@ -232,6 +232,32 @@ class TdxPluginService:
             force_refresh=True,
         )
 
+    async def get_cached_stock_move_reason(
+        self,
+        stock_code: str,
+        trade_date: Optional[date] = None,
+        *,
+        source_scope: str = "mixed",
+        db: Optional[AsyncSession] = None,
+    ) -> Optional[str]:
+        """Return a cached stock-move reason without touching slow external sources."""
+        target_date = trade_date or date.today()
+        normalized_code = self._normalize_code(stock_code)
+        cache_key = self._stock_move_cache_key(normalized_code, source_scope, target_date)
+
+        cached_payload = self._read_stock_move_payload_cache(cache_key)
+        cached_reason = self._stock_move_payload_reason_title(cached_payload)
+        if cached_reason:
+            return cached_reason
+
+        persistent_payload = await self._read_persistent_stock_move_cache(
+            db,
+            normalized_code,
+            source_scope,
+            target_date,
+        )
+        return self._stock_move_payload_reason_title(persistent_payload)
+
     async def get_plate_strength(self, trade_date: Optional[date] = None, db: Optional[AsyncSession] = None) -> Dict[str, Any]:
         target_date = await self._resolve_trade_date(trade_date, db)
         warnings: List[str] = []
@@ -832,6 +858,17 @@ class TdxPluginService:
                 if title and title != "暂无异动原因" and content:
                     return True
         return False
+
+    @staticmethod
+    def _stock_move_payload_reason_title(payload: Optional[Dict[str, Any]]) -> Optional[str]:
+        if not payload:
+            return None
+        for item in payload.get("items") or []:
+            for reason in item.get("reasons") or []:
+                title = str(reason.get("title") or "").strip()
+                if title and title != "暂无异动原因":
+                    return title
+        return None
 
     @staticmethod
     def _payload_generated_at(payload: Dict[str, Any]) -> datetime:

@@ -3,6 +3,7 @@ WebSocket路由
 """
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
 from typing import Optional
+import contextlib
 import json
 import asyncio
 from datetime import datetime, date, time as time_type
@@ -236,7 +237,7 @@ async def process_realtime_hot_limit_up_tick(trade_date: date) -> int:
             alert.get("reason"),
             alert.get("continuous_days", 1),
         )
-        await broadcast_tdx_limit_up_event(alert)
+        await broadcast_tdx_limit_up_event(alert, trade_date=trade_date)
         schedule_tdx_stock_move_cache_refresh(alert, trade_date)
 
     return len(alerts)
@@ -382,12 +383,14 @@ async def broadcast_realtime_sync_message(message: dict):
         await manager.broadcast_limit_up_delta(payload)
 
 
-async def broadcast_tdx_limit_up_event(alert: dict):
+async def broadcast_tdx_limit_up_event(alert: dict, trade_date: Optional[date] = None):
     """广播通达信插件涨停事件。"""
     stock_code = alert.get("stock_code", "")
     stock_name = alert.get("stock_name", "")
     event_time = alert.get("time", "")
-    reason = alert.get("reason")
+    fallback_reason = alert.get("reason")
+    event_trade_date = coerce_tdx_alert_trade_date(trade_date or alert.get("trade_date"))
+    reason = await resolve_tdx_limit_up_speech_reason(stock_code, fallback_reason, event_trade_date)
     continuous_days = alert.get("continuous_days", 1)
     status_label = tdx_limit_up_status_label(continuous_days)
     event_id = f"tdx-limit-up-touch-{stock_code}-{event_time}"
@@ -407,6 +410,41 @@ async def broadcast_tdx_limit_up_event(alert: dict):
         },
         stock_code=stock_code,
     )
+
+
+async def resolve_tdx_limit_up_speech_reason(
+    stock_code: str,
+    fallback_reason: object = None,
+    trade_date: Optional[date] = None,
+) -> object:
+    if not stock_code:
+        return fallback_reason
+    try:
+        async with async_session_maker() as db:
+            cached_reason = await tdx_plugin_service.get_cached_stock_move_reason(
+                stock_code,
+                trade_date,
+                source_scope="mixed",
+                db=db,
+            )
+            if cached_reason:
+                return cached_reason
+    except Exception as exc:
+        logger.debug(f"TDX limit-up speech reason cache lookup skipped for {stock_code}: {exc}")
+    return fallback_reason
+
+
+def coerce_tdx_alert_trade_date(value: object) -> Optional[date]:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = str(value or "").strip()
+    if not text:
+        return None
+    with contextlib.suppress(ValueError):
+        return date.fromisoformat(text[:10])
+    return None
 
 
 def tdx_limit_up_speech_text(stock_name: str, status_label: str, reason: object = None) -> str:

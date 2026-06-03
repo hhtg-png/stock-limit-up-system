@@ -1,8 +1,13 @@
 import unittest
-from datetime import date
+from datetime import date, datetime
 from unittest.mock import AsyncMock, patch
 
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.pool import StaticPool
+
 from app.api.v1 import websocket as websocket_api
+from app.database import Base
+from app.models.tdx_cache import TdxStockMoveCache
 
 
 class TdxPluginWebSocketTests(unittest.IsolatedAsyncioTestCase):
@@ -16,6 +21,10 @@ class TdxPluginWebSocketTests(unittest.IsolatedAsyncioTestCase):
         }
 
         with patch.object(
+            websocket_api,
+            "resolve_tdx_limit_up_speech_reason",
+            AsyncMock(return_value="家电催化"),
+        ), patch.object(
             websocket_api.manager,
             "broadcast_tdx_plugin_event",
             AsyncMock(),
@@ -31,6 +40,77 @@ class TdxPluginWebSocketTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("封死涨停", payload["speech_text"])
         self.assertEqual(payload["stock_code"], "001259")
         self.assertEqual(broadcast.await_args.kwargs["stock_code"], "001259")
+
+    async def test_broadcast_tdx_limit_up_event_prefers_cached_stock_move_reason_for_speech(self):
+        engine = create_async_engine(
+            "sqlite+aiosqlite://",
+            future=True,
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        Session = async_sessionmaker(engine, expire_on_commit=False)
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+        cached_payload = {
+            "items": [
+                {
+                    "stock_code": "001259",
+                    "stock_name": "利仁科技",
+                    "trade_date": "2026-06-03",
+                    "source_scope": "mixed",
+                    "reasons": [
+                        {
+                            "source": "综合解析",
+                            "title": "小家电+机器人+消费电子",
+                            "content": "异动分析缓存正文",
+                        }
+                    ],
+                }
+            ],
+            "updated_at": "2026-06-03T09:40:00",
+            "source_status": {"stock_move_cache": "seed"},
+            "is_cache": False,
+            "warnings": [],
+        }
+
+        async with Session() as session:
+            session.add(
+                TdxStockMoveCache(
+                    stock_code="001259",
+                    source_scope="mixed",
+                    trade_date=date(2026, 6, 3),
+                    stock_name="利仁科技",
+                    payload_json=cached_payload,
+                    source_status={"stock_move_cache": "seed"},
+                    warnings=[],
+                    generated_at=datetime(2026, 6, 3, 9, 40, 0),
+                )
+            )
+            await session.commit()
+
+        alert = {
+            "stock_code": "001259",
+            "stock_name": "利仁科技",
+            "time": "09:41:00",
+            "reason": "家电催化",
+            "continuous_days": 7,
+            "trade_date": date(2026, 6, 3),
+        }
+
+        try:
+            with patch.object(websocket_api, "async_session_maker", Session), patch.object(
+                websocket_api.manager,
+                "broadcast_tdx_plugin_event",
+                AsyncMock(),
+            ) as broadcast:
+                await websocket_api.broadcast_tdx_limit_up_event(alert)
+
+            payload = broadcast.await_args.args[1]
+            self.assertEqual(payload["reason"], "小家电+机器人+消费电子")
+            self.assertEqual(payload["speech_text"], "利仁科技7板，小家电加机器人加消费电子")
+        finally:
+            await engine.dispose()
 
     async def test_broadcast_tdx_news_event_uses_plugin_payload_without_stock_filter(self):
         item = {
@@ -119,7 +199,7 @@ class TdxPluginWebSocketTests(unittest.IsolatedAsyncioTestCase):
         rich_list.assert_not_called()
         collect_alerts.assert_called_once_with([alert], trade_date)
         broadcast_alert.assert_awaited_once()
-        broadcast_tdx.assert_awaited_once_with(alert)
+        broadcast_tdx.assert_awaited_once_with(alert, trade_date=trade_date)
         schedule_cache_refresh.assert_called_once_with(alert, trade_date)
 
 
