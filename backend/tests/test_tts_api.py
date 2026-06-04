@@ -40,6 +40,25 @@ class TtsApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 422)
 
+    def test_playback_log_endpoint_records_client_status(self):
+        payload = {
+            "stage": "audio_playing",
+            "mode": "neural-audio",
+            "text": "平煤股份首板，煤炭开采",
+            "elapsed_ms": 1840,
+            "detail": {"urgent": True, "queue": 0},
+        }
+
+        with patch("app.api.v1.tts.logger", create=True) as logger:
+            response = self.client.post("/tts/playback-log", json=payload)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"ok": True})
+        logger.info.assert_called_once()
+        self.assertIn("TTS_PLAYBACK", logger.info.call_args.args[0])
+        self.assertIn("audio_playing", logger.info.call_args.args[0])
+        self.assertIn("平煤股份首板", logger.info.call_args.args[0])
+
 
 if __name__ == "__main__":
     unittest.main()

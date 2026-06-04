@@ -1,12 +1,22 @@
 """Text-to-speech endpoints for realtime broadcast playback."""
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse
+from loguru import logger
+from pydantic import BaseModel, Field
 
 from app.services.edge_tts_service import edge_tts_service
 
 router = APIRouter()
+
+
+class SpeechPlaybackLogRequest(BaseModel):
+    stage: str = Field(..., min_length=1, max_length=64)
+    mode: str = Field(..., min_length=1, max_length=40)
+    text: str = Field("", max_length=160)
+    elapsed_ms: Optional[int] = Field(None, ge=0, le=60000)
+    detail: dict[str, Any] = Field(default_factory=dict)
 
 
 @router.get("/speech", summary="神经语音播报音频")
@@ -29,3 +39,18 @@ async def get_speech_audio(
         media_type="audio/mpeg",
         headers={"Cache-Control": "public, max-age=604800, immutable"},
     )
+
+
+@router.post("/playback-log", summary="客户端语音播放状态日志")
+async def record_speech_playback_log(payload: SpeechPlaybackLogRequest):
+    safe_detail = {
+        str(key)[:40]: value
+        for key, value in list((payload.detail or {}).items())[:8]
+        if isinstance(value, (str, int, float, bool)) or value is None
+    }
+    safe_text = payload.text.strip().replace("\n", " ")[:120]
+    logger.info(
+        f"TTS_PLAYBACK stage={payload.stage} mode={payload.mode} "
+        f"elapsed_ms={payload.elapsed_ms} text={safe_text} detail={safe_detail}"
+    )
+    return {"ok": True}

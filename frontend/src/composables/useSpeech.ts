@@ -21,7 +21,9 @@ const targetTtsAudioId = 'tdx-target-tts-audio'
 const targetNeuralTtsEndpoint = '/api/v1/tts/speech'
 const targetNeuralTtsVoice = 'zh-CN-XiaoyiNeural'
 const targetAudioFallbackVolume = 0.9
-const NEURAL_TTS_START_TIMEOUT_MS = 3000
+const NEURAL_TTS_START_TIMEOUT_MS = 5000
+const SPEECH_PLAYBACK_LOG_ENDPOINT = '/api/v1/tts/playback-log'
+const SPEECH_PLAYBACK_LOG_TEXT_LIMIT = 120
 const SPEECH_UNLOCK_STORAGE_KEY = 'tdx-plugin-speech-unlocked'
 const NEWS_SPEECH_SIMILARITY_WINDOW_MS = 60 * 1000
 const NEWS_SPEECH_SIMILARITY_THRESHOLD = 0.8
@@ -50,6 +52,8 @@ type SpeechQueueItem = {
   mode: SpeechPlaybackMode
   urgent?: boolean
 }
+
+type SpeechPlaybackLogDetail = Record<string, string | number | boolean | null | undefined>
 
 function normalizeUnlockSpeechOptions(options: UnlockSpeechOptions | Event): UnlockSpeechOptions {
   if (typeof Event !== 'undefined' && options instanceof Event) return {}
@@ -192,6 +196,61 @@ function buildTargetTtsUrl(text: string) {
   return `${targetNeuralTtsEndpoint}?${params.toString()}`
 }
 
+function playbackNow() {
+  if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
+    return performance.now()
+  }
+  return Date.now()
+}
+
+function reportSpeechPlaybackStatus(
+  stage: string,
+  text: string,
+  detail: SpeechPlaybackLogDetail = {}
+) {
+  if (typeof window === 'undefined') return
+
+  const payload = {
+    stage,
+    mode: detail.mode || 'neural-audio',
+    text: text.trim().slice(0, SPEECH_PLAYBACK_LOG_TEXT_LIMIT),
+    elapsed_ms: typeof detail.elapsed_ms === 'number' ? detail.elapsed_ms : undefined,
+    detail
+  }
+  const body = JSON.stringify(payload)
+
+  try {
+    console.debug?.('[tdx-speech]', stage, payload)
+  } catch {
+    // 控制台不可用不影响播报。
+  }
+
+  try {
+    if (
+      typeof navigator !== 'undefined' &&
+      typeof navigator.sendBeacon === 'function' &&
+      typeof Blob !== 'undefined'
+    ) {
+      const blob = new Blob([body], { type: 'application/json' })
+      if (navigator.sendBeacon(SPEECH_PLAYBACK_LOG_ENDPOINT, blob)) return
+    }
+  } catch {
+    // 老 WebView 不支持 sendBeacon 时继续尝试 fetch。
+  }
+
+  try {
+    if (typeof fetch !== 'function') return
+    fetch(SPEECH_PLAYBACK_LOG_ENDPOINT, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body,
+      keepalive: true
+    }).catch(() => {})
+  } catch {
+    // 播放诊断不能影响真实播报。
+  }
+}
+
 function isNewsSpeechKey(speechKey: string) {
   return speechKey.startsWith('news-')
 }
@@ -271,23 +330,46 @@ function finishSpeechItem(token = currentSpeechToken) {
 
 function playWithWebSpeech(text: string, token = currentSpeechToken) {
   if (!hasWebSpeechSupport()) {
+    reportSpeechPlaybackStatus('web_speech_unavailable', text, { mode: 'web-speech' })
     finishSpeechItem(token)
     return
   }
 
   try {
+    const startedAt = playbackNow()
     const utterance = new SpeechSynthesisUtterance(text)
     applyTargetSpeechProfile(utterance)
+    reportSpeechPlaybackStatus('web_speech_start', text, {
+      mode: 'web-speech',
+      voice: speechVoiceName.value || undefined,
+      token
+    })
     utterance.onend = () => {
+      reportSpeechPlaybackStatus('web_speech_end', text, {
+        mode: 'web-speech',
+        elapsed_ms: Math.round(playbackNow() - startedAt),
+        token
+      })
       finishSpeechItem(token)
     }
 
-    utterance.onerror = () => {
+    utterance.onerror = (event) => {
+      reportSpeechPlaybackStatus('web_speech_error', text, {
+        mode: 'web-speech',
+        elapsed_ms: Math.round(playbackNow() - startedAt),
+        error: event.error,
+        token
+      })
       finishSpeechItem(token)
     }
 
     window.speechSynthesis.speak(utterance)
-  } catch {
+  } catch (error) {
+    reportSpeechPlaybackStatus('web_speech_exception', text, {
+      mode: 'web-speech',
+      error: error instanceof Error ? error.message : String(error),
+      token
+    })
     finishSpeechItem(token)
   }
 }
@@ -295,6 +377,7 @@ function playWithWebSpeech(text: string, token = currentSpeechToken) {
 function playWithAudioFallback(text: string, onFailure?: () => void, token = currentSpeechToken) {
   const audio = ensureTargetTtsAudio()
   if (!audio) {
+    reportSpeechPlaybackStatus('audio_element_missing', text, { token })
     if (onFailure) onFailure()
     else finishSpeechItem(token)
     return
@@ -302,6 +385,8 @@ function playWithAudioFallback(text: string, onFailure?: () => void, token = cur
 
   let settled = false
   let startTimeoutId: ReturnType<typeof setTimeout> | undefined
+  const startedAt = playbackNow()
+  const elapsedDetail = () => Math.round(playbackNow() - startedAt)
   const clearStartTimeout = () => {
     if (startTimeoutId === undefined) return
     clearTimeout(startTimeoutId)
@@ -317,28 +402,60 @@ function playWithAudioFallback(text: string, onFailure?: () => void, token = cur
   const finishOnce = () => {
     if (settled) return
     settled = true
+    reportSpeechPlaybackStatus('audio_ended', text, {
+      elapsed_ms: elapsedDetail(),
+      token
+    })
     cleanupAudioHandlers()
     finishSpeechItem(token)
   }
-  const failOnce = () => {
+  const failOnce = (
+    reasonOrEvent: string | Event = 'audio_error',
+    error?: unknown,
+    shouldReport = true
+  ) => {
     if (settled) return
     settled = true
+    const reason = typeof reasonOrEvent === 'string' ? reasonOrEvent : 'audio_error'
+    if (shouldReport) {
+      reportSpeechPlaybackStatus(reason, text, {
+        elapsed_ms: elapsedDetail(),
+        error: error instanceof Error ? error.message : undefined,
+        token
+      })
+    }
     cleanupAudioHandlers()
     if (token !== currentSpeechToken) return
     if (onFailure) onFailure()
     else finishSpeechItem(token)
   }
+  const markCanPlay = () => {
+    reportSpeechPlaybackStatus('audio_canplay', text, {
+      elapsed_ms: elapsedDetail(),
+      token
+    })
+    clearStartTimeout()
+  }
   const markStarted = () => {
+    reportSpeechPlaybackStatus('audio_playing', text, {
+      elapsed_ms: elapsedDetail(),
+      token
+    })
     clearStartTimeout()
   }
 
   audio.onended = finishOnce
-  audio.onerror = failOnce
+  audio.onerror = (event) => failOnce('audio_error', event)
   audio.onplaying = markStarted
-  audio.oncanplay = markStarted
+  audio.oncanplay = markCanPlay
   audio.src = buildTargetTtsUrl(text)
   startTimeoutId = setTimeout(() => {
     if (settled) return
+    reportSpeechPlaybackStatus('audio_timeout', text, {
+      elapsed_ms: elapsedDetail(),
+      timeout_ms: NEURAL_TTS_START_TIMEOUT_MS,
+      token
+    })
     try {
       audio.pause()
       audio.removeAttribute('src')
@@ -346,21 +463,26 @@ function playWithAudioFallback(text: string, onFailure?: () => void, token = cur
     } catch {
       // 仅用于让慢速神经音频降级，清理失败时继续走失败路径。
     }
-    failOnce()
+    failOnce('audio_timeout', undefined, false)
   }, NEURAL_TTS_START_TIMEOUT_MS)
 
   try {
+    reportSpeechPlaybackStatus('audio_play_request', text, {
+      timeout_ms: NEURAL_TTS_START_TIMEOUT_MS,
+      token
+    })
     const playPromise = audio.play()
     if (playPromise?.catch) {
-      playPromise.catch(failOnce)
+      playPromise.catch((error) => failOnce('audio_play_rejected', error))
     }
-  } catch {
-    failOnce()
+  } catch (error) {
+    failOnce('audio_play_exception', error)
   }
 }
 
 function playWithNeuralTts(text: string, token = currentSpeechToken) {
   playWithAudioFallback(text, () => {
+    reportSpeechPlaybackStatus('web_speech_fallback', text, { token })
     playWithWebSpeech(text, token)
   }, token)
 }
