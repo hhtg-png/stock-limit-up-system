@@ -20,8 +20,8 @@ for (const path of [
   )
   assert.match(
     source,
-    /knownLimitUpSpeechKeys/,
-    `${path} should separate known snapshot events from spoken speech`
+    /seenSpeechKeys/,
+    `${path} should keep the previous event-identity speech guard`
   )
   assert.match(
     source,
@@ -30,8 +30,8 @@ for (const path of [
   )
   assert.match(
     source,
-    /function rememberExistingEvents[\s\S]*markKnownLimitUpSpeechKey\(item\)[\s\S]*rememberTouchedStock\(item\)/,
-    `${path} initial snapshots should only mark events as known`
+    /function rememberExistingEvents[\s\S]*seenSpeechKeys\.add\(limitUpEventSpeechKey\(item\)\)[\s\S]*rememberTouchedStock\(item\)/,
+    `${path} initial snapshots should only mark event ids as seen`
   )
   const rememberBlock = source.match(/function rememberExistingEvents[\s\S]*?\n}\s*\n\s*function announceNewStatusEvents/)?.[0] || ''
   assert.doesNotMatch(
@@ -41,13 +41,13 @@ for (const path of [
   )
   assert.match(
     source,
-    /function announceNewStatusEvents\(items: TdxLimitUpEvent\[\],\s*source:\s*'snapshot' \| 'realtime'/,
-    `${path} should distinguish polling snapshots from realtime events`
+    /function announceNewStatusEvents\(items: TdxLimitUpEvent\[\]\)/,
+    `${path} should keep realtime speech in the visible plugin page`
   )
   assert.match(
     source,
-    /source === 'snapshot' && wasKnown/,
-    `${path} should avoid replaying already known snapshot rows`
+    /if \(!key \|\| seenSpeechKeys\.has\(key\)\) continue[\s\S]*const isFirstTouch = isFirstTouchedStock\(item\)/,
+    `${path} should inspect first-touch status before marking a realtime event handled`
   )
   assert.match(
     source,
@@ -56,8 +56,13 @@ for (const path of [
   )
   assert.match(
     source,
-    /if \(!rememberLimitUpSpeech\(item,\s*speechText\)\) continue[\s\S]*enqueuePluginSpeech\(speechText/,
+    /if \(!rememberLimitUpSpeech\(item,\s*speechText\)\) \{[\s\S]*seenSpeechKeys\.add\(key\)[\s\S]*continue[\s\S]*\}[\s\S]*enqueuePluginSpeech\(speechText/,
     `${path} should guarantee the first eligible speech is queued before later duplicates are skipped`
+  )
+  assert.match(
+    source,
+    /if \(!enqueuePluginSpeech\(speechText,\s*key,\s*\{\s*force:\s*true,\s*urgent:\s*true\s*\}\)\) \{[\s\S]*forgetLimitUpSpeech\(item,\s*speechText\)[\s\S]*continue[\s\S]*\}[\s\S]*seenSpeechKeys\.add\(key\)[\s\S]*rememberTouchedStock\(item\)/,
+    `${path} should only mark eligible events handled after they enter the speech queue`
   )
 }
 

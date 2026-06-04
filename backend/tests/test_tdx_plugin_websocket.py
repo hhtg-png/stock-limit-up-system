@@ -113,6 +113,8 @@ class TdxPluginWebSocketTests(unittest.IsolatedAsyncioTestCase):
             await engine.dispose()
 
     async def test_resolve_tdx_limit_up_speech_reason_refreshes_stock_move_cache_when_missing(self):
+        self.assertLessEqual(websocket_api.TDX_LIMIT_UP_REASON_REFRESH_TIMEOUT, 0.5)
+
         refreshed_payload = {
             "items": [
                 {

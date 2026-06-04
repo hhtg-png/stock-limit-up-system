@@ -108,7 +108,7 @@ const activePlate = ref('')
 const hideOpened = ref(false)
 const loading = ref(false)
 const errorText = ref('')
-const knownLimitUpSpeechKeys = new Set<string>()
+const seenSpeechKeys = new Set<string>()
 const seenTouchedStockCodes = new Set<string>()
 const spokenLimitUpSpeechAt = new Map<string, number>()
 const plateScroller = ref<HTMLElement | null>(null)
@@ -189,32 +189,37 @@ function hasSnapshotStructureChanged(statusItems: readonly TdxLimitUpEvent[], sn
 
 function rememberExistingEvents(items: TdxLimitUpEvent[]) {
   for (const item of items) {
-    markKnownLimitUpSpeechKey(item)
+    seenSpeechKeys.add(limitUpEventSpeechKey(item))
     rememberTouchedStock(item)
   }
 }
 
-function announceNewStatusEvents(items: TdxLimitUpEvent[], source: 'snapshot' | 'realtime') {
+function announceNewStatusEvents(items: TdxLimitUpEvent[]) {
   for (const item of items) {
     const key = limitUpEventSpeechKey(item)
-    if (!key) continue
-    const wasKnown = knownLimitUpSpeechKeys.has(key)
-    markKnownLimitUpSpeechKey(item)
-    if (source === 'snapshot' && wasKnown) continue
-    const isFirstTouch = rememberTouchedStock(item)
-    if (!isFirstTouch && isPlainSealedStatusEvent(item)) continue
-    if (!speechUnlocked.value) continue
+    if (!key || seenSpeechKeys.has(key)) continue
+    const isFirstTouch = isFirstTouchedStock(item)
+    if (!isFirstTouch && isPlainSealedStatusEvent(item)) {
+      seenSpeechKeys.add(key)
+      continue
+    }
     const speechText = limitUpSpeechText(item, isFirstTouch)
-    if (!rememberLimitUpSpeech(item, speechText)) continue
+    if (!rememberLimitUpSpeech(item, speechText)) {
+      seenSpeechKeys.add(key)
+      continue
+    }
     if (!enqueuePluginSpeech(speechText, key, { force: true, urgent: true })) {
       forgetLimitUpSpeech(item, speechText)
+      continue
     }
+    seenSpeechKeys.add(key)
+    rememberTouchedStock(item)
   }
 }
 
-function markKnownLimitUpSpeechKey(item: TdxLimitUpEvent) {
-  const key = limitUpEventSpeechKey(item)
-  if (key) knownLimitUpSpeechKeys.add(key)
+function isFirstTouchedStock(item: TdxLimitUpEvent) {
+  const code = item.stock_code
+  return Boolean(code && !seenTouchedStockCodes.has(code))
 }
 
 function rememberTouchedStock(item: TdxLimitUpEvent) {
@@ -225,13 +230,13 @@ function rememberTouchedStock(item: TdxLimitUpEvent) {
   return isFirstTouch
 }
 
-function handleStatusEvents(items: TdxLimitUpEvent[], options: { primeOnly?: boolean; source?: 'snapshot' | 'realtime' } = {}) {
+function handleStatusEvents(items: TdxLimitUpEvent[], options: { primeOnly?: boolean } = {}) {
   if (options.primeOnly && !hasPrimedLimitUpSpeech) {
     rememberExistingEvents(items)
     hasPrimedLimitUpSpeech = true
     return
   }
-  announceNewStatusEvents(items, options.source || 'snapshot')
+  announceNewStatusEvents(items)
 }
 
 function handleSpeechToggle(event: Event) {
@@ -518,7 +523,7 @@ onMounted(() => {
 watch(realtimeLimitUpEvents, (nextItems, previousItems) => {
   const previousKeys = new Set(previousItems.map(item => item.event_id))
   const newRealtimeItems = nextItems.filter(item => !previousKeys.has(item.event_id))
-  handleStatusEvents(newRealtimeItems, { primeOnly: false, source: 'realtime' })
+  handleStatusEvents(newRealtimeItems, { primeOnly: false })
 })
 
 onUnmounted(() => {
