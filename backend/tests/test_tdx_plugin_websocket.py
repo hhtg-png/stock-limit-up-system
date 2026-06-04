@@ -112,6 +112,50 @@ class TdxPluginWebSocketTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await engine.dispose()
 
+    async def test_resolve_tdx_limit_up_speech_reason_refreshes_stock_move_cache_when_missing(self):
+        refreshed_payload = {
+            "items": [
+                {
+                    "stock_code": "002576",
+                    "stock_name": "通达动力",
+                    "trade_date": "2026-06-03",
+                    "source_scope": "mixed",
+                    "reasons": [
+                        {
+                            "source": "综合解析",
+                            "title": "机器人+核心客户比亚迪+驱动电机",
+                            "content": "异动解析正文",
+                        }
+                    ],
+                }
+            ],
+            "updated_at": "2026-06-03T09:42:00",
+            "source_status": {"stock_move": "ok"},
+            "is_cache": False,
+            "warnings": [],
+        }
+
+        with patch.object(
+            websocket_api.tdx_plugin_service,
+            "get_cached_stock_move_reason",
+            AsyncMock(return_value=None),
+        ) as cached_reason, patch.object(
+            websocket_api.tdx_plugin_service,
+            "refresh_stock_move_cache",
+            AsyncMock(return_value=refreshed_payload),
+        ) as refresh_cache:
+            reason = await websocket_api.resolve_tdx_limit_up_speech_reason(
+                "002576",
+                "电机",
+                date(2026, 6, 3),
+            )
+
+        self.assertEqual(reason, "机器人+核心客户比亚迪+驱动电机")
+        cached_reason.assert_awaited_once()
+        refresh_cache.assert_awaited_once()
+        self.assertEqual(refresh_cache.await_args.args[:2], ("002576", date(2026, 6, 3)))
+        self.assertEqual(refresh_cache.await_args.kwargs["source_scope"], "mixed")
+
     async def test_broadcast_tdx_news_event_uses_plugin_payload_without_stock_filter(self):
         item = {
             "news_id": "glh-2474876",

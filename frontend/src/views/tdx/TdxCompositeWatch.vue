@@ -139,6 +139,7 @@ const MOVE_PANEL_MAX_PERCENT = 62
 const MOVE_PANEL_STORAGE_KEY = 'tdx-limit-up-move-panel-percent'
 const STOCK_MOVE_CACHE_TTL_MS = 5 * 60 * 1000
 const STOCK_MOVE_CACHE_MAX = 160
+const LIMIT_UP_SPEECH_DEDUPE_WINDOW_MS = 60 * 1000
 
 type StockMoveCacheEntry = {
   payload: TdxPluginPayload<TdxStockMove>
@@ -153,8 +154,9 @@ const activePlate = ref('')
 const hideOpened = ref(false)
 const loading = ref(false)
 const errorText = ref('')
-const seenSpeechKeys = new Set<string>()
+const knownLimitUpSpeechKeys = new Set<string>()
 const seenTouchedStockCodes = new Set<string>()
+const spokenLimitUpSpeechAt = new Map<string, number>()
 const knownNewsKeys = new Set<string>()
 const spokenNewsKeys = new Set<string>()
 const stockMovePayload = ref<TdxPluginPayload<TdxStockMove> | null>(null)
@@ -253,20 +255,32 @@ function hasSnapshotStructureChanged(statusItems: readonly TdxLimitUpEvent[], sn
 
 function rememberExistingEvents(items: TdxLimitUpEvent[]) {
   for (const item of items) {
-    seenSpeechKeys.add(limitUpEventSpeechKey(item))
+    markKnownLimitUpSpeechKey(item)
     rememberTouchedStock(item)
   }
 }
 
-function announceNewStatusEvents(items: TdxLimitUpEvent[]) {
+function announceNewStatusEvents(items: TdxLimitUpEvent[], source: 'snapshot' | 'realtime') {
   for (const item of items) {
     const key = limitUpEventSpeechKey(item)
-    if (!key || seenSpeechKeys.has(key)) continue
-    seenSpeechKeys.add(key)
+    if (!key) continue
+    const wasKnown = knownLimitUpSpeechKeys.has(key)
+    markKnownLimitUpSpeechKey(item)
+    if (source === 'snapshot' && wasKnown) continue
     const isFirstTouch = rememberTouchedStock(item)
     if (!isFirstTouch && isPlainSealedStatusEvent(item)) continue
-    enqueuePluginSpeech(limitUpSpeechText(item, isFirstTouch), key, { force: true, urgent: true })
+    if (!speechUnlocked.value) continue
+    const speechText = limitUpSpeechText(item, isFirstTouch)
+    if (!rememberLimitUpSpeech(item, speechText)) continue
+    if (!enqueuePluginSpeech(speechText, key, { force: true, urgent: true })) {
+      forgetLimitUpSpeech(item, speechText)
+    }
   }
+}
+
+function markKnownLimitUpSpeechKey(item: TdxLimitUpEvent) {
+  const key = limitUpEventSpeechKey(item)
+  if (key) knownLimitUpSpeechKeys.add(key)
 }
 
 function rememberTouchedStock(item: TdxLimitUpEvent) {
@@ -277,13 +291,13 @@ function rememberTouchedStock(item: TdxLimitUpEvent) {
   return isFirstTouch
 }
 
-function handleStatusEvents(items: TdxLimitUpEvent[], options: { primeOnly?: boolean } = {}) {
+function handleStatusEvents(items: TdxLimitUpEvent[], options: { primeOnly?: boolean; source?: 'snapshot' | 'realtime' } = {}) {
   if (options.primeOnly && !hasPrimedLimitUpSpeech) {
     rememberExistingEvents(items)
     hasPrimedLimitUpSpeech = true
     return
   }
-  announceNewStatusEvents(items)
+  announceNewStatusEvents(items, options.source || 'snapshot')
 }
 
 function newsKey(item: TdxNewsItem) {
@@ -684,6 +698,31 @@ function limitUpEventSpeechKey(item: TdxLimitUpEvent) {
   return item.event_id || `${item.stock_code}-${item.event_type}-${item.event_time}`
 }
 
+function limitUpSpeechDedupeKey(item: TdxLimitUpEvent, speechText: string) {
+  return `${item.stock_code}-${speechText.replace(/\s+/g, '')}`
+}
+
+function pruneLimitUpSpeechDedupe(now = Date.now()) {
+  for (const [key, spokenAt] of spokenLimitUpSpeechAt) {
+    if (now - spokenAt > LIMIT_UP_SPEECH_DEDUPE_WINDOW_MS) {
+      spokenLimitUpSpeechAt.delete(key)
+    }
+  }
+}
+
+function rememberLimitUpSpeech(item: TdxLimitUpEvent, speechText: string, now = Date.now()) {
+  pruneLimitUpSpeechDedupe(now)
+  const key = limitUpSpeechDedupeKey(item, speechText)
+  const spokenAt = spokenLimitUpSpeechAt.get(key)
+  if (spokenAt && now - spokenAt < LIMIT_UP_SPEECH_DEDUPE_WINDOW_MS) return false
+  spokenLimitUpSpeechAt.set(key, now)
+  return true
+}
+
+function forgetLimitUpSpeech(item: TdxLimitUpEvent, speechText: string) {
+  spokenLimitUpSpeechAt.delete(limitUpSpeechDedupeKey(item, speechText))
+}
+
 function formatEventTime(value?: string | Date | null) {
   if (!value) return ''
   if (value instanceof Date) return value.toTimeString().slice(0, 8)
@@ -736,7 +775,7 @@ watch(realtimeNewsItems, (nextItems, previousItems) => {
 watch(realtimeLimitUpEvents, (nextItems, previousItems) => {
   const previousKeys = new Set(previousItems.map(item => item.event_id))
   const newRealtimeItems = nextItems.filter(item => !previousKeys.has(item.event_id))
-  handleStatusEvents(newRealtimeItems, { primeOnly: false })
+  handleStatusEvents(newRealtimeItems, { primeOnly: false, source: 'realtime' })
 })
 
 onUnmounted(() => {

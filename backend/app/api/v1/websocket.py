@@ -41,6 +41,7 @@ TDX_NEWS_SYNC_LIMIT = 80
 TDX_NEWS_BROADCAST_LIMIT = 10
 TDX_NEWS_TTS_WARM_LIMIT = 3
 TDX_NEWS_TTS_WARM_TIMEOUT = 3
+TDX_LIMIT_UP_REASON_REFRESH_TIMEOUT = 1.5
 
 
 @router.websocket("/ws/realtime")
@@ -429,8 +430,23 @@ async def resolve_tdx_limit_up_speech_reason(
             )
             if cached_reason:
                 return cached_reason
+            target_date = trade_date or date.today()
+            refreshed_payload = await asyncio.wait_for(
+                tdx_plugin_service.refresh_stock_move_cache(
+                    stock_code,
+                    target_date,
+                    db=db,
+                    source_scope="mixed",
+                ),
+                timeout=TDX_LIMIT_UP_REASON_REFRESH_TIMEOUT,
+            )
+            refreshed_reason = tdx_plugin_service._stock_move_payload_reason_title(refreshed_payload)
+            if refreshed_reason:
+                return refreshed_reason
+    except asyncio.TimeoutError:
+        logger.debug(f"TDX limit-up speech reason refresh timed out for {stock_code}")
     except Exception as exc:
-        logger.debug(f"TDX limit-up speech reason cache lookup skipped for {stock_code}: {exc}")
+        logger.debug(f"TDX limit-up speech reason refresh skipped for {stock_code}: {exc}")
     return fallback_reason
 
 
