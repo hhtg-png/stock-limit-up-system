@@ -24,7 +24,7 @@ assert.match(speech, /isSimilarRecentNewsSpeech/, 'plugin speech should compare 
 assert.match(speech, /speechKey\.startsWith\('news-'\)/, 'similarity dedupe should only apply to aggregate news speech keys')
 assert.doesNotMatch(speech, /vol:\s*'99'/, 'audio fallback should not use clipping-prone max volume')
 assert.match(speech, /targetAudioFallbackVolume/, 'audio fallback should apply a controlled element volume')
-assert.match(speech, /NEURAL_TTS_START_TIMEOUT_MS\s*=\s*900/, 'neural TTS should have a short startup timeout for uncached audio')
+assert.match(speech, /NEURAL_TTS_START_TIMEOUT_MS\s*=\s*3000/, 'neural TTS should wait long enough for uncached limit-up audio in Tongdaxin WebView')
 assert.match(speech, /function shouldUseTargetAudioPlayback\(\)[\s\S]*speechUnlocked\.value[\s\S]*hasAudioFallbackSupport\(\)/, 'unlocked plugin speech should prefer backend neural audio playback')
 assert.match(speech, /playWithAudioFallback\([\s\S]*playWithWebSpeech/, 'speech should fall back to Web Speech if neural audio fails')
 assert.match(speech, /setTimeout\(\(\)\s*=>[\s\S]*NEURAL_TTS_START_TIMEOUT_MS/, 'speech should not wait indefinitely for uncached neural TTS audio')
