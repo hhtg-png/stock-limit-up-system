@@ -33,6 +33,10 @@
               <el-icon><Document /></el-icon>
               <span>每日资讯</span>
             </el-menu-item>
+            <el-menu-item index="/limit-up-classification">
+              <el-icon><Grid /></el-icon>
+              <span>涨停分类</span>
+            </el-menu-item>
             <el-menu-item index="/jiege-mode">
               <el-icon><TrendCharts /></el-icon>
               <span>交易模式</span>
@@ -135,7 +139,7 @@ import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRoute } from 'vue-router'
 import {
   DataBoard, PieChart, Setting,
-  Fold, Expand, Bell, TrendCharts, Calendar, Document
+  Fold, Expand, Bell, TrendCharts, Calendar, Document, Grid
 } from '@element-plus/icons-vue'
 import zhCn from 'element-plus/dist/locale/zh-cn.mjs'
 import AlertPanel from '@/components/alert/AlertPanel.vue'
@@ -161,6 +165,7 @@ const mobileNavItems = [
   { path: '/statistics', label: '报表', icon: PieChart },
   { path: '/daily-analysis', label: '分析', icon: Calendar },
   { path: '/daily-info', label: '资讯', icon: Document },
+  { path: '/limit-up-classification', label: '分类', icon: Grid },
   { path: '/jiege-mode', label: '交易', icon: TrendCharts },
   { path: '/industry-trends', label: '趋势', icon: TrendCharts },
   { path: '/ultra-short-signals', label: '超短', icon: Bell },

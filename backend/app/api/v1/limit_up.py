@@ -17,6 +17,7 @@ from app.schemas.limit_up import (
     LimitUpRealtimeResponse
 )
 from app.services.realtime_limit_up_service import realtime_limit_up_service
+from app.services.ths_limit_up_classification_service import ths_limit_up_classification_service
 from app.utils.trade_date import get_trade_date_with_fallback
 
 router = APIRouter()
@@ -136,6 +137,17 @@ async def get_realtime_limit_up(
         is_fallback=False,
         data=limit_up_list
     )
+
+
+@router.get("/classification", summary="获取同花顺涨停原因板块分类")
+async def get_limit_up_classification(
+    trade_date: Optional[date] = Query(None, description="交易日期，默认今天"),
+    db: AsyncSession = Depends(get_db)
+):
+    """按同花顺涨停原因做严格板块分类，展示首封和回封时间。"""
+    if trade_date is None:
+        trade_date = date.today()
+    return await ths_limit_up_classification_service.get_classification(trade_date, db=db)
 
 
 @router.get("/{stock_code}", response_model=LimitUpDetail, summary="获取涨停详情")

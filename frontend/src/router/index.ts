@@ -40,6 +40,12 @@ const router = createRouter({
       meta: { title: '每日资讯' }
     },
     {
+      path: '/limit-up-classification',
+      name: 'LimitUpClassification',
+      component: () => import('@/views/LimitUpClassification.vue'),
+      meta: { title: '涨停分类' }
+    },
+    {
       path: '/jiege-mode',
       name: 'JiegeMode',
       component: () => import('@/views/JiegeMode.vue'),

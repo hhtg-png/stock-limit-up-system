@@ -1,5 +1,11 @@
 import axios from 'axios'
-import type { LimitUpRealtime, LimitUpDetail, LimitUpReasonStats, LimitUpRealtimeResponse } from '@/types/limit-up'
+import type {
+  LimitUpClassificationResponse,
+  LimitUpRealtime,
+  LimitUpDetail,
+  LimitUpReasonStats,
+  LimitUpRealtimeResponse
+} from '@/types/limit-up'
 
 const api = axios.create({
   baseURL: '/api/v1',
@@ -14,6 +20,14 @@ export async function getRealtimeLimitUp(params?: {
   sort_by?: string
 }): Promise<LimitUpRealtimeResponse> {
   const { data } = await api.get('/limit-up/realtime', { params })
+  return data
+}
+
+// 获取同花顺涨停原因板块分类
+export async function getLimitUpClassification(params?: {
+  trade_date?: string
+}): Promise<LimitUpClassificationResponse> {
+  const { data } = await api.get('/limit-up/classification', { params })
   return data
 }
 

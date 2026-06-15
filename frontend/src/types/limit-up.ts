@@ -45,6 +45,43 @@ export interface LimitUpReasonStats {
   stocks: string[]
 }
 
+export interface LimitUpClassificationStock {
+  stock_code: string
+  stock_name: string
+  trade_date: string
+  continuous_limit_up_days: number
+  current_status: string
+  is_sealed: boolean
+  open_count: number
+  first_limit_up_time: string
+  final_seal_time: string
+  limit_up_reason: string
+  classified_plate: string
+  seal_amount: number
+  turnover_rate: number
+  amount: number
+}
+
+export interface LimitUpClassificationGroup {
+  plate_name: string
+  count: number
+  sealed_count: number
+  opened_count: number
+  earliest_first_limit_time: string
+  latest_first_limit_time: string
+  stocks: LimitUpClassificationStock[]
+}
+
+export interface LimitUpClassificationResponse {
+  requested_date: string
+  trade_date: string
+  is_fallback: boolean
+  updated_at: string
+  source_status: Record<string, string>
+  total_count: number
+  groups: LimitUpClassificationGroup[]
+}
+
 // API响应类型（带日期回退信息）
 export interface LimitUpRealtimeResponse {
   trade_date: string
