@@ -166,6 +166,75 @@ class MarketReviewSourceServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(stock_codes, ["600001", "600002"])
 
+    async def test_collect_for_date_marks_301_codes_as_gem_board(self):
+        async def today_fetcher(trade_date):
+            self.assertEqual(trade_date, date(2026, 6, 15))
+            return [
+                {
+                    "stock_code": "301176",
+                    "stock_name": "逸豪新材",
+                    "continuous_limit_up_days": 2,
+                    "is_sealed": True,
+                    "first_limit_up_time": datetime(2026, 6, 15, 9, 32, 18),
+                    "current_price": 60.0,
+                    "change_pct": 20.0,
+                    "amount": 42969.0,
+                    "limit_up_reason": "PCB铜箔",
+                }
+            ]
+
+        async def empty_yesterday_pool(_trade_date):
+            return []
+
+        async def quote_fetcher(codes):
+            self.assertEqual(set(codes), {"301176"})
+            return {
+                "301176": {
+                    "code": "301176",
+                    "name": "逸豪新材",
+                    "price": 60.0,
+                    "pre_close": 50.0,
+                    "change_pct": 20.0,
+                    "amount": 42969.0,
+                }
+            }
+
+        async def market_stats_fetcher(_trade_date):
+            return {
+                "limit_down_count": 0,
+                "market_turnover": 1000.0,
+                "up_count_ex_st": 100,
+                "down_count_ex_st": 100,
+            }
+
+        service = MarketReviewSourceService(
+            session_factory=self.session_factory,
+            today_limit_up_fetcher=today_fetcher,
+            yesterday_pool_fetcher=empty_yesterday_pool,
+            quote_fetcher=quote_fetcher,
+            market_stats_fetcher=market_stats_fetcher,
+            current_date_provider=lambda: date(2026, 6, 15),
+        )
+
+        payload = await service.collect_for_date(date(2026, 6, 15))
+        row = payload["stock_rows"][0]
+
+        self.assertEqual(row["stock_code"], "301176")
+        self.assertEqual(row["board_type"], "gem")
+        self.assertEqual(row["today_continuous_days"], 2)
+        self.assertAlmostEqual(service._limit_ratio("301176", "逸豪新材"), 0.20)
+        self.assertTrue(service._is_limit_down(-19.6, "301176", "逸豪新材"))
+        self.assertFalse(service._is_limit_down(-10.0, "301176", "逸豪新材"))
+
+        async with self.session_factory() as session:
+            stock = (
+                await session.execute(
+                    select(Stock).where(Stock.stock_code == "301176")
+                )
+            ).scalar_one()
+
+        self.assertEqual(stock.is_cy, 1)
+
     async def test_historical_market_stats_are_loaded_when_daily_statistics_are_missing(self):
         called = {}
 

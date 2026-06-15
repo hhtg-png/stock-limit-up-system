@@ -515,8 +515,8 @@ class MarketReviewSourceService:
                 "stock_name": stock_name or stock_code,
                 "market": self._detect_market(stock_code),
                 "is_st": self._is_st_name(stock_name),
-                "is_kc": int(stock_code.startswith("688")),
-                "is_cy": int(stock_code.startswith("300")),
+                "is_kc": int(self._is_star_code(stock_code)),
+                "is_cy": int(self._is_gem_code(stock_code)),
             }
 
         for item in yesterday_pool:
@@ -531,8 +531,8 @@ class MarketReviewSourceService:
                     "stock_name": stock_name or stock_code,
                     "market": self._detect_market(stock_code),
                     "is_st": self._is_st_name(stock_name),
-                    "is_kc": int(stock_code.startswith("688")),
-                    "is_cy": int(stock_code.startswith("300")),
+                    "is_kc": int(self._is_star_code(stock_code)),
+                    "is_cy": int(self._is_gem_code(stock_code)),
                 },
             )
 
@@ -546,8 +546,8 @@ class MarketReviewSourceService:
                     "stock_name": quote.get("name", "") or stock_code,
                     "market": self._detect_market(stock_code),
                     "is_st": self._is_st_name(quote.get("name", "")),
-                    "is_kc": int(stock_code.startswith("688")),
-                    "is_cy": int(stock_code.startswith("300")),
+                    "is_kc": int(self._is_star_code(stock_code)),
+                    "is_cy": int(self._is_gem_code(stock_code)),
                 },
             )
 
@@ -857,13 +857,22 @@ class MarketReviewSourceService:
         return "SZ"
 
     def _detect_board_type(self, stock_code: str) -> str:
-        if stock_code.startswith("688"):
+        if self._is_star_code(stock_code):
             return "star"
-        if stock_code.startswith("300"):
+        if self._is_gem_code(stock_code):
             return "gem"
         if stock_code.startswith("8"):
             return "bj"
         return "main"
+
+    def _is_gem_code(self, stock_code: str) -> bool:
+        return stock_code.startswith(("300", "301"))
+
+    def _is_star_code(self, stock_code: str) -> bool:
+        return stock_code.startswith("688")
+
+    def _is_twenty_percent_code(self, stock_code: str) -> bool:
+        return self._is_gem_code(stock_code) or self._is_star_code(stock_code)
 
     def _is_limit_down(self, change_pct: Optional[float], stock_code: str, stock_name: str) -> bool:
         if change_pct is None:
@@ -872,7 +881,7 @@ class MarketReviewSourceService:
             return change_pct <= -4.8
         if stock_code.startswith("8"):
             return change_pct <= -29.5
-        if stock_code.startswith(("300", "688")):
+        if self._is_twenty_percent_code(stock_code):
             return change_pct <= -19.5
         return change_pct <= -9.5
 
@@ -881,7 +890,7 @@ class MarketReviewSourceService:
             return 0.05
         if stock_code.startswith("8"):
             return 0.30
-        if stock_code.startswith(("300", "688")):
+        if self._is_twenty_percent_code(stock_code):
             return 0.20
         return 0.10
 
