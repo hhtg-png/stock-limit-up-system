@@ -496,12 +496,17 @@ class ThsLimitUpClassificationService:
         """Generate DeepSeek classification cache outside the HTTP request path."""
         try:
             async with async_session_maker() as db:
-                items, _ = await self._load_realtime_items(requested_date)
                 trade_date = requested_date
-                if not items:
+                if requested_date != today_cn():
                     items = await self._load_db_items(requested_date, db)
                     if items:
                         trade_date = items[0]["trade_date"]
+                else:
+                    items, _ = await self._load_realtime_items(requested_date)
+                    if not items:
+                        items = await self._load_db_items(requested_date, db)
+                        if items:
+                            trade_date = items[0]["trade_date"]
                 normalized = [self._normalize_item(item, trade_date) for item in items]
                 if not normalized:
                     return
@@ -582,6 +587,15 @@ class ThsLimitUpClassificationService:
             return self._apply_ai_payload(stocks, payload), "ai"
 
         if not force:
+            if existing and existing.status == "ready" and trade_date != today_cn():
+                payload = dict(existing.classifications_json or {})
+                next_stocks = self._apply_ai_payload(stocks, payload)
+                applied_count = self._ai_applied_count(next_stocks)
+                if applied_count:
+                    source_status["ai_classification"] = "cache_stale_partial_hit"
+                    source_status["ai_model"] = existing.model or ""
+                    source_status["ai_applied_count"] = str(applied_count)
+                    return next_stocks, "ai"
             source_status["ai_classification"] = "cache_stale" if existing else "cache_miss"
             if existing and existing.model:
                 source_status["ai_model"] = existing.model
@@ -693,6 +707,10 @@ class ThsLimitUpClassificationService:
             next_stock["ai_keywords"] = DeepSeekLimitUpClassificationClient._clean_keywords(item.get("keywords"))
             applied.append(next_stock)
         return applied
+
+    @staticmethod
+    def _ai_applied_count(stocks: List[Dict[str, Any]]) -> int:
+        return sum(1 for stock in stocks if stock.get("classification_method") == "ai")
 
     async def _apply_ths_article_analysis(
         self,
