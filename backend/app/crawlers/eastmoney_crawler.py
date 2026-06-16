@@ -282,16 +282,28 @@ class EastMoneyCrawler(BaseCrawler):
                 # 涨停原因/题材
                 hybk = item.get("hybk", "")  # 行业板块
                 
-                # 连板/高标标签。zttj: {"days": 3, "ct": 2} 表示 3天2板。
+                # 连板/高标标签。zttj: {"days": 3, "ct": 2} 表示 3天2板；
+                # lbc 才是东方财富给出的连续连板数。
                 zttj = item.get("zttj") or {}
                 if not isinstance(zttj, dict):
                     zttj = {}
-                lbc = int(zttj.get("ct") or item.get("lbc", 1) or 1)
-                window_days = int(zttj.get("days") or lbc or 1)
-                if window_days > lbc > 1:
-                    board_label = f"{window_days}天{lbc}板"
-                elif lbc > 1:
-                    board_label = f"{lbc}板"
+                source_lbc = self._to_positive_int(item.get("lbc"))
+                zttj_count = self._to_positive_int(zttj.get("ct"))
+                zttj_days = self._to_positive_int(zttj.get("days"))
+
+                if source_lbc is not None:
+                    continuous_days = source_lbc
+                elif zttj_count is not None and zttj_days == zttj_count:
+                    continuous_days = zttj_count
+                else:
+                    continuous_days = None
+
+                label_count = zttj_count or continuous_days or 1
+                window_days = zttj_days or label_count
+                if window_days > label_count > 1:
+                    board_label = f"{window_days}天{label_count}板"
+                elif label_count > 1:
+                    board_label = f"{label_count}板"
                 else:
                     board_label = "首板"
                 
@@ -331,7 +343,7 @@ class EastMoneyCrawler(BaseCrawler):
                     "final_seal_time": last_limit_up_time,
                     "limit_up_reason": hybk,
                     "reason_category": self._classify_reason(hybk),
-                    "continuous_limit_up_days": lbc,
+                    "continuous_limit_up_days": continuous_days,
                     "board_label": board_label,
                     "limit_up_price": price,
                     "turnover_rate": hs,
@@ -346,9 +358,19 @@ class EastMoneyCrawler(BaseCrawler):
             except Exception as e:
                 logger.warning(f"[{self.name}] Parse item error: {e}")
                 continue
-        
+
         return result
-    
+
+    @staticmethod
+    def _to_positive_int(value: Any) -> Optional[int]:
+        if value in (None, ""):
+            return None
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            return None
+        return number if number > 0 else None
+
     def _classify_reason(self, reason: str) -> str:
         """分类涨停原因"""
         if not reason:

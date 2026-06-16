@@ -624,15 +624,21 @@ class MarketReviewSourceService:
                 or quote.get("name")
                 or stock_code
             )
+            today_touched_limit_up = bool(today_item)
             today_continuous_days = self._to_int(
                 today_item.get("continuous_limit_up_days")
                 or today_item.get("today_continuous_days")
             )
             yesterday_continuous_days = self._to_int(yesterday_item.get("ylbc"))
+            if (
+                today_touched_limit_up
+                and today_continuous_days == 0
+                and yesterday_continuous_days > 0
+            ):
+                today_continuous_days = yesterday_continuous_days + 1
             if yesterday_continuous_days == 0 and today_continuous_days > 1:
                 yesterday_continuous_days = today_continuous_days - 1
 
-            today_touched_limit_up = bool(today_item)
             today_sealed_close = self._is_sealed(today_item) if today_touched_limit_up else False
             close_price = self._resolve_close_price(today_item, quote, stock_code, stock_name)
             pre_close = self._resolve_pre_close(today_item, quote, stock_code, stock_name)

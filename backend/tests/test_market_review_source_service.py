@@ -235,6 +235,73 @@ class MarketReviewSourceServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(stock.is_cy, 1)
 
+    async def test_collect_for_date_derives_opened_continuation_from_yesterday_pool(self):
+        async def today_fetcher(trade_date):
+            self.assertEqual(trade_date, date(2026, 6, 16))
+            return [
+                {
+                    "stock_code": "600001",
+                    "stock_name": "Alpha",
+                    "continuous_limit_up_days": None,
+                    "is_sealed": False,
+                    "first_limit_up_time": datetime(2026, 6, 16, 9, 57, 0),
+                    "open_count": 7,
+                    "current_price": 11.0,
+                    "change_pct": 6.0,
+                    "amount": 123456.0,
+                    "limit_up_reason": "化学制品",
+                    "data_source": "EM",
+                }
+            ]
+
+        async def yesterday_pool_fetcher(trade_date):
+            self.assertEqual(trade_date, date(2026, 6, 16))
+            return [
+                {
+                    "c": "600001",
+                    "n": "Alpha",
+                    "ylbc": 4,
+                    "zdp": 10.0,
+                }
+            ]
+
+        async def quote_fetcher(codes):
+            self.assertEqual(set(codes), {"600001"})
+            return {
+                "600001": {
+                    "code": "600001",
+                    "name": "Alpha",
+                    "price": 11.0,
+                    "pre_close": 10.4,
+                    "change_pct": 6.0,
+                    "amount": 123456.0,
+                }
+            }
+
+        async def market_stats_fetcher(_trade_date):
+            return {
+                "limit_down_count": 0,
+                "market_turnover": 1000.0,
+                "up_count_ex_st": 100,
+                "down_count_ex_st": 100,
+            }
+
+        service = MarketReviewSourceService(
+            session_factory=self.session_factory,
+            today_limit_up_fetcher=today_fetcher,
+            yesterday_pool_fetcher=yesterday_pool_fetcher,
+            quote_fetcher=quote_fetcher,
+            market_stats_fetcher=market_stats_fetcher,
+            current_date_provider=lambda: date(2026, 6, 16),
+        )
+
+        payload = await service.collect_for_date(date(2026, 6, 16))
+        row = payload["stock_rows"][0]
+
+        self.assertTrue(row["today_opened_close"])
+        self.assertEqual(row["yesterday_continuous_days"], 4)
+        self.assertEqual(row["today_continuous_days"], 5)
+
     async def test_historical_market_stats_are_loaded_when_daily_statistics_are_missing(self):
         called = {}
 
