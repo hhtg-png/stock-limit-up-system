@@ -117,8 +117,8 @@
             <el-table-column label="分类依据" width="112" align="center">
               <template #default="{ row }">
                 <el-tooltip
-                  v-if="row.ai_reason_summary"
-                  :content="row.ai_reason_summary"
+                  v-if="classificationTooltip(row)"
+                  :content="classificationTooltip(row)"
                   placement="top"
                 >
                   <el-tag :type="classificationTagType(row)" size="small" effect="plain">
@@ -134,20 +134,35 @@
               <template #default="{ row }">
                 <div class="theme-tags">
                   <el-tag
-                    v-for="theme in row.fine_themes"
+                    v-for="theme in displayThemes(row)"
                     :key="theme"
                     size="small"
                     effect="plain"
                   >
                     {{ theme }}
                   </el-tag>
-                  <span v-if="!row.fine_themes?.length">-</span>
+                  <span v-if="!displayThemes(row).length">-</span>
                 </div>
               </template>
             </el-table-column>
             <el-table-column label="同花顺异动解读" min-width="190" show-overflow-tooltip>
               <template #default="{ row }">
                 {{ row.ths_move_title || '-' }}
+              </template>
+            </el-table-column>
+            <el-table-column label="证据句" min-width="250" show-overflow-tooltip>
+              <template #default="{ row }">
+                <a
+                  v-if="row.ths_article_url"
+                  class="analysis-link"
+                  :href="row.ths_article_url"
+                  target="_blank"
+                  rel="noopener"
+                  @click.stop
+                >
+                  {{ row.classification_evidence || row.ths_move_summary || '-' }}
+                </a>
+                <span v-else>{{ row.classification_evidence || row.ths_move_summary || '-' }}</span>
               </template>
             </el-table-column>
             <el-table-column label="封单(万)" width="100" align="right">
@@ -190,9 +205,9 @@
                 <span>{{ stock.continuous_limit_up_days > 1 ? `${stock.continuous_limit_up_days}板` : '首板' }}</span>
                 <span>{{ classificationLabel(stock) }}</span>
               </div>
-              <div v-if="stock.fine_themes?.length" class="theme-tags">
+              <div v-if="displayThemes(stock).length" class="theme-tags">
                 <el-tag
-                  v-for="theme in stock.fine_themes"
+                  v-for="theme in displayThemes(stock)"
                   :key="theme"
                   size="small"
                   effect="plain"
@@ -203,6 +218,9 @@
               <p v-if="stock.ai_reason_summary" class="ai-summary">{{ stock.ai_reason_summary }}</p>
               <p v-if="stock.ths_move_title" class="move-summary">
                 同花顺异动解读：{{ stock.ths_move_title }}
+              </p>
+              <p v-if="stock.classification_evidence" class="move-summary">
+                证据句：{{ stock.classification_evidence }}
               </p>
               <p v-if="stock.ths_move_summary" class="move-summary">{{ stock.ths_move_summary }}</p>
               <p>{{ stock.limit_up_reason || '暂无同花顺涨停原因' }}</p>
@@ -237,6 +255,9 @@ const errorMessage = ref('')
 const groups = computed<LimitUpClassificationGroup[]>(() => classification.value?.groups || [])
 const sourceText = computed(() => {
   const status = classification.value?.source_status || {}
+  if (status.ths_article_analysis === 'ok' || status.ths_article_analysis === 'partial') {
+    return '同花顺异动分析'
+  }
   if (status.ths_move_classification === 'ok' || status.ths_move_classification === 'partial') {
     return '实时池+同花顺异动'
   }
@@ -251,6 +272,8 @@ const classificationText = computed(() => {
   if (status.ai_classification === 'refresh_scheduled') return 'AI生成中'
   if (status.ai_classification === 'missing_api_key') return '规则分类'
   if (status.ai_classification === 'error') return '规则分类'
+  if (status.ths_article_analysis === 'ok') return '异动分析规则'
+  if (status.ths_article_analysis === 'partial') return '异动分析+兜底'
   if (status.ths_move_classification === 'ok') return '异动解读规则'
   if (status.ths_move_classification === 'partial') return '异动解读+短原因'
   return classification.value?.classification_method === 'ai' ? 'DeepSeek分类' : '规则分类'
@@ -316,14 +339,29 @@ function openStock(row: LimitUpClassificationStock) {
 
 function classificationLabel(row: LimitUpClassificationStock) {
   if (row.classification_method !== 'ai') {
+    if (row.classification_basis === 'ths_move_analysis') return '异动分析'
     return row.classification_basis === 'ths_move' ? '异动解读' : '短原因'
   }
   return row.ai_confidence ? `AI ${(row.ai_confidence * 100).toFixed(0)}%` : 'AI'
 }
 
 function classificationTagType(row: LimitUpClassificationStock) {
+  if (row.classification_method !== 'ai' && row.classification_basis === 'ths_move_analysis') return 'danger'
   if (row.classification_method !== 'ai' && row.classification_basis === 'ths_move') return 'primary'
   return row.classification_method === 'ai' ? 'success' : 'info'
+}
+
+function classificationTooltip(row: LimitUpClassificationStock) {
+  return row.ai_reason_summary || row.classification_evidence || row.ths_move_summary || ''
+}
+
+function displayThemes(row: LimitUpClassificationStock) {
+  const themes = [
+    row.fine_theme,
+    ...(row.secondary_themes || []),
+    ...(row.fine_themes || [])
+  ].filter(Boolean)
+  return Array.from(new Set(themes)).slice(0, 5)
 }
 
 function formatWan(value?: number | null) {
@@ -468,6 +506,15 @@ onMounted(() => {
   flex-wrap: wrap;
   gap: 5px;
   align-items: center;
+}
+
+.analysis-link {
+  color: #2563eb;
+  text-decoration: none;
+}
+
+.analysis-link:hover {
+  text-decoration: underline;
 }
 
 .classification-card-list {

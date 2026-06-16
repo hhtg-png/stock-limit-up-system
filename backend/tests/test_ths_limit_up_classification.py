@@ -9,6 +9,7 @@ from sqlalchemy.pool import StaticPool
 from app.api.v1 import limit_up
 from app.database import Base
 from app.models.limit_up import LimitUpClassificationDigest
+from app.services.ths_move_analysis_source import ThsMoveAnalysis
 from app.services.ths_limit_up_classification_service import ThsLimitUpClassificationService
 
 
@@ -79,6 +80,19 @@ class FakeThsMoveService:
     async def get_stock_move(self, stock_code, trade_date, *, source_scope="mixed", db=None):
         self.calls.append((stock_code, trade_date, source_scope, db is not None))
         return self.payloads.get(stock_code, {"items": [], "source_status": {"stock_move": "empty"}})
+
+
+class FakeThsMoveAnalysisSource:
+    def __init__(self, analyses):
+        self.analyses = analyses
+        self.calls = []
+
+    async def get_daily_analyses(self, trade_date, *, target_codes=None, force_refresh=False):
+        self.calls.append((trade_date, tuple(target_codes or ()), force_refresh))
+        if target_codes:
+            targets = {str(code) for code in target_codes}
+            return [item for item in self.analyses if item.stock_code in targets]
+        return list(self.analyses)
 
 
 class FakeRowsResult:
@@ -295,6 +309,76 @@ class ThsLimitUpClassificationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stock["classification_basis"], "ths_move")
         self.assertEqual(stock["ths_move_title"], "PCB铜箔+AI电源")
         self.assertIn("AI服务器电源", stock["ths_move_summary"])
+
+    async def test_prefers_ths_article_analysis_and_event_priority_over_concept_words(self):
+        trade_date = date(2026, 6, 16)
+        analysis_source = FakeThsMoveAnalysisSource(
+            [
+                ThsMoveAnalysis(
+                    stock_code="603335",
+                    stock_name="迪生力",
+                    trade_date=trade_date,
+                    title="涨停雷达：并购重组+存储芯片+机器人 迪生力触及涨停",
+                    summary="异动原因揭秘：公司拟收购广东全芯半导体30%股权，标的主营存储芯片封装测试。",
+                    evidence="公司拟收购广东全芯半导体30%股权，标的主营存储芯片封装测试。",
+                    article_url="http://yuanchuang.10jqka.com.cn/20260616/c677499000.shtml",
+                    published_at="2026-06-16 10:17:00",
+                )
+            ]
+        )
+        ths_move_service = FakeThsMoveService(
+            {
+                "603335": {
+                    "items": [
+                        {
+                            "stock_code": "603335",
+                            "reasons": [
+                                {
+                                    "source": "同花顺",
+                                    "title": "机器人+汽车零部件",
+                                    "content": "旧fallback只看到概念词。",
+                                }
+                            ],
+                        }
+                    ]
+                }
+            }
+        )
+        service = ThsLimitUpClassificationService(
+            realtime_service=FakeRealtimeLimitUpService(
+                [
+                    make_realtime_item(
+                        "603335",
+                        "迪生力",
+                        "汽车零部件+机器人",
+                        first_time=datetime(2026, 6, 16, 10, 17, 0),
+                    )
+                ]
+            ),
+            ths_analysis_source=analysis_source,
+            ths_move_service=ths_move_service,
+        )
+
+        payload = await service.get_classification(trade_date)
+
+        self.assertEqual(
+            analysis_source.calls,
+            [(trade_date, ("603335",), False)],
+        )
+        self.assertEqual(ths_move_service.calls, [])
+        self.assertEqual(payload["source_status"]["ths_article_analysis"], "ok")
+        self.assertEqual(payload["source_status"]["classification_granularity"], "ths_article_fine_theme")
+        self.assertEqual(payload["groups"][0]["plate_name"], "并购重组")
+        stock = payload["groups"][0]["stocks"][0]
+        self.assertEqual(stock["classification_basis"], "ths_move_analysis")
+        self.assertEqual(stock["classified_plate"], "并购重组")
+        self.assertEqual(stock["primary_theme"], "并购重组")
+        self.assertEqual(stock["fine_theme"], "收购半导体")
+        self.assertIn("存储芯片", stock["secondary_themes"])
+        self.assertIn("拟收购广东全芯半导体30%股权", stock["classification_evidence"])
+        self.assertEqual(stock["ths_article_url"], "http://yuanchuang.10jqka.com.cn/20260616/c677499000.shtml")
+        self.assertEqual(stock["ths_article_time"], "2026-06-16 10:17:00")
+        self.assertNotEqual(stock["classified_plate"], "机器人")
 
     async def test_ths_move_error_falls_back_to_limit_up_reason_classification(self):
         class ErrorThsMoveService:

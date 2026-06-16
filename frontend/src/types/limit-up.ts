@@ -59,9 +59,16 @@ export interface LimitUpClassificationStock {
   classified_plate: string
   rule_classified_plate: string
   fine_themes: string[]
-  classification_basis: 'ths_move' | 'limit_up_reason'
+  primary_theme: string
+  fine_theme: string
+  secondary_themes: string[]
+  classification_evidence: string
+  classification_confidence: number
+  classification_basis: 'ths_move_analysis' | 'ths_move' | 'limit_up_reason'
   ths_move_title: string
   ths_move_summary: string
+  ths_article_url: string
+  ths_article_time: string
   classification_method: 'ai' | 'rule'
   ai_confidence: number
   ai_reason_summary: string

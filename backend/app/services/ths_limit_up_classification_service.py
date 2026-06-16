@@ -48,6 +48,10 @@ class DeepSeekLimitUpClassificationClient:
                 "stock_code": stock["stock_code"],
                 "stock_name": stock["stock_name"],
                 "limit_up_reason": stock["limit_up_reason"],
+                "primary_theme": stock.get("primary_theme") or stock.get("classified_plate") or "",
+                "fine_theme": stock.get("fine_theme") or "",
+                "secondary_themes": stock.get("secondary_themes") or [],
+                "classification_evidence": stock.get("classification_evidence") or "",
                 "ths_move_title": stock.get("ths_move_title") or "",
                 "ths_move_summary": stock.get("ths_move_summary") or "",
                 "classification_basis": stock.get("classification_basis") or "limit_up_reason",
@@ -65,13 +69,14 @@ class DeepSeekLimitUpClassificationClient:
                 "你是A股涨停同花顺异动解读分类助手。只根据输入的同花顺字段分类，只输出JSON。",
                 (
                     "请把每只股票归入当天最合适的主导细分炒作题材。严格要求："
-                    "1. 优先依据ths_move_title和ths_move_summary；为空时才依据limit_up_reason；"
+                    "1. 优先依据ths_move_title、ths_move_summary、classification_evidence；为空时才依据limit_up_reason；"
                     "2. 这些字段均为同花顺口径，禁止补充外部新闻或其它来源；"
-                    "3. 复合原因按细分炒作方向分类，禁止输出人工智能、半导体、新能源等宽泛大类；"
-                    "4. plate_name用简短中文细分题材名，如PCB铜箔、AI电源、AI算力PCB、高速覆铜板、人形机器人；"
-                    "5. confidence为0到1的小数；"
-                    "6. reason_summary一句话说明分类依据；"
-                    "7. keywords提取1到4个同花顺异动或原因关键词。"
+                    "3. 并购重组、收购资产、股权变更、重大订单、业绩预增等强事件优先于普通概念词；"
+                    "4. 产业炒作按细分方向分类，禁止输出人工智能、半导体、新能源等宽泛大类；"
+                    "5. plate_name用简短中文题材名，如并购重组、PCB铜箔、AI电源、AI算力PCB、高速覆铜板、人形机器人；"
+                    "6. confidence为0到1的小数；"
+                    "7. reason_summary一句话说明分类依据；"
+                    "8. keywords提取1到4个同花顺异动或原因关键词。"
                     "只输出JSON对象，格式为："
                     "{classifications:[{stock_code,plate_name,confidence,reason_summary,keywords}]}。"
                     f"交易日期：{trade_date.isoformat()}。股票："
@@ -162,6 +167,11 @@ class ThsLimitUpClassificationService:
     """Group A-share limit-up stocks by deterministic THS reason rules."""
 
     _FINE_THEME_ALIASES = (
+        ("并购重组", "并购重组"),
+        ("资产重组", "并购重组"),
+        ("重大资产重组", "并购重组"),
+        ("收购半导体", "收购半导体"),
+        ("收购芯片", "收购半导体"),
         ("AI服务器电源", "AI电源"),
         ("AI算力电源", "AI电源"),
         ("服务器电源", "AI电源"),
@@ -188,6 +198,8 @@ class ThsLimitUpClassificationService:
         ("功率半导体", "功率半导体"),
         ("半导体靶材", "半导体靶材"),
         ("存储芯片", "存储芯片"),
+        ("存储封装", "存储芯片"),
+        ("封装测试", "先进封装"),
         ("光通信芯片", "光通信芯片"),
         ("人形机器人", "人形机器人"),
         ("机器人线缆", "机器人线缆"),
@@ -209,6 +221,63 @@ class ThsLimitUpClassificationService:
         ("数据中心", "数据中心"),
         ("算力租赁", "算力租赁"),
         ("AI算力", "AI算力"),
+    )
+
+    _EVENT_PRIORITY_RULES = (
+        (
+            "并购重组",
+            (
+                "拟收购",
+                "收购",
+                "并购",
+                "重组",
+                "资产注入",
+                "股权转让",
+                "协议转让",
+                "控制权变更",
+                "增资扩股",
+                "购买资产",
+                "购买股权",
+                "取得股权",
+                "取得控制权",
+                "注入资产",
+            ),
+        ),
+        (
+            "重大订单",
+            (
+                "重大合同",
+                "签订合同",
+                "中标",
+                "订单",
+                "采购协议",
+                "框架协议",
+                "供货协议",
+            ),
+        ),
+        (
+            "业绩增长",
+            (
+                "业绩预增",
+                "预增",
+                "扭亏",
+                "净利润同比增长",
+                "净利润增长",
+                "业绩增长",
+                "业绩大增",
+            ),
+        ),
+        (
+            "资产处置",
+            (
+                "资产出售",
+                "出售资产",
+                "资产处置",
+                "转让资产",
+                "土地收储",
+                "政府收储",
+            ),
+        ),
     )
 
     _LOW_SIGNAL_THEME_KEYWORDS = (
@@ -267,12 +336,14 @@ class ThsLimitUpClassificationService:
         *,
         realtime_service=None,
         ai_classification_client=None,
+        ths_analysis_source=None,
         ths_move_service=None,
         ths_move_timeout: float = 1.2,
         ths_move_concurrency: int = 16,
     ):
         self.realtime_service = realtime_service or realtime_limit_up_service
         self.ai_classification_client = ai_classification_client or DeepSeekLimitUpClassificationClient()
+        self.ths_analysis_source = ths_analysis_source
         self.ths_move_service = ths_move_service
         self.ths_move_timeout = ths_move_timeout
         self.ths_move_concurrency = max(1, int(ths_move_concurrency or 1))
@@ -309,6 +380,7 @@ class ThsLimitUpClassificationService:
 
         normalized = [self._normalize_item(item, trade_date) for item in items]
         if normalized:
+            await self._apply_ths_article_analysis(trade_date, normalized, source_status)
             await self._apply_ths_move_interpretation(db, trade_date, normalized, source_status)
         classification_method = "rule"
         if normalized and isinstance(db, AsyncSession):
@@ -362,6 +434,7 @@ class ThsLimitUpClassificationService:
                 normalized = [self._normalize_item(item, trade_date) for item in items]
                 if not normalized:
                     return
+                await self._apply_ths_article_analysis(trade_date, normalized, {})
                 await self._apply_ths_move_interpretation(db, trade_date, normalized, {})
                 await self._apply_ai_classification(
                     db,
@@ -515,6 +588,77 @@ class ThsLimitUpClassificationService:
             applied.append(next_stock)
         return applied
 
+    async def _apply_ths_article_analysis(
+        self,
+        trade_date: date,
+        stocks: List[Dict[str, Any]],
+        source_status: Dict[str, str],
+    ) -> None:
+        if not self.ths_analysis_source:
+            source_status["ths_article_analysis"] = "not_configured"
+            return
+
+        codes = [str(stock.get("stock_code") or "").strip() for stock in stocks if stock.get("stock_code")]
+        try:
+            analyses = await self.ths_analysis_source.get_daily_analyses(
+                trade_date,
+                target_codes=codes,
+                force_refresh=False,
+            )
+        except Exception as exc:
+            logger.warning(f"THS article analysis fetch failed: {exc}")
+            source_status["ths_article_analysis"] = "error"
+            source_status["ths_article_error"] = str(exc)[:120]
+            return
+
+        analysis_map = {
+            str(self._analysis_value(analysis, "stock_code") or "").strip(): analysis
+            for analysis in analyses or []
+            if self._analysis_value(analysis, "stock_code")
+        }
+        used_count = 0
+        for stock in stocks:
+            analysis = analysis_map.get(str(stock.get("stock_code") or "").strip())
+            if not analysis:
+                continue
+
+            title = self._clean_move_text(self._analysis_value(analysis, "title"), limit=100)
+            summary = self._clean_move_text(self._analysis_value(analysis, "summary"), limit=320)
+            evidence = self._clean_move_text(self._analysis_value(analysis, "evidence") or summary, limit=280)
+            if not title and not evidence:
+                continue
+
+            decision = self.classify_ths_article_analysis(
+                title=title,
+                summary=summary,
+                evidence=evidence,
+                fallback_reason=stock.get("limit_up_reason") or "",
+            )
+            if not decision["classified_plate"]:
+                continue
+
+            stock["ths_move_title"] = title
+            stock["ths_move_summary"] = evidence or summary
+            stock["classification_basis"] = "ths_move_analysis"
+            stock["classified_plate"] = decision["classified_plate"]
+            stock["rule_classified_plate"] = decision["classified_plate"]
+            stock["primary_theme"] = decision["primary_theme"]
+            stock["fine_theme"] = decision["fine_theme"]
+            stock["secondary_themes"] = decision["secondary_themes"]
+            stock["fine_themes"] = decision["fine_themes"]
+            stock["classification_evidence"] = evidence or summary
+            stock["classification_confidence"] = decision["confidence"]
+            stock["ths_article_url"] = str(self._analysis_value(analysis, "article_url") or "")
+            stock["ths_article_time"] = str(self._analysis_value(analysis, "published_at") or "")
+            used_count += 1
+
+        if used_count:
+            source_status["ths_article_analysis"] = "ok" if used_count == len(stocks) else "partial"
+            source_status["classification_granularity"] = "ths_article_fine_theme"
+        else:
+            source_status["ths_article_analysis"] = "empty"
+        source_status["ths_article_used_count"] = str(used_count)
+
     async def _apply_ths_move_interpretation(
         self,
         db: Optional[AsyncSession],
@@ -522,6 +666,13 @@ class ThsLimitUpClassificationService:
         stocks: List[Dict[str, Any]],
         source_status: Dict[str, str],
     ) -> None:
+        pending_stocks = [
+            stock for stock in stocks
+            if stock.get("classification_basis") != "ths_move_analysis"
+        ]
+        if not pending_stocks:
+            source_status["ths_move_classification"] = "skipped_article_analysis"
+            return
         if not self.ths_move_service:
             source_status["ths_move_classification"] = "not_configured"
             return
@@ -571,15 +722,21 @@ class ThsLimitUpClassificationService:
             stock["rule_classified_plate"] = rule_classified_plate
             stock["classified_plate"] = rule_classified_plate
             stock["fine_themes"] = fine_themes or [rule_classified_plate]
+            stock["primary_theme"] = rule_classified_plate
+            stock["fine_theme"] = fine_themes[0] if fine_themes else rule_classified_plate
+            stock["secondary_themes"] = [theme for theme in fine_themes[1:] if theme != rule_classified_plate]
+            stock["classification_evidence"] = summary or title
+            stock["classification_confidence"] = 0.78
             return "ok"
 
-        results = await asyncio.gather(*(enrich(stock) for stock in stocks))
+        results = await asyncio.gather(*(enrich(stock) for stock in pending_stocks))
         for result in results:
             counts[result if result in counts else "error"] += 1
 
         if counts["ok"]:
-            status = "ok" if counts["ok"] == len(stocks) else "partial"
-            source_status["classification_granularity"] = "ths_move_fine_theme"
+            status = "ok" if counts["ok"] == len(pending_stocks) else "partial"
+            if source_status.get("classification_granularity") != "ths_article_fine_theme":
+                source_status["classification_granularity"] = "ths_move_fine_theme"
         elif counts["timeout"] and not counts["error"]:
             status = "timeout"
         elif counts["error"]:
@@ -598,8 +755,15 @@ class ThsLimitUpClassificationService:
                 "stock_code": stock["stock_code"],
                 "stock_name": stock["stock_name"],
                 "limit_up_reason": stock["limit_up_reason"],
+                "primary_theme": stock.get("primary_theme") or "",
+                "fine_theme": stock.get("fine_theme") or "",
+                "secondary_themes": stock.get("secondary_themes") or [],
+                "classification_evidence": stock.get("classification_evidence") or "",
                 "ths_move_title": stock.get("ths_move_title") or "",
                 "ths_move_summary": stock.get("ths_move_summary") or "",
+                "classification_basis": stock.get("classification_basis") or "",
+                "ths_article_url": stock.get("ths_article_url") or "",
+                "ths_article_time": stock.get("ths_article_time") or "",
                 "rule_classified_plate": stock["rule_classified_plate"],
                 "fine_themes": stock.get("fine_themes") or [],
                 "first_limit_up_time": stock["first_limit_up_time"],
@@ -617,6 +781,8 @@ class ThsLimitUpClassificationService:
         reason = item.get("limit_up_reason") or ""
         fine_themes = self.extract_fine_themes(reason)
         rule_classified_plate = fine_themes[0] if fine_themes else self.classify_reason(reason)
+        primary_theme = rule_classified_plate
+        fine_theme = fine_themes[0] if fine_themes else rule_classified_plate
         return {
             "stock_code": item.get("stock_code", ""),
             "stock_name": item.get("stock_name", ""),
@@ -631,9 +797,16 @@ class ThsLimitUpClassificationService:
             "classified_plate": rule_classified_plate,
             "rule_classified_plate": rule_classified_plate,
             "fine_themes": fine_themes,
+            "primary_theme": primary_theme,
+            "fine_theme": fine_theme,
+            "secondary_themes": [theme for theme in fine_themes[1:] if theme != fine_theme],
+            "classification_evidence": reason[:280],
+            "classification_confidence": 0.55 if reason else 0.0,
             "classification_basis": "limit_up_reason",
             "ths_move_title": "",
             "ths_move_summary": "",
+            "ths_article_url": "",
+            "ths_article_time": "",
             "classification_method": "rule",
             "ai_confidence": 0.0,
             "ai_reason_summary": "",
@@ -672,6 +845,58 @@ class ThsLimitUpClassificationService:
             )
         )
         return groups
+
+    @classmethod
+    def classify_ths_article_analysis(
+        cls,
+        *,
+        title: str,
+        summary: str,
+        evidence: str,
+        fallback_reason: str = "",
+    ) -> Dict[str, Any]:
+        source_text = cls._join_reason_texts([title, evidence, summary])
+        fallback_text = fallback_reason or ""
+        title_themes = cls._extract_title_themes(title)
+        text_themes = cls.extract_fine_themes_from_texts([title, evidence, summary, fallback_text])
+        all_themes = cls._merge_themes(title_themes, text_themes)
+        event_theme = cls._detect_priority_event(source_text)
+        if event_theme:
+            fine_theme = cls._event_fine_theme(event_theme, source_text, all_themes)
+            secondary_themes = [
+                theme for theme in all_themes
+                if theme not in {event_theme, fine_theme}
+            ]
+            fine_themes = cls._merge_themes([fine_theme], secondary_themes, [event_theme])
+            return {
+                "classified_plate": event_theme,
+                "primary_theme": event_theme,
+                "fine_theme": fine_theme,
+                "secondary_themes": secondary_themes[:4],
+                "fine_themes": fine_themes[:5],
+                "confidence": 0.92,
+            }
+
+        if all_themes:
+            plate = all_themes[0]
+            return {
+                "classified_plate": plate,
+                "primary_theme": plate,
+                "fine_theme": plate,
+                "secondary_themes": all_themes[1:5],
+                "fine_themes": all_themes[:5],
+                "confidence": 0.82,
+            }
+
+        fallback_plate = cls.classify_reason(cls._join_reason_texts([source_text, fallback_text]))
+        return {
+            "classified_plate": fallback_plate,
+            "primary_theme": fallback_plate,
+            "fine_theme": fallback_plate,
+            "secondary_themes": [],
+            "fine_themes": [fallback_plate] if fallback_plate else [],
+            "confidence": 0.62 if fallback_plate and fallback_plate != "其他" else 0.4,
+        }
 
     @classmethod
     def classify_reason(cls, reason: str) -> str:
@@ -724,6 +949,69 @@ class ThsLimitUpClassificationService:
         for _, _, theme in sorted(matches):
             if theme not in themes:
                 themes.append(theme)
+        return themes
+
+    @classmethod
+    def _extract_title_themes(cls, title: str) -> List[str]:
+        text = cls._clean_move_text(title, limit=160)
+        if not text:
+            return []
+        match = re.search(r"涨停雷达[:：](.*?)(?:触及涨停|涨停)", text)
+        theme_text = match.group(1) if match else text
+        theme_text = re.split(r"\s+[^+\s]{2,12}$", theme_text.strip(), maxsplit=1)[0]
+        if "+" in theme_text and " " in theme_text:
+            theme_text = theme_text.split(" ", 1)[0]
+        return cls.extract_fine_themes(theme_text, limit=5)
+
+    @classmethod
+    def _detect_priority_event(cls, text: str) -> str:
+        normalized = re.sub(r"\s+", "", text or "")
+        if not normalized:
+            return ""
+        if re.search(r"(拟取得|拟获得|取得|获得).{0,20}控制权", normalized):
+            return "并购重组"
+        for event_theme, keywords in cls._EVENT_PRIORITY_RULES:
+            if any(keyword in normalized for keyword in keywords):
+                return event_theme
+        return ""
+
+    @classmethod
+    def _event_fine_theme(cls, event_theme: str, text: str, themes: List[str]) -> str:
+        normalized = re.sub(r"\s+", "", text or "")
+        if event_theme == "并购重组":
+            if any(keyword in normalized for keyword in ("半导体", "芯片", "集成电路", "封装测试", "存储")):
+                return "收购半导体"
+            if any(keyword in normalized for keyword in ("机器人", "减速器", "执行器")):
+                return "收购机器人"
+            if any(keyword in normalized for keyword in ("算力", "数据中心", "服务器")):
+                return "收购算力资产"
+            if any(keyword in normalized for keyword in ("电池", "储能", "光伏")):
+                return "收购新能源资产"
+            return "并购重组"
+        if event_theme == "重大订单":
+            if any(keyword in normalized for keyword in ("算力", "数据中心", "服务器")):
+                return "算力订单"
+            if any(keyword in normalized for keyword in ("电力", "储能", "光伏", "风电")):
+                return "新能源订单"
+            return "重大订单"
+        if event_theme == "业绩增长":
+            if "扭亏" in normalized:
+                return "扭亏增长"
+            if "预增" in normalized:
+                return "业绩预增"
+            return "业绩增长"
+        if event_theme == "资产处置":
+            return "资产处置"
+        return themes[0] if themes else event_theme
+
+    @staticmethod
+    def _merge_themes(*theme_lists: Iterable[str]) -> List[str]:
+        themes: List[str] = []
+        for theme_list in theme_lists:
+            for raw_theme in theme_list or []:
+                theme = str(raw_theme or "").strip()
+                if theme and theme not in themes:
+                    themes.append(theme)
         return themes
 
     @classmethod
@@ -796,6 +1084,12 @@ class ThsLimitUpClassificationService:
         return text[:limit]
 
     @staticmethod
+    def _analysis_value(analysis: Any, field_name: str) -> Any:
+        if isinstance(analysis, dict):
+            return analysis.get(field_name)
+        return getattr(analysis, field_name, None)
+
+    @staticmethod
     def _join_reason_texts(texts: Iterable[str]) -> str:
         return "+".join(str(text or "").strip() for text in texts if str(text or "").strip())
 
@@ -828,8 +1122,10 @@ class ThsLimitUpClassificationService:
 
 
 from app.services.tdx_plugin_service import tdx_plugin_service  # noqa: E402
+from app.services.ths_move_analysis_source import ths_move_analysis_source  # noqa: E402
 
 
 ths_limit_up_classification_service = ThsLimitUpClassificationService(
+    ths_analysis_source=ths_move_analysis_source,
     ths_move_service=tdx_plugin_service,
 )
