@@ -832,9 +832,23 @@ class ThsLimitUpClassificationServiceTests(unittest.IsolatedAsyncioTestCase):
                 )
             ]
         )
+        ths_move_service = FakeThsMoveService(
+            {
+                "600001": {
+                    "items": [
+                        {
+                            "title": "今日错误异动",
+                            "summary": "这条同花顺异动补充不应该用于历史日期。",
+                        }
+                    ],
+                    "source_status": {"stock_move": "ok"},
+                }
+            }
+        )
         service = ThsLimitUpClassificationService(
             realtime_service=FailingRealtimeLimitUpService(),
             ths_analysis_source=analysis_source,
+            ths_move_service=ths_move_service,
         )
 
         async with Session() as session:
@@ -843,8 +857,10 @@ class ThsLimitUpClassificationServiceTests(unittest.IsolatedAsyncioTestCase):
         await engine.dispose()
 
         self.assertEqual(analysis_source.calls, [])
+        self.assertEqual(ths_move_service.calls, [])
         self.assertEqual(payload["source_status"]["realtime_path"], "skipped_historical")
         self.assertEqual(payload["source_status"]["ths_article_analysis"], "skipped_historical")
+        self.assertEqual(payload["source_status"]["ths_move_classification"], "skipped_historical")
         self.assertEqual(payload["groups"][0]["plate_name"], "PCB铜箔")
         stock_payload = payload["groups"][0]["stocks"][0]
         self.assertEqual(stock_payload["classification_basis"], "limit_up_reason")

@@ -775,6 +775,10 @@ class ThsLimitUpClassificationService:
         stocks: List[Dict[str, Any]],
         source_status: Dict[str, str],
     ) -> None:
+        if trade_date != today_cn():
+            source_status["ths_move_classification"] = "skipped_historical"
+            return
+
         pending_stocks = [
             stock for stock in stocks
             if stock.get("classification_basis") != "ths_move_analysis"
