@@ -211,6 +211,7 @@ const classificationText = computed(() => {
   const status = classification.value?.source_status || {}
   if (status.ai_classification === 'cache_hit') return 'DeepSeek缓存'
   if (status.ai_classification === 'ready') return 'DeepSeek生成'
+  if (status.ai_classification === 'refresh_scheduled') return 'AI生成中'
   if (status.ai_classification === 'missing_api_key') return '规则分类'
   if (status.ai_classification === 'error') return '规则分类'
   return classification.value?.classification_method === 'ai' ? 'DeepSeek分类' : '规则分类'
@@ -262,6 +263,8 @@ async function regenerateAiClassification() {
     ElMessage.warning('未配置 DeepSeek Key，已使用规则分类')
   } else if (status === 'error') {
     ElMessage.warning('AI分类失败，已使用规则分类')
+  } else if (status === 'refresh_scheduled') {
+    ElMessage.success('AI分类已开始生成，稍后刷新查看')
   } else {
     ElMessage.success('AI分类已更新')
   }

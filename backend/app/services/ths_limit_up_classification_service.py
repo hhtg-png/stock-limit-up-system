@@ -12,6 +12,7 @@ from loguru import logger
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.database import async_session_maker
 from app.models.limit_up import LimitUpClassificationDigest, LimitUpRecord
 from app.models.stock import Stock
 from app.services.intelligence_service import DeepSeekSummaryClient
@@ -254,6 +255,29 @@ class ThsLimitUpClassificationService:
             return items, "fast_pool_ths"
 
         return await self.realtime_service.get_realtime_limit_up_list(requested_date), "full_realtime"
+
+    async def rebuild_ai_classification_cache(self, requested_date: date) -> None:
+        """Generate DeepSeek classification cache outside the HTTP request path."""
+        try:
+            async with async_session_maker() as db:
+                items, _ = await self._load_realtime_items(requested_date)
+                trade_date = requested_date
+                if not items:
+                    items = await self._load_db_items(requested_date, db)
+                    if items:
+                        trade_date = items[0]["trade_date"]
+                normalized = [self._normalize_item(item, trade_date) for item in items]
+                if not normalized:
+                    return
+                await self._apply_ai_classification(
+                    db,
+                    trade_date,
+                    normalized,
+                    {},
+                    force=True,
+                )
+        except Exception as exc:
+            logger.warning(f"Background DeepSeek limit-up classification failed: {exc}")
 
     async def _load_db_items(self, requested_date: date, db: AsyncSession) -> List[Dict[str, Any]]:
         latest_date = (

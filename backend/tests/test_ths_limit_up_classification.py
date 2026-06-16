@@ -360,6 +360,56 @@ class ThsLimitUpClassificationApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/classification", paths)
         self.assertLess(paths.index("/classification"), paths.index("/{stock_code}"))
 
+    async def test_force_ai_route_schedules_background_refresh_without_waiting(self):
+        trade_date = date(2026, 6, 16)
+
+        class FakeBackgroundTasks:
+            def __init__(self):
+                self.tasks = []
+
+            def add_task(self, fn, *args, **kwargs):
+                self.tasks.append((fn, args, kwargs))
+
+        class FakeClassificationService:
+            def __init__(self):
+                self.calls = []
+
+            async def get_classification(self, requested_date, *, db=None, force_ai=False):
+                self.calls.append((requested_date, force_ai))
+                if force_ai:
+                    raise AssertionError("HTTP route must not wait for AI classification")
+                return {
+                    "requested_date": requested_date,
+                    "trade_date": requested_date,
+                    "is_fallback": False,
+                    "updated_at": "2026-06-16T11:30:00",
+                    "source_status": {"ai_classification": "cache_miss"},
+                    "classification_method": "rule",
+                    "total_count": 0,
+                    "groups": [],
+                }
+
+            async def rebuild_ai_classification_cache(self, requested_date):
+                return requested_date
+
+        fake_background = FakeBackgroundTasks()
+        fake_service = FakeClassificationService()
+        with patch.object(limit_up, "ths_limit_up_classification_service", fake_service):
+            payload = await limit_up.get_limit_up_classification(
+                background_tasks=fake_background,
+                trade_date=trade_date,
+                force_ai=True,
+                db=object(),
+            )
+
+        self.assertEqual(fake_service.calls, [(trade_date, False)])
+        self.assertEqual(payload["source_status"]["ai_classification"], "refresh_scheduled")
+        self.assertEqual(len(fake_background.tasks), 1)
+        task_fn, task_args, task_kwargs = fake_background.tasks[0]
+        self.assertEqual(task_fn, fake_service.rebuild_ai_classification_cache)
+        self.assertEqual(task_args, (trade_date,))
+        self.assertEqual(task_kwargs, {})
+
 
 if __name__ == "__main__":
     unittest.main()

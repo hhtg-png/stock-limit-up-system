@@ -141,6 +141,7 @@ async def get_realtime_limit_up(
 
 @router.get("/classification", summary="获取同花顺涨停原因板块分类")
 async def get_limit_up_classification(
+    background_tasks: BackgroundTasks,
     trade_date: Optional[date] = Query(None, description="交易日期，默认今天"),
     force_ai: bool = Query(False, description="是否强制重新生成 DeepSeek 分类"),
     db: AsyncSession = Depends(get_db)
@@ -148,7 +149,11 @@ async def get_limit_up_classification(
     """按同花顺涨停原因做板块分类，展示首封和回封时间。"""
     if trade_date is None:
         trade_date = date.today()
-    return await ths_limit_up_classification_service.get_classification(trade_date, db=db, force_ai=force_ai)
+    payload = await ths_limit_up_classification_service.get_classification(trade_date, db=db)
+    if force_ai:
+        background_tasks.add_task(ths_limit_up_classification_service.rebuild_ai_classification_cache, trade_date)
+        payload.setdefault("source_status", {})["ai_classification"] = "refresh_scheduled"
+    return payload
 
 
 @router.get("/{stock_code}", response_model=LimitUpDetail, summary="获取涨停详情")
