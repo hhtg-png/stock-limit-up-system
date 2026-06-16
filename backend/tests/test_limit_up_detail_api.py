@@ -72,6 +72,40 @@ def make_record(trade_date):
 
 
 class LimitUpDetailApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_get_realtime_limit_up_defaults_unknown_continuous_days_to_first_board(self):
+        trade_date = date(2026, 6, 16)
+
+        with patch.object(
+            limit_up.realtime_limit_up_service,
+            "get_realtime_limit_up_list",
+            AsyncMock(
+                return_value=[
+                    {
+                        "stock_code": "603335",
+                        "stock_name": "迪生力",
+                        "first_limit_up_time": datetime(2026, 6, 16, 10, 12, 30),
+                        "final_seal_time": None,
+                        "limit_up_reason": "汽车零部件",
+                        "reason_category": "汽车",
+                        "continuous_limit_up_days": None,
+                        "open_count": 1,
+                        "is_final_sealed": False,
+                        "limit_up_price": 6.72,
+                        "current_price": 6.31,
+                    }
+                ]
+            ),
+        ):
+            response = await limit_up.get_realtime_limit_up(
+                trade_date,
+                continuous_days=None,
+                reason_category=None,
+                sort_by="time",
+                db=None,
+            )
+
+        self.assertEqual(response.data[0].continuous_limit_up_days, 1)
+
     async def test_get_limit_up_detail_falls_back_to_latest_available_record_date(self):
         requested_date = date(2026, 5, 12)
         fallback_date = date(2026, 5, 8)

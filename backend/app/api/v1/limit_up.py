@@ -23,6 +23,14 @@ from app.utils.trade_date import get_trade_date_with_fallback
 router = APIRouter()
 
 
+def _positive_int_or_default(value, default: int = 1) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
 @router.get("/realtime", response_model=LimitUpRealtimeResponse, summary="获取实时涨停列表")
 async def get_realtime_limit_up(
     trade_date: Optional[date] = Query(None, description="交易日期，默认今天"),
@@ -83,8 +91,9 @@ async def get_realtime_limit_up(
     # 处理实时数据
     limit_up_list = []
     for item in raw_data:
+        continuous_limit_up_days = _positive_int_or_default(item.get("continuous_limit_up_days"))
         # 筛选条件
-        if continuous_days is not None and item.get("continuous_limit_up_days", 1) < continuous_days:
+        if continuous_days is not None and continuous_limit_up_days < continuous_days:
             continue
         if reason_category and item.get("reason_category") != reason_category:
             continue
@@ -109,7 +118,7 @@ async def get_realtime_limit_up(
             final_seal_time=final_time_str,
             limit_up_reason=item.get("limit_up_reason", ""),
             reason_category=item.get("reason_category", "其他"),
-            continuous_limit_up_days=item.get("continuous_limit_up_days", 1),
+            continuous_limit_up_days=continuous_limit_up_days,
             open_count=item.get("open_count", 0),
             is_sealed=is_sealed,
             current_status=current_status,
