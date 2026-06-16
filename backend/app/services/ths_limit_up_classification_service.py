@@ -319,6 +319,12 @@ class ThsLimitUpClassificationService:
             payload = dict(existing.classifications_json or {})
             return self._apply_ai_payload(stocks, payload), "ai"
 
+        if not force:
+            source_status["ai_classification"] = "cache_stale" if existing else "cache_miss"
+            if existing and existing.model:
+                source_status["ai_model"] = existing.model
+            return stocks, "rule"
+
         if not getattr(self.ai_classification_client, "api_key", None):
             source_status["ai_classification"] = "missing_api_key"
             return stocks, "rule"

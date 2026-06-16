@@ -63,6 +63,12 @@ class FailingAiClassificationClient(FakeAiClassificationClient):
         raise AssertionError("cached classification should avoid DeepSeek call")
 
 
+class CountingAiClassificationClient(FakeAiClassificationClient):
+    async def classify_limit_up_reasons(self, trade_date, stocks):
+        self.calls.append((trade_date, [stock["stock_code"] for stock in stocks]))
+        return await super().classify_limit_up_reasons(trade_date, stocks)
+
+
 class FakeRowsResult:
     def __init__(self, rows):
         self.rows = rows
@@ -195,6 +201,46 @@ class ThsLimitUpClassificationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(new_energy_group["plate_name"], "新能源")
         self.assertEqual(new_energy_group["stocks"][0]["classified_plate"], "新能源")
 
+    async def test_missing_ai_cache_uses_rule_classification_until_forced(self):
+        engine = create_async_engine(
+            "sqlite+aiosqlite://",
+            future=True,
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        Session = async_sessionmaker(engine, expire_on_commit=False)
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+        trade_date = date(2026, 6, 15)
+        realtime = FakeRealtimeLimitUpService(
+            [
+                make_realtime_item(
+                    "600406",
+                    "国电南瑞",
+                    "智能电网+特高压",
+                    first_time=datetime(2026, 6, 15, 9, 36, 0),
+                )
+            ]
+        )
+        ai_client = CountingAiClassificationClient(
+            [{"stock_code": "600406", "plate_name": "电力设备", "confidence": 0.9}]
+        )
+        service = ThsLimitUpClassificationService(
+            realtime_service=realtime,
+            ai_classification_client=ai_client,
+        )
+
+        async with Session() as session:
+            payload = await service.get_classification(trade_date, db=session)
+
+        await engine.dispose()
+
+        self.assertEqual(ai_client.calls, [])
+        self.assertEqual(payload["classification_method"], "rule")
+        self.assertEqual(payload["source_status"]["ai_classification"], "cache_miss")
+        self.assertEqual(payload["groups"][0]["plate_name"], "人工智能")
+
     async def test_deepseek_cache_overrides_rule_plate_without_changing_ths_reason(self):
         engine = create_async_engine(
             "sqlite+aiosqlite://",
@@ -235,7 +281,7 @@ class ThsLimitUpClassificationServiceTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with Session() as session:
-            first_payload = await service.get_classification(trade_date, db=session)
+            first_payload = await service.get_classification(trade_date, db=session, force_ai=True)
             second_service = ThsLimitUpClassificationService(
                 realtime_service=realtime,
                 ai_classification_client=FailingAiClassificationClient([]),
