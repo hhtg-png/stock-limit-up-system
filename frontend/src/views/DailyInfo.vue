@@ -63,14 +63,14 @@
     <div v-loading="loading" class="content">
       <el-empty
         v-if="!loading && isEmpty"
-        description="暂无资讯摘要，可点击同步知识库后再查看"
+        :description="emptyDescription"
       />
 
       <template v-else-if="dailyInfo">
         <div class="intelligence-layout">
           <aside class="history-panel">
             <div class="section-header">
-              <h4>{{ searchKeyword.trim() ? '搜索结果' : '历史摘要' }}</h4>
+              <h4>{{ hasActiveSearch ? '搜索结果' : '历史摘要' }}</h4>
               <el-tag size="small" type="info">{{ displayHistoryItems.length }}</el-tag>
             </div>
             <div v-if="displayHistoryItems.length" class="history-list">
@@ -83,7 +83,7 @@
                 @click="selectHistory(item)"
               >
                 <span class="history-date">{{ item.trade_date }}</span>
-                <span class="history-overview">{{ item.summary.overview || '暂无摘要' }}</span>
+                <span class="history-overview" v-html="highlightText(item.summary.overview || '暂无摘要')" />
                 <span class="history-meta">{{ item.source_count }} 篇 · {{ formatTime(item.generated_at) }}</span>
               </button>
             </div>
@@ -117,7 +117,7 @@
                   {{ dailyInfo.cache_hit ? '缓存命中' : '已更新' }}
                 </el-tag>
               </div>
-              <p>{{ dailyInfo.summary.overview || '-' }}</p>
+              <p v-html="highlightText(dailyInfo.summary.overview || '-')" />
             </section>
 
             <section class="panel">
@@ -128,40 +128,54 @@
               <el-table v-if="mentionedStocks.length" :data="mentionedStocks" size="small" class="stock-table desktop-stock-table">
                 <el-table-column label="方向" min-width="130">
                   <template #default="{ row }">
-                    <el-tag v-if="row.sector" size="small" effect="plain">{{ row.sector }}</el-tag>
+                    <el-tag v-if="row.sector" size="small" effect="plain">
+                      <span v-html="highlightText(row.sector)" />
+                    </el-tag>
                     <span v-else class="empty-text">-</span>
                   </template>
                 </el-table-column>
                 <el-table-column label="个股" min-width="110">
                   <template #default="{ row }">
-                    <span class="stock-name">{{ row.name }}</span>
+                    <span class="stock-name" v-html="highlightText(row.name)" />
                   </template>
                 </el-table-column>
                 <el-table-column label="代码" min-width="90">
                   <template #default="{ row }">
-                    <el-tag v-if="row.code" size="small" effect="plain">{{ row.code }}</el-tag>
+                    <el-tag v-if="row.code" size="small" effect="plain">
+                      <span v-html="highlightText(row.code)" />
+                    </el-tag>
                     <span v-else class="empty-text">-</span>
                   </template>
                 </el-table-column>
                 <el-table-column label="个股总结" min-width="280">
                   <template #default="{ row }">
-                    {{ row.summary || row.reason || '-' }}
+                    <span v-html="highlightText(row.summary || row.reason || '-')" />
                   </template>
                 </el-table-column>
-                <el-table-column prop="reason" label="催化依据" min-width="220" />
-                <el-table-column prop="source_title" label="来源" min-width="180" />
+                <el-table-column label="催化依据" min-width="220">
+                  <template #default="{ row }">
+                    <span v-html="highlightText(row.reason || '-')" />
+                  </template>
+                </el-table-column>
+                <el-table-column label="来源" min-width="180">
+                  <template #default="{ row }">
+                    <span v-html="highlightText(row.source_title || '-')" />
+                  </template>
+                </el-table-column>
               </el-table>
               <div v-if="mentionedStocks.length" class="stock-card-list">
                 <article v-for="stock in mentionedStocks" :key="stockKey(stock)" class="stock-card">
                   <header>
-                    <strong>{{ stock.name }}</strong>
-                    <span v-if="stock.code">{{ stock.code }}</span>
-                    <el-tag v-if="stock.sector" size="small" effect="plain">{{ stock.sector }}</el-tag>
+                    <strong v-html="highlightText(stock.name)" />
+                    <span v-if="stock.code" v-html="highlightText(stock.code)" />
+                    <el-tag v-if="stock.sector" size="small" effect="plain">
+                      <span v-html="highlightText(stock.sector)" />
+                    </el-tag>
                   </header>
-                  <p>{{ stock.summary || stock.reason || '-' }}</p>
+                  <p v-html="highlightText(stock.summary || stock.reason || '-')" />
                   <footer>
-                    <span>{{ stock.reason || '暂无催化依据' }}</span>
-                    <em>{{ stock.source_title || '未知来源' }}</em>
+                    <span v-html="highlightText(stock.reason || '暂无催化依据')" />
+                    <em v-html="highlightText(stock.source_title || '未知来源')" />
                   </footer>
                 </article>
               </div>
@@ -174,7 +188,9 @@
                   <h4>盘前/盘后主线</h4>
                 </div>
                 <div v-if="mainLines.length" class="tag-list">
-                  <el-tag v-for="item in mainLines" :key="item" effect="plain">{{ item }}</el-tag>
+                  <el-tag v-for="item in mainLines" :key="item" effect="plain">
+                    <span v-html="highlightText(item)" />
+                  </el-tag>
                 </div>
                 <span v-else class="empty-text">暂无主线</span>
               </section>
@@ -184,7 +200,9 @@
                   <h4>产业链催化</h4>
                 </div>
                 <ul v-if="catalysts.length" class="item-list">
-                  <li v-for="item in catalysts" :key="item">{{ item }}</li>
+                  <li v-for="item in catalysts" :key="item">
+                    <span v-html="highlightText(item)" />
+                  </li>
                 </ul>
                 <span v-else class="empty-text">暂无催化</span>
               </section>
@@ -195,7 +213,7 @@
                 <div class="section-header">
                   <h4>交易预案</h4>
                 </div>
-                <p>{{ dailyInfo.summary.plan || '-' }}</p>
+                <p v-html="highlightText(dailyInfo.summary.plan || '-')" />
               </section>
 
               <section class="panel risk-panel">
@@ -203,7 +221,9 @@
                   <h4>风险点</h4>
                 </div>
                 <ul v-if="risks.length" class="item-list">
-                  <li v-for="item in risks" :key="item">{{ item }}</li>
+                  <li v-for="item in risks" :key="item">
+                    <span v-html="highlightText(item)" />
+                  </li>
                 </ul>
                 <span v-else class="empty-text">暂无风险提示</span>
               </section>
@@ -222,7 +242,7 @@
                   :icon="Document"
                   @click="openSource(source)"
                 >
-                  {{ source.title }}
+                  <span v-html="highlightText(source.title)" />
                 </el-button>
               </div>
               <span v-else class="empty-text">暂无来源</span>
@@ -235,7 +255,7 @@
     <el-dialog v-model="sourceDialogVisible" width="76%" class="source-dialog" destroy-on-close>
       <template #header>
         <div class="dialog-title">
-          <span>{{ sourceDetail?.title || '来源原文' }}</span>
+          <span v-html="highlightText(sourceDetail?.title || '来源原文')" />
           <el-tag v-if="sourceDetail?.media_type_name" size="small" type="info">
             {{ sourceDetail.media_type_name }}
           </el-tag>
@@ -243,13 +263,13 @@
       </template>
       <div v-loading="sourceLoading" class="source-detail">
         <div v-if="sourceDetail" class="source-meta">
-          <span>{{ sourceDetail.source_name }}</span>
+          <span v-html="highlightText(sourceDetail.source_name)" />
           <span>{{ sourceDetail.trade_date || '-' }}</span>
           <a v-if="sourceDetail.jump_url" :href="sourceDetail.jump_url" target="_blank" rel="noreferrer">
             打开知识库链接
           </a>
         </div>
-        <pre>{{ sourceBody }}</pre>
+        <pre v-html="highlightText(sourceBody)" />
       </div>
     </el-dialog>
   </div>
@@ -300,6 +320,9 @@ const lastObsidianFile = ref('')
 let syncPollTimer: number | null = null
 let appliedSyncFinishedAt = ''
 
+const activeSearchKeyword = computed(() => searchKeyword.value.trim())
+const hasActiveSearch = computed(() => Boolean(activeSearchKeyword.value))
+const emptyDescription = computed(() => hasActiveSearch.value ? '没有匹配的每日资讯' : '暂无资讯摘要，可点击同步知识库后再查看')
 const mainLines = computed(() => stringList(dailyInfo.value?.summary.main_lines))
 const catalysts = computed(() => stringList(dailyInfo.value?.summary.catalysts))
 const risks = computed(() => stringList(dailyInfo.value?.summary.risks))
@@ -542,7 +565,7 @@ function stopSyncPolling() {
 }
 
 async function searchData() {
-  const keyword = searchKeyword.value.trim()
+  const keyword = activeSearchKeyword.value
   if (!keyword) {
     await clearSearch()
     return
@@ -678,6 +701,42 @@ function changedCount(sources: Record<string, { changed_documents: number }>): n
   return Object.values(sources).reduce((total, source) => total + source.changed_documents, 0)
 }
 
+function highlightText(value: unknown, fallback = '-'): string {
+  const text = String(value ?? '')
+  const displayText = text || fallback
+  const keyword = activeSearchKeyword.value
+  if (!keyword) return escapeHtml(displayText)
+
+  const matcher = new RegExp(escapeRegExp(keyword), 'gi')
+  let highlighted = ''
+  let lastIndex = 0
+  for (const match of displayText.matchAll(matcher)) {
+    const index = match.index ?? 0
+    highlighted += escapeHtml(displayText.slice(lastIndex, index))
+    highlighted += `<mark class="search-highlight">${escapeHtml(match[0])}</mark>`
+    lastIndex = index + match[0].length
+  }
+  highlighted += escapeHtml(displayText.slice(lastIndex))
+  return highlighted
+}
+
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, char => {
+    const entities: Record<string, string> = {
+      '&': '&amp;',
+      '<': '&lt;',
+      '>': '&gt;',
+      '"': '&quot;',
+      "'": '&#39;'
+    }
+    return entities[char]
+  })
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
 function formatTime(value?: string | null): string {
   if (!value) return '-'
   return dayjs(value).format('YYYY-MM-DD HH:mm')
@@ -726,6 +785,15 @@ function formatTime(value?: string | null): string {
 
 .state-alert {
   border-radius: 6px;
+}
+
+:deep(.search-highlight) {
+  display: inline;
+  padding: 0 2px;
+  border-radius: 2px;
+  background: #fff2b8;
+  color: #8a4b00;
+  font-weight: 600;
 }
 
 .content {
