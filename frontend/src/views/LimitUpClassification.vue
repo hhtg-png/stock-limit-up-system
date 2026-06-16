@@ -15,6 +15,9 @@
           @change="handleDateChange"
         />
         <el-button :icon="Refresh" @click="refreshData" :loading="loading">刷新</el-button>
+        <el-button :icon="MagicStick" @click="regenerateAiClassification" :loading="aiRefreshing">
+          重算AI分类
+        </el-button>
       </div>
     </div>
 
@@ -58,6 +61,10 @@
           <div class="metric">
             <span>来源</span>
             <strong>{{ sourceText }}</strong>
+          </div>
+          <div class="metric">
+            <span>分类方式</span>
+            <strong>{{ classificationText }}</strong>
           </div>
         </div>
 
@@ -107,6 +114,22 @@
                 </el-tag>
               </template>
             </el-table-column>
+            <el-table-column label="分类依据" width="112" align="center">
+              <template #default="{ row }">
+                <el-tooltip
+                  v-if="row.ai_reason_summary"
+                  :content="row.ai_reason_summary"
+                  placement="top"
+                >
+                  <el-tag :type="classificationTagType(row)" size="small" effect="plain">
+                    {{ classificationLabel(row) }}
+                  </el-tag>
+                </el-tooltip>
+                <el-tag v-else :type="classificationTagType(row)" size="small" effect="plain">
+                  {{ classificationLabel(row) }}
+                </el-tag>
+              </template>
+            </el-table-column>
             <el-table-column label="封单(万)" width="100" align="right">
               <template #default="{ row }">
                 {{ formatWan(row.seal_amount) }}
@@ -145,7 +168,9 @@
                 <span>首封 {{ stock.first_limit_up_time || '-' }}</span>
                 <span>回封 {{ stock.final_seal_time || '-' }}</span>
                 <span>{{ stock.continuous_limit_up_days > 1 ? `${stock.continuous_limit_up_days}板` : '首板' }}</span>
+                <span>{{ classificationLabel(stock) }}</span>
               </div>
+              <p v-if="stock.ai_reason_summary" class="ai-summary">{{ stock.ai_reason_summary }}</p>
               <p>{{ stock.limit_up_reason || '暂无同花顺涨停原因' }}</p>
             </article>
           </div>
@@ -159,7 +184,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import { Refresh } from '@element-plus/icons-vue'
+import { MagicStick, Refresh } from '@element-plus/icons-vue'
 import dayjs from 'dayjs'
 import { getLimitUpClassification } from '@/api/limit-up'
 import type {
@@ -172,6 +197,7 @@ const router = useRouter()
 const selectedDate = ref(dayjs().format('YYYY-MM-DD'))
 const classification = ref<LimitUpClassificationResponse | null>(null)
 const loading = ref(false)
+const aiRefreshing = ref(false)
 const errorMessage = ref('')
 
 const groups = computed<LimitUpClassificationGroup[]>(() => classification.value?.groups || [])
@@ -181,13 +207,26 @@ const sourceText = computed(() => {
   if (status.limit_up_db === 'ok') return '历史缓存'
   return '同花顺'
 })
+const classificationText = computed(() => {
+  const status = classification.value?.source_status || {}
+  if (status.ai_classification === 'cache_hit') return 'DeepSeek缓存'
+  if (status.ai_classification === 'ready') return 'DeepSeek生成'
+  if (status.ai_classification === 'missing_api_key') return '规则分类'
+  if (status.ai_classification === 'error') return '规则分类'
+  return classification.value?.classification_method === 'ai' ? 'DeepSeek分类' : '规则分类'
+})
 
-async function fetchData(options: { silent?: boolean } = {}) {
-  loading.value = true
+async function fetchData(options: { silent?: boolean; forceAi?: boolean } = {}) {
+  if (options.forceAi) {
+    aiRefreshing.value = true
+  } else {
+    loading.value = true
+  }
   errorMessage.value = ''
   try {
     classification.value = await getLimitUpClassification({
-      trade_date: selectedDate.value
+      trade_date: selectedDate.value,
+      force_ai: options.forceAi || undefined
     })
   } catch (error) {
     console.error('Fetch limit-up classification error:', error)
@@ -196,7 +235,11 @@ async function fetchData(options: { silent?: boolean } = {}) {
       ElMessage.error(errorMessage.value)
     }
   } finally {
-    loading.value = false
+    if (options.forceAi) {
+      aiRefreshing.value = false
+    } else {
+      loading.value = false
+    }
   }
 }
 
@@ -211,9 +254,31 @@ async function refreshData() {
   }
 }
 
+async function regenerateAiClassification() {
+  await fetchData({ forceAi: true })
+  if (errorMessage.value) return
+  const status = classification.value?.source_status?.ai_classification
+  if (status === 'missing_api_key') {
+    ElMessage.warning('未配置 DeepSeek Key，已使用规则分类')
+  } else if (status === 'error') {
+    ElMessage.warning('AI分类失败，已使用规则分类')
+  } else {
+    ElMessage.success('AI分类已更新')
+  }
+}
+
 function openStock(row: LimitUpClassificationStock) {
   if (!row.stock_code) return
   router.push(`/stock/${row.stock_code}`)
+}
+
+function classificationLabel(row: LimitUpClassificationStock) {
+  if (row.classification_method !== 'ai') return '规则'
+  return row.ai_confidence ? `AI ${(row.ai_confidence * 100).toFixed(0)}%` : 'AI'
+}
+
+function classificationTagType(row: LimitUpClassificationStock) {
+  return row.classification_method === 'ai' ? 'success' : 'info'
 }
 
 function formatWan(value?: number | null) {
@@ -285,7 +350,7 @@ onMounted(() => {
 
 .summary-row {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
   gap: 10px;
 }
 
@@ -371,10 +436,16 @@ onMounted(() => {
 
   .toolbar-actions {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 8px;
 
     :deep(.el-date-editor) {
+      grid-column: 1 / -1;
+      width: 100%;
+    }
+
+    .el-button {
+      margin-left: 0;
       width: 100%;
     }
   }
@@ -444,6 +515,11 @@ onMounted(() => {
       font-size: 13px;
       line-height: 1.6;
       overflow-wrap: anywhere;
+    }
+
+    .ai-summary {
+      margin-bottom: 5px;
+      color: #166534;
     }
   }
 

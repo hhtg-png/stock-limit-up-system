@@ -26,6 +26,7 @@ export async function getRealtimeLimitUp(params?: {
 // 获取同花顺涨停原因板块分类
 export async function getLimitUpClassification(params?: {
   trade_date?: string
+  force_ai?: boolean
 }): Promise<LimitUpClassificationResponse> {
   const { data } = await api.get('/limit-up/classification', { params })
   return data

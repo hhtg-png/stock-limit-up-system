@@ -2,7 +2,13 @@ import unittest
 from datetime import date, datetime
 from unittest.mock import AsyncMock, patch
 
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.pool import StaticPool
+
 from app.api.v1 import limit_up
+from app.database import Base
+from app.models.limit_up import LimitUpClassificationDigest
 from app.services.ths_limit_up_classification_service import ThsLimitUpClassificationService
 
 
@@ -14,6 +20,47 @@ class FakeRealtimeLimitUpService:
     async def get_realtime_limit_up_list(self, trade_date):
         self.requested_dates.append(trade_date)
         return self.items
+
+
+class FakeFastRealtimeLimitUpService:
+    def __init__(self, items, reason_map):
+        self.items = items
+        self.reason_map = reason_map
+        self.fast_dates = []
+        self.heavy_calls = []
+
+    async def get_fast_limit_up_pool(self, trade_date, wait_for_refresh=False, max_cache_age=None):
+        self.fast_dates.append((trade_date, wait_for_refresh, max_cache_age))
+        return [dict(item) for item in self.items]
+
+    async def _fetch_ths_reason_map(self):
+        return dict(self.reason_map)
+
+    async def get_realtime_limit_up_list(self, trade_date):
+        self.heavy_calls.append(trade_date)
+        raise AssertionError("classification should not call heavy realtime enrichment")
+
+
+class FakeAiClassificationClient:
+    def __init__(self, classifications, *, api_key="configured", status="ready"):
+        self.classifications = classifications
+        self.api_key = api_key
+        self.status = status
+        self.calls = []
+        self.model = "deepseek-test"
+
+    async def classify_limit_up_reasons(self, trade_date, stocks):
+        self.calls.append((trade_date, [stock["stock_code"] for stock in stocks]))
+        return {
+            "model": self.model,
+            "model_status": self.status,
+            "classifications": self.classifications,
+        }
+
+
+class FailingAiClassificationClient(FakeAiClassificationClient):
+    async def classify_limit_up_reasons(self, trade_date, stocks):
+        raise AssertionError("cached classification should avoid DeepSeek call")
 
 
 class FakeRowsResult:
@@ -64,6 +111,28 @@ def make_realtime_item(
 
 
 class ThsLimitUpClassificationServiceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_uses_fast_pool_and_ths_reason_map_without_heavy_realtime_enrichment(self):
+        trade_date = date(2026, 6, 15)
+        realtime = FakeFastRealtimeLimitUpService(
+            [
+                make_realtime_item(
+                    "600021",
+                    "上海电力",
+                    "",
+                    first_time=datetime(2026, 6, 15, 9, 33, 0),
+                )
+            ],
+            {"600021": "电力改革+虚拟电厂"},
+        )
+        service = ThsLimitUpClassificationService(realtime_service=realtime)
+
+        payload = await service.get_classification(trade_date)
+
+        self.assertEqual(realtime.fast_dates[0][0], trade_date)
+        self.assertEqual(realtime.heavy_calls, [])
+        self.assertEqual(payload["source_status"]["realtime_path"], "fast_pool_ths")
+        self.assertEqual(payload["groups"][0]["stocks"][0]["limit_up_reason"], "电力改革+虚拟电厂")
+
     async def test_groups_realtime_items_by_strict_ths_reason_and_preserves_seal_times(self):
         trade_date = date(2026, 6, 15)
         service = ThsLimitUpClassificationService(
@@ -125,6 +194,74 @@ class ThsLimitUpClassificationServiceTests(unittest.IsolatedAsyncioTestCase):
         new_energy_group = payload["groups"][1]
         self.assertEqual(new_energy_group["plate_name"], "新能源")
         self.assertEqual(new_energy_group["stocks"][0]["classified_plate"], "新能源")
+
+    async def test_deepseek_cache_overrides_rule_plate_without_changing_ths_reason(self):
+        engine = create_async_engine(
+            "sqlite+aiosqlite://",
+            future=True,
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        Session = async_sessionmaker(engine, expire_on_commit=False)
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+        trade_date = date(2026, 6, 15)
+        reason = "智能电网+特高压"
+        realtime = FakeRealtimeLimitUpService(
+            [
+                make_realtime_item(
+                    "600406",
+                    "国电南瑞",
+                    reason,
+                    first_time=datetime(2026, 6, 15, 9, 36, 0),
+                )
+            ]
+        )
+        ai_client = FakeAiClassificationClient(
+            [
+                {
+                    "stock_code": "600406",
+                    "plate_name": "电力设备",
+                    "confidence": 0.93,
+                    "reason_summary": "同花顺原因指向智能电网和特高压。",
+                    "keywords": ["智能电网", "特高压"],
+                }
+            ]
+        )
+        service = ThsLimitUpClassificationService(
+            realtime_service=realtime,
+            ai_classification_client=ai_client,
+        )
+
+        async with Session() as session:
+            first_payload = await service.get_classification(trade_date, db=session)
+            second_service = ThsLimitUpClassificationService(
+                realtime_service=realtime,
+                ai_classification_client=FailingAiClassificationClient([]),
+            )
+            second_payload = await second_service.get_classification(trade_date, db=session)
+            cached = (await session.execute(select(LimitUpClassificationDigest))).scalars().all()
+
+        await engine.dispose()
+
+        self.assertEqual(ai_client.calls, [(trade_date, ["600406"])])
+        self.assertEqual(len(cached), 1)
+        self.assertEqual(first_payload["classification_method"], "ai")
+        self.assertEqual(first_payload["source_status"]["ai_classification"], "ready")
+        self.assertEqual(second_payload["source_status"]["ai_classification"], "cache_hit")
+        self.assertEqual(first_payload["groups"][0]["plate_name"], "电力设备")
+        stock = first_payload["groups"][0]["stocks"][0]
+        self.assertEqual(stock["limit_up_reason"], reason)
+        self.assertEqual(stock["classified_plate"], "电力设备")
+        self.assertEqual(stock["rule_classified_plate"], "人工智能")
+        self.assertEqual(stock["classification_method"], "ai")
+        self.assertEqual(stock["ai_confidence"], 0.93)
+        self.assertEqual(stock["ai_keywords"], ["智能电网", "特高压"])
+
+        cached_stock = second_payload["groups"][0]["stocks"][0]
+        self.assertEqual(cached_stock["classified_plate"], "电力设备")
+        self.assertEqual(cached_stock["classification_method"], "ai")
 
     async def test_falls_back_to_database_records_when_realtime_pool_is_empty(self):
         requested_date = date(2026, 6, 16)

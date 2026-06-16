@@ -142,12 +142,13 @@ async def get_realtime_limit_up(
 @router.get("/classification", summary="获取同花顺涨停原因板块分类")
 async def get_limit_up_classification(
     trade_date: Optional[date] = Query(None, description="交易日期，默认今天"),
+    force_ai: bool = Query(False, description="是否强制重新生成 DeepSeek 分类"),
     db: AsyncSession = Depends(get_db)
 ):
-    """按同花顺涨停原因做严格板块分类，展示首封和回封时间。"""
+    """按同花顺涨停原因做板块分类，展示首封和回封时间。"""
     if trade_date is None:
         trade_date = date.today()
-    return await ths_limit_up_classification_service.get_classification(trade_date, db=db)
+    return await ths_limit_up_classification_service.get_classification(trade_date, db=db, force_ai=force_ai)
 
 
 @router.get("/{stock_code}", response_model=LimitUpDetail, summary="获取涨停详情")

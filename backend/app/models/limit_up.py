@@ -1,9 +1,9 @@
 """
 涨停记录相关模型
 """
-from sqlalchemy import Column, Integer, String, DateTime, Float, Text, ForeignKey, Date, Index, Boolean
+from sqlalchemy import Column, Integer, String, DateTime, Float, Text, ForeignKey, Date, Index, Boolean, JSON, UniqueConstraint
 from sqlalchemy.orm import relationship
-from datetime import datetime, date
+from datetime import datetime
 
 from app.database import Base
 
@@ -87,3 +87,23 @@ class LimitUpStatusChange(Base):
     
     def __repr__(self):
         return f"<LimitUpStatusChange {self.limit_up_record_id} {self.status} {self.change_time}>"
+
+
+class LimitUpClassificationDigest(Base):
+    """每日涨停分类 AI 增强缓存。"""
+
+    __tablename__ = "limit_up_classification_digests"
+    __table_args__ = (
+        UniqueConstraint("trade_date", name="uq_limit_up_classification_trade_date"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    trade_date = Column(Date, nullable=False, index=True, comment="交易日期")
+    classifications_json = Column(JSON, default=dict, nullable=False, comment="AI 分类结果")
+    status = Column(String(20), default="pending", nullable=False, comment="状态")
+    content_hash = Column(String(64), default="", nullable=False, comment="输入内容哈希")
+    model = Column(String(80), default="", nullable=False, comment="模型名称")
+    error = Column(Text, default="", nullable=False, comment="错误信息")
+    generated_at = Column(DateTime, default=datetime.now, nullable=False, comment="生成时间")
+    created_at = Column(DateTime, default=datetime.now, nullable=False, comment="创建时间")
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, nullable=False, comment="更新时间")

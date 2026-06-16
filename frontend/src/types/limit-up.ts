@@ -57,6 +57,11 @@ export interface LimitUpClassificationStock {
   final_seal_time: string
   limit_up_reason: string
   classified_plate: string
+  rule_classified_plate: string
+  classification_method: 'ai' | 'rule'
+  ai_confidence: number
+  ai_reason_summary: string
+  ai_keywords: string[]
   seal_amount: number
   turnover_rate: number
   amount: number
@@ -78,6 +83,7 @@ export interface LimitUpClassificationResponse {
   is_fallback: boolean
   updated_at: string
   source_status: Record<string, string>
+  classification_method: 'ai' | 'rule'
   total_count: number
   groups: LimitUpClassificationGroup[]
 }
