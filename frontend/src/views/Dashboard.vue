@@ -58,6 +58,7 @@
     <!-- 数据表格 -->
     <div class="data-table card">
       <el-table 
+        ref="tableRef"
         :data="tableData" 
         v-loading="loading"
         stripe
@@ -136,7 +137,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref, reactive, onMounted, onUnmounted } from 'vue'
+import { computed, ref, reactive, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import dayjs from 'dayjs'
@@ -151,6 +152,7 @@ const limitUpStore = useLimitUpStore()
 const loading = ref(false)
 const refreshing = ref(false)
 const isFetching = ref(false)
+const tableRef = ref<any>()
 const selectedDate = ref(dayjs().format('YYYY-MM-DD'))
 const sortBy = ref<'time' | 'reseal_time' | 'seal_amount' | 'continuous_days'>('time')
 const RESYNC_INTERVAL = 90000
@@ -255,6 +257,7 @@ async function fetchData(options: FetchOptions = {}) {
 
 function applyFilters() {
   // 列表已由计算属性自动响应筛选条件变化
+  resetTableScroll()
 }
 
 function updateRealtimeMode() {
@@ -263,23 +266,27 @@ function updateRealtimeMode() {
 
 function handleDateChange() {
   updateRealtimeMode()
+  resetTableScroll()
   fetchData({ showLoading: true })
 }
 
 function setSortBy(type: 'time' | 'reseal_time' | 'seal_amount' | 'continuous_days') {
   sortBy.value = type
+  resetTableScroll()
 }
 
 function resetFilters() {
   filters.minContinuousDays = undefined
   filters.reasonCategory = ''
   filters.status = ''
+  resetTableScroll()
 }
 
 async function refreshData() {
   try {
     refreshing.value = true
     await fetchData({ showLoading: false, silent: false })
+    resetTableScroll()
     ElMessage.success('数据已刷新')
   } catch (e: any) {
     console.error('Refresh error:', e)
@@ -287,6 +294,12 @@ async function refreshData() {
   } finally {
     refreshing.value = false
   }
+}
+
+function resetTableScroll() {
+  nextTick(() => {
+    tableRef.value?.setScrollTop?.(0)
+  })
 }
 
 function handleRowClick(row: LimitUpRealtime) {
@@ -341,6 +354,11 @@ onMounted(() => {
     fetchData({ showLoading: false, silent: true })
   }, RESYNC_INTERVAL)
 })
+
+watch(
+  () => [filters.minContinuousDays, filters.reasonCategory, filters.status] as const,
+  () => resetTableScroll()
+)
 
 onUnmounted(() => {
   limitUpStore.setAcceptRealtimeUpdates(true)
