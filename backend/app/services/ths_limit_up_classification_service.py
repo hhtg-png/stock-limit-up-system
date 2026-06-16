@@ -235,6 +235,8 @@ class ThsLimitUpClassificationService:
                 "股权转让",
                 "协议转让",
                 "控制权变更",
+                "控制权拟变更",
+                "拟变更控制权",
                 "增资扩股",
                 "购买资产",
                 "购买股权",
@@ -858,9 +860,12 @@ class ThsLimitUpClassificationService:
         source_text = cls._join_reason_texts([title, evidence, summary])
         fallback_text = fallback_reason or ""
         title_themes = cls._extract_title_themes(title)
-        text_themes = cls.extract_fine_themes_from_texts([title, evidence, summary, fallback_text])
-        all_themes = cls._merge_themes(title_themes, text_themes)
-        event_theme = cls._detect_priority_event(source_text)
+        evidence_alias_themes = cls._find_alias_themes_by_position(cls._join_reason_texts([evidence, summary]))
+        fallback_themes = cls.extract_fine_themes(fallback_text, limit=4)
+        all_themes = cls._merge_themes(title_themes, evidence_alias_themes, fallback_themes)
+        event_theme = cls._detect_priority_event(title)
+        if not event_theme and not cls._is_industry_background(evidence):
+            event_theme = cls._detect_priority_event(source_text)
         if event_theme:
             fine_theme = cls._event_fine_theme(event_theme, source_text, all_themes)
             secondary_themes = [
@@ -974,6 +979,10 @@ class ThsLimitUpClassificationService:
             if any(keyword in normalized for keyword in keywords):
                 return event_theme
         return ""
+
+    @staticmethod
+    def _is_industry_background(text: str) -> bool:
+        return re.sub(r"\s+", "", text or "").startswith("行业原因")
 
     @classmethod
     def _event_fine_theme(cls, event_theme: str, text: str, themes: List[str]) -> str:

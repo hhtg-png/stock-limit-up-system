@@ -245,6 +245,26 @@ class ThsLimitUpClassificationServiceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(service.classify_reason(reason), expected)
                 self.assertEqual(service.extract_fine_themes(reason)[0], expected)
 
+    async def test_industry_background_performance_does_not_override_title_theme(self):
+        service = ThsLimitUpClassificationService(realtime_service=FakeRealtimeLimitUpService([]))
+
+        decision = service.classify_ths_article_analysis(
+            title="涨停雷达：锆铪分离+锆系新材+半导体上游+固态电池 三祥新材触及涨停",
+            summary=(
+                "异动原因揭秘：行业原因：1、亿纬锂能预计2026年上半年净利润同比增长95%-110%，"
+                "龙头业绩超预期打响中报预增行情。2、锂电行业供给侧出清。"
+            ),
+            evidence=(
+                "行业原因：1、亿纬锂能预计2026年上半年净利润同比增长95%-110%，"
+                "龙头业绩超预期打响中报预增行情。2、锂电行业供给侧出清。"
+            ),
+            fallback_reason="锆铪分离+锆系新材+半导体上游+固态电池",
+        )
+
+        self.assertEqual(decision["classified_plate"], "锆铪分离")
+        self.assertEqual(decision["fine_theme"], "锆铪分离")
+        self.assertIn("固态电池", decision["secondary_themes"])
+
     async def test_prefers_ths_move_interpretation_for_fine_theme_grouping(self):
         engine = create_async_engine(
             "sqlite+aiosqlite://",
