@@ -95,8 +95,8 @@
             <el-table-column prop="stock_name" label="名称" width="100" />
             <el-table-column label="连板" width="76" align="center">
               <template #default="{ row }">
-                <el-tag v-if="row.continuous_limit_up_days > 1" size="small" type="info">
-                  {{ row.continuous_limit_up_days }}板
+                <el-tag v-if="row.continuous_limit_up_days > 1 || row.board_label" size="small" type="info">
+                  {{ boardLabel(row) }}
                 </el-tag>
                 <span v-else>首板</span>
               </template>
@@ -202,7 +202,7 @@
               <div class="card-metrics">
                 <span>首封 {{ stock.first_limit_up_time || '-' }}</span>
                 <span>回封 {{ stock.final_seal_time || '-' }}</span>
-                <span>{{ stock.continuous_limit_up_days > 1 ? `${stock.continuous_limit_up_days}板` : '首板' }}</span>
+                <span>{{ boardLabel(stock) }}</span>
                 <span>{{ classificationLabel(stock) }}</span>
               </div>
               <div v-if="displayThemes(stock).length" class="theme-tags">
@@ -353,6 +353,10 @@ function classificationTagType(row: LimitUpClassificationStock) {
 
 function classificationTooltip(row: LimitUpClassificationStock) {
   return row.ai_reason_summary || row.classification_evidence || row.ths_move_summary || ''
+}
+
+function boardLabel(row: LimitUpClassificationStock) {
+  return row.board_label || (row.continuous_limit_up_days > 1 ? `${row.continuous_limit_up_days}板` : '首板')
 }
 
 function displayThemes(row: LimitUpClassificationStock) {

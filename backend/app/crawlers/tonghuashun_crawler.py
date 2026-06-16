@@ -391,18 +391,25 @@ class TongHuaShunCrawler(BaseCrawler):
                 reason = item.get("reason_type", "") or item.get("limit_up_reason", "")
                 reason_category = self._classify_reason(reason)
                 
-                # 解析连板天数 - 从 high_days 解析（如"首板"=1, "2连板"=2）
+                # 解析连板标签 - high_days 可能是 "首板"、"2连板"、"3天2板"
                 continuous_days = 1
                 high_days = item.get("high_days", "")
+                board_label = "首板"
                 if high_days:
-                    if "首板" in high_days:
+                    high_days_text = str(high_days).strip().replace("连板", "板")
+                    if "首板" in high_days_text:
                         continuous_days = 1
+                        board_label = "首板"
                     else:
-                        # 尝试提取数字（如"2连板" -> 2）
                         import re
-                        match = re.search(r'(\d+)', high_days)
-                        if match:
-                            continuous_days = int(match.group(1))
+                        window_match = re.search(r"(\d+)天(\d+)板", high_days_text)
+                        board_match = re.search(r"(\d+)板", high_days_text)
+                        if window_match:
+                            continuous_days = int(window_match.group(2))
+                            board_label = f"{window_match.group(1)}天{window_match.group(2)}板"
+                        elif board_match:
+                            continuous_days = int(board_match.group(1))
+                            board_label = f"{continuous_days}板"
                 
                 # 开板次数 - 新API字段是 open_num
                 open_count = item.get("open_num", 0) or item.get("break_times", 0)
@@ -422,6 +429,7 @@ class TongHuaShunCrawler(BaseCrawler):
                     "limit_up_reason": reason,
                     "reason_category": reason_category,
                     "continuous_limit_up_days": continuous_days,
+                    "board_label": board_label,
                     "limit_up_price": float(price) if price else 0,
                     "turnover_rate": float(item.get("turnover_rate", 0) or 0),
                     "amount": float(item.get("amount", 0) or 0) / 10000,  # 转换为万元

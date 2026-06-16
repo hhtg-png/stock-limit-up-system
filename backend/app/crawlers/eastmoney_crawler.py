@@ -282,8 +282,18 @@ class EastMoneyCrawler(BaseCrawler):
                 # 涨停原因/题材
                 hybk = item.get("hybk", "")  # 行业板块
                 
-                # 连板数
-                lbc = item.get("lbc", 1)  # 连板次数
+                # 连板/高标标签。zttj: {"days": 3, "ct": 2} 表示 3天2板。
+                zttj = item.get("zttj") or {}
+                if not isinstance(zttj, dict):
+                    zttj = {}
+                lbc = int(zttj.get("ct") or item.get("lbc", 1) or 1)
+                window_days = int(zttj.get("days") or lbc or 1)
+                if window_days > lbc > 1:
+                    board_label = f"{window_days}天{lbc}板"
+                elif lbc > 1:
+                    board_label = f"{lbc}板"
+                else:
+                    board_label = "首板"
                 
                 # 涨停价
                 price = item.get("p", 0)
@@ -322,6 +332,7 @@ class EastMoneyCrawler(BaseCrawler):
                     "limit_up_reason": hybk,
                     "reason_category": self._classify_reason(hybk),
                     "continuous_limit_up_days": lbc,
+                    "board_label": board_label,
                     "limit_up_price": price,
                     "turnover_rate": hs,
                     "float_market_value": float_market_value,  # 流通市值

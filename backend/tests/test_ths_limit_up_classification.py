@@ -936,6 +936,72 @@ class ThsLimitUpClassificationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stock_payload["classification_basis"], "limit_up_reason")
         self.assertEqual(stock_payload["ths_move_title"], "")
 
+    async def test_historical_db_fallback_displays_n_days_m_boards_label(self):
+        engine = create_async_engine(
+            "sqlite+aiosqlite://",
+            future=True,
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        Session = async_sessionmaker(engine, expire_on_commit=False)
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+        async with Session() as session:
+            stock = Stock(stock_code="603678", stock_name="火炬电子", market="SH")
+            other_stock = Stock(stock_code="600012", stock_name="中间交易日", market="SH")
+            session.add_all([stock, other_stock])
+            await session.flush()
+            session.add_all(
+                [
+                    LimitUpRecord(
+                        stock_id=stock.id,
+                        trade_date=date(2026, 6, 11),
+                        first_limit_up_time=datetime(2026, 6, 11, 13, 14, 9),
+                        final_seal_time=datetime(2026, 6, 11, 13, 14, 9),
+                        limit_up_reason="MLCC+商业航天",
+                        continuous_limit_up_days=1,
+                        open_count=0,
+                        is_final_sealed=True,
+                        current_status="sealed",
+                    ),
+                    LimitUpRecord(
+                        stock_id=other_stock.id,
+                        trade_date=date(2026, 6, 12),
+                        first_limit_up_time=datetime(2026, 6, 12, 9, 31, 0),
+                        final_seal_time=datetime(2026, 6, 12, 9, 31, 0),
+                        limit_up_reason="测试交易日",
+                        continuous_limit_up_days=1,
+                        open_count=0,
+                        is_final_sealed=True,
+                        current_status="sealed",
+                    ),
+                    LimitUpRecord(
+                        stock_id=stock.id,
+                        trade_date=date(2026, 6, 15),
+                        first_limit_up_time=datetime(2026, 6, 15, 9, 40, 45),
+                        final_seal_time=datetime(2026, 6, 15, 9, 40, 45),
+                        limit_up_reason="MLCC+超级电容+存储代理+商业航天",
+                        continuous_limit_up_days=3,
+                        open_count=0,
+                        is_final_sealed=True,
+                        current_status="sealed",
+                    ),
+                ]
+            )
+            await session.commit()
+
+        service = ThsLimitUpClassificationService(realtime_service=FailingRealtimeLimitUpService())
+        async with Session() as session:
+            payload = await service.get_classification(date(2026, 6, 15), db=session)
+
+        await engine.dispose()
+
+        stock_payload = payload["groups"][0]["stocks"][0]
+        self.assertEqual(stock_payload["stock_code"], "603678")
+        self.assertEqual(stock_payload["continuous_limit_up_days"], 2)
+        self.assertEqual(stock_payload["board_label"], "3天2板")
+
     async def test_rebuild_ai_cache_for_historical_date_uses_database_not_realtime(self):
         engine = create_async_engine(
             "sqlite+aiosqlite://",
