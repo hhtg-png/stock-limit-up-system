@@ -8,7 +8,12 @@ from .intelligence import (  # noqa: F401
     JiegeTradingRule,
     KnowledgeDocument,
 )
-from .limit_up import LimitUpClassificationDigest, LimitUpRecord, LimitUpStatusChange  # noqa: F401
+from .limit_up import (  # noqa: F401
+    LimitUpClassificationArchive,
+    LimitUpClassificationDigest,
+    LimitUpRecord,
+    LimitUpStatusChange,
+)
 from .market_data import CrawlerTask, DailyStatistics, DataValidation, UserConfig  # noqa: F401
 from .market_review import (  # noqa: F401
     DailyAnalysisRecord,
@@ -33,6 +38,7 @@ __all__ = [
     "KnowledgeDocument",
     "LimitUpRecord",
     "LimitUpStatusChange",
+    "LimitUpClassificationArchive",
     "LimitUpClassificationDigest",
     "MarketReviewDailyMetric",
     "MarketReviewLimitUpEvent",

@@ -158,6 +158,18 @@ class DataScheduler:
             max_instances=1
         )
 
+        self.scheduler.add_job(
+            self._archive_limit_up_classification,
+            CronTrigger(
+                hour=daily_analysis_after_close_time.hour,
+                minute=daily_analysis_after_close_time.minute,
+                timezone=CN_TZ,
+            ),
+            id="limit_up_classification_archive",
+            name="涨停分类日终归档",
+            max_instances=1,
+        )
+
         # 盘中每日分析月表（每个交易日14:50先刷新市场复盘事实，再生成盘中版）
         self.scheduler.add_job(
             self._calculate_intraday_daily_analysis,
@@ -633,6 +645,26 @@ class DataScheduler:
                 logger.error(f"After-close market review catchup failed: {e}")
 
         await self._calculate_daily_analysis()
+        await self._archive_limit_up_classification()
+
+    async def _archive_limit_up_classification(self):
+        """归档收盘后的涨停分类快照。"""
+        try:
+            from app.services.ths_limit_up_classification_service import ths_limit_up_classification_service
+
+            today = today_cn()
+            resolved_trade_date = _resolve_cn_trade_date_for_market_review(today)
+            if resolved_trade_date is None:
+                logger.info("Skipping limit-up classification archive because current China date is not a trading day")
+                return
+
+            archive = await ths_limit_up_classification_service.archive_daily_classification(resolved_trade_date)
+            logger.info(
+                "Limit-up classification archived: "
+                f"{archive.trade_date}, {archive.total_count} stocks, {archive.group_count} groups"
+            )
+        except Exception as e:
+            logger.error(f"Limit-up classification archive error: {e}")
     
     async def _clear_daily_cache(self):
         """清理每日缓存"""

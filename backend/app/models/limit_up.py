@@ -107,3 +107,25 @@ class LimitUpClassificationDigest(Base):
     generated_at = Column(DateTime, default=datetime.now, nullable=False, comment="生成时间")
     created_at = Column(DateTime, default=datetime.now, nullable=False, comment="创建时间")
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, nullable=False, comment="更新时间")
+
+
+class LimitUpClassificationArchive(Base):
+    """每日涨停分类日终归档快照。"""
+
+    __tablename__ = "limit_up_classification_archives"
+    __table_args__ = (
+        UniqueConstraint("trade_date", name="uq_limit_up_classification_archive_trade_date"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    trade_date = Column(Date, nullable=False, index=True, comment="交易日期")
+    payload_json = Column(JSON, default=dict, nullable=False, comment="完整涨停分类响应快照")
+    status = Column(String(20), default="ready", nullable=False, comment="归档状态")
+    total_count = Column(Integer, default=0, nullable=False, comment="归档涨停数")
+    group_count = Column(Integer, default=0, nullable=False, comment="归档板块数")
+    content_hash = Column(String(64), default="", nullable=False, comment="快照内容哈希")
+    source_status = Column(JSON, default=dict, nullable=False, comment="归档时来源状态")
+    error = Column(Text, default="", nullable=False, comment="错误信息")
+    archived_at = Column(DateTime, default=datetime.now, nullable=False, comment="归档时间")
+    created_at = Column(DateTime, default=datetime.now, nullable=False, comment="创建时间")
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, nullable=False, comment="更新时间")

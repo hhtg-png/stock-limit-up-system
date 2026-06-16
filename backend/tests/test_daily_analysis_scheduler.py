@@ -89,6 +89,19 @@ class DailyAnalysisSchedulerTests(unittest.TestCase):
         self.assertEqual(daily_job["trigger"].kwargs["hour"], 15)
         self.assertEqual(daily_job["trigger"].kwargs["minute"], 6)
 
+    def test_start_registers_limit_up_classification_archive_after_close_job(self):
+        scheduler = DataScheduler()
+        scheduler.scheduler = FakeScheduler()
+
+        scheduler.start()
+
+        archive_job = next(
+            job for job in scheduler.scheduler.jobs
+            if job["id"] == "limit_up_classification_archive"
+        )
+        self.assertEqual(archive_job["trigger"].kwargs["hour"], 15)
+        self.assertEqual(archive_job["trigger"].kwargs["minute"], 6)
+
     def test_start_registers_daily_analysis_intraday_job_at_1450(self):
         scheduler = DataScheduler()
         scheduler.scheduler = FakeScheduler()
@@ -145,6 +158,42 @@ class DailyAnalysisSchedulerTests(unittest.TestCase):
         build_daily_analysis.assert_awaited_once()
         self.assertEqual(build_daily_analysis.await_args.args[1], trade_date)
         self.assertEqual(build_daily_analysis.await_args.kwargs["session"], "intraday")
+
+    def test_archive_limit_up_classification_skips_non_trading_day(self):
+        scheduler = DataScheduler()
+
+        with patch(
+            "app.data_collectors.scheduler._resolve_cn_trade_date_for_market_review",
+            return_value=None,
+        ):
+            asyncio.run(scheduler._archive_limit_up_classification())
+
+    def test_after_close_catchup_runs_limit_up_classification_archive(self):
+        scheduler = DataScheduler()
+        trade_date = date(2026, 5, 19)
+
+        with patch(
+            "app.data_collectors.scheduler._should_run_after_close_catchup",
+            return_value=True,
+        ), patch(
+            "app.data_collectors.scheduler._resolve_cn_trade_date_for_market_review",
+            return_value=trade_date,
+        ), patch.object(
+            scheduler,
+            "_build_market_review",
+            new_callable=AsyncMock,
+        ), patch.object(
+            scheduler,
+            "_calculate_daily_analysis",
+            new_callable=AsyncMock,
+        ), patch.object(
+            scheduler,
+            "_archive_limit_up_classification",
+            new_callable=AsyncMock,
+        ) as archive_classification:
+            asyncio.run(scheduler._run_after_close_catchup())
+
+        archive_classification.assert_awaited_once()
 
 
 if __name__ == "__main__":

@@ -14,7 +14,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import async_session_maker
-from app.models.limit_up import LimitUpClassificationDigest, LimitUpRecord
+from app.models.limit_up import LimitUpClassificationArchive, LimitUpClassificationDigest, LimitUpRecord
 from app.models.stock import Stock
 from app.services.intelligence_service import DeepSeekSummaryClient
 from app.services.realtime_limit_up_service import realtime_limit_up_service
@@ -356,7 +356,13 @@ class ThsLimitUpClassificationService:
         *,
         db: Optional[AsyncSession] = None,
         force_ai: bool = False,
+        use_archive: bool = True,
     ) -> Dict[str, Any]:
+        if use_archive and not force_ai and isinstance(db, AsyncSession):
+            archived_payload = await self._get_archived_payload(db, requested_date)
+            if archived_payload is not None:
+                return archived_payload
+
         source_status = {
             "classification_scope": "strict_ths",
             "classification_granularity": "fine_theme",
@@ -404,6 +410,55 @@ class ThsLimitUpClassificationService:
             "total_count": len(normalized),
             "groups": groups,
         }
+
+    async def archive_daily_classification(
+        self,
+        requested_date: date,
+        *,
+        db: Optional[AsyncSession] = None,
+    ) -> LimitUpClassificationArchive:
+        """Persist a post-close classification snapshot for one trading day."""
+        if isinstance(db, AsyncSession):
+            return await self._archive_daily_classification_with_session(requested_date, db)
+
+        async with async_session_maker() as session:
+            return await self._archive_daily_classification_with_session(requested_date, session)
+
+    async def _archive_daily_classification_with_session(
+        self,
+        requested_date: date,
+        db: AsyncSession,
+    ) -> LimitUpClassificationArchive:
+        payload = await self.get_classification(
+            requested_date,
+            db=db,
+            force_ai=False,
+            use_archive=False,
+        )
+        payload = self._json_safe_payload(payload)
+        trade_date_value = self._payload_trade_date(payload, requested_date)
+        now = datetime.now()
+        payload.setdefault("source_status", {})["classification_archive"] = "written"
+        payload["archived_at"] = now.isoformat(timespec="seconds")
+        content_hash = self._payload_content_hash(payload)
+
+        existing = await self._get_archive(db, trade_date_value)
+        if existing is None:
+            existing = LimitUpClassificationArchive(trade_date=trade_date_value)
+            db.add(existing)
+
+        existing.payload_json = payload
+        existing.status = "ready"
+        existing.total_count = int(payload.get("total_count") or 0)
+        existing.group_count = len(payload.get("groups") or [])
+        existing.content_hash = content_hash
+        existing.source_status = dict(payload.get("source_status") or {})
+        existing.error = ""
+        existing.archived_at = now
+        existing.updated_at = now
+        await db.commit()
+        await db.refresh(existing)
+        return existing
 
     async def _load_realtime_items(self, requested_date: date) -> tuple[List[Dict[str, Any]], str]:
         get_fast_pool = getattr(self.realtime_service, "get_fast_limit_up_pool", None)
@@ -539,6 +594,27 @@ class ThsLimitUpClassificationService:
             select(LimitUpClassificationDigest).where(LimitUpClassificationDigest.trade_date == trade_date)
         )
         return result.scalars().first()
+
+    async def _get_archive(self, db: AsyncSession, trade_date: date) -> Optional[LimitUpClassificationArchive]:
+        result = await db.execute(
+            select(LimitUpClassificationArchive).where(LimitUpClassificationArchive.trade_date == trade_date)
+        )
+        return result.scalars().first()
+
+    async def _get_archived_payload(self, db: AsyncSession, requested_date: date) -> Optional[Dict[str, Any]]:
+        archive = await self._get_archive(db, requested_date)
+        if archive is None or archive.status != "ready":
+            return None
+        payload = dict(archive.payload_json or {})
+        payload["requested_date"] = requested_date.isoformat()
+        payload["trade_date"] = self._payload_trade_date(payload, requested_date).isoformat()
+        payload["is_fallback"] = False
+        source_status = dict(payload.get("source_status") or {})
+        source_status["classification_archive"] = "hit"
+        source_status["classification_archive_at"] = archive.archived_at.isoformat(timespec="seconds") if archive.archived_at else ""
+        payload["source_status"] = source_status
+        payload["updated_at"] = archive.archived_at.isoformat(timespec="seconds") if archive.archived_at else payload.get("updated_at", "")
+        return payload
 
     async def _write_ai_digest(
         self,
@@ -776,6 +852,28 @@ class ThsLimitUpClassificationService:
         ]
         encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _json_safe_payload(cls, payload: Dict[str, Any]) -> Dict[str, Any]:
+        return json.loads(json.dumps(payload, ensure_ascii=False, default=cls._json_default))
+
+    @staticmethod
+    def _json_default(value: Any) -> str:
+        if isinstance(value, (date, datetime, time)):
+            return value.isoformat()
+        return str(value)
+
+    @classmethod
+    def _payload_content_hash(cls, payload: Dict[str, Any]) -> str:
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=cls._json_default)
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _payload_trade_date(payload: Dict[str, Any], fallback_date: date) -> date:
+        value = payload.get("trade_date") or fallback_date
+        if isinstance(value, date):
+            return value
+        return datetime.strptime(str(value), "%Y-%m-%d").date()
 
     def _normalize_item(self, item: Dict[str, Any], default_trade_date: date) -> Dict[str, Any]:
         is_sealed = bool(item.get("is_sealed", item.get("is_final_sealed", True)))

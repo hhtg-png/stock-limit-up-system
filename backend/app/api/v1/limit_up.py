@@ -149,7 +149,11 @@ async def get_limit_up_classification(
     """按同花顺涨停原因做板块分类，展示首封和回封时间。"""
     if trade_date is None:
         trade_date = date.today()
-    payload = await ths_limit_up_classification_service.get_classification(trade_date, db=db)
+    payload = await ths_limit_up_classification_service.get_classification(
+        trade_date,
+        db=db,
+        use_archive=not force_ai,
+    )
     if force_ai:
         background_tasks.add_task(ths_limit_up_classification_service.rebuild_ai_classification_cache, trade_date)
         payload.setdefault("source_status", {})["ai_classification"] = "refresh_scheduled"

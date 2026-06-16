@@ -8,7 +8,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.api.v1 import limit_up
 from app.database import Base
-from app.models.limit_up import LimitUpClassificationDigest
+from app.models.limit_up import LimitUpClassificationArchive, LimitUpClassificationDigest
 from app.services.ths_move_analysis_source import ThsMoveAnalysis
 from app.services.ths_limit_up_classification_service import ThsLimitUpClassificationService
 
@@ -21,6 +21,17 @@ class FakeRealtimeLimitUpService:
     async def get_realtime_limit_up_list(self, trade_date):
         self.requested_dates.append(trade_date)
         return self.items
+
+
+class FailingRealtimeLimitUpService:
+    async def get_realtime_limit_up_list(self, trade_date):
+        raise AssertionError("archived classification should avoid realtime reload")
+
+    async def get_fast_limit_up_pool(self, trade_date, wait_for_refresh=False, max_cache_age=None):
+        raise AssertionError("archived classification should avoid fast realtime pool")
+
+    async def _fetch_ths_reason_map(self):
+        raise AssertionError("archived classification should avoid THS reason fetch")
 
 
 class FakeFastRealtimeLimitUpService:
@@ -605,6 +616,54 @@ class ThsLimitUpClassificationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cached_stock["classified_plate"], "电力设备")
         self.assertEqual(cached_stock["classification_method"], "ai")
 
+    async def test_archive_daily_classification_persists_snapshot_and_historical_reads_use_archive(self):
+        engine = create_async_engine(
+            "sqlite+aiosqlite://",
+            future=True,
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        Session = async_sessionmaker(engine, expire_on_commit=False)
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+        trade_date = date(2026, 6, 16)
+        realtime = FakeRealtimeLimitUpService(
+            [
+                make_realtime_item(
+                    "600001",
+                    "铜箔科技",
+                    "PCB铜箔+AI电源",
+                    first_time=datetime(2026, 6, 16, 9, 32, 0),
+                )
+            ]
+        )
+        service = ThsLimitUpClassificationService(realtime_service=realtime)
+
+        async with Session() as session:
+            archive = await service.archive_daily_classification(trade_date, db=session)
+            archived_rows = (await session.execute(select(LimitUpClassificationArchive))).scalars().all()
+
+        self.assertEqual(len(archived_rows), 1)
+        self.assertEqual(archive.trade_date, trade_date)
+        self.assertEqual(archive.status, "ready")
+        self.assertEqual(archive.total_count, 1)
+        self.assertEqual(archive.payload_json["groups"][0]["plate_name"], "PCB铜箔")
+
+        archived_service = ThsLimitUpClassificationService(
+            realtime_service=FailingRealtimeLimitUpService(),
+            ai_classification_client=FailingAiClassificationClient([]),
+        )
+        async with Session() as session:
+            payload = await archived_service.get_classification(trade_date, db=session)
+
+        await engine.dispose()
+
+        self.assertEqual(payload["source_status"]["classification_archive"], "hit")
+        self.assertEqual(payload["groups"][0]["plate_name"], "PCB铜箔")
+        self.assertEqual(payload["groups"][0]["stocks"][0]["stock_code"], "600001")
+        self.assertEqual(realtime.requested_dates, [trade_date])
+
     async def test_falls_back_to_database_records_when_realtime_pool_is_empty(self):
         requested_date = date(2026, 6, 16)
         service = ThsLimitUpClassificationService(
@@ -670,8 +729,8 @@ class ThsLimitUpClassificationApiTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self):
                 self.calls = []
 
-            async def get_classification(self, requested_date, *, db=None, force_ai=False):
-                self.calls.append((requested_date, force_ai))
+            async def get_classification(self, requested_date, *, db=None, force_ai=False, use_archive=True):
+                self.calls.append((requested_date, force_ai, use_archive))
                 if force_ai:
                     raise AssertionError("HTTP route must not wait for AI classification")
                 return {
@@ -698,7 +757,7 @@ class ThsLimitUpClassificationApiTests(unittest.IsolatedAsyncioTestCase):
                 db=object(),
             )
 
-        self.assertEqual(fake_service.calls, [(trade_date, False)])
+        self.assertEqual(fake_service.calls, [(trade_date, False, False)])
         self.assertEqual(payload["source_status"]["ai_classification"], "refresh_scheduled")
         self.assertEqual(len(fake_background.tasks), 1)
         task_fn, task_args, task_kwargs = fake_background.tasks[0]
