@@ -96,6 +96,7 @@ def _format_board_height_label(
         f"{_get_stock_value(row, 'stock_name')}{height}"
         for row in stock_rows
         if _get_stock_int(row, "today_continuous_days") == height
+        and bool(_get_stock_value(row, "today_sealed_close"))
         and (board_types is None or _get_stock_value(row, "board_type") in board_types)
     ]
     return "\n".join(names) if names else None

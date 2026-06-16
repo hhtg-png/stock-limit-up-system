@@ -25,7 +25,7 @@ class MarketReviewMetricsService:
         board_heights = sorted(
             {
                 self._to_int(row.get("today_continuous_days"))
-                for row in touched_rows
+                for row in sealed_rows
                 if self._to_int(row.get("today_continuous_days")) > 0
             },
             reverse=True,
@@ -41,17 +41,20 @@ class MarketReviewMetricsService:
         ]
 
         promoted_first_board = [
-            row for row in yesterday_first_board if self._to_int(row.get("today_continuous_days")) >= 2
+            row
+            for row in yesterday_first_board
+            if row.get("today_sealed_close") and self._to_int(row.get("today_continuous_days")) >= 2
         ]
         promoted_continuous = [
             row
             for row in yesterday_continuous
-            if self._to_int(row.get("today_continuous_days")) > self._to_int(row.get("yesterday_continuous_days"))
+            if row.get("today_sealed_close")
+            and self._to_int(row.get("today_continuous_days")) > self._to_int(row.get("yesterday_continuous_days"))
         ]
 
         gem_days = [
             self._to_int(row.get("today_continuous_days"))
-            for row in touched_rows
+            for row in sealed_rows
             if row.get("board_type") in {"gem", "star"}
         ]
 
@@ -78,7 +81,7 @@ class MarketReviewMetricsService:
             "limit_up_count": len(touched_rows),
             "limit_down_count": self._to_int(limit_down_count),
             "continuous_count": len(
-                [row for row in touched_rows if self._to_int(row.get("today_continuous_days")) >= 2]
+                [row for row in sealed_rows if self._to_int(row.get("today_continuous_days")) >= 2]
             ),
             "max_board_height": board_heights[0] if board_heights else 0,
             "second_board_height": board_heights[1] if len(board_heights) > 1 else 0,

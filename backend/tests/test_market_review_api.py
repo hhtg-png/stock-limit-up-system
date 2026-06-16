@@ -260,8 +260,8 @@ class MarketReviewApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         row = response.json()["data"]["rows"][0]
-        self.assertEqual(row["max_board_label"], "Alpha4\nBeta4")
-        self.assertEqual(row["second_board_label"], "Gamma3")
+        self.assertEqual(row["max_board_label"], "Alpha4")
+        self.assertIsNone(row["second_board_label"])
         self.assertEqual(row["gem_board_label"], "Zeta2")
 
     def test_daily_endpoint_resolves_future_end_date_to_latest_available_metric(self):
@@ -576,7 +576,7 @@ class MarketReviewApiTests(unittest.TestCase):
         self.assertIsNotNone(payload["snapshot_time"])
         self.assertEqual(payload["data"]["series"], ["2026-05-06"])
         row = payload["data"]["rows"][0]
-        self.assertEqual(row["max_board_label"], "LiveAlpha3\nLiveBeta3")
+        self.assertEqual(row["max_board_label"], "LiveAlpha3")
         self.assertEqual(row["second_board_label"], "LiveGamma2")
         self.assertEqual(row["gem_board_label"], "LiveGamma2")
         self.assertEqual([stock["stock_code"] for stock in payload["detail"]["stocks"]], ["600011", "600010", "600012", "600013"])
@@ -602,7 +602,7 @@ class MarketReviewApiTests(unittest.TestCase):
         self.assertFalse(payload["is_live"])
         self.assertFalse(payload["is_fallback"])
         self.assertEqual(payload["data"]["series"], ["2026-04-28"])
-        self.assertEqual(payload["data"]["rows"][0]["max_board_label"], "Alpha4\nBeta4")
+        self.assertEqual(payload["data"]["rows"][0]["max_board_label"], "Alpha4")
         self.assertEqual(payload["detail"]["stocks"][0]["stock_code"], "600002")
         self.assertEqual(payload["ladder"]["ladders"][0]["continuous_days"], 4)
         self.review_module._collect_intraday_source.assert_not_awaited()

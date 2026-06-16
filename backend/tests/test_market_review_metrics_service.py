@@ -65,12 +65,12 @@ class MarketReviewMetricsServiceTests(unittest.TestCase):
 
         self.assertEqual(metric["trade_date"], date(2026, 4, 27))
         self.assertEqual(metric["limit_up_count"], 2)
-        self.assertEqual(metric["continuous_count"], 2)
-        self.assertEqual(metric["max_board_height"], 3)
-        self.assertEqual(metric["second_board_height"], 2)
-        self.assertEqual(metric["gem_board_height"], 3)
+        self.assertEqual(metric["continuous_count"], 1)
+        self.assertEqual(metric["max_board_height"], 2)
+        self.assertEqual(metric["second_board_height"], 0)
+        self.assertEqual(metric["gem_board_height"], 0)
         self.assertAlmostEqual(metric["first_to_second_rate"], 100.0)
-        self.assertAlmostEqual(metric["continuous_promotion_rate"], 100.0)
+        self.assertAlmostEqual(metric["continuous_promotion_rate"], 0.0)
         self.assertAlmostEqual(metric["seal_rate"], 50.0)
         self.assertAlmostEqual(metric["yesterday_limit_up_avg_change"], 7.25)
         self.assertAlmostEqual(metric["yesterday_continuous_avg_change"], 4.5)
@@ -257,6 +257,64 @@ class MarketReviewMetricsServiceTests(unittest.TestCase):
 
         self.assertEqual(metric["max_board_height"], 3)
         self.assertEqual(metric["second_board_height"], 2)
+
+    def test_aggregate_daily_metrics_uses_only_sealed_rows_for_board_heights(self):
+        rows = [
+            {
+                "stock_code": "600021",
+                "board_type": "main",
+                "today_touched_limit_up": True,
+                "today_sealed_close": False,
+                "today_opened_close": True,
+                "today_continuous_days": 5,
+                "change_pct": -0.5,
+                "amount": 10000.0,
+            },
+            {
+                "stock_code": "600022",
+                "board_type": "main",
+                "today_touched_limit_up": True,
+                "today_sealed_close": True,
+                "today_opened_close": False,
+                "today_continuous_days": 4,
+                "change_pct": 10.0,
+                "amount": 20000.0,
+            },
+            {
+                "stock_code": "600023",
+                "board_type": "main",
+                "today_touched_limit_up": True,
+                "today_sealed_close": False,
+                "today_opened_close": True,
+                "today_continuous_days": 3,
+                "change_pct": 2.0,
+                "amount": 30000.0,
+            },
+            {
+                "stock_code": "300024",
+                "board_type": "gem",
+                "today_touched_limit_up": True,
+                "today_sealed_close": True,
+                "today_opened_close": False,
+                "today_continuous_days": 2,
+                "change_pct": 20.0,
+                "amount": 40000.0,
+            },
+        ]
+
+        metric = self.service.aggregate_daily_metrics(
+            trade_date=date(2026, 6, 16),
+            stock_rows=rows,
+            limit_down_count=0,
+            market_turnover=0,
+            up_count_ex_st=0,
+            down_count_ex_st=0,
+        )
+
+        self.assertEqual(metric["max_board_height"], 4)
+        self.assertEqual(metric["second_board_height"], 2)
+        self.assertEqual(metric["gem_board_height"], 2)
+        self.assertEqual(metric["continuous_count"], 2)
 
 
 if __name__ == "__main__":
