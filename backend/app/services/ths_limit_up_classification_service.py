@@ -18,6 +18,7 @@ from app.models.limit_up import LimitUpClassificationArchive, LimitUpClassificat
 from app.models.stock import Stock
 from app.services.intelligence_service import DeepSeekSummaryClient
 from app.services.realtime_limit_up_service import realtime_limit_up_service
+from app.utils.time_utils import today_cn
 
 
 class DeepSeekLimitUpClassificationClient:
@@ -370,10 +371,23 @@ class ThsLimitUpClassificationService:
             "ths_reason": "ok",
             "ai_classification": "not_requested",
         }
-        items, realtime_path = await self._load_realtime_items(requested_date)
-        source_status["realtime_path"] = realtime_path
         trade_date = requested_date
         is_fallback = False
+        items: List[Dict[str, Any]] = []
+
+        if isinstance(db, AsyncSession) and requested_date != today_cn():
+            source_status["limit_up_pool"] = "skipped_historical"
+            source_status["realtime_path"] = "skipped_historical"
+            items = await self._load_db_items(requested_date, db)
+            if items:
+                trade_date = items[0]["trade_date"]
+                is_fallback = trade_date != requested_date
+                source_status["limit_up_db"] = "ok"
+            else:
+                source_status["limit_up_db"] = "empty"
+        else:
+            items, realtime_path = await self._load_realtime_items(requested_date)
+            source_status["realtime_path"] = realtime_path
 
         if not items:
             source_status["limit_up_pool"] = "empty"
@@ -602,13 +616,27 @@ class ThsLimitUpClassificationService:
         return result.scalars().first()
 
     async def _get_archived_payload(self, db: AsyncSession, requested_date: date) -> Optional[Dict[str, Any]]:
-        archive = await self._get_archive(db, requested_date)
-        if archive is None or archive.status != "ready":
+        if requested_date == today_cn():
+            archive = await self._get_archive(db, requested_date)
+            if archive is not None and archive.status != "ready":
+                archive = None
+        else:
+            result = await db.execute(
+                select(LimitUpClassificationArchive)
+                .where(
+                    LimitUpClassificationArchive.trade_date <= requested_date,
+                    LimitUpClassificationArchive.status == "ready",
+                )
+                .order_by(LimitUpClassificationArchive.trade_date.desc())
+                .limit(1)
+            )
+            archive = result.scalars().first()
+        if archive is None:
             return None
         payload = dict(archive.payload_json or {})
         payload["requested_date"] = requested_date.isoformat()
-        payload["trade_date"] = self._payload_trade_date(payload, requested_date).isoformat()
-        payload["is_fallback"] = False
+        payload["trade_date"] = archive.trade_date.isoformat()
+        payload["is_fallback"] = archive.trade_date != requested_date
         source_status = dict(payload.get("source_status") or {})
         source_status["classification_archive"] = "hit"
         source_status["classification_archive_at"] = archive.archived_at.isoformat(timespec="seconds") if archive.archived_at else ""
@@ -672,6 +700,9 @@ class ThsLimitUpClassificationService:
         stocks: List[Dict[str, Any]],
         source_status: Dict[str, str],
     ) -> None:
+        if trade_date != today_cn():
+            source_status["ths_article_analysis"] = "skipped_historical"
+            return
         if not self.ths_analysis_source:
             source_status["ths_article_analysis"] = "not_configured"
             return

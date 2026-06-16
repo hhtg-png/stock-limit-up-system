@@ -9,6 +9,8 @@ from sqlalchemy.pool import StaticPool
 from app.api.v1 import limit_up
 from app.database import Base
 from app.models.limit_up import LimitUpClassificationArchive, LimitUpClassificationDigest
+from app.models.limit_up import LimitUpRecord
+from app.models.stock import Stock
 from app.services.ths_move_analysis_source import ThsMoveAnalysis
 from app.services.ths_limit_up_classification_service import ThsLimitUpClassificationService
 
@@ -155,7 +157,7 @@ def make_realtime_item(
 
 class ThsLimitUpClassificationServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_uses_fast_pool_and_ths_reason_map_without_heavy_realtime_enrichment(self):
-        trade_date = date(2026, 6, 15)
+        trade_date = date(2026, 6, 16)
         realtime = FakeFastRealtimeLimitUpService(
             [
                 make_realtime_item(
@@ -177,7 +179,7 @@ class ThsLimitUpClassificationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["groups"][0]["stocks"][0]["limit_up_reason"], "电力改革+虚拟电厂")
 
     async def test_groups_realtime_items_by_strict_ths_reason_and_preserves_seal_times(self):
-        trade_date = date(2026, 6, 15)
+        trade_date = date(2026, 6, 16)
         service = ThsLimitUpClassificationService(
             realtime_service=FakeRealtimeLimitUpService(
                 [
@@ -519,14 +521,14 @@ class ThsLimitUpClassificationServiceTests(unittest.IsolatedAsyncioTestCase):
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
 
-        trade_date = date(2026, 6, 15)
+        trade_date = date(2026, 6, 16)
         realtime = FakeRealtimeLimitUpService(
             [
                 make_realtime_item(
                     "600406",
                     "国电南瑞",
                     "智能电网+特高压",
-                    first_time=datetime(2026, 6, 15, 9, 36, 0),
+                    first_time=datetime(2026, 6, 16, 9, 36, 0),
                 )
             ]
         )
@@ -559,7 +561,7 @@ class ThsLimitUpClassificationServiceTests(unittest.IsolatedAsyncioTestCase):
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
 
-        trade_date = date(2026, 6, 15)
+        trade_date = date(2026, 6, 16)
         reason = "智能电网+特高压"
         realtime = FakeRealtimeLimitUpService(
             [
@@ -567,7 +569,7 @@ class ThsLimitUpClassificationServiceTests(unittest.IsolatedAsyncioTestCase):
                     "600406",
                     "国电南瑞",
                     reason,
-                    first_time=datetime(2026, 6, 15, 9, 36, 0),
+                    first_time=datetime(2026, 6, 16, 9, 36, 0),
                 )
             ]
         )
@@ -663,6 +665,190 @@ class ThsLimitUpClassificationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["groups"][0]["plate_name"], "PCB铜箔")
         self.assertEqual(payload["groups"][0]["stocks"][0]["stock_code"], "600001")
         self.assertEqual(realtime.requested_dates, [trade_date])
+
+    async def test_non_trading_date_reads_latest_archive_without_realtime_reload(self):
+        engine = create_async_engine(
+            "sqlite+aiosqlite://",
+            future=True,
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        Session = async_sessionmaker(engine, expire_on_commit=False)
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+        async with Session() as session:
+            session.add(
+                LimitUpClassificationArchive(
+                    trade_date=date(2026, 6, 12),
+                    payload_json={
+                        "requested_date": "2026-06-12",
+                        "trade_date": "2026-06-12",
+                        "is_fallback": False,
+                        "updated_at": "2026-06-12T15:06:00",
+                        "source_status": {"classification_archive": "written"},
+                        "classification_method": "rule",
+                        "total_count": 1,
+                        "groups": [
+                            {
+                                "plate_name": "PCB铜箔",
+                                "count": 1,
+                                "sealed_count": 1,
+                                "opened_count": 0,
+                                "earliest_first_limit_time": "09:32:00",
+                                "latest_first_limit_time": "09:32:00",
+                                "stocks": [{"stock_code": "600001", "stock_name": "铜箔科技"}],
+                            }
+                        ],
+                    },
+                    total_count=1,
+                    group_count=1,
+                    content_hash="archive-hash",
+                    source_status={"classification_archive": "written"},
+                )
+            )
+            await session.commit()
+
+        service = ThsLimitUpClassificationService(realtime_service=FailingRealtimeLimitUpService())
+        async with Session() as session:
+            payload = await service.get_classification(date(2026, 6, 13), db=session)
+
+        await engine.dispose()
+
+        self.assertEqual(payload["requested_date"], "2026-06-13")
+        self.assertEqual(payload["trade_date"], "2026-06-12")
+        self.assertTrue(payload["is_fallback"])
+        self.assertEqual(payload["source_status"]["classification_archive"], "hit")
+        self.assertEqual(payload["groups"][0]["plate_name"], "PCB铜箔")
+
+    async def test_current_date_ignores_previous_archive_and_uses_realtime(self):
+        engine = create_async_engine(
+            "sqlite+aiosqlite://",
+            future=True,
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        Session = async_sessionmaker(engine, expire_on_commit=False)
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+        async with Session() as session:
+            session.add(
+                LimitUpClassificationArchive(
+                    trade_date=date(2026, 6, 15),
+                    payload_json={
+                        "requested_date": "2026-06-15",
+                        "trade_date": "2026-06-15",
+                        "is_fallback": False,
+                        "updated_at": "2026-06-15T15:06:00",
+                        "source_status": {"classification_archive": "written"},
+                        "classification_method": "rule",
+                        "total_count": 1,
+                        "groups": [
+                            {
+                                "plate_name": "昨日归档",
+                                "count": 1,
+                                "sealed_count": 1,
+                                "opened_count": 0,
+                                "earliest_first_limit_time": "09:32:00",
+                                "latest_first_limit_time": "09:32:00",
+                                "stocks": [{"stock_code": "600015", "stock_name": "昨日股票"}],
+                            }
+                        ],
+                    },
+                    total_count=1,
+                    group_count=1,
+                    content_hash="previous-archive-hash",
+                    source_status={"classification_archive": "written"},
+                )
+            )
+            await session.commit()
+
+        trade_date = date(2026, 6, 16)
+        realtime = FakeRealtimeLimitUpService(
+            [
+                make_realtime_item(
+                    "600016",
+                    "今日股票",
+                    "AI电源+PCB铜箔",
+                    first_time=datetime(2026, 6, 16, 9, 35, 0),
+                )
+            ]
+        )
+        service = ThsLimitUpClassificationService(realtime_service=realtime)
+
+        async with Session() as session:
+            payload = await service.get_classification(trade_date, db=session)
+
+        await engine.dispose()
+
+        self.assertEqual(realtime.requested_dates, [trade_date])
+        self.assertNotEqual(payload["source_status"].get("classification_archive"), "hit")
+        self.assertEqual(payload["trade_date"], trade_date)
+        self.assertEqual(payload["groups"][0]["stocks"][0]["stock_code"], "600016")
+
+    async def test_historical_unarchived_date_uses_db_without_current_ths_article_analysis(self):
+        engine = create_async_engine(
+            "sqlite+aiosqlite://",
+            future=True,
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        Session = async_sessionmaker(engine, expire_on_commit=False)
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+        async with Session() as session:
+            stock = Stock(stock_code="600001", stock_name="铜箔科技", market="SH")
+            session.add(stock)
+            await session.flush()
+            session.add(
+                LimitUpRecord(
+                    stock_id=stock.id,
+                    trade_date=date(2026, 6, 12),
+                    first_limit_up_time=datetime(2026, 6, 12, 9, 32, 0),
+                    final_seal_time=datetime(2026, 6, 12, 9, 32, 0),
+                    limit_up_reason="PCB铜箔+AI电源",
+                    continuous_limit_up_days=1,
+                    open_count=0,
+                    is_final_sealed=True,
+                    current_status="sealed",
+                    seal_amount=10000.0,
+                    turnover_rate=5.5,
+                    amount=180000.0,
+                )
+            )
+            await session.commit()
+
+        analysis_source = FakeThsMoveAnalysisSource(
+            [
+                ThsMoveAnalysis(
+                    stock_code="600001",
+                    stock_name="铜箔科技",
+                    trade_date=date(2026, 6, 16),
+                    title="涨停雷达：今日错误题材 铜箔科技触及涨停",
+                    summary="异动原因揭秘：今日原因不应该用于历史日期。",
+                    evidence="今日原因不应该用于历史日期。",
+                )
+            ]
+        )
+        service = ThsLimitUpClassificationService(
+            realtime_service=FailingRealtimeLimitUpService(),
+            ths_analysis_source=analysis_source,
+        )
+
+        async with Session() as session:
+            payload = await service.get_classification(date(2026, 6, 12), db=session)
+
+        await engine.dispose()
+
+        self.assertEqual(analysis_source.calls, [])
+        self.assertEqual(payload["source_status"]["realtime_path"], "skipped_historical")
+        self.assertEqual(payload["source_status"]["ths_article_analysis"], "skipped_historical")
+        self.assertEqual(payload["groups"][0]["plate_name"], "PCB铜箔")
+        stock_payload = payload["groups"][0]["stocks"][0]
+        self.assertEqual(stock_payload["classification_basis"], "limit_up_reason")
+        self.assertEqual(stock_payload["ths_move_title"], "")
 
     async def test_falls_back_to_database_records_when_realtime_pool_is_empty(self):
         requested_date = date(2026, 6, 16)
