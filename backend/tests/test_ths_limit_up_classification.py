@@ -156,6 +156,16 @@ def make_realtime_item(
 
 
 class ThsLimitUpClassificationServiceTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.today_patch = patch(
+            "app.services.ths_limit_up_classification_service.today_cn",
+            return_value=date(2026, 6, 16),
+        )
+        self.today_patch.start()
+
+    def tearDown(self):
+        self.today_patch.stop()
+
     async def test_uses_fast_pool_and_ths_reason_map_without_heavy_realtime_enrichment(self):
         trade_date = date(2026, 6, 16)
         realtime = FakeFastRealtimeLimitUpService(
