@@ -9,6 +9,7 @@ export interface LimitUpRecord {
   limit_up_reason?: string
   reason_category?: string
   continuous_limit_up_days: number
+  board_label?: string
   open_count: number
   is_final_sealed: boolean
   current_status?: 'sealed' | 'opened' | 'broken' | 'final_sealed' | 'unknown'
@@ -50,6 +51,7 @@ export interface LimitUpClassificationStock {
   stock_name: string
   trade_date: string
   continuous_limit_up_days: number
+  board_label: string
   current_status: string
   is_sealed: boolean
   open_count: number

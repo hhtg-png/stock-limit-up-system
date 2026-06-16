@@ -61,6 +61,7 @@ class DeepSeekLimitUpClassificationClient:
                 "first_limit_up_time": stock["first_limit_up_time"],
                 "final_seal_time": stock["final_seal_time"],
                 "continuous_limit_up_days": stock["continuous_limit_up_days"],
+                "board_label": stock.get("board_label") or "",
             }
             for stock in stocks
             if stock.get("stock_code")
@@ -496,12 +497,17 @@ class ThsLimitUpClassificationService:
         """Generate DeepSeek classification cache outside the HTTP request path."""
         try:
             async with async_session_maker() as db:
-                items, _ = await self._load_realtime_items(requested_date)
                 trade_date = requested_date
-                if not items:
+                if requested_date != today_cn():
                     items = await self._load_db_items(requested_date, db)
                     if items:
                         trade_date = items[0]["trade_date"]
+                else:
+                    items, _ = await self._load_realtime_items(requested_date)
+                    if not items:
+                        items = await self._load_db_items(requested_date, db)
+                        if items:
+                            trade_date = items[0]["trade_date"]
                 normalized = [self._normalize_item(item, trade_date) for item in items]
                 if not normalized:
                     return
@@ -544,7 +550,7 @@ class ThsLimitUpClassificationService:
             .order_by(LimitUpRecord.first_limit_up_time, Stock.stock_code)
         )
         result = await db.execute(query)
-        return [
+        items = [
             {
                 "stock_code": row[0],
                 "stock_name": row[1],
@@ -563,6 +569,63 @@ class ThsLimitUpClassificationService:
             }
             for row in result.all()
         ]
+        if isinstance(db, AsyncSession):
+            await self._apply_historical_board_labels(items, requested_date, db)
+        else:
+            for item in items:
+                item["board_label"] = self._format_board_label("", int(item.get("continuous_limit_up_days") or 1))
+        return items
+
+    async def _apply_historical_board_labels(
+        self,
+        items: List[Dict[str, Any]],
+        requested_date: date,
+        db: AsyncSession,
+    ) -> None:
+        if not items:
+            return
+
+        trade_date = items[0].get("trade_date") or requested_date
+        max_window = max(int(item.get("continuous_limit_up_days") or 1) for item in items)
+        max_window = max(1, min(max_window, 10))
+        if max_window <= 1:
+            for item in items:
+                item["board_label"] = "首板"
+            return
+
+        recent_date_result = await db.execute(
+            select(LimitUpRecord.trade_date)
+            .where(LimitUpRecord.trade_date <= trade_date)
+            .group_by(LimitUpRecord.trade_date)
+            .order_by(LimitUpRecord.trade_date.desc())
+            .limit(max_window)
+        )
+        recent_dates = [row[0] for row in recent_date_result.all()]
+        if not recent_dates:
+            for item in items:
+                item["board_label"] = self._format_board_label("", int(item.get("continuous_limit_up_days") or 1))
+            return
+
+        codes = [str(item.get("stock_code") or "") for item in items if item.get("stock_code")]
+        record_result = await db.execute(
+            select(Stock.stock_code, LimitUpRecord.trade_date)
+            .join(Stock, LimitUpRecord.stock_id == Stock.id)
+            .where(Stock.stock_code.in_(codes), LimitUpRecord.trade_date.in_(recent_dates))
+        )
+        dates_by_code: Dict[str, set[date]] = defaultdict(set)
+        for code, record_date in record_result.all():
+            dates_by_code[str(code)].add(record_date)
+
+        for item in items:
+            window_days = int(item.get("continuous_limit_up_days") or 1)
+            code = str(item.get("stock_code") or "")
+            stock_dates = dates_by_code.get(code, set())
+            board_count = sum(1 for record_date in recent_dates[:window_days] if record_date in stock_dates)
+            if window_days > board_count > 1:
+                item["continuous_limit_up_days"] = board_count
+                item["board_label"] = f"{window_days}天{board_count}板"
+            else:
+                item["board_label"] = self._format_board_label("", int(item.get("continuous_limit_up_days") or 1))
 
     async def _apply_ai_classification(
         self,
@@ -582,6 +645,15 @@ class ThsLimitUpClassificationService:
             return self._apply_ai_payload(stocks, payload), "ai"
 
         if not force:
+            if existing and existing.status == "ready" and trade_date != today_cn():
+                payload = dict(existing.classifications_json or {})
+                next_stocks = self._apply_ai_payload(stocks, payload)
+                applied_count = self._ai_applied_count(next_stocks)
+                if applied_count:
+                    source_status["ai_classification"] = "cache_stale_partial_hit"
+                    source_status["ai_model"] = existing.model or ""
+                    source_status["ai_applied_count"] = str(applied_count)
+                    return next_stocks, "ai"
             source_status["ai_classification"] = "cache_stale" if existing else "cache_miss"
             if existing and existing.model:
                 source_status["ai_model"] = existing.model
@@ -693,6 +765,10 @@ class ThsLimitUpClassificationService:
             next_stock["ai_keywords"] = DeepSeekLimitUpClassificationClient._clean_keywords(item.get("keywords"))
             applied.append(next_stock)
         return applied
+
+    @staticmethod
+    def _ai_applied_count(stocks: List[Dict[str, Any]]) -> int:
+        return sum(1 for stock in stocks if stock.get("classification_method") == "ai")
 
     async def _apply_ths_article_analysis(
         self,
@@ -882,6 +958,7 @@ class ThsLimitUpClassificationService:
                 "first_limit_up_time": stock["first_limit_up_time"],
                 "final_seal_time": stock["final_seal_time"],
                 "continuous_limit_up_days": stock["continuous_limit_up_days"],
+                "board_label": stock.get("board_label") or "",
             }
             for stock in sorted(stocks, key=lambda item: item["stock_code"])
         ]
@@ -918,11 +995,13 @@ class ThsLimitUpClassificationService:
         rule_classified_plate = fine_themes[0] if fine_themes else self.classify_reason(reason)
         primary_theme = rule_classified_plate
         fine_theme = fine_themes[0] if fine_themes else rule_classified_plate
+        board_count = int(item.get("continuous_limit_up_days") or 1)
         return {
             "stock_code": item.get("stock_code", ""),
             "stock_name": item.get("stock_name", ""),
             "trade_date": item.get("trade_date") or default_trade_date,
-            "continuous_limit_up_days": int(item.get("continuous_limit_up_days") or 1),
+            "continuous_limit_up_days": board_count,
+            "board_label": self._format_board_label(item.get("board_label"), board_count),
             "current_status": current_status,
             "is_sealed": is_sealed,
             "open_count": int(item.get("open_count") or 0),
@@ -1261,6 +1340,17 @@ class ThsLimitUpClassificationService:
             text = value.strip()
             return text[-8:] if len(text) >= 8 else text
         return ""
+
+    @staticmethod
+    def _format_board_label(value: Any, board_count: int) -> str:
+        text = str(value or "").strip()
+        if text:
+            text = text.replace("连板", "板")
+            if text in {"1板", "首板"}:
+                return "首板"
+            if re.fullmatch(r"\d+天\d+板", text) or re.fullmatch(r"\d+板", text):
+                return text
+        return f"{board_count}板" if board_count > 1 else "首板"
 
 
 from app.services.tdx_plugin_service import tdx_plugin_service  # noqa: E402
