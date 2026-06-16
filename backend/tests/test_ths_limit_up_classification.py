@@ -48,9 +48,11 @@ class FakeAiClassificationClient:
         self.status = status
         self.calls = []
         self.model = "deepseek-test"
+        self.last_stocks = []
 
     async def classify_limit_up_reasons(self, trade_date, stocks):
         self.calls.append((trade_date, [stock["stock_code"] for stock in stocks]))
+        self.last_stocks = [dict(stock) for stock in stocks]
         return {
             "model": self.model,
             "model_status": self.status,
@@ -67,6 +69,16 @@ class CountingAiClassificationClient(FakeAiClassificationClient):
     async def classify_limit_up_reasons(self, trade_date, stocks):
         self.calls.append((trade_date, [stock["stock_code"] for stock in stocks]))
         return await super().classify_limit_up_reasons(trade_date, stocks)
+
+
+class FakeThsMoveService:
+    def __init__(self, payloads):
+        self.payloads = payloads
+        self.calls = []
+
+    async def get_stock_move(self, stock_code, trade_date, *, source_scope="mixed", db=None):
+        self.calls.append((stock_code, trade_date, source_scope, db is not None))
+        return self.payloads.get(stock_code, {"items": [], "source_status": {"stock_move": "empty"}})
 
 
 class FakeRowsResult:
@@ -218,6 +230,168 @@ class ThsLimitUpClassificationServiceTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(reason=reason):
                 self.assertEqual(service.classify_reason(reason), expected)
                 self.assertEqual(service.extract_fine_themes(reason)[0], expected)
+
+    async def test_prefers_ths_move_interpretation_for_fine_theme_grouping(self):
+        engine = create_async_engine(
+            "sqlite+aiosqlite://",
+            future=True,
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        Session = async_sessionmaker(engine, expire_on_commit=False)
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+        trade_date = date(2026, 6, 16)
+        realtime = FakeRealtimeLimitUpService(
+            [
+                make_realtime_item(
+                    "600001",
+                    "铜箔科技",
+                    "AI算力+PCB概念",
+                    first_time=datetime(2026, 6, 16, 9, 32, 0),
+                )
+            ]
+        )
+        ths_move_service = FakeThsMoveService(
+            {
+                "600001": {
+                    "items": [
+                        {
+                            "stock_code": "600001",
+                            "reasons": [
+                                {
+                                    "source": "同花顺",
+                                    "title": "PCB铜箔+AI电源",
+                                    "content": "公司铜箔产品用于AI服务器电源和高速PCB材料方向。",
+                                }
+                            ],
+                            "concepts": ["PCB铜箔", "AI电源"],
+                        }
+                    ],
+                    "source_status": {"stock_move": "ok"},
+                }
+            }
+        )
+        service = ThsLimitUpClassificationService(
+            realtime_service=realtime,
+            ths_move_service=ths_move_service,
+        )
+
+        async with Session() as session:
+            payload = await service.get_classification(trade_date, db=session)
+
+        await engine.dispose()
+
+        self.assertEqual(ths_move_service.calls, [("600001", trade_date, "ths", True)])
+        self.assertEqual(payload["source_status"]["ths_move_classification"], "ok")
+        self.assertEqual(payload["source_status"]["classification_granularity"], "ths_move_fine_theme")
+        self.assertEqual(payload["groups"][0]["plate_name"], "PCB铜箔")
+        stock = payload["groups"][0]["stocks"][0]
+        self.assertEqual(stock["classified_plate"], "PCB铜箔")
+        self.assertEqual(stock["rule_classified_plate"], "PCB铜箔")
+        self.assertEqual(stock["fine_themes"][:2], ["PCB铜箔", "AI电源"])
+        self.assertNotIn("AI算力", stock["fine_themes"])
+        self.assertEqual(stock["classification_basis"], "ths_move")
+        self.assertEqual(stock["ths_move_title"], "PCB铜箔+AI电源")
+        self.assertIn("AI服务器电源", stock["ths_move_summary"])
+
+    async def test_ths_move_error_falls_back_to_limit_up_reason_classification(self):
+        class ErrorThsMoveService:
+            async def get_stock_move(self, stock_code, trade_date, *, source_scope="mixed", db=None):
+                raise RuntimeError("ths move unavailable")
+
+        engine = create_async_engine(
+            "sqlite+aiosqlite://",
+            future=True,
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        Session = async_sessionmaker(engine, expire_on_commit=False)
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+        trade_date = date(2026, 6, 16)
+        service = ThsLimitUpClassificationService(
+            realtime_service=FakeRealtimeLimitUpService(
+                [
+                    make_realtime_item(
+                        "600002",
+                        "电源科技",
+                        "AI电源+英伟达",
+                        first_time=datetime(2026, 6, 16, 9, 35, 0),
+                    )
+                ]
+            ),
+            ths_move_service=ErrorThsMoveService(),
+        )
+
+        async with Session() as session:
+            payload = await service.get_classification(trade_date, db=session)
+
+        await engine.dispose()
+
+        self.assertEqual(payload["source_status"]["ths_move_classification"], "error")
+        self.assertEqual(payload["groups"][0]["plate_name"], "AI电源")
+        stock = payload["groups"][0]["stocks"][0]
+        self.assertEqual(stock["classification_basis"], "limit_up_reason")
+        self.assertEqual(stock["ths_move_title"], "")
+
+    async def test_forced_ai_receives_ths_move_interpretation_context(self):
+        engine = create_async_engine(
+            "sqlite+aiosqlite://",
+            future=True,
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        Session = async_sessionmaker(engine, expire_on_commit=False)
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+        trade_date = date(2026, 6, 16)
+        ai_client = FakeAiClassificationClient(
+            [{"stock_code": "600003", "plate_name": "PCB铜箔", "confidence": 0.96}]
+        )
+        service = ThsLimitUpClassificationService(
+            realtime_service=FakeRealtimeLimitUpService(
+                [
+                    make_realtime_item(
+                        "600003",
+                        "材料科技",
+                        "AI算力+PCB概念",
+                        first_time=datetime(2026, 6, 16, 9, 38, 0),
+                    )
+                ]
+            ),
+            ths_move_service=FakeThsMoveService(
+                {
+                    "600003": {
+                        "items": [
+                            {
+                                "stock_code": "600003",
+                                "reasons": [
+                                    {
+                                        "source": "同花顺",
+                                        "title": "PCB铜箔+AI电源",
+                                        "content": "同花顺异动解读指向PCB铜箔方向。",
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                }
+            ),
+            ai_classification_client=ai_client,
+        )
+
+        async with Session() as session:
+            await service.get_classification(trade_date, db=session, force_ai=True)
+
+        await engine.dispose()
+
+        self.assertEqual(ai_client.last_stocks[0]["classification_basis"], "ths_move")
+        self.assertEqual(ai_client.last_stocks[0]["ths_move_title"], "PCB铜箔+AI电源")
+        self.assertEqual(ai_client.last_stocks[0]["rule_classified_plate"], "PCB铜箔")
 
     async def test_missing_ai_cache_uses_rule_classification_until_forced(self):
         engine = create_async_engine(

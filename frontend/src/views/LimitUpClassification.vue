@@ -145,6 +145,11 @@
                 </div>
               </template>
             </el-table-column>
+            <el-table-column label="同花顺异动解读" min-width="190" show-overflow-tooltip>
+              <template #default="{ row }">
+                {{ row.ths_move_title || '-' }}
+              </template>
+            </el-table-column>
             <el-table-column label="封单(万)" width="100" align="right">
               <template #default="{ row }">
                 {{ formatWan(row.seal_amount) }}
@@ -196,6 +201,10 @@
                 </el-tag>
               </div>
               <p v-if="stock.ai_reason_summary" class="ai-summary">{{ stock.ai_reason_summary }}</p>
+              <p v-if="stock.ths_move_title" class="move-summary">
+                同花顺异动解读：{{ stock.ths_move_title }}
+              </p>
+              <p v-if="stock.ths_move_summary" class="move-summary">{{ stock.ths_move_summary }}</p>
               <p>{{ stock.limit_up_reason || '暂无同花顺涨停原因' }}</p>
             </article>
           </div>
@@ -228,6 +237,9 @@ const errorMessage = ref('')
 const groups = computed<LimitUpClassificationGroup[]>(() => classification.value?.groups || [])
 const sourceText = computed(() => {
   const status = classification.value?.source_status || {}
+  if (status.ths_move_classification === 'ok' || status.ths_move_classification === 'partial') {
+    return '实时池+同花顺异动'
+  }
   if (status.limit_up_pool === 'ok') return '实时池+同花顺'
   if (status.limit_up_db === 'ok') return '历史缓存'
   return '同花顺'
@@ -239,6 +251,8 @@ const classificationText = computed(() => {
   if (status.ai_classification === 'refresh_scheduled') return 'AI生成中'
   if (status.ai_classification === 'missing_api_key') return '规则分类'
   if (status.ai_classification === 'error') return '规则分类'
+  if (status.ths_move_classification === 'ok') return '异动解读规则'
+  if (status.ths_move_classification === 'partial') return '异动解读+短原因'
   return classification.value?.classification_method === 'ai' ? 'DeepSeek分类' : '规则分类'
 })
 
@@ -301,11 +315,14 @@ function openStock(row: LimitUpClassificationStock) {
 }
 
 function classificationLabel(row: LimitUpClassificationStock) {
-  if (row.classification_method !== 'ai') return '规则'
+  if (row.classification_method !== 'ai') {
+    return row.classification_basis === 'ths_move' ? '异动解读' : '短原因'
+  }
   return row.ai_confidence ? `AI ${(row.ai_confidence * 100).toFixed(0)}%` : 'AI'
 }
 
 function classificationTagType(row: LimitUpClassificationStock) {
+  if (row.classification_method !== 'ai' && row.classification_basis === 'ths_move') return 'primary'
   return row.classification_method === 'ai' ? 'success' : 'info'
 }
 
@@ -555,6 +572,11 @@ onMounted(() => {
     .ai-summary {
       margin-bottom: 5px;
       color: #166534;
+    }
+
+    .move-summary {
+      margin-bottom: 5px;
+      color: #1f2937;
     }
   }
 
