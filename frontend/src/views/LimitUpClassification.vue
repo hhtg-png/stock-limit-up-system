@@ -130,6 +130,21 @@
                 </el-tag>
               </template>
             </el-table-column>
+            <el-table-column label="细分题材" min-width="170">
+              <template #default="{ row }">
+                <div class="theme-tags">
+                  <el-tag
+                    v-for="theme in row.fine_themes"
+                    :key="theme"
+                    size="small"
+                    effect="plain"
+                  >
+                    {{ theme }}
+                  </el-tag>
+                  <span v-if="!row.fine_themes?.length">-</span>
+                </div>
+              </template>
+            </el-table-column>
             <el-table-column label="封单(万)" width="100" align="right">
               <template #default="{ row }">
                 {{ formatWan(row.seal_amount) }}
@@ -169,6 +184,16 @@
                 <span>回封 {{ stock.final_seal_time || '-' }}</span>
                 <span>{{ stock.continuous_limit_up_days > 1 ? `${stock.continuous_limit_up_days}板` : '首板' }}</span>
                 <span>{{ classificationLabel(stock) }}</span>
+              </div>
+              <div v-if="stock.fine_themes?.length" class="theme-tags">
+                <el-tag
+                  v-for="theme in stock.fine_themes"
+                  :key="theme"
+                  size="small"
+                  effect="plain"
+                >
+                  {{ theme }}
+                </el-tag>
               </div>
               <p v-if="stock.ai_reason_summary" class="ai-summary">{{ stock.ai_reason_summary }}</p>
               <p>{{ stock.limit_up_reason || '暂无同花顺涨停原因' }}</p>
@@ -421,6 +446,13 @@ onMounted(() => {
   }
 }
 
+.theme-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  align-items: center;
+}
+
 .classification-card-list {
   display: none;
 }
@@ -539,6 +571,10 @@ onMounted(() => {
       color: #4b5563;
       font-size: 12px;
     }
+  }
+
+  .theme-tags {
+    margin-bottom: 8px;
   }
 }
 </style>

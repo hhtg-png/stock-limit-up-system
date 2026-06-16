@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 from collections import defaultdict
 from datetime import date, datetime, time
 from typing import Any, Dict, Iterable, List, Optional
@@ -48,6 +49,7 @@ class DeepSeekLimitUpClassificationClient:
                 "stock_name": stock["stock_name"],
                 "limit_up_reason": stock["limit_up_reason"],
                 "rule_classified_plate": stock["rule_classified_plate"],
+                "fine_themes": stock.get("fine_themes") or [],
                 "first_limit_up_time": stock["first_limit_up_time"],
                 "final_seal_time": stock["final_seal_time"],
                 "continuous_limit_up_days": stock["continuous_limit_up_days"],
@@ -59,10 +61,10 @@ class DeepSeekLimitUpClassificationClient:
             payload = await self.summary_client._request_json(
                 "你是A股涨停同花顺原因分类助手。只根据输入的同花顺涨停原因分类，只输出JSON。",
                 (
-                    "请把每只股票归入当天最合适的主导题材板块。严格要求："
+                    "请把每只股票归入当天最合适的主导细分炒作题材。严格要求："
                     "1. 只能依据limit_up_reason字段，不补充外部新闻或其它来源；"
-                    "2. 复合原因按当天主导题材语义分类，避免仅因'智能'等泛词误归人工智能；"
-                    "3. plate_name用简短中文题材名，如电力设备、机器人、半导体、业绩增长；"
+                    "2. 复合原因按细分炒作方向分类，禁止输出人工智能、半导体、新能源等宽泛大类；"
+                    "3. plate_name用简短中文细分题材名，如PCB铜箔、AI电源、AI算力PCB、高速覆铜板、人形机器人；"
                     "4. confidence为0到1的小数；"
                     "5. reason_summary一句话说明分类依据；"
                     "6. keywords提取1到4个同花顺原因关键词。"
@@ -155,6 +157,64 @@ class DeepSeekLimitUpClassificationClient:
 class ThsLimitUpClassificationService:
     """Group A-share limit-up stocks by deterministic THS reason rules."""
 
+    _FINE_THEME_ALIASES = (
+        ("AI服务器电源", "AI电源"),
+        ("AI算力电源", "AI电源"),
+        ("AI电源", "AI电源"),
+        ("PCB铜箔", "PCB铜箔"),
+        ("复合铜箔", "复合铜箔"),
+        ("PET铜箔", "PET铜箔"),
+        ("AI算力PCB", "AI算力PCB"),
+        ("AI服务器PCB", "AI服务器PCB"),
+        ("高速覆铜板", "高速覆铜板"),
+        ("高速电子树脂", "高速电子树脂"),
+        ("PCB化学品", "PCB化学品"),
+        ("覆铜板", "覆铜板"),
+        ("电子布", "电子布"),
+        ("玻璃基板", "玻璃基板"),
+        ("先进封装", "先进封装"),
+        ("功率半导体", "功率半导体"),
+        ("半导体靶材", "半导体靶材"),
+        ("存储芯片", "存储芯片"),
+        ("光通信芯片", "光通信芯片"),
+        ("人形机器人", "人形机器人"),
+        ("机器人线缆", "机器人线缆"),
+        ("工业机器人", "工业机器人"),
+        ("机器人", "机器人"),
+        ("减速器", "减速器"),
+        ("AI眼镜电池", "AI眼镜电池"),
+        ("固态电池", "固态电池"),
+        ("智能电网", "智能电网"),
+        ("特高压", "特高压"),
+        ("输变电", "输变电设备"),
+        ("数据中心", "数据中心"),
+        ("算力租赁", "算力租赁"),
+        ("AI算力", "AI算力"),
+    )
+
+    _LOW_SIGNAL_THEME_KEYWORDS = (
+        "股权激励",
+        "定增",
+        "审核通过",
+        "H股",
+        "递表",
+        "一季报",
+        "年报",
+        "半年报",
+        "业绩",
+        "分红",
+        "权益分派",
+        "风险提示",
+        "控股股东",
+        "总裁受让",
+        "市占率",
+        "龙头",
+        "国资",
+        "央企",
+        "国企",
+        "中科院",
+    )
+
     _CATEGORY_KEYWORDS = {
         "人工智能": [
             "AI",
@@ -196,6 +256,7 @@ class ThsLimitUpClassificationService:
     ) -> Dict[str, Any]:
         source_status = {
             "classification_scope": "strict_ths",
+            "classification_granularity": "fine_theme",
             "limit_up_pool": "ok",
             "ths_reason": "ok",
             "ai_classification": "not_requested",
@@ -428,6 +489,7 @@ class ThsLimitUpClassificationService:
                 "stock_name": stock["stock_name"],
                 "limit_up_reason": stock["limit_up_reason"],
                 "rule_classified_plate": stock["rule_classified_plate"],
+                "fine_themes": stock.get("fine_themes") or [],
                 "first_limit_up_time": stock["first_limit_up_time"],
                 "final_seal_time": stock["final_seal_time"],
                 "continuous_limit_up_days": stock["continuous_limit_up_days"],
@@ -441,7 +503,8 @@ class ThsLimitUpClassificationService:
         is_sealed = bool(item.get("is_sealed", item.get("is_final_sealed", True)))
         current_status = item.get("current_status") or ("sealed" if is_sealed else "opened")
         reason = item.get("limit_up_reason") or ""
-        rule_classified_plate = self.classify_reason(reason)
+        fine_themes = self.extract_fine_themes(reason)
+        rule_classified_plate = fine_themes[0] if fine_themes else self.classify_reason(reason)
         return {
             "stock_code": item.get("stock_code", ""),
             "stock_name": item.get("stock_name", ""),
@@ -455,6 +518,7 @@ class ThsLimitUpClassificationService:
             "limit_up_reason": reason,
             "classified_plate": rule_classified_plate,
             "rule_classified_plate": rule_classified_plate,
+            "fine_themes": fine_themes,
             "classification_method": "rule",
             "ai_confidence": 0.0,
             "ai_reason_summary": "",
@@ -496,6 +560,46 @@ class ThsLimitUpClassificationService:
 
     @classmethod
     def classify_reason(cls, reason: str) -> str:
+        fine_themes = cls.extract_fine_themes(reason, limit=1)
+        if fine_themes:
+            return fine_themes[0]
+        return cls._classify_broad_reason(reason)
+
+    @classmethod
+    def extract_fine_themes(cls, reason: str, limit: int = 4) -> List[str]:
+        themes: List[str] = []
+        for raw_part in cls._split_reason(reason):
+            theme = cls._normalize_fine_theme(raw_part)
+            if not theme or theme in themes:
+                continue
+            themes.append(theme)
+            if len(themes) >= limit:
+                break
+        return themes
+
+    @classmethod
+    def _normalize_fine_theme(cls, raw_theme: str) -> str:
+        theme = re.sub(r"\s+", "", raw_theme or "")
+        theme = theme.strip("：:（）()[]【】")
+        if not theme:
+            return ""
+        theme = re.sub(r"[ⅠⅡⅢIV]+$", "", theme)
+        theme = re.sub(r"(概念|板块|方向|业务|应用)$", "", theme)
+        if cls._is_low_signal_theme(theme):
+            return ""
+        for keyword, canonical in cls._FINE_THEME_ALIASES:
+            if keyword in theme:
+                return canonical
+        if len(theme) > 18:
+            return ""
+        return theme
+
+    @classmethod
+    def _is_low_signal_theme(cls, theme: str) -> bool:
+        return any(keyword in theme for keyword in cls._LOW_SIGNAL_THEME_KEYWORDS)
+
+    @classmethod
+    def _classify_broad_reason(cls, reason: str) -> str:
         text = reason or ""
         if not text:
             return "其他"
@@ -508,7 +612,18 @@ class ThsLimitUpClassificationService:
 
     @staticmethod
     def _split_reason(reason: str) -> List[str]:
-        normalized = reason.replace("/", "+").replace("，", "+").replace("、", "+").replace(",", "+")
+        normalized = (
+            reason.replace("/", "+")
+            .replace("＋", "+")
+            .replace("／", "+")
+            .replace("，", "+")
+            .replace("、", "+")
+            .replace(",", "+")
+            .replace("；", "+")
+            .replace(";", "+")
+            .replace("|", "+")
+            .replace("｜", "+")
+        )
         return [part.strip() for part in normalized.split("+") if part.strip()]
 
     @staticmethod

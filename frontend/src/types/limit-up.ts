@@ -58,6 +58,7 @@ export interface LimitUpClassificationStock {
   limit_up_reason: string
   classified_plate: string
   rule_classified_plate: string
+  fine_themes: string[]
   classification_method: 'ai' | 'rule'
   ai_confidence: number
   ai_reason_summary: string

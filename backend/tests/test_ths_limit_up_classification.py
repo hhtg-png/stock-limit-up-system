@@ -147,7 +147,7 @@ class ThsLimitUpClassificationServiceTests(unittest.IsolatedAsyncioTestCase):
                     make_realtime_item(
                         "603000",
                         "人民网",
-                        "AI大模型+数据要素",
+                        "AI电源+英伟达+股权激励",
                         first_time=datetime(2026, 6, 15, 9, 31, 20),
                         final_time=datetime(2026, 6, 15, 9, 45, 5),
                         board=2,
@@ -155,7 +155,7 @@ class ThsLimitUpClassificationServiceTests(unittest.IsolatedAsyncioTestCase):
                     make_realtime_item(
                         "002230",
                         "科大讯飞",
-                        "人工智能+机器人",
+                        "AI电源+机器人",
                         first_time=datetime(2026, 6, 15, 10, 2, 1),
                         sealed=False,
                         open_count=1,
@@ -163,7 +163,7 @@ class ThsLimitUpClassificationServiceTests(unittest.IsolatedAsyncioTestCase):
                     make_realtime_item(
                         "300750",
                         "宁德时代",
-                        "锂电池+储能",
+                        "固态电池+储能",
                         first_time=datetime(2026, 6, 15, 9, 40, 0),
                     ),
                 ]
@@ -185,7 +185,7 @@ class ThsLimitUpClassificationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["total_count"], 3)
 
         ai_group = payload["groups"][0]
-        self.assertEqual(ai_group["plate_name"], "人工智能")
+        self.assertEqual(ai_group["plate_name"], "AI电源")
         self.assertEqual(ai_group["count"], 2)
         self.assertEqual(ai_group["sealed_count"], 1)
         self.assertEqual(ai_group["opened_count"], 1)
@@ -194,12 +194,30 @@ class ThsLimitUpClassificationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([stock["stock_code"] for stock in ai_group["stocks"]], ["603000", "002230"])
         self.assertEqual(ai_group["stocks"][0]["first_limit_up_time"], "09:31:20")
         self.assertEqual(ai_group["stocks"][0]["final_seal_time"], "09:45:05")
+        self.assertEqual(ai_group["stocks"][0]["fine_themes"], ["AI电源", "英伟达"])
         self.assertEqual(ai_group["stocks"][1]["current_status"], "opened")
         self.assertEqual(ai_group["stocks"][1]["final_seal_time"], "")
 
         new_energy_group = payload["groups"][1]
-        self.assertEqual(new_energy_group["plate_name"], "新能源")
-        self.assertEqual(new_energy_group["stocks"][0]["classified_plate"], "新能源")
+        self.assertEqual(new_energy_group["plate_name"], "固态电池")
+        self.assertEqual(new_energy_group["stocks"][0]["classified_plate"], "固态电池")
+
+    async def test_classifies_by_fine_grained_ths_speculation_theme(self):
+        service = ThsLimitUpClassificationService(realtime_service=FakeRealtimeLimitUpService([]))
+
+        examples = {
+            "PCB铜箔+复合铜箔+PET铜箔": "PCB铜箔",
+            "AI电源+英伟达+H股发行": "AI电源",
+            "AI算力PCB+存储芯片": "AI算力PCB",
+            "高速覆铜板+环氧树脂+先进封装": "高速覆铜板",
+            "智能电网+特高压": "智能电网",
+            "定增审核通过+AI眼镜电池+机器人+固态电池": "AI眼镜电池",
+        }
+
+        for reason, expected in examples.items():
+            with self.subTest(reason=reason):
+                self.assertEqual(service.classify_reason(reason), expected)
+                self.assertEqual(service.extract_fine_themes(reason)[0], expected)
 
     async def test_missing_ai_cache_uses_rule_classification_until_forced(self):
         engine = create_async_engine(
@@ -239,7 +257,7 @@ class ThsLimitUpClassificationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ai_client.calls, [])
         self.assertEqual(payload["classification_method"], "rule")
         self.assertEqual(payload["source_status"]["ai_classification"], "cache_miss")
-        self.assertEqual(payload["groups"][0]["plate_name"], "人工智能")
+        self.assertEqual(payload["groups"][0]["plate_name"], "智能电网")
 
     async def test_deepseek_cache_overrides_rule_plate_without_changing_ths_reason(self):
         engine = create_async_engine(
@@ -300,7 +318,7 @@ class ThsLimitUpClassificationServiceTests(unittest.IsolatedAsyncioTestCase):
         stock = first_payload["groups"][0]["stocks"][0]
         self.assertEqual(stock["limit_up_reason"], reason)
         self.assertEqual(stock["classified_plate"], "电力设备")
-        self.assertEqual(stock["rule_classified_plate"], "人工智能")
+        self.assertEqual(stock["rule_classified_plate"], "智能电网")
         self.assertEqual(stock["classification_method"], "ai")
         self.assertEqual(stock["ai_confidence"], 0.93)
         self.assertEqual(stock["ai_keywords"], ["智能电网", "特高压"])
@@ -345,7 +363,7 @@ class ThsLimitUpClassificationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(payload["is_fallback"])
         self.assertEqual(payload["source_status"]["limit_up_pool"], "empty")
         self.assertEqual(payload["source_status"]["limit_up_db"], "ok")
-        self.assertEqual(payload["groups"][0]["plate_name"], "人工智能")
+        self.assertEqual(payload["groups"][0]["plate_name"], "AI算力")
         self.assertEqual(payload["groups"][0]["stocks"][0]["first_limit_up_time"], "09:35:00")
         self.assertEqual(payload["groups"][0]["stocks"][0]["final_seal_time"], "10:08:30")
 
