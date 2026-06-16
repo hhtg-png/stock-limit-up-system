@@ -300,6 +300,7 @@ import type {
   IntelligenceSyncResult,
   ObsidianStatus
 } from '@/types/intelligence'
+import { filterVisibleDailyInfoSearchResults } from '@/utils/dailyInfoSearch'
 
 const selectedDate = ref(dayjs().format('YYYY-MM-DD'))
 const dailyInfo = ref<DailyInfoResponse | null>(null)
@@ -575,8 +576,9 @@ async function searchData() {
   errorMessage.value = ''
   try {
     const response = await searchDailyInfo(keyword)
-    historyItems.value = response.items
-    dailyInfo.value = response.items[0] || null
+    const filteredItems = filterVisibleDailyInfoSearchResults(response.items, keyword)
+    historyItems.value = filteredItems
+    dailyInfo.value = filteredItems[0] || null
     if (dailyInfo.value) {
       selectedDate.value = dailyInfo.value.trade_date
     }
