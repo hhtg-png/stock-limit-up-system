@@ -10,8 +10,19 @@ class FakeScalarResult:
     def __init__(self, value):
         self.value = value
 
+    def scalar(self):
+        return self.value
+
     def scalar_one_or_none(self):
         return self.value
+
+
+class FakeAllResult:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def all(self):
+        return self.rows
 
 
 class FakeScalars:
@@ -50,7 +61,7 @@ def make_stock():
     )
 
 
-def make_record(trade_date):
+def make_record(trade_date, continuous_limit_up_days=1, seal_amount=12345.0):
     return SimpleNamespace(
         id=10,
         stock_id=1,
@@ -59,12 +70,14 @@ def make_record(trade_date):
         final_seal_time=datetime(2026, 5, 8, 14, 30, 0),
         limit_up_reason="锂电池",
         reason_category="题材",
-        continuous_limit_up_days=1,
+        continuous_limit_up_days=continuous_limit_up_days,
         open_count=0,
         is_final_sealed=True,
         current_status="sealed",
-        seal_amount=12345.0,
+        seal_amount=seal_amount,
+        seal_volume=None,
         limit_up_price=42.5,
+        close_price=42.5,
         turnover_rate=8.6,
         amount=98765.0,
         data_source="TEST",
@@ -75,7 +88,7 @@ class LimitUpDetailApiTests(unittest.IsolatedAsyncioTestCase):
     async def test_get_realtime_limit_up_defaults_unknown_continuous_days_to_first_board(self):
         trade_date = date(2026, 6, 16)
 
-        with patch.object(
+        with patch("app.api.v1.limit_up.today_cn", return_value=trade_date), patch.object(
             limit_up.realtime_limit_up_service,
             "get_realtime_limit_up_list",
             AsyncMock(
@@ -105,6 +118,35 @@ class LimitUpDetailApiTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(response.data[0].continuous_limit_up_days, 1)
+
+    async def test_get_realtime_limit_up_reads_historical_date_from_database_first(self):
+        today = date(2026, 6, 18)
+        requested_date = date(2026, 6, 16)
+        stock = make_stock()
+        record = make_record(requested_date, continuous_limit_up_days=2, seal_amount=5000)
+        db = SequencedSession([
+            FakeScalarResult(1),
+            FakeAllResult([(record, stock)]),
+        ])
+
+        with patch("app.api.v1.limit_up.today_cn", return_value=today), patch.object(
+            limit_up.realtime_limit_up_service,
+            "get_realtime_limit_up_list",
+            AsyncMock(side_effect=AssertionError("historical date should read database first")),
+        ):
+            response = await limit_up.get_realtime_limit_up(
+                requested_date,
+                continuous_days=2,
+                reason_category=None,
+                sort_by="seal_amount",
+                db=db,
+            )
+
+        self.assertEqual(response.trade_date, requested_date)
+        self.assertFalse(response.is_fallback)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0].stock_code, "002466")
+        self.assertEqual(response.data[0].continuous_limit_up_days, 2)
 
     async def test_get_limit_up_detail_falls_back_to_latest_available_record_date(self):
         requested_date = date(2026, 5, 12)
