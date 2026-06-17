@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from app.api.v1 import limit_up
+from app.services.data_init_service import DataInitService
 
 
 class FakeScalarResult:
@@ -45,10 +46,25 @@ class SequencedSession:
     def __init__(self, results):
         self.results = list(results)
         self.queries = []
+        self.commit_count = 0
 
     async def execute(self, query):
         self.queries.append(query)
         return self.results.pop(0)
+
+    async def commit(self):
+        self.commit_count += 1
+
+
+class FakeAsyncSessionContext:
+    def __init__(self, session):
+        self.session = session
+
+    async def __aenter__(self):
+        return self.session
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
 
 
 def make_stock():
@@ -90,6 +106,78 @@ def make_record(
 
 
 class LimitUpDetailApiTests(unittest.IsolatedAsyncioTestCase):
+    def test_data_init_existing_record_update_persists_seal_fields(self):
+        service = DataInitService()
+        record = make_record(
+            date(2026, 6, 17),
+            continuous_limit_up_days=1,
+            seal_amount=0,
+            current_status="unknown",
+        )
+
+        service._update_existing_limit_up_record(
+            record,
+            {
+                "seal_amount": 8888.0,
+                "limit_up_price": 12.3,
+                "amount": 99999.0,
+                "turnover_rate": 4.2,
+                "is_final_sealed": True,
+                "open_count": 0,
+                "continuous_limit_up_days": 2,
+            },
+            turnover_rate=4.2,
+        )
+
+        self.assertEqual(record.seal_amount, 8888.0)
+        self.assertEqual(record.continuous_limit_up_days, 2)
+        self.assertEqual(record.current_status, "sealed")
+
+    async def test_refresh_limit_up_data_updates_seal_amount_without_marking_resealed_opened(self):
+        trade_date = date(2026, 6, 17)
+        stock = make_stock()
+        record = make_record(
+            trade_date,
+            continuous_limit_up_days=2,
+            seal_amount=0,
+            current_status="opened",
+        )
+        db = SequencedSession([FakeAllResult([(record, stock)])])
+        final_time = datetime(2026, 6, 17, 9, 25, 0)
+
+        with patch(
+            "app.api.v1.limit_up.async_session_maker",
+            return_value=FakeAsyncSessionContext(db),
+        ), patch(
+            "app.crawlers.kaipanla_crawler.kpl_crawler.crawl",
+            AsyncMock(return_value=[
+                {
+                    "stock_code": "002466",
+                    "seal_amount": 8888.0,
+                    "is_final_sealed": True,
+                    "open_count": 1,
+                    "final_seal_time": final_time,
+                    "data_source": "KPL",
+                }
+            ]),
+        ), patch(
+            "app.crawlers.kaipanla_crawler.kpl_crawler.close_client",
+            AsyncMock(),
+        ), patch(
+            "app.crawlers.tonghuashun_crawler.ths_crawler.crawl",
+            AsyncMock(return_value=[]),
+        ), patch(
+            "app.crawlers.tonghuashun_crawler.ths_crawler.close_client",
+            AsyncMock(),
+        ):
+            await limit_up._refresh_limit_up_data(trade_date)
+
+        self.assertEqual(record.seal_amount, 8888.0)
+        self.assertEqual(record.open_count, 1)
+        self.assertEqual(record.current_status, "sealed")
+        self.assertEqual(record.final_seal_time, final_time)
+        self.assertEqual(db.commit_count, 1)
+
     async def test_get_realtime_limit_up_defaults_unknown_continuous_days_to_first_board(self):
         trade_date = date(2026, 6, 16)
 

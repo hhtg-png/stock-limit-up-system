@@ -545,9 +545,10 @@ async def _refresh_limit_up_data(trade_date: date):
                     if category and category != "其他":
                         record.reason_category = category
                     
-                    # 更新状态
+                    # 更新状态和封单相关字段
                     is_sealed = new_data.get("is_final_sealed")
                     open_count = new_data.get("open_count")
+                    seal_amount = new_data.get("seal_amount")
                     
                     if is_sealed is not None:
                         record.is_final_sealed = is_sealed
@@ -555,8 +556,11 @@ async def _refresh_limit_up_data(trade_date: date):
                     
                     if open_count is not None:
                         record.open_count = open_count
-                        if open_count > 0:
-                            record.current_status = "opened"
+                        if is_sealed is None:
+                            record.current_status = "sealed" if record.is_final_sealed else "opened"
+
+                    if seal_amount is not None:
+                        record.seal_amount = seal_amount
                     
                     # 更新最后封板时间
                     final_seal_time = new_data.get("final_seal_time")

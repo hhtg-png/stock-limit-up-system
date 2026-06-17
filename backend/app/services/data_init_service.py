@@ -239,6 +239,39 @@ class DataInitService:
             return None
         
         return round(rate, 2)
+
+    def _update_existing_limit_up_record(
+        self,
+        record: LimitUpRecord,
+        item: Dict,
+        turnover_rate: Optional[float],
+    ) -> None:
+        """用新采集数据补全已有涨停记录。"""
+        if turnover_rate and turnover_rate > 0:
+            record.turnover_rate = turnover_rate
+        if item.get("limit_up_reason"):
+            record.limit_up_reason = item.get("limit_up_reason")
+        if item.get("reason_category") and item.get("reason_category") != "其他":
+            record.reason_category = item.get("reason_category")
+
+        for field in (
+            "seal_amount",
+            "limit_up_price",
+            "amount",
+            "final_seal_time",
+            "open_count",
+            "continuous_limit_up_days",
+        ):
+            value = item.get(field)
+            if value is not None:
+                setattr(record, field, value)
+
+        is_final_sealed = item.get("is_final_sealed")
+        if is_final_sealed is not None:
+            record.is_final_sealed = is_final_sealed
+            record.current_status = "sealed" if is_final_sealed else "opened"
+        elif item.get("current_status") and item.get("current_status") != "unknown":
+            record.current_status = item.get("current_status")
     
     async def _save_to_database(self, data_list: List[Dict], trade_date: date) -> int:
         """保存数据到数据库"""
@@ -269,14 +302,11 @@ class DataInitService:
                     turnover_rate = self._validate_turnover_rate(item.get("turnover_rate"))
                     
                     if existing_record:
-                        # 更新现有记录的换手率（如果有新的有效值）
-                        if turnover_rate and turnover_rate > 0:
-                            existing_record.turnover_rate = turnover_rate
-                        # 更新其他可能变化的字段
-                        if item.get("limit_up_reason"):
-                            existing_record.limit_up_reason = item.get("limit_up_reason")
-                        if item.get("reason_category") and item.get("reason_category") != "其他":
-                            existing_record.reason_category = item.get("reason_category")
+                        self._update_existing_limit_up_record(
+                            existing_record,
+                            item,
+                            turnover_rate,
+                        )
                         saved_count += 1
                         continue
                     
