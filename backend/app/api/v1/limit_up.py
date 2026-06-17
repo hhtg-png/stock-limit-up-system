@@ -67,7 +67,11 @@ def _filter_and_sort_limit_up_list(
     return limit_up_list
 
 
-def _record_to_realtime(record: LimitUpRecord, stock: Stock) -> LimitUpRealtime:
+def _record_to_realtime(
+    record: LimitUpRecord,
+    stock: Stock,
+    continuous_days_override: Optional[int] = None,
+) -> LimitUpRealtime:
     is_final_sealed = getattr(record, "is_final_sealed", True)
     if is_final_sealed is None:
         is_final_sealed = True
@@ -84,7 +88,9 @@ def _record_to_realtime(record: LimitUpRecord, stock: Stock) -> LimitUpRealtime:
         limit_up_reason=getattr(record, "limit_up_reason", None),
         reason_category=getattr(record, "reason_category", None),
         continuous_limit_up_days=_positive_int_or_default(
-            getattr(record, "continuous_limit_up_days", None)
+            continuous_days_override
+            if continuous_days_override is not None
+            else getattr(record, "continuous_limit_up_days", None)
         ),
         open_count=_positive_int_or_default(getattr(record, "open_count", 0), default=0),
         is_sealed=is_final_sealed,
@@ -105,6 +111,65 @@ def _record_to_realtime(record: LimitUpRecord, stock: Stock) -> LimitUpRealtime:
     )
 
 
+async def _calculate_strict_database_continuous_days(
+    db: AsyncSession,
+    actual_date: date,
+    rows,
+    lookback_days: int = 30,
+) -> Dict[int, int]:
+    stock_ids = [getattr(record, "stock_id", None) for record, _ in rows]
+    stock_ids = [stock_id for stock_id in stock_ids if stock_id is not None]
+    if not stock_ids:
+        return {}
+
+    date_result = await db.execute(
+        select(LimitUpRecord.trade_date)
+        .where(LimitUpRecord.trade_date <= actual_date)
+        .group_by(LimitUpRecord.trade_date)
+        .order_by(LimitUpRecord.trade_date.desc())
+        .limit(lookback_days)
+    )
+    trade_dates = [row[0] for row in date_result.all()]
+    if not trade_dates:
+        return {}
+
+    streak_result = await db.execute(
+        select(
+            LimitUpRecord.stock_id,
+            LimitUpRecord.trade_date,
+            LimitUpRecord.is_final_sealed,
+        )
+        .where(and_(
+            LimitUpRecord.stock_id.in_(stock_ids),
+            LimitUpRecord.trade_date.in_(trade_dates),
+        ))
+    )
+    sealed_dates_by_stock: Dict[int, set] = {}
+    for stock_id, trade_day, is_final_sealed in streak_result.all():
+        if is_final_sealed:
+            sealed_dates_by_stock.setdefault(stock_id, set()).add(trade_day)
+
+    strict_days: Dict[int, int] = {}
+    for record, _ in rows:
+        stock_id = getattr(record, "stock_id", None)
+        if stock_id is None:
+            continue
+        if not getattr(record, "is_final_sealed", True):
+            strict_days[stock_id] = 1
+            continue
+
+        sealed_dates = sealed_dates_by_stock.get(stock_id, set())
+        streak = 0
+        for trade_day in trade_dates:
+            if trade_day in sealed_dates:
+                streak += 1
+            else:
+                break
+        strict_days[stock_id] = max(streak, 1)
+
+    return strict_days
+
+
 async def _get_database_limit_up_response(
     db: AsyncSession,
     trade_date: date,
@@ -119,9 +184,15 @@ async def _get_database_limit_up_response(
         .where(LimitUpRecord.trade_date == actual_date)
     )
     result = await db.execute(query)
+    rows = result.all()
+    strict_days = await _calculate_strict_database_continuous_days(db, actual_date, rows)
     limit_up_list = [
-        _record_to_realtime(record, stock)
-        for record, stock in result.all()
+        _record_to_realtime(
+            record,
+            stock,
+            continuous_days_override=strict_days.get(getattr(record, "stock_id", None)),
+        )
+        for record, stock in rows
     ]
 
     return LimitUpRealtimeResponse(

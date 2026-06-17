@@ -215,6 +215,7 @@ class LimitUpDetailApiTests(unittest.IsolatedAsyncioTestCase):
     async def test_get_realtime_limit_up_reads_historical_date_from_database_first(self):
         today = date(2026, 6, 18)
         requested_date = date(2026, 6, 16)
+        previous_date = date(2026, 6, 15)
         stock = make_stock()
         record = make_record(
             requested_date,
@@ -225,6 +226,11 @@ class LimitUpDetailApiTests(unittest.IsolatedAsyncioTestCase):
         db = SequencedSession([
             FakeScalarResult(1),
             FakeAllResult([(record, stock)]),
+            FakeAllResult([(requested_date,), (previous_date,)]),
+            FakeAllResult([
+                (stock.id, requested_date, True),
+                (stock.id, previous_date, True),
+            ]),
         ])
 
         with patch("app.api.v1.limit_up.today_cn", return_value=today), patch.object(
@@ -246,6 +252,39 @@ class LimitUpDetailApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.data[0].stock_code, "002466")
         self.assertEqual(response.data[0].continuous_limit_up_days, 2)
         self.assertEqual(response.data[0].current_status, "sealed")
+
+    async def test_get_realtime_limit_up_recomputes_polluted_historical_board_count(self):
+        today = date(2026, 6, 18)
+        requested_date = date(2026, 6, 15)
+        previous_date = date(2026, 6, 12)
+        stock = make_stock()
+        record = make_record(
+            requested_date,
+            continuous_limit_up_days=8,
+            seal_amount=0,
+            current_status="sealed",
+        )
+        db = SequencedSession([
+            FakeScalarResult(1),
+            FakeAllResult([(record, stock)]),
+            FakeAllResult([(requested_date,), (previous_date,)]),
+            FakeAllResult([(stock.id, requested_date, True)]),
+        ])
+
+        with patch("app.api.v1.limit_up.today_cn", return_value=today), patch.object(
+            limit_up.realtime_limit_up_service,
+            "get_realtime_limit_up_list",
+            AsyncMock(side_effect=AssertionError("historical date should read database first")),
+        ):
+            response = await limit_up.get_realtime_limit_up(
+                requested_date,
+                continuous_days=None,
+                reason_category=None,
+                sort_by="time",
+                db=db,
+            )
+
+        self.assertEqual(response.data[0].continuous_limit_up_days, 1)
 
     async def test_get_limit_up_detail_falls_back_to_latest_available_record_date(self):
         requested_date = date(2026, 5, 12)
