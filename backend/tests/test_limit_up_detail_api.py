@@ -226,11 +226,7 @@ class LimitUpDetailApiTests(unittest.IsolatedAsyncioTestCase):
         db = SequencedSession([
             FakeScalarResult(1),
             FakeAllResult([(record, stock)]),
-            FakeAllResult([(requested_date,), (previous_date,)]),
-            FakeAllResult([
-                (stock.id, requested_date, True),
-                (stock.id, previous_date, True),
-            ]),
+            FakeAllResult([(stock.id, True, 2)]),
         ])
 
         with patch("app.api.v1.limit_up.today_cn", return_value=today), patch.object(
@@ -253,6 +249,71 @@ class LimitUpDetailApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.data[0].continuous_limit_up_days, 2)
         self.assertEqual(response.data[0].current_status, "sealed")
 
+    async def test_get_realtime_limit_up_uses_market_review_continuous_days_when_available(self):
+        today = date(2026, 6, 18)
+        requested_date = date(2026, 5, 13)
+        stock = make_stock()
+        record = make_record(
+            requested_date,
+            continuous_limit_up_days=5,
+            seal_amount=5000,
+            current_status="sealed",
+        )
+        db = SequencedSession([
+            FakeScalarResult(1),
+            FakeAllResult([(record, stock)]),
+            FakeAllResult([(stock.id, True, 6)]),
+        ])
+
+        with patch("app.api.v1.limit_up.today_cn", return_value=today), patch.object(
+            limit_up.realtime_limit_up_service,
+            "get_realtime_limit_up_list",
+            AsyncMock(side_effect=AssertionError("historical date should read database first")),
+        ):
+            response = await limit_up.get_realtime_limit_up(
+                requested_date,
+                continuous_days=None,
+                reason_category=None,
+                sort_by="time",
+                db=db,
+            )
+
+        self.assertEqual(response.data[0].continuous_limit_up_days, 6)
+        self.assertEqual(len(db.queries), 3)
+
+    async def test_get_realtime_limit_up_treats_market_review_broken_row_as_first_board(self):
+        today = date(2026, 6, 18)
+        requested_date = date(2026, 5, 14)
+        stock = make_stock()
+        record = make_record(
+            requested_date,
+            continuous_limit_up_days=6,
+            seal_amount=0,
+            current_status="opened",
+        )
+        record.is_final_sealed = False
+        record.final_seal_time = None
+        db = SequencedSession([
+            FakeScalarResult(1),
+            FakeAllResult([(record, stock)]),
+            FakeAllResult([(stock.id, False, 6)]),
+        ])
+
+        with patch("app.api.v1.limit_up.today_cn", return_value=today), patch.object(
+            limit_up.realtime_limit_up_service,
+            "get_realtime_limit_up_list",
+            AsyncMock(side_effect=AssertionError("historical date should read database first")),
+        ):
+            response = await limit_up.get_realtime_limit_up(
+                requested_date,
+                continuous_days=2,
+                reason_category=None,
+                sort_by="time",
+                db=db,
+            )
+
+        self.assertEqual(response.data, [])
+
     async def test_get_realtime_limit_up_recomputes_polluted_historical_board_count(self):
         today = date(2026, 6, 18)
         requested_date = date(2026, 6, 15)
@@ -267,6 +328,7 @@ class LimitUpDetailApiTests(unittest.IsolatedAsyncioTestCase):
         db = SequencedSession([
             FakeScalarResult(1),
             FakeAllResult([(record, stock)]),
+            FakeAllResult([]),
             FakeAllResult([(requested_date,), (previous_date,)]),
             FakeAllResult([(stock.id, requested_date, True)]),
         ])

@@ -11,6 +11,7 @@ from loguru import logger
 from app.database import get_db, async_session_maker
 from app.models.stock import Stock
 from app.models.limit_up import LimitUpRecord, LimitUpStatusChange
+from app.models.market_review import MarketReviewStockDaily
 from app.schemas.limit_up import (
     LimitUpRealtime, LimitUpRecord as LimitUpRecordSchema,
     LimitUpDetail, LimitUpHistoryQuery, LimitUpReasonStats,
@@ -170,6 +171,38 @@ async def _calculate_strict_database_continuous_days(
     return strict_days
 
 
+async def _get_market_review_continuous_days(
+    db: AsyncSession,
+    actual_date: date,
+    rows,
+) -> Dict[int, int]:
+    stock_ids = [getattr(record, "stock_id", None) for record, _ in rows]
+    stock_ids = [stock_id for stock_id in stock_ids if stock_id is not None]
+    if not stock_ids:
+        return {}
+
+    result = await db.execute(
+        select(
+            MarketReviewStockDaily.stock_id,
+            MarketReviewStockDaily.today_sealed_close,
+            MarketReviewStockDaily.today_continuous_days,
+        )
+        .where(and_(
+            MarketReviewStockDaily.stock_id.in_(stock_ids),
+            MarketReviewStockDaily.trade_date == actual_date,
+            MarketReviewStockDaily.today_touched_limit_up.is_(True),
+        ))
+    )
+
+    review_days: Dict[int, int] = {}
+    for stock_id, today_sealed_close, today_continuous_days in result.all():
+        if today_sealed_close:
+            review_days[stock_id] = _positive_int_or_default(today_continuous_days)
+        else:
+            review_days[stock_id] = 1
+    return review_days
+
+
 async def _get_database_limit_up_response(
     db: AsyncSession,
     trade_date: date,
@@ -185,12 +218,24 @@ async def _get_database_limit_up_response(
     )
     result = await db.execute(query)
     rows = result.all()
-    strict_days = await _calculate_strict_database_continuous_days(db, actual_date, rows)
+    review_days = await _get_market_review_continuous_days(db, actual_date, rows)
+    strict_rows = [
+        (record, stock)
+        for record, stock in rows
+        if getattr(record, "stock_id", None) not in review_days
+    ]
+    strict_days = await _calculate_strict_database_continuous_days(
+        db,
+        actual_date,
+        strict_rows,
+    )
     limit_up_list = [
         _record_to_realtime(
             record,
             stock,
-            continuous_days_override=strict_days.get(getattr(record, "stock_id", None)),
+            continuous_days_override=review_days.get(
+                getattr(record, "stock_id", None)
+            ) or strict_days.get(getattr(record, "stock_id", None)),
         )
         for record, stock in rows
     ]
