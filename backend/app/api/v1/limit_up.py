@@ -71,9 +71,9 @@ def _record_to_realtime(record: LimitUpRecord, stock: Stock) -> LimitUpRealtime:
     is_final_sealed = getattr(record, "is_final_sealed", True)
     if is_final_sealed is None:
         is_final_sealed = True
-    current_status = getattr(record, "current_status", None) or (
-        "sealed" if is_final_sealed else "opened"
-    )
+    current_status = getattr(record, "current_status", None)
+    if not current_status or current_status == "unknown":
+        current_status = "sealed" if is_final_sealed else "opened"
 
     return LimitUpRealtime(
         stock_code=stock.stock_code,

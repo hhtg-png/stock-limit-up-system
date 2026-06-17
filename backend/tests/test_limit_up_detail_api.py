@@ -61,7 +61,12 @@ def make_stock():
     )
 
 
-def make_record(trade_date, continuous_limit_up_days=1, seal_amount=12345.0):
+def make_record(
+    trade_date,
+    continuous_limit_up_days=1,
+    seal_amount=12345.0,
+    current_status="sealed",
+):
     return SimpleNamespace(
         id=10,
         stock_id=1,
@@ -73,7 +78,7 @@ def make_record(trade_date, continuous_limit_up_days=1, seal_amount=12345.0):
         continuous_limit_up_days=continuous_limit_up_days,
         open_count=0,
         is_final_sealed=True,
-        current_status="sealed",
+        current_status=current_status,
         seal_amount=seal_amount,
         seal_volume=None,
         limit_up_price=42.5,
@@ -123,7 +128,12 @@ class LimitUpDetailApiTests(unittest.IsolatedAsyncioTestCase):
         today = date(2026, 6, 18)
         requested_date = date(2026, 6, 16)
         stock = make_stock()
-        record = make_record(requested_date, continuous_limit_up_days=2, seal_amount=5000)
+        record = make_record(
+            requested_date,
+            continuous_limit_up_days=2,
+            seal_amount=5000,
+            current_status="unknown",
+        )
         db = SequencedSession([
             FakeScalarResult(1),
             FakeAllResult([(record, stock)]),
@@ -147,6 +157,7 @@ class LimitUpDetailApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(response.data), 1)
         self.assertEqual(response.data[0].stock_code, "002466")
         self.assertEqual(response.data[0].continuous_limit_up_days, 2)
+        self.assertEqual(response.data[0].current_status, "sealed")
 
     async def test_get_limit_up_detail_falls_back_to_latest_available_record_date(self):
         requested_date = date(2026, 5, 12)
