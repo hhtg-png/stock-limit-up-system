@@ -14,8 +14,8 @@
           <el-menu
             :default-active="currentRoute"
             :collapse="isCollapsed"
-            router
             class="sidebar-menu"
+            @select="handleMenuSelect"
           >
             <el-menu-item index="/">
               <el-icon><DataBoard /></el-icon>
@@ -136,7 +136,7 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import {
   DataBoard, PieChart, Setting,
   Fold, Expand, Bell, TrendCharts, Calendar, Document, Grid
@@ -151,6 +151,7 @@ import { getConfig, toggleAlert as toggleAlertConfig } from '@/api/config'
 import dayjs from 'dayjs'
 
 const route = useRoute()
+const router = useRouter()
 const alertStore = useAlertStore()
 const configStore = useConfigStore()
 const { connect } = useWebSocket()
@@ -182,6 +183,11 @@ const isMobileNavActive = (path: string) => {
     return route.path === '/' || route.path === '/limit-up' || route.path.startsWith('/stock/')
   }
   return route.path.startsWith(path)
+}
+
+const handleMenuSelect = (path: string) => {
+  if (path === route.path) return
+  router.push(path)
 }
 
 // 播报数量
