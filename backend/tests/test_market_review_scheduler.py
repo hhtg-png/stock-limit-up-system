@@ -391,7 +391,7 @@ class MarketReviewSchedulerTests(unittest.IsolatedAsyncioTestCase):
             return_value=True,
             create=True,
         ), patch(
-            "app.data_collectors.scheduler._resolve_cn_trade_date_for_market_review",
+            "app.data_collectors.scheduler._resolve_latest_cn_trade_date_for_market_review",
             return_value=date(2026, 5, 13),
             create=True,
         ), patch.object(
@@ -405,8 +405,41 @@ class MarketReviewSchedulerTests(unittest.IsolatedAsyncioTestCase):
         ) as calculate_daily_analysis:
             await scheduler._run_after_close_catchup()
 
-        build_market_review.assert_awaited_once()
-        calculate_daily_analysis.assert_awaited_once()
+        build_market_review.assert_awaited_once_with(date(2026, 5, 13))
+        calculate_daily_analysis.assert_awaited_once_with(date(2026, 5, 13))
+
+    async def test_after_close_catchup_uses_latest_trading_day_when_started_on_weekend(self):
+        scheduler = self._create_scheduler()
+
+        with patch(
+            "app.data_collectors.scheduler._should_run_after_close_catchup",
+            return_value=True,
+            create=True,
+        ), patch(
+            "app.data_collectors.scheduler.today_cn",
+            return_value=date(2026, 6, 21),
+        ), patch(
+            "app.data_collectors.scheduler._get_cn_trading_dates",
+            return_value=[date(2026, 6, 19)],
+        ) as get_trading_dates, patch.object(
+            scheduler,
+            "_build_market_review",
+            AsyncMock(),
+        ) as build_market_review, patch.object(
+            scheduler,
+            "_calculate_daily_analysis",
+            AsyncMock(),
+        ) as calculate_daily_analysis, patch.object(
+            scheduler,
+            "_archive_limit_up_classification",
+            AsyncMock(),
+        ) as archive_classification:
+            await scheduler._run_after_close_catchup()
+
+        get_trading_dates.assert_called_once_with(date(2026, 6, 11), date(2026, 6, 21))
+        build_market_review.assert_awaited_once_with(date(2026, 6, 19))
+        calculate_daily_analysis.assert_awaited_once_with(date(2026, 6, 19))
+        archive_classification.assert_awaited_once_with(date(2026, 6, 19))
 
     async def test_after_close_catchup_skips_before_build_time(self):
         scheduler = self._create_scheduler()

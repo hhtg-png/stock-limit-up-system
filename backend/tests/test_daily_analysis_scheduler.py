@@ -176,7 +176,7 @@ class DailyAnalysisSchedulerTests(unittest.TestCase):
             "app.data_collectors.scheduler._should_run_after_close_catchup",
             return_value=True,
         ), patch(
-            "app.data_collectors.scheduler._resolve_cn_trade_date_for_market_review",
+            "app.data_collectors.scheduler._resolve_latest_cn_trade_date_for_market_review",
             return_value=trade_date,
         ), patch.object(
             scheduler,
@@ -193,7 +193,7 @@ class DailyAnalysisSchedulerTests(unittest.TestCase):
         ) as archive_classification:
             asyncio.run(scheduler._run_after_close_catchup())
 
-        archive_classification.assert_awaited_once()
+        archive_classification.assert_awaited_once_with(trade_date)
 
 
 if __name__ == "__main__":

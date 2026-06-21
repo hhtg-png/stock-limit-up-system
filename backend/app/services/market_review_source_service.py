@@ -643,6 +643,8 @@ class MarketReviewSourceService:
             close_price = self._resolve_close_price(today_item, quote, stock_code, stock_name)
             pre_close = self._resolve_pre_close(today_item, quote, stock_code, stock_name)
             change_pct = self._resolve_change_pct(today_item, yesterday_item, quote, close_price, pre_close)
+            limit_up_price = self._to_float(today_item.get("limit_up_price"))
+            seal_amount = self._to_float(today_item.get("seal_amount"))
 
             stock_rows.append(
                 {
@@ -664,8 +666,10 @@ class MarketReviewSourceService:
                     "open_count": self._to_int(today_item.get("open_count")),
                     "close_price": close_price,
                     "pre_close": pre_close,
+                    "limit_up_price": limit_up_price,
                     "change_pct": change_pct,
                     "amount": self._resolve_amount(today_item, quote),
+                    "seal_amount": seal_amount if seal_amount is not None else 0.0,
                     "turnover_rate": self._resolve_turnover_rate(today_item, quote),
                     "tradable_market_value": self._to_float(today_item.get("tradable_market_value")),
                     "limit_up_reason": today_item.get("limit_up_reason", "") or None,

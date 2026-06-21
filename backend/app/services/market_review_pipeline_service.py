@@ -1,13 +1,14 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, time
 from typing import Any, Dict, Iterable, Optional
 
-from sqlalchemy import delete
+from sqlalchemy import delete, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import async_session_maker
+from app.models.limit_up import LimitUpRecord
 from app.models.market_review import (
     MarketReviewDailyMetric,
     MarketReviewLimitUpEvent,
@@ -89,11 +90,13 @@ class MarketReviewPipelineService:
         if metric_row:
             await self._upsert_metric_row(db, metric_row)
         await self._replace_trade_date_rows(db, trade_date, stock_rows, event_rows)
+        limit_sync_result = await self._sync_limit_up_records_from_review(db, trade_date, stock_rows)
 
         return {
             "metric_rows": 1 if metric_row else 0,
             "stock_rows": len(stock_rows),
             "event_rows": len(event_rows),
+            **limit_sync_result,
         }
 
     async def run_for_date(
@@ -177,6 +180,138 @@ class MarketReviewPipelineService:
         if event_rows:
             await self._upsert_event_rows(db, event_rows)
 
+    async def _sync_limit_up_records_from_review(
+        self,
+        db: AsyncSession,
+        trade_date: date,
+        stock_rows: Iterable[Dict[str, Any]],
+    ) -> Dict[str, int]:
+        touched_rows = [
+            row
+            for row in stock_rows
+            if row.get("today_touched_limit_up") and row.get("stock_id")
+        ]
+        touched_stock_ids = {int(row["stock_id"]) for row in touched_rows}
+
+        existing_records = (
+            await db.execute(
+                select(LimitUpRecord).where(LimitUpRecord.trade_date == trade_date)
+            )
+        ).scalars().all()
+        existing_by_stock_id = {
+            int(record.stock_id): record
+            for record in existing_records
+            if record.stock_id is not None
+        }
+
+        upsert_count = 0
+        for row in touched_rows:
+            stock_id = int(row["stock_id"])
+            record = existing_by_stock_id.get(stock_id)
+            if record is None:
+                record = LimitUpRecord(stock_id=stock_id, trade_date=trade_date)
+                db.add(record)
+                existing_by_stock_id[stock_id] = record
+
+            self._apply_review_row_to_limit_up_record(record, row, trade_date)
+            upsert_count += 1
+
+        deleted_count = 0
+        for record in existing_records:
+            if record.stock_id not in touched_stock_ids:
+                await db.delete(record)
+                deleted_count += 1
+
+        return {
+            "limit_up_records": upsert_count,
+            "limit_up_deleted": deleted_count,
+        }
+
+    def _apply_review_row_to_limit_up_record(
+        self,
+        record: LimitUpRecord,
+        row: Dict[str, Any],
+        trade_date: date,
+    ) -> None:
+        sealed = bool(row.get("today_sealed_close"))
+        continuous_days = self._to_int(row.get("today_continuous_days"))
+        record.continuous_limit_up_days = continuous_days if sealed and continuous_days > 0 else 1
+        record.is_final_sealed = sealed
+        record.current_status = "sealed" if sealed else "opened"
+        record.first_limit_up_time = self._combine_date_time(trade_date, row.get("first_limit_time"))
+        record.final_seal_time = (
+            self._combine_date_time(trade_date, row.get("final_seal_time"))
+            if sealed
+            else None
+        )
+        record.open_count = self._to_int(row.get("open_count"))
+        record.limit_up_reason = row.get("limit_up_reason") or record.limit_up_reason
+        record.reason_category = row.get("reason_category") or record.reason_category
+        record.close_price = self._to_float(row.get("close_price")) or record.close_price
+        record.limit_up_price = self._resolve_limit_up_price(row, record.limit_up_price)
+        record.turnover_rate = self._to_float(row.get("turnover_rate"))
+        record.amount = self._to_float(row.get("amount")) or 0.0
+        record.seal_amount = self._resolve_seal_amount(row, record.seal_amount, sealed)
+        record.data_source = "MARKET_REVIEW"
+        record.is_validated = True
+        record.updated_at = datetime.now()
+
+    def _resolve_limit_up_price(self, row: Dict[str, Any], existing_price: Optional[float]) -> Optional[float]:
+        for value in (
+            row.get("limit_up_price"),
+            row.get("close_price") if row.get("today_sealed_close") else None,
+        ):
+            resolved = self._to_float(value)
+            if resolved is not None and resolved > 0:
+                return resolved
+
+        pre_close = self._to_float(row.get("pre_close"))
+        if pre_close is not None and pre_close > 0:
+            return round(pre_close * (1 + self._limit_ratio(row)), 2)
+
+        existing = self._to_float(existing_price)
+        if existing is not None and existing > 0:
+            return existing
+        return None
+
+    def _resolve_seal_amount(
+        self,
+        row: Dict[str, Any],
+        existing_amount: Optional[float],
+        sealed: bool,
+    ) -> float:
+        if not sealed:
+            return 0.0
+
+        source_amount = self._to_float(row.get("seal_amount"))
+        if source_amount is not None and source_amount > 0:
+            return source_amount
+
+        existing = self._to_float(existing_amount)
+        if existing is not None and existing > 0:
+            return existing
+        return 0.0
+
+    def _limit_ratio(self, row: Dict[str, Any]) -> float:
+        stock_code = str(row.get("stock_code") or "")
+        board_type = str(row.get("board_type") or "main")
+        if row.get("is_st"):
+            return 0.05
+        if board_type == "bj" or stock_code.startswith("8"):
+            return 0.30
+        if board_type in {"gem", "star"}:
+            return 0.20
+        return 0.10
+
+    def _combine_date_time(self, trade_date: date, value: Any) -> Optional[datetime]:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, time):
+            return datetime.combine(trade_date, value)
+        return None
+
     def _resolve_authoritative_flag(
         self,
         normalized_data: Dict[str, Any],
@@ -221,6 +356,22 @@ class MarketReviewPipelineService:
     def _filter_model_columns(self, model, row: Dict[str, Any]) -> Dict[str, Any]:
         allowed_columns = set(model.__table__.columns.keys())
         return {key: value for key, value in row.items() if key in allowed_columns}
+
+    def _to_int(self, value: Any) -> int:
+        if value in (None, ""):
+            return 0
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    def _to_float(self, value: Any) -> Optional[float]:
+        if value in (None, ""):
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
 
 market_review_pipeline_service = MarketReviewPipelineService()

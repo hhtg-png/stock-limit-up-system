@@ -302,6 +302,56 @@ class MarketReviewSourceServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["yesterday_continuous_days"], 4)
         self.assertEqual(row["today_continuous_days"], 5)
 
+    async def test_collect_for_date_preserves_limit_up_price_and_seal_amount_for_sync(self):
+        async def today_fetcher(trade_date):
+            self.assertEqual(trade_date, date(2026, 6, 19))
+            return [
+                {
+                    "stock_code": "600001",
+                    "stock_name": "Alpha",
+                    "continuous_limit_up_days": 1,
+                    "is_sealed": False,
+                    "first_limit_up_time": datetime(2026, 6, 19, 9, 40, 0),
+                    "open_count": 2,
+                    "current_price": 10.66,
+                    "limit_up_price": 11.0,
+                    "seal_amount": 4321.0,
+                    "change_pct": 6.6,
+                    "amount": 123456.0,
+                    "limit_up_reason": "算力",
+                    "data_source": "EM",
+                }
+            ]
+
+        async def empty_yesterday_pool(_trade_date):
+            return []
+
+        async def empty_quotes(_codes):
+            return {}
+
+        async def market_stats_fetcher(_trade_date):
+            return {
+                "limit_down_count": 0,
+                "market_turnover": 1000.0,
+                "up_count_ex_st": 100,
+                "down_count_ex_st": 100,
+            }
+
+        service = MarketReviewSourceService(
+            session_factory=self.session_factory,
+            today_limit_up_fetcher=today_fetcher,
+            yesterday_pool_fetcher=empty_yesterday_pool,
+            quote_fetcher=empty_quotes,
+            market_stats_fetcher=market_stats_fetcher,
+            current_date_provider=lambda: date(2026, 6, 19),
+        )
+
+        payload = await service.collect_for_date(date(2026, 6, 19))
+        row = payload["stock_rows"][0]
+
+        self.assertAlmostEqual(row["limit_up_price"], 11.0)
+        self.assertAlmostEqual(row["seal_amount"], 4321.0)
+
     async def test_historical_market_stats_are_loaded_when_daily_statistics_are_missing(self):
         called = {}
 

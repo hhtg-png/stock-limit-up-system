@@ -67,6 +67,18 @@ def _resolve_cn_trade_date_for_market_review(current_date: Optional[date] = None
     return resolved_date
 
 
+def _resolve_latest_cn_trade_date_for_market_review(
+    current_date: Optional[date] = None,
+    lookback_days: int = 10,
+) -> Optional[date]:
+    resolved_date = current_date or today_cn()
+    start_date = resolved_date - timedelta(days=lookback_days)
+    trading_dates = _get_cn_trading_dates(start_date, resolved_date)
+    if not trading_dates:
+        return None
+    return max(trading_dates)
+
+
 def _should_run_after_close_catchup(now: Optional[datetime] = None) -> bool:
     current = now or datetime.now(CN_TZ)
     build_time = time(settings.MARKET_REVIEW_BUILD_HOUR, settings.MARKET_REVIEW_BUILD_MINUTE)
@@ -534,14 +546,13 @@ class DataScheduler:
         except Exception as e:
             logger.error(f"Calculate daily stats error: {e}")
 
-    async def _calculate_daily_analysis(self):
+    async def _calculate_daily_analysis(self, trade_date: Optional[date] = None):
         """生成每日分析月表数据"""
         try:
             from app.database import async_session_maker
             from app.services.daily_analysis_service import daily_analysis_service
 
-            today = today_cn()
-            resolved_trade_date = _resolve_cn_trade_date_for_market_review(today)
+            resolved_trade_date = trade_date or _resolve_cn_trade_date_for_market_review(today_cn())
             if resolved_trade_date is None:
                 logger.info("Skipping daily analysis build because current China date is not a trading day")
                 return
@@ -632,28 +643,27 @@ class DataScheduler:
         if not _should_run_after_close_catchup():
             return
 
-        trade_date = _resolve_cn_trade_date_for_market_review(today_cn())
+        trade_date = _resolve_latest_cn_trade_date_for_market_review(today_cn())
         if trade_date is None:
-            logger.info("Skipping after-close catchup because current China date is not a trading day")
+            logger.info("Skipping after-close catchup because no recent China trading day was found")
             return
 
         logger.info(f"Running after-close catchup for {trade_date}")
         if settings.MARKET_REVIEW_ENABLED:
             try:
-                await self._build_market_review()
+                await self._build_market_review(trade_date)
             except Exception as e:
                 logger.error(f"After-close market review catchup failed: {e}")
 
-        await self._calculate_daily_analysis()
-        await self._archive_limit_up_classification()
+        await self._calculate_daily_analysis(trade_date)
+        await self._archive_limit_up_classification(trade_date)
 
-    async def _archive_limit_up_classification(self):
+    async def _archive_limit_up_classification(self, trade_date: Optional[date] = None):
         """归档收盘后的涨停分类快照。"""
         try:
             from app.services.ths_limit_up_classification_service import ths_limit_up_classification_service
 
-            today = today_cn()
-            resolved_trade_date = _resolve_cn_trade_date_for_market_review(today)
+            resolved_trade_date = trade_date or _resolve_cn_trade_date_for_market_review(today_cn())
             if resolved_trade_date is None:
                 logger.info("Skipping limit-up classification archive because current China date is not a trading day")
                 return
@@ -680,14 +690,14 @@ class DataScheduler:
         except Exception as e:
             logger.error(f"Clear cache error: {e}")
 
-    async def _build_market_review(self):
+    async def _build_market_review(self, trade_date: Optional[date] = None):
         """构建当日市场复盘数据"""
         try:
-            trade_date = _resolve_cn_trade_date_for_market_review()
-            if trade_date is None:
+            resolved_trade_date = trade_date or _resolve_cn_trade_date_for_market_review()
+            if resolved_trade_date is None:
                 logger.info("Skipping market review build because current China date is not a trading day")
                 return
-            await market_review_pipeline_service.run_for_date(trade_date, calc_version=1)
+            await market_review_pipeline_service.run_for_date(resolved_trade_date, calc_version=1)
             logger.info("Market review build completed")
         except Exception as e:
             logger.error(f"Market review build error: {e}")

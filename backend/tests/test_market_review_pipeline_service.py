@@ -1,12 +1,13 @@
 import copy
 import unittest
-from datetime import date, time
+from datetime import date, datetime, time
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 import app.models  # noqa: F401
 from app.database import Base
+from app.models.limit_up import LimitUpRecord
 from app.models.market_review import (
     MarketReviewDailyMetric,
     MarketReviewLimitUpEvent,
@@ -53,6 +54,15 @@ class MarketReviewPipelineServiceTests(unittest.IsolatedAsyncioTestCase):
                         id=2,
                         stock_code="600002",
                         stock_name="Beta",
+                        market="SH",
+                        is_st=0,
+                        is_kc=0,
+                        is_cy=0,
+                    ),
+                    Stock(
+                        id=3,
+                        stock_code="600003",
+                        stock_name="Gamma",
                         market="SH",
                         is_st=0,
                         is_kc=0,
@@ -424,6 +434,106 @@ class MarketReviewPipelineServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stock_rows_on_drift_date, [])
         self.assertEqual([row.stock_code for row in event_rows_on_authoritative_date], ["600001"])
         self.assertEqual(event_rows_on_drift_date, [])
+
+    async def test_persist_payload_syncs_limit_up_records_from_authoritative_review_snapshot(self):
+        service = MarketReviewPipelineService(session_factory=self.session_factory)
+        trade_date = date(2026, 6, 19)
+        normalized = self._normalized_input()
+        normalized["stock_rows"][0].update(
+            {
+                "trade_date": trade_date,
+                "limit_up_price": 11.2,
+                "seal_amount": 3000.0,
+            }
+        )
+        broken_row = copy.deepcopy(normalized["stock_rows"][0])
+        broken_row.update(
+            {
+                "stock_id": 2,
+                "stock_code": "600002",
+                "stock_name": "Beta",
+                "today_sealed_close": False,
+                "today_opened_close": True,
+                "today_broken": True,
+                "today_continuous_days": 5,
+                "first_limit_time": time(9, 38),
+                "final_seal_time": time(10, 1),
+                "open_count": 3,
+                "close_price": 6.2,
+                "pre_close": 6.0,
+                "limit_up_price": 6.6,
+                "seal_amount": 0.0,
+                "amount": 8888.0,
+                "turnover_rate": 7.7,
+                "limit_up_reason": "机器人",
+            }
+        )
+        normalized["stock_rows"].append(broken_row)
+
+        async with self.session_factory() as session:
+            session.add_all(
+                [
+                    LimitUpRecord(
+                        stock_id=1,
+                        trade_date=trade_date,
+                        continuous_limit_up_days=9,
+                        is_final_sealed=True,
+                        current_status="sealed",
+                        first_limit_up_time=datetime(2026, 6, 19, 9, 25),
+                        final_seal_time=datetime(2026, 6, 19, 9, 25),
+                        limit_up_price=10.0,
+                        seal_amount=1.0,
+                        data_source="OLD",
+                    ),
+                    LimitUpRecord(
+                        stock_id=3,
+                        trade_date=trade_date,
+                        continuous_limit_up_days=2,
+                        is_final_sealed=True,
+                        current_status="sealed",
+                        data_source="OLD",
+                    ),
+                ]
+            )
+            await session.commit()
+
+        payload = await service.build_payload_for_date(trade_date, normalized=normalized)
+
+        async with self.session_factory() as session:
+            result = await service.persist_payload(session, payload)
+            await session.commit()
+
+        async with self.session_factory() as session:
+            records = (
+                await session.execute(
+                    select(LimitUpRecord).where(LimitUpRecord.trade_date == trade_date)
+                )
+            ).scalars().all()
+
+        records_by_stock_id = {record.stock_id: record for record in records}
+        self.assertEqual(set(records_by_stock_id), {1, 2})
+        self.assertEqual(result["limit_up_records"], 2)
+        self.assertEqual(result["limit_up_deleted"], 1)
+
+        sealed = records_by_stock_id[1]
+        self.assertEqual(sealed.continuous_limit_up_days, 2)
+        self.assertTrue(sealed.is_final_sealed)
+        self.assertEqual(sealed.current_status, "sealed")
+        self.assertEqual(sealed.first_limit_up_time, datetime(2026, 6, 19, 9, 31))
+        self.assertEqual(sealed.final_seal_time, datetime(2026, 6, 19, 14, 55))
+        self.assertAlmostEqual(sealed.limit_up_price, 11.2)
+        self.assertAlmostEqual(sealed.seal_amount, 3000.0)
+        self.assertEqual(sealed.data_source, "MARKET_REVIEW")
+
+        opened = records_by_stock_id[2]
+        self.assertEqual(opened.continuous_limit_up_days, 1)
+        self.assertFalse(opened.is_final_sealed)
+        self.assertEqual(opened.current_status, "opened")
+        self.assertEqual(opened.first_limit_up_time, datetime(2026, 6, 19, 9, 38))
+        self.assertIsNone(opened.final_seal_time)
+        self.assertAlmostEqual(opened.limit_up_price, 6.6)
+        self.assertEqual(opened.seal_amount, 0.0)
+        self.assertAlmostEqual(opened.close_price, 6.2)
 
     async def test_persist_payload_with_truthy_non_boolean_authority_raises_and_preserves_existing_rows(self):
         service = MarketReviewPipelineService(session_factory=self.session_factory)
