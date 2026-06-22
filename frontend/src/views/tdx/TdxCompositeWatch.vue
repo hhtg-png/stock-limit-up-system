@@ -124,7 +124,7 @@ import { getTdxLimitUpLive, getTdxLimitUpLiveStatus, getTdxNews, getTdxStockMove
 import { useSpeech } from '@/composables/useSpeech'
 import { useTdxStockLink } from '@/composables/useTdxStockLink'
 import { installTdxStockSelectionBridge } from '@/composables/useTdxStockSelection'
-import { useTdxPluginRealtime } from '@/composables/useWebSocket'
+import { clearTdxPluginRealtime, useTdxPluginRealtime } from '@/composables/useWebSocket'
 import { useLimitUpStore } from '@/stores/limit-up'
 import { formatTdxSealAmount, pickDisplayChangePct, resolveTdxMergedDisplayState } from '@/utils/tdxLimitUpDisplay'
 import type { LimitUpRealtime } from '@/types/limit-up'
@@ -154,6 +154,7 @@ const activePlate = ref('')
 const hideOpened = ref(false)
 const loading = ref(false)
 const errorText = ref('')
+const activeTradeDate = ref('')
 const seenSpeechKeys = new Set<string>()
 const seenTouchedStockCodes = new Set<string>()
 const spokenLimitUpSpeechAt = new Map<string, number>()
@@ -212,6 +213,7 @@ async function loadData(options: { silent?: boolean } = {}) {
   errorText.value = ''
   try {
     const next = await getTdxLimitUpLive()
+    applyPayloadTradeDate(next)
     payload.value = next
     rememberExistingEvents(next.items)
     primeStockMove(next.items)
@@ -229,6 +231,7 @@ async function loadQuoteStatus() {
   statusInFlight = true
   try {
     const next = await getTdxLimitUpLiveStatus()
+    applyPayloadTradeDate(next)
     statusPayload.value = next
     handleStatusEvents(next.items, { primeOnly: true })
     primeStockMove(next.items)
@@ -251,6 +254,39 @@ function hasSnapshotStructureChanged(statusItems: readonly TdxLimitUpEvent[], sn
   const snapshotCodes = new Set(snapshotItems.map(item => item.stock_code).filter(Boolean))
   if (snapshotCodes.size !== statusItems.length) return true
   return statusItems.some(item => !snapshotCodes.has(item.stock_code))
+}
+
+function applyPayloadTradeDate(next: TdxPluginPayload<TdxLimitUpEvent>) {
+  const tradeDate = payloadTradeDate(next)
+  if (!tradeDate || activeTradeDate.value === tradeDate) return
+  resetDailyState(tradeDate)
+}
+
+function payloadTradeDate(next: TdxPluginPayload<TdxLimitUpEvent> | null) {
+  return String(next?.updated_at || '').slice(0, 10)
+}
+
+function resetDailyState(tradeDate: string) {
+  activeTradeDate.value = tradeDate
+  payload.value = null
+  statusPayload.value = null
+  activePlate.value = ''
+  seenSpeechKeys.clear()
+  seenTouchedStockCodes.clear()
+  spokenLimitUpSpeechAt.clear()
+  hasPrimedLimitUpSpeech = false
+  stockMoveRequestId++
+  selectedMoveCode.value = ''
+  stockMovePayload.value = null
+  stockMoveErrorText.value = ''
+  stockMoveLoading.value = false
+  stockMoveCache.clear()
+  limitUpStore.setRealtimeSnapshot(tradeDate, [])
+  clearTdxPluginRealtime()
+}
+
+function isCurrentTradeDate(value?: string | null) {
+  return !activeTradeDate.value || !value || value === activeTradeDate.value
 }
 
 function rememberExistingEvents(items: TdxLimitUpEvent[]) {
@@ -403,7 +439,7 @@ async function loadStockMove(stockCode = selectedMoveCode.value) {
   stockMoveLoading.value = true
   stockMoveErrorText.value = ''
   try {
-    const next = await getTdxStockMove(stockCode)
+    const next = await getTdxStockMove(stockCode, activeTradeDate.value ? { trade_date: activeTradeDate.value } : undefined)
     if (requestId !== stockMoveRequestId) return
     rememberCachedStockMove(stockCode, next)
     stockMovePayload.value = next
@@ -417,20 +453,24 @@ async function loadStockMove(stockCode = selectedMoveCode.value) {
 }
 
 function readCachedStockMove(stockCode: string) {
-  const entry = stockMoveCache.get(stockCode)
+  const entry = stockMoveCache.get(stockMoveCacheKey(stockCode))
   if (!entry) return null
   if (Date.now() - entry.cachedAt > STOCK_MOVE_CACHE_TTL_MS) {
-    stockMoveCache.delete(stockCode)
+    stockMoveCache.delete(stockMoveCacheKey(stockCode))
     return null
   }
   return entry.payload
 }
 
 function rememberCachedStockMove(stockCode: string, next: TdxPluginPayload<TdxStockMove>) {
-  stockMoveCache.set(stockCode, { payload: next, cachedAt: Date.now() })
+  stockMoveCache.set(stockMoveCacheKey(stockCode), { payload: next, cachedAt: Date.now() })
   if (stockMoveCache.size <= STOCK_MOVE_CACHE_MAX) return
   const oldestKey = stockMoveCache.keys().next().value
   if (oldestKey) stockMoveCache.delete(oldestKey)
+}
+
+function stockMoveCacheKey(stockCode: string) {
+  return `${activeTradeDate.value || 'latest'}:${normalizeStockCode(stockCode)}`
 }
 
 function stockMoveReasonTitle(item: TdxStockMove) {
@@ -526,9 +566,11 @@ function buildMergedEvents() {
     upsertEvent(byCode, item)
   }
   for (const item of realtimeList.value || []) {
+    if (!isCurrentTradeDate(item.trade_date)) continue
     upsertEvent(byCode, realtimeToTdxEvent(item))
   }
   for (const item of realtimeLimitUpEvents.value || []) {
+    if (!isCurrentTradeDate(item.trade_date)) continue
     upsertEvent(byCode, item)
   }
   return Array.from(byCode.values()).sort((a, b) => {
@@ -567,6 +609,7 @@ function normalizeTdxEvent(item: TdxLimitUpEvent): TdxLimitUpEvent {
   const sealAmount = Number(item.seal_amount || 0)
   return {
     event_id: item.event_id || `tdx-${item.stock_code}-${item.event_time}`,
+    trade_date: item.trade_date || activeTradeDate.value,
     event_type: item.event_type || (item.is_sealed ? 'limit_up_sealed' : 'limit_up_opened'),
     event_label: item.event_label || (item.is_sealed ? '封死涨停' : '涨停打开'),
     event_time: item.event_time || '',
@@ -607,6 +650,7 @@ function realtimeToTdxEvent(item: LimitUpRealtime): TdxLimitUpEvent {
   const eventTime = formatEventTime(item.first_limit_up_time || item.final_seal_time)
   return {
     event_id: `realtime-${item.trade_date || ''}-${item.stock_code}-${eventType}-${eventTime}`,
+    trade_date: item.trade_date || activeTradeDate.value,
     event_type: eventType,
     event_label: eventLabel,
     event_time: eventTime,

@@ -62,6 +62,16 @@ class FakeScalarResult:
         return self.value
 
 
+class QueryAwareLatestDateSession:
+    def __init__(self, latest_trade_date):
+        self.latest_trade_date = latest_trade_date
+
+    async def execute(self, query):
+        if "max(" in str(query).lower():
+            return FakeScalarResult(self.latest_trade_date)
+        return FakeRowsResult([])
+
+
 class SequencedSession:
     def __init__(self, results):
         self.results = list(results)
@@ -598,6 +608,26 @@ class TdxPluginServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["items"][0]["stock_code"], "001259")
         self.assertEqual(payload["items"][0]["stock_name"], "利仁科技")
         self.assertIn("数据库兜底", payload["warnings"][0])
+
+    async def test_limit_up_live_defaults_to_today_instead_of_latest_db_date(self):
+        class FrozenDate(date):
+            @classmethod
+            def today(cls):
+                return cls(2026, 5, 29)
+
+        service = TdxPluginService()
+        db = QueryAwareLatestDateSession(date(2026, 5, 28))
+
+        with patch("app.services.tdx_plugin_service.date", FrozenDate), patch.object(
+            service.realtime_limit_up_service,
+            "get_realtime_limit_up_list",
+            AsyncMock(return_value=[]),
+        ) as mocked_get_list:
+            payload = await service.get_limit_up_live(db=db)
+
+        mocked_get_list.assert_awaited_once_with(date(2026, 5, 29))
+        self.assertEqual(payload["updated_at"][:10], "2026-05-29")
+        self.assertEqual(payload["items"], [])
 
     async def test_stock_move_defaults_to_latest_available_trade_date(self):
         service = TdxPluginService()

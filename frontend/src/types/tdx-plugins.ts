@@ -12,6 +12,7 @@ export interface TdxPluginPayload<T> {
 
 export interface TdxLimitUpEvent {
   event_id: string
+  trade_date?: string
   event_type: string
   event_label: string
   event_time: string

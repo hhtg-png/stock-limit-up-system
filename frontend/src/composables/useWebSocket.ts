@@ -76,6 +76,7 @@ function normalizeTdxLimitUpEvent(data: Record<string, any>, timestamp: string):
   const eventType = String(data.event_type || (isSealed ? 'limit_up_sealed' : 'limit_up_opened'))
   return {
     event_id: String(data.event_id || `tdx-ws-${stockCode}-${eventTime}-${eventType}`),
+    trade_date: String(data.trade_date || ''),
     event_type: eventType,
     event_label: eventLabel,
     event_time: eventTime,
@@ -115,6 +116,11 @@ export function useTdxPluginRealtime() {
     realtimeNewsItems: tdxNewsItems,
     realtimeLimitUpEvents: tdxLimitUpEvents
   }
+}
+
+export function clearTdxPluginRealtime() {
+  tdxNewsItems.value = []
+  tdxLimitUpEvents.value = []
 }
 
 export function useWebSocket() {

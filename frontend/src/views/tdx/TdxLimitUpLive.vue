@@ -92,7 +92,7 @@ import { storeToRefs } from 'pinia'
 import { getTdxLimitUpLive, getTdxLimitUpLiveStatus } from '@/api/tdx-plugins'
 import { useSpeech } from '@/composables/useSpeech'
 import { useTdxStockLink } from '@/composables/useTdxStockLink'
-import { useTdxPluginRealtime } from '@/composables/useWebSocket'
+import { clearTdxPluginRealtime, useTdxPluginRealtime } from '@/composables/useWebSocket'
 import { useLimitUpStore } from '@/stores/limit-up'
 import { formatTdxSealAmount, pickDisplayChangePct, resolveTdxMergedDisplayState } from '@/utils/tdxLimitUpDisplay'
 import type { LimitUpRealtime } from '@/types/limit-up'
@@ -108,6 +108,7 @@ const activePlate = ref('')
 const hideOpened = ref(false)
 const loading = ref(false)
 const errorText = ref('')
+const activeTradeDate = ref('')
 const seenSpeechKeys = new Set<string>()
 const seenTouchedStockCodes = new Set<string>()
 const spokenLimitUpSpeechAt = new Map<string, number>()
@@ -148,6 +149,7 @@ async function loadData(options: { silent?: boolean } = {}) {
   errorText.value = ''
   try {
     const next = await getTdxLimitUpLive()
+    applyPayloadTradeDate(next)
     payload.value = next
     rememberExistingEvents(next.items)
   } catch (error) {
@@ -164,6 +166,7 @@ async function loadQuoteStatus() {
   statusInFlight = true
   try {
     const next = await getTdxLimitUpLiveStatus()
+    applyPayloadTradeDate(next)
     statusPayload.value = next
     handleStatusEvents(next.items, { primeOnly: true })
   } finally {
@@ -185,6 +188,33 @@ function hasSnapshotStructureChanged(statusItems: readonly TdxLimitUpEvent[], sn
   const snapshotCodes = new Set(snapshotItems.map(item => item.stock_code).filter(Boolean))
   if (snapshotCodes.size !== statusItems.length) return true
   return statusItems.some(item => !snapshotCodes.has(item.stock_code))
+}
+
+function applyPayloadTradeDate(next: TdxPluginPayload<TdxLimitUpEvent>) {
+  const tradeDate = payloadTradeDate(next)
+  if (!tradeDate || activeTradeDate.value === tradeDate) return
+  resetDailyState(tradeDate)
+}
+
+function payloadTradeDate(next: TdxPluginPayload<TdxLimitUpEvent> | null) {
+  return String(next?.updated_at || '').slice(0, 10)
+}
+
+function resetDailyState(tradeDate: string) {
+  activeTradeDate.value = tradeDate
+  payload.value = null
+  statusPayload.value = null
+  activePlate.value = ''
+  seenSpeechKeys.clear()
+  seenTouchedStockCodes.clear()
+  spokenLimitUpSpeechAt.clear()
+  hasPrimedLimitUpSpeech = false
+  limitUpStore.setRealtimeSnapshot(tradeDate, [])
+  clearTdxPluginRealtime()
+}
+
+function isCurrentTradeDate(value?: string | null) {
+  return !activeTradeDate.value || !value || value === activeTradeDate.value
 }
 
 function rememberExistingEvents(items: TdxLimitUpEvent[]) {
@@ -281,9 +311,11 @@ function buildMergedEvents() {
     upsertEvent(byCode, item)
   }
   for (const item of realtimeList.value || []) {
+    if (!isCurrentTradeDate(item.trade_date)) continue
     upsertEvent(byCode, realtimeToTdxEvent(item))
   }
   for (const item of realtimeLimitUpEvents.value || []) {
+    if (!isCurrentTradeDate(item.trade_date)) continue
     upsertEvent(byCode, item)
   }
   return Array.from(byCode.values()).sort((a, b) => {
@@ -322,6 +354,7 @@ function normalizeTdxEvent(item: TdxLimitUpEvent): TdxLimitUpEvent {
   const sealAmount = Number(item.seal_amount || 0)
   return {
     event_id: item.event_id || `tdx-${item.stock_code}-${item.event_time}`,
+    trade_date: item.trade_date || activeTradeDate.value,
     event_type: item.event_type || (item.is_sealed ? 'limit_up_sealed' : 'limit_up_opened'),
     event_label: item.event_label || (item.is_sealed ? '封死涨停' : '涨停打开'),
     event_time: item.event_time || '',
@@ -362,6 +395,7 @@ function realtimeToTdxEvent(item: LimitUpRealtime): TdxLimitUpEvent {
   const eventTime = formatEventTime(item.first_limit_up_time || item.final_seal_time)
   return {
     event_id: `realtime-${item.trade_date || ''}-${item.stock_code}-${eventType}-${eventTime}`,
+    trade_date: item.trade_date || activeTradeDate.value,
     event_type: eventType,
     event_label: eventLabel,
     event_time: eventTime,
