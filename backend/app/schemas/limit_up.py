@@ -44,6 +44,7 @@ class LimitUpRealtime(LimitUpBase):
     continuous_limit_up_days: int = Field(1, description="连板天数")
     open_count: int = Field(0, description="开板次数")
     is_sealed: bool = Field(True, description="当前是否封板")
+    is_one_word: bool = Field(False, description="是否一字涨停")
     current_status: str = Field("unknown", description="当前状态(sealed/opened/broken)")
     seal_amount: Optional[float] = Field(None, description="封单金额(万元)")
     seal_volume: Optional[int] = Field(None, description="封单量(手)")

@@ -17,7 +17,9 @@ export async function getRealtimeLimitUp(params?: {
   trade_date?: string
   continuous_days?: number
   reason_category?: string
+  status?: string
   sort_by?: string
+  sort_order?: string
 }): Promise<LimitUpRealtimeResponse> {
   const { data } = await api.get('/limit-up/realtime', { params })
   return data

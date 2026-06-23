@@ -12,6 +12,7 @@ export interface LimitUpRecord {
   board_label?: string
   open_count: number
   is_final_sealed: boolean
+  is_one_word?: boolean
   current_status?: 'sealed' | 'opened' | 'broken' | 'final_sealed' | 'unknown'
   seal_amount?: number
   seal_volume?: number

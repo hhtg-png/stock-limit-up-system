@@ -1552,38 +1552,22 @@ class IntelligenceService:
         if not keyword:
             return await self.list_daily_digests(db, limit=limit)
 
-        pattern = f"%{keyword}%"
-        document_result = await db.execute(
-            select(KnowledgeDocument.trade_date)
-            .where(
-                KnowledgeDocument.source_key == "daily",
-                KnowledgeDocument.trade_date.is_not(None),
-                or_(
-                    KnowledgeDocument.title.like(pattern),
-                    KnowledgeDocument.abstract.like(pattern),
-                    KnowledgeDocument.introduction.like(pattern),
-                    KnowledgeDocument.content_text.like(pattern),
-                    cast(KnowledgeDocument.summary_json, String).like(pattern),
-                ),
-            )
-            .distinct()
-        )
-        matched_dates = {item for item in document_result.scalars().all() if item is not None}
-        digest_conditions = [cast(DailyInfoDigest.summary_json, String).like(pattern)]
-        if matched_dates:
-            digest_conditions.append(DailyInfoDigest.trade_date.in_(matched_dates))
-
+        search_window = max(limit * 5, 200)
         result = await db.execute(
             select(DailyInfoDigest)
-            .where(or_(*digest_conditions))
             .order_by(
                 DailyInfoDigest.trade_date.desc(),
                 DailyInfoDigest.generated_at.desc(),
                 DailyInfoDigest.id.desc(),
             )
-            .limit(limit)
+            .limit(search_window)
         )
-        return await self._serialize_daily_digest_records(db, list(result.scalars().all()))
+        items = await self._serialize_daily_digest_records(db, list(result.scalars().all()))
+        return [
+            item
+            for item in items
+            if self._daily_info_visible_search_text(item).lower().find(keyword.lower()) >= 0
+        ][:limit]
 
     async def get_daily_digest_version(
         self,
@@ -1629,6 +1613,33 @@ class IntelligenceService:
             sources = await self._get_daily_documents(db, digest.trade_date)
             items.append(self.serialize_daily_digest(digest, cache_hit=True, sources=sources))
         return items
+
+    def _daily_info_visible_search_text(self, item: Dict[str, Any]) -> str:
+        summary = item.get("summary") or {}
+        parts: List[str] = [
+            str(item.get("trade_date") or ""),
+            str(summary.get("overview") or ""),
+            str(summary.get("plan") or ""),
+        ]
+        for key in ("main_lines", "catalysts", "risks", "source_titles"):
+            value = summary.get(key)
+            if isinstance(value, list):
+                parts.extend(str(entry or "") for entry in value)
+        for key in ("mentioned_stocks", "stocks"):
+            value = summary.get(key)
+            if not isinstance(value, list):
+                continue
+            for stock in value:
+                if not isinstance(stock, dict):
+                    continue
+                parts.extend(
+                    str(stock.get(field) or "")
+                    for field in ("name", "code", "sector", "summary", "reason", "source_title")
+                )
+        sources = item.get("sources") or []
+        if isinstance(sources, list):
+            parts.extend(str(source.get("title") or "") for source in sources if isinstance(source, dict))
+        return "\n".join(parts)
 
     def _daily_digest_order_key(self, digest: Any) -> tuple:
         return (

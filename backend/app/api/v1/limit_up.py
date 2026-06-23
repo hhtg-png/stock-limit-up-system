@@ -41,11 +41,26 @@ def _format_hms(value) -> Optional[str]:
     return str(value)
 
 
+def _is_one_word_limit_up(first_limit_up_time, open_count: int, is_sealed: bool) -> bool:
+    first_time = _format_hms(first_limit_up_time)
+    return bool(is_sealed) and int(open_count or 0) == 0 and bool(first_time and first_time <= "09:25:59")
+
+
+def _sort_desc(sort_by: str, sort_order: Optional[str]) -> bool:
+    if sort_order == "asc":
+        return False
+    if sort_order == "desc":
+        return True
+    return sort_by in {"seal_amount", "continuous_days"}
+
+
 def _filter_and_sort_limit_up_list(
     limit_up_list: List[LimitUpRealtime],
     continuous_days: Optional[int],
     reason_category: Optional[str],
+    status: Optional[str],
     sort_by: str,
+    sort_order: Optional[str] = None,
 ) -> List[LimitUpRealtime]:
     if continuous_days is not None:
         limit_up_list = [
@@ -57,13 +72,18 @@ def _filter_and_sort_limit_up_list(
             item for item in limit_up_list
             if item.reason_category == reason_category
         ]
+    if status == "sealed":
+        limit_up_list = [item for item in limit_up_list if item.is_sealed]
+    elif status == "opened":
+        limit_up_list = [item for item in limit_up_list if not item.is_sealed]
 
+    reverse = _sort_desc(sort_by, sort_order)
     if sort_by == "time":
-        limit_up_list.sort(key=lambda x: x.first_limit_up_time or "99:99:99")
+        limit_up_list.sort(key=lambda x: x.first_limit_up_time or "99:99:99", reverse=reverse)
     elif sort_by == "seal_amount":
-        limit_up_list.sort(key=lambda x: x.seal_amount or 0, reverse=True)
+        limit_up_list.sort(key=lambda x: (x.seal_amount or 0, bool(x.is_one_word)), reverse=reverse)
     elif sort_by == "continuous_days":
-        limit_up_list.sort(key=lambda x: x.continuous_limit_up_days or 0, reverse=True)
+        limit_up_list.sort(key=lambda x: x.continuous_limit_up_days or 0, reverse=reverse)
 
     return limit_up_list
 
@@ -79,13 +99,16 @@ def _record_to_realtime(
     current_status = getattr(record, "current_status", None)
     if not current_status or current_status == "unknown":
         current_status = "sealed" if is_final_sealed else "opened"
+    open_count = _positive_int_or_default(getattr(record, "open_count", 0), default=0)
+    first_limit_up_time = _format_hms(record.first_limit_up_time)
+    final_seal_time = _format_hms(getattr(record, "final_seal_time", None))
 
     return LimitUpRealtime(
         stock_code=stock.stock_code,
         stock_name=stock.stock_name,
         trade_date=record.trade_date,
-        first_limit_up_time=_format_hms(record.first_limit_up_time),
-        final_seal_time=_format_hms(getattr(record, "final_seal_time", None)),
+        first_limit_up_time=first_limit_up_time,
+        final_seal_time=final_seal_time,
         limit_up_reason=getattr(record, "limit_up_reason", None),
         reason_category=getattr(record, "reason_category", None),
         continuous_limit_up_days=_positive_int_or_default(
@@ -93,8 +116,9 @@ def _record_to_realtime(
             if continuous_days_override is not None
             else getattr(record, "continuous_limit_up_days", None)
         ),
-        open_count=_positive_int_or_default(getattr(record, "open_count", 0), default=0),
+        open_count=open_count,
         is_sealed=is_final_sealed,
+        is_one_word=_is_one_word_limit_up(first_limit_up_time, open_count, is_final_sealed),
         current_status=current_status,
         seal_amount=getattr(record, "seal_amount", None),
         seal_volume=getattr(record, "seal_volume", None),
@@ -208,7 +232,9 @@ async def _get_database_limit_up_response(
     trade_date: date,
     continuous_days: Optional[int],
     reason_category: Optional[str],
+    status: Optional[str],
     sort_by: str,
+    sort_order: Optional[str],
 ) -> LimitUpRealtimeResponse:
     actual_date, is_fallback = await get_trade_date_with_fallback(db, trade_date)
     query = (
@@ -247,7 +273,9 @@ async def _get_database_limit_up_response(
             limit_up_list,
             continuous_days,
             reason_category,
+            status,
             sort_by,
+            sort_order,
         ),
     )
 
@@ -257,7 +285,9 @@ async def get_realtime_limit_up(
     trade_date: Optional[date] = Query(None, description="交易日期，默认今天"),
     continuous_days: Optional[int] = Query(None, description="连板天数筛选"),
     reason_category: Optional[str] = Query(None, description="原因分类筛选"),
+    status: Optional[str] = Query(None, description="状态筛选(sealed/opened)"),
     sort_by: str = Query("time", description="排序字段(time/seal_amount/continuous_days)"),
+    sort_order: Optional[str] = Query(None, description="排序方向(asc/desc)"),
     db: AsyncSession = Depends(get_db)
 ):
     """获取实时涨停列表（东方财富数据+同花顺涨停原因）"""
@@ -271,7 +301,9 @@ async def get_realtime_limit_up(
             trade_date,
             continuous_days,
             reason_category,
+            status,
             sort_by,
+            sort_order,
         )
 
     raw_data = await realtime_limit_up_service.get_realtime_limit_up_list(trade_date)
@@ -282,7 +314,9 @@ async def get_realtime_limit_up(
             trade_date,
             continuous_days,
             reason_category,
+            status,
             sort_by,
+            sort_order,
         )
     
     # 处理实时数据
@@ -298,6 +332,7 @@ async def get_realtime_limit_up(
         final_time = item.get("final_seal_time")
         first_time_str = _format_hms(first_time)
         final_time_str = _format_hms(final_time)
+        open_count = _positive_int_or_default(item.get("open_count", 0), default=0)
         
         code = item.get("stock_code", "")
         market = item.get("market", "SH" if code.startswith("6") else "SZ")
@@ -311,8 +346,9 @@ async def get_realtime_limit_up(
             limit_up_reason=item.get("limit_up_reason", ""),
             reason_category=item.get("reason_category", "其他"),
             continuous_limit_up_days=continuous_limit_up_days,
-            open_count=item.get("open_count", 0),
+            open_count=open_count,
             is_sealed=is_sealed,
+            is_one_word=_is_one_word_limit_up(first_time_str, open_count, is_sealed),
             current_status=current_status,
             seal_amount=item.get("seal_amount", 0),
             seal_volume=None,
@@ -332,7 +368,9 @@ async def get_realtime_limit_up(
             limit_up_list,
             continuous_days,
             reason_category,
+            status,
             sort_by,
+            sort_order,
         )
     )
 

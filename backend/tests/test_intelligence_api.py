@@ -354,14 +354,17 @@ class IntelligenceApiTests(unittest.TestCase):
         self.assertEqual(payload["title"], "复盘.md")
         self.assertIn("市场修复", payload["content_text"])
 
-    def test_search_daily_info_matches_digest_and_original_content(self):
+    def test_search_daily_info_matches_only_visible_history_fields(self):
         summary_response = self.client.get("/intelligence/daily-info/search", params={"keyword": "市场修复"})
+        title_response = self.client.get("/intelligence/daily-info/search", params={"keyword": "AI资讯"})
         content_response = self.client.get("/intelligence/daily-info/search", params={"keyword": "机器人"})
 
         self.assertEqual(summary_response.status_code, 200)
+        self.assertEqual(title_response.status_code, 200)
         self.assertEqual(content_response.status_code, 200)
         self.assertEqual([item["trade_date"] for item in summary_response.json()["items"]], ["2026-05-18"])
-        self.assertEqual([item["trade_date"] for item in content_response.json()["items"]], ["2026-05-17"])
+        self.assertEqual([item["trade_date"] for item in title_response.json()["items"]], ["2026-05-17"])
+        self.assertEqual(content_response.json()["items"], [])
 
     def test_get_daily_info_returns_cached_digest_without_model_refresh(self):
         async def mark_digest_as_missing_key():

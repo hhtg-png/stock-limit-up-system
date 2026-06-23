@@ -354,7 +354,7 @@ class MarketReviewApiTests(unittest.TestCase):
         self.assertEqual(payload["is_fallback"], True)
         self.assertEqual(payload["stocks"][0]["stock_code"], "600002")
 
-    def test_ladder_endpoint_groups_descending_filters_and_orders_sealed_before_opened(self):
+    def test_ladder_endpoint_groups_descending_and_excludes_opened_rows(self):
         response = self.client.get(
             "/api/v1/statistics/review/ladder",
             params={"trade_date": "2026-04-28"},
@@ -366,18 +366,20 @@ class MarketReviewApiTests(unittest.TestCase):
         self.assertEqual(payload["is_fallback"], False)
         self.assertEqual(
             [ladder["continuous_days"] for ladder in payload["ladders"]],
-            [4, 3, 2],
+            [4, 2],
         )
-        self.assertEqual(payload["ladders"][0]["count"], 2)
+        self.assertEqual(payload["ladders"][0]["count"], 1)
         self.assertEqual(
             [stock["stock_code"] for stock in payload["ladders"][0]["stocks"]],
-            ["600001", "600002"],
+            ["600001"],
         )
         ladder_stock_codes = {
             stock["stock_code"]
             for ladder in payload["ladders"]
             for stock in ladder["stocks"]
         }
+        self.assertNotIn("600002", ladder_stock_codes)
+        self.assertNotIn("600003", ladder_stock_codes)
         self.assertNotIn("600004", ladder_stock_codes)
         self.assertNotIn("600005", ladder_stock_codes)
 
@@ -416,7 +418,7 @@ class MarketReviewApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         ladder = response.json()["ladders"][0]
         self.assertEqual(ladder["continuous_days"], 4)
-        self.assertEqual(ladder["count"], 2)
+        self.assertEqual(ladder["count"], 1)
         self.assertEqual(ladder["cohort_count"], 3)
         self.assertEqual(ladder["cohort_sealed_count"], 1)
         self.assertEqual(ladder["cohort_opened_count"], 1)
@@ -581,7 +583,11 @@ class MarketReviewApiTests(unittest.TestCase):
         self.assertEqual(row["gem_board_label"], "LiveGamma2")
         self.assertEqual([stock["stock_code"] for stock in payload["detail"]["stocks"]], ["600011", "600010", "600012", "600013"])
         self.assertEqual([ladder["continuous_days"] for ladder in payload["ladder"]["ladders"]], [3, 2])
-        self.assertEqual(payload["ladder"]["ladders"][0]["count"], 2)
+        self.assertEqual(payload["ladder"]["ladders"][0]["count"], 1)
+        self.assertEqual(
+            [stock["stock_code"] for stock in payload["ladder"]["ladders"][0]["stocks"]],
+            ["600010"],
+        )
         self.assertEqual(payload["ladder"]["ladders"][0]["cohort_count"], 3)
         self.assertAlmostEqual(payload["ladder"]["ladders"][0]["cohort_seal_rate"], 33.33)
         self.assertAlmostEqual(payload["ladder"]["ladders"][0]["cohort_avg_change"], 5.4)

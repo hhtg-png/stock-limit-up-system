@@ -16,6 +16,8 @@ assert.match(limitUp, /useLimitUpStore/, '涨停播报 should merge WebSocket li
 assert.match(limitUp, /useTdxPluginRealtime/, '涨停播报 should merge plugin WebSocket events into the table')
 assert.match(limitUp, /snapshotInFlight/, '涨停播报 should prevent overlapping slow snapshot requests')
 assert.match(limitUp, /statusInFlight/, '涨停播报 should prevent overlapping fast status requests')
+assert.match(limitUp, /function hydrateSnapshotAfterStatus/, '涨停播报 should defer slow snapshot hydration until after the fast status payload renders')
+assert.match(limitUp, /loadQuoteStatus\(\)\s*hydrateSnapshotAfterStatus\(\)/, '涨停播报 should request fast status before slow snapshot hydration on mount')
 assert.doesNotMatch(limitUp, /setInterval\(loadData,\s*5000\)/, '涨停播报 should not depend on 5 second full-table polling')
 
 const news = read('src/views/tdx/TdxNewsFeed.vue')
@@ -31,5 +33,9 @@ assert.match(ws, /useTdxPluginRealtime/, 'WebSocket composable should expose TDX
 assert.match(ws, /pushTdxNewsItem/, 'tdx_news_event messages should be normalized into realtime news state')
 assert.match(ws, /pushTdxLimitUpEvent/, 'tdx_limit_up_event messages should be normalized into realtime limit-up state')
 assert.doesNotMatch(ws, /`news-\$\{item\.news_id \|\| message\.timestamp\}`/, 'tdx_news_event speech should be owned by news pages, not the websocket handler')
+
+const composite = read('src/views/tdx/TdxCompositeWatch.vue')
+assert.match(composite, /function hydrateSnapshotAfterStatus/, '复合插件 should defer slow snapshot hydration until after the fast status payload renders')
+assert.match(composite, /loadQuoteStatus\(\)\s*hydrateSnapshotAfterStatus\(\)/, '复合插件 should request fast status before slow snapshot hydration on mount')
 
 console.log('tdx realtime hybrid strategy checks passed')

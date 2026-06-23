@@ -176,6 +176,7 @@ const limitUpStore = useLimitUpStore()
 const { realtimeList } = storeToRefs(limitUpStore)
 let snapshotTimer = 0
 let quoteTimer = 0
+let snapshotHydrationTimer = 0
 let snapshotInFlight = false
 let statusInFlight = false
 let hasPrimedLimitUpSpeech = false
@@ -245,6 +246,13 @@ async function refreshSnapshotWhenStructureChanged() {
   const statusItems = statusPayload.value?.items || []
   if (!hasSnapshotStructureChanged(statusItems, payload.value.items || [])) return
   await loadData({ silent: true })
+}
+
+function hydrateSnapshotAfterStatus() {
+  window.clearTimeout(snapshotHydrationTimer)
+  snapshotHydrationTimer = window.setTimeout(() => {
+    loadData({ silent: true })
+  }, 250)
 }
 
 function hasSnapshotStructureChanged(statusItems: readonly TdxLimitUpEvent[], snapshotItems: readonly TdxLimitUpEvent[]) {
@@ -804,8 +812,8 @@ function displayStatus(item: TdxLimitUpEvent) {
 
 onMounted(() => {
   tdxSelectionCleanup = installTdxStockSelectionBridge(handleExternalStockSelection)
-  loadData()
   loadQuoteStatus()
+  hydrateSnapshotAfterStatus()
   loadInitialNewsSnapshot()
   snapshotTimer = window.setInterval(refreshSnapshotWhenStructureChanged, SNAPSHOT_REFRESH_MS)
   quoteTimer = window.setInterval(loadQuoteStatus, QUOTE_REFRESH_MS)
@@ -828,6 +836,7 @@ watch(realtimeLimitUpEvents, (nextItems, previousItems) => {
 })
 
 onUnmounted(() => {
+  window.clearTimeout(snapshotHydrationTimer)
   window.clearInterval(snapshotTimer)
   window.clearInterval(quoteTimer)
   stopMovePanelResize()

@@ -19,6 +19,9 @@
           <el-tag :type="item.is_sealed ? 'danger' : 'warning'" size="small">
             {{ item.is_sealed ? '封板' : '炸板' }}
           </el-tag>
+          <el-tag v-if="item.is_one_word" type="danger" size="small">
+            一字
+          </el-tag>
         </div>
       </div>
 

@@ -82,17 +82,20 @@ def make_record(
     continuous_limit_up_days=1,
     seal_amount=12345.0,
     current_status="sealed",
+    first_limit_up_time=datetime(2026, 5, 8, 10, 12, 30),
+    final_seal_time=datetime(2026, 5, 8, 14, 30, 0),
+    open_count=0,
 ):
     return SimpleNamespace(
         id=10,
         stock_id=1,
         trade_date=trade_date,
-        first_limit_up_time=datetime(2026, 5, 8, 10, 12, 30),
-        final_seal_time=datetime(2026, 5, 8, 14, 30, 0),
+        first_limit_up_time=first_limit_up_time,
+        final_seal_time=final_seal_time,
         limit_up_reason="锂电池",
         reason_category="题材",
         continuous_limit_up_days=continuous_limit_up_days,
-        open_count=0,
+        open_count=open_count,
         is_final_sealed=True,
         current_status=current_status,
         seal_amount=seal_amount,
@@ -280,6 +283,45 @@ class LimitUpDetailApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.data[0].continuous_limit_up_days, 6)
         self.assertEqual(len(db.queries), 3)
+
+    async def test_get_realtime_limit_up_keeps_one_word_second_board_with_empty_seal_amount(self):
+        today = date(2026, 6, 18)
+        requested_date = date(2026, 6, 17)
+        stock = make_stock()
+        record = make_record(
+            requested_date,
+            continuous_limit_up_days=2,
+            seal_amount=0,
+            current_status="sealed",
+            first_limit_up_time=datetime(2026, 6, 17, 9, 25, 3),
+            final_seal_time=datetime(2026, 6, 17, 9, 25, 3),
+            open_count=0,
+        )
+        db = SequencedSession([
+            FakeScalarResult(1),
+            FakeAllResult([(record, stock)]),
+            FakeAllResult([(stock.id, True, 2)]),
+        ])
+
+        with patch("app.api.v1.limit_up.today_cn", return_value=today), patch.object(
+            limit_up.realtime_limit_up_service,
+            "get_realtime_limit_up_list",
+            AsyncMock(side_effect=AssertionError("historical date should read database first")),
+        ):
+            response = await limit_up.get_realtime_limit_up(
+                requested_date,
+                continuous_days=2,
+                reason_category=None,
+                status="sealed",
+                sort_by="seal_amount",
+                sort_order="desc",
+                db=db,
+            )
+
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0].continuous_limit_up_days, 2)
+        self.assertTrue(response.data[0].is_one_word)
+        self.assertEqual(response.data[0].seal_amount, 0)
 
     async def test_get_realtime_limit_up_treats_market_review_broken_row_as_first_board(self):
         today = date(2026, 6, 18)

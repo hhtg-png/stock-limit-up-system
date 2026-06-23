@@ -162,6 +162,14 @@ def _build_intraday_detail(trade_date: date, stock_rows: list[dict[str, Any]]) -
 
 
 def _is_ladder_display_row(row: MarketReviewStockDaily | dict[str, Any]) -> bool:
+    return (
+        bool(_get_stock_value(row, "today_touched_limit_up"))
+        and bool(_get_stock_value(row, "today_sealed_close"))
+        and _get_stock_int(row, "today_continuous_days") >= 2
+    )
+
+
+def _is_ladder_cohort_touch_row(row: MarketReviewStockDaily | dict[str, Any]) -> bool:
     return bool(_get_stock_value(row, "today_touched_limit_up")) and _get_stock_int(row, "today_continuous_days") >= 2
 
 
@@ -177,7 +185,7 @@ def _is_same_ladder_cohort_row(row: MarketReviewStockDaily | dict[str, Any], con
         return True
 
     return (
-        _is_ladder_display_row(row)
+        _is_ladder_cohort_touch_row(row)
         and _get_stock_int(row, "today_continuous_days") == continuous_days
         and yesterday_days == 0
     )

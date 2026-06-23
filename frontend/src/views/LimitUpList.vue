@@ -77,6 +77,9 @@
             <el-tag :type="row.is_sealed ? 'info' : 'warning'" size="small">
               {{ row.is_sealed ? '封板' : '炸板' }}
             </el-tag>
+            <el-tag v-if="row.is_one_word" class="one-word-tag" type="danger" size="small">
+              一字
+            </el-tag>
           </template>
         </el-table-column>
         <el-table-column prop="open_count" label="开板" width="65" align="center">
@@ -181,41 +184,16 @@ const reasonCategories = computed(() => {
   return [...cats].sort()
 })
 
-const tableData = computed(() => {
-  let filtered = [...limitUpStore.realtimeList]
+const tableData = computed(() => limitUpStore.realtimeList)
 
-  if (filters.minContinuousDays) {
-    filtered = filtered.filter(item => item.continuous_limit_up_days >= filters.minContinuousDays!)
+const apiSort = computed(() => {
+  if (tableSort.value.prop === 'seal_amount') {
+    return { sortBy: 'seal_amount', sortOrder: tableSort.value.order === 'ascending' ? 'asc' : 'desc' }
   }
-  if (filters.reasonCategory) {
-    filtered = filtered.filter(item => item.reason_category === filters.reasonCategory)
+  if (tableSort.value.prop === 'continuous_limit_up_days') {
+    return { sortBy: 'continuous_days', sortOrder: tableSort.value.order === 'ascending' ? 'asc' : 'desc' }
   }
-  if (filters.status === 'sealed') {
-    filtered = filtered.filter(item => item.is_sealed)
-  } else if (filters.status === 'opened') {
-    filtered = filtered.filter(item => !item.is_sealed)
-  }
-
-  const { prop, order } = tableSort.value
-  if (!prop || !order) {
-    return filtered
-  }
-
-  const sortOrder = order === 'ascending' ? 1 : -1
-  return [...filtered].sort((a: any, b: any) => {
-    const va = a[prop]
-    const vb = b[prop]
-
-    if (va == null && vb == null) return 0
-    if (va == null) return 1
-    if (vb == null) return -1
-
-    if (typeof va === 'string' || typeof vb === 'string') {
-      return String(va).localeCompare(String(vb)) * sortOrder
-    }
-
-    return (va - vb) * sortOrder
-  })
+  return { sortBy: 'time', sortOrder: tableSort.value.order === 'descending' ? 'desc' : 'asc' }
 })
 
 async function fetchData(options: FetchOptions = {}) {
@@ -229,7 +207,12 @@ async function fetchData(options: FetchOptions = {}) {
 
   try {
     const response = await getRealtimeLimitUp({
-      trade_date: selectedDate.value
+      trade_date: selectedDate.value,
+      continuous_days: filters.minContinuousDays,
+      reason_category: filters.reasonCategory || undefined,
+      status: filters.status || undefined,
+      sort_by: apiSort.value.sortBy,
+      sort_order: apiSort.value.sortOrder
     })
     limitUpStore.setSnapshot(response.trade_date, response.data || [])
     if (response.is_fallback && !silent) {
@@ -249,8 +232,8 @@ async function fetchData(options: FetchOptions = {}) {
 }
 
 function applyFilters() {
-  // 列表已由计算属性自动响应筛选条件变化
   resetTableScroll()
+  fetchData({ showLoading: true })
 }
 
 function updateRealtimeMode() {
@@ -268,6 +251,7 @@ function resetFilters() {
   filters.reasonCategory = ''
   filters.status = ''
   resetTableScroll()
+  fetchData({ showLoading: true })
 }
 
 async function refreshData() {
@@ -290,6 +274,7 @@ function handleSortChange({ prop, order }: { prop?: string; order?: 'ascending' 
     order: order || null
   }
   resetTableScroll()
+  fetchData({ showLoading: true })
 }
 
 function resetTableScroll() {
@@ -382,6 +367,10 @@ onUnmounted(() => {
       .el-table__row:hover {
         background-color: #fafafa;
       }
+    }
+
+    :deep(.one-word-tag) {
+      margin-left: 4px;
     }
   }
 }
