@@ -2,7 +2,7 @@
   <div class="limit-up-list">
     <!-- 筛选区 -->
     <div class="filter-bar card">
-      <el-form inline>
+      <el-form class="filter-form" inline>
         <el-form-item label="交易日期">
           <el-date-picker
             v-model="selectedDate"
@@ -70,16 +70,17 @@
             </div>
           </div>
         </el-form-item>
+        <span class="filter-break" aria-hidden="true"></span>
+        <el-form-item v-if="displayTradeDate" class="filter-date-tag">
+          <el-tag :type="isFallbackDate ? 'warning' : 'info'" size="small">
+            数据日期 {{ displayTradeDate }}
+          </el-tag>
+        </el-form-item>
         <el-form-item class="filter-actions">
           <el-button type="primary" @click="applyFilters">查询</el-button>
           <el-button @click="resetFilters">重置</el-button>
           <el-button type="warning" @click="refreshData" :loading="refreshing">刷新数据</el-button>
           <el-button @click="exportData">导出</el-button>
-        </el-form-item>
-        <el-form-item v-if="displayTradeDate" class="filter-date-tag">
-          <el-tag :type="isFallbackDate ? 'warning' : 'info'" size="small">
-            数据日期 {{ displayTradeDate }}
-          </el-tag>
         </el-form-item>
       </el-form>
     </div>
@@ -468,31 +469,50 @@ onUnmounted(() => {
   .filter-bar {
     margin-bottom: 16px;
     
+    .filter-form {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: flex-start;
+      gap: 12px 14px;
+    }
+
     :deep(.el-form-item) {
       margin-bottom: 0;
+      margin-right: 0;
+    }
+
+    :deep(.el-form-item__label) {
+      padding-right: 8px;
+      color: #606266;
     }
 
     .price-filter {
+      flex: 1 1 480px;
+      min-width: 420px;
+
       :deep(.el-form-item__content) {
         align-items: flex-start;
+        width: 100%;
       }
     }
 
     .price-filter__content {
       display: flex;
       align-items: center;
-      gap: 8px;
+      gap: 10px;
       flex-wrap: wrap;
+      width: 100%;
     }
 
     .price-presets {
-      display: flex;
-      align-items: center;
-      gap: 4px;
+      display: grid;
+      grid-template-columns: repeat(4, minmax(62px, 1fr));
+      gap: 6px;
+      flex: 1 1 280px;
 
       :deep(.el-button) {
         margin-left: 0;
-        padding: 5px 9px;
+        padding: 5px 0;
       }
     }
 
@@ -500,10 +520,11 @@ onUnmounted(() => {
       display: flex;
       align-items: center;
       gap: 4px;
+      flex: 0 0 160px;
     }
 
     .price-input {
-      width: 72px;
+      width: 68px;
 
       :deep(.el-input__inner) {
         text-align: right;
@@ -513,6 +534,29 @@ onUnmounted(() => {
     .price-separator {
       color: #909399;
       line-height: 24px;
+    }
+
+    .filter-break {
+      flex: 1 0 100%;
+      height: 0;
+    }
+
+    .filter-actions {
+      margin-left: auto;
+
+      :deep(.el-form-item__content) {
+        display: flex;
+        gap: 8px;
+        flex-wrap: nowrap;
+      }
+
+      :deep(.el-button) {
+        margin-left: 0;
+      }
+    }
+
+    .filter-date-tag {
+      align-self: center;
     }
   }
 
@@ -536,11 +580,14 @@ onUnmounted(() => {
     .filter-bar {
       margin-bottom: 10px;
       padding: 12px;
+      overflow: hidden;
 
-      :deep(.el-form) {
+      .filter-form {
         display: grid;
         grid-template-columns: repeat(2, minmax(0, 1fr));
         gap: 8px;
+        min-width: 0;
+        width: 100%;
       }
 
       :deep(.el-form-item) {
@@ -554,34 +601,48 @@ onUnmounted(() => {
       :deep(.el-form-item__content),
       :deep(.el-date-editor),
       :deep(.el-select) {
+        margin-left: 0 !important;
+        max-width: 100%;
+        min-width: 0 !important;
         width: 100% !important;
       }
 
       :deep(.el-button) {
         min-width: 0;
         padding: 8px 10px;
+        width: 100%;
       }
 
-      :deep(.filter-actions),
-      :deep(.filter-date-tag),
+      .filter-actions,
+      .filter-date-tag,
       .price-filter {
         grid-column: 1 / -1;
+        min-width: 0;
+      }
+
+      .filter-break {
+        display: none;
       }
 
       :deep(.filter-actions .el-form-item__content) {
         display: grid;
-        grid-template-columns: repeat(4, minmax(0, 1fr));
+        grid-template-columns: repeat(2, minmax(0, 1fr));
         gap: 6px;
       }
 
       .price-filter__content {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr);
         width: 100%;
         align-items: stretch;
+        gap: 8px;
       }
 
       .price-presets {
         display: grid;
-        grid-template-columns: repeat(4, minmax(0, 1fr));
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        flex: none;
+        min-width: 0;
         width: 100%;
         gap: 6px;
 
@@ -591,7 +652,10 @@ onUnmounted(() => {
       }
 
       .price-inputs {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
         width: 100%;
+        flex: none;
       }
 
       .price-input {

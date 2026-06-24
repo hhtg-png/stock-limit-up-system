@@ -68,7 +68,7 @@
         </el-aside>
 
         <!-- 主内容区 -->
-        <el-container>
+        <el-container class="content-container">
           <!-- 顶部栏 -->
           <el-header class="header">
             <div class="header-left">
@@ -286,6 +286,10 @@ onUnmounted(() => {
   height: 100%;
 }
 
+.content-container {
+  min-width: 0;
+}
+
 .aside {
   background: #001529;
   transition: width 0.3s;
@@ -393,6 +397,7 @@ onUnmounted(() => {
 .main {
   background: #f0f2f5;
   padding: 16px;
+  min-width: 0;
   overflow-y: auto;
 }
 
