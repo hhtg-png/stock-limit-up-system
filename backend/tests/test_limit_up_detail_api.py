@@ -67,28 +67,41 @@ class FakeAsyncSessionContext:
         return False
 
 
-def make_stock():
+def make_stock(
+    stock_id=1,
+    stock_code="002466",
+    stock_name="天齐锂业",
+    market="SZ",
+    industry="有色金属",
+):
     return SimpleNamespace(
-        id=1,
-        stock_code="002466",
-        stock_name="天齐锂业",
-        market="SZ",
-        industry="有色金属",
+        id=stock_id,
+        stock_code=stock_code,
+        stock_name=stock_name,
+        market=market,
+        industry=industry,
     )
 
 
 def make_record(
     trade_date,
+    record_id=10,
+    stock_id=1,
     continuous_limit_up_days=1,
     seal_amount=12345.0,
     current_status="sealed",
     first_limit_up_time=datetime(2026, 5, 8, 10, 12, 30),
     final_seal_time=datetime(2026, 5, 8, 14, 30, 0),
     open_count=0,
+    limit_up_price=42.5,
+    close_price=None,
 ):
+    if close_price is None:
+        close_price = limit_up_price
+
     return SimpleNamespace(
-        id=10,
-        stock_id=1,
+        id=record_id,
+        stock_id=stock_id,
         trade_date=trade_date,
         first_limit_up_time=first_limit_up_time,
         final_seal_time=final_seal_time,
@@ -100,8 +113,8 @@ def make_record(
         current_status=current_status,
         seal_amount=seal_amount,
         seal_volume=None,
-        limit_up_price=42.5,
-        close_price=42.5,
+        limit_up_price=limit_up_price,
+        close_price=close_price,
         turnover_rate=8.6,
         amount=98765.0,
         data_source="TEST",
@@ -355,6 +368,70 @@ class LimitUpDetailApiTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(response.data, [])
+
+    async def test_get_realtime_limit_up_filters_first_board_and_price_range_from_database(self):
+        today = date(2026, 6, 18)
+        requested_date = date(2026, 6, 17)
+        low_first_stock = make_stock(1, "001001", "低价首板")
+        mid_second_stock = make_stock(2, "001002", "中价二板")
+        high_first_stock = make_stock(3, "001003", "高价首板")
+        rows = [
+            (
+                make_record(
+                    requested_date,
+                    record_id=1,
+                    stock_id=1,
+                    continuous_limit_up_days=1,
+                    limit_up_price=18.8,
+                ),
+                low_first_stock,
+            ),
+            (
+                make_record(
+                    requested_date,
+                    record_id=2,
+                    stock_id=2,
+                    continuous_limit_up_days=2,
+                    limit_up_price=18.9,
+                ),
+                mid_second_stock,
+            ),
+            (
+                make_record(
+                    requested_date,
+                    record_id=3,
+                    stock_id=3,
+                    continuous_limit_up_days=1,
+                    limit_up_price=120.0,
+                ),
+                high_first_stock,
+            ),
+        ]
+        db = SequencedSession([
+            FakeScalarResult(1),
+            FakeAllResult(rows),
+            FakeAllResult([(1, True, 1), (2, True, 2), (3, True, 1)]),
+        ])
+
+        with patch("app.api.v1.limit_up.today_cn", return_value=today), patch.object(
+            limit_up.realtime_limit_up_service,
+            "get_realtime_limit_up_list",
+            AsyncMock(side_effect=AssertionError("historical date should read database first")),
+        ):
+            response = await limit_up.get_realtime_limit_up(
+                requested_date,
+                continuous_days=None,
+                continuous_days_exact=1,
+                reason_category=None,
+                status=None,
+                min_price=1,
+                max_price=20,
+                sort_by="time",
+                sort_order="asc",
+                db=db,
+            )
+
+        self.assertEqual([item.stock_code for item in response.data], ["001001"])
 
     async def test_get_realtime_limit_up_recomputes_polluted_historical_board_count(self):
         today = date(2026, 6, 18)

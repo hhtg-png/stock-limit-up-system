@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, and_, update
 from typing import Optional, List, Dict
 from datetime import date, datetime
+import math
 from loguru import logger
 
 from app.database import get_db, async_session_maker
@@ -31,6 +32,29 @@ def _positive_int_or_default(value, default: int = 1) -> int:
     except (TypeError, ValueError):
         return default
     return parsed if parsed > 0 else default
+
+
+def _positive_int_or_none(value) -> Optional[int]:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _positive_float_or_none(value) -> Optional[float]:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) and parsed > 0 else None
+
+
+def _price_for_filter(item: LimitUpRealtime) -> Optional[float]:
+    return (
+        _positive_float_or_none(getattr(item, "limit_up_price", None))
+        or _positive_float_or_none(getattr(item, "current_price", None))
+    )
 
 
 def _format_hms(value) -> Optional[str]:
@@ -61,8 +85,21 @@ def _filter_and_sort_limit_up_list(
     status: Optional[str],
     sort_by: str,
     sort_order: Optional[str] = None,
+    continuous_days_exact: Optional[int] = None,
+    min_price: Optional[float] = None,
+    max_price: Optional[float] = None,
 ) -> List[LimitUpRealtime]:
-    if continuous_days is not None:
+    continuous_days = _positive_int_or_none(continuous_days)
+    continuous_days_exact = _positive_int_or_none(continuous_days_exact)
+    min_price = _positive_float_or_none(min_price)
+    max_price = _positive_float_or_none(max_price)
+
+    if continuous_days_exact is not None:
+        limit_up_list = [
+            item for item in limit_up_list
+            if _positive_int_or_default(item.continuous_limit_up_days) == continuous_days_exact
+        ]
+    elif continuous_days is not None:
         limit_up_list = [
             item for item in limit_up_list
             if _positive_int_or_default(item.continuous_limit_up_days) >= continuous_days
@@ -76,6 +113,18 @@ def _filter_and_sort_limit_up_list(
         limit_up_list = [item for item in limit_up_list if item.is_sealed]
     elif status == "opened":
         limit_up_list = [item for item in limit_up_list if not item.is_sealed]
+    if min_price is not None or max_price is not None:
+        filtered_list = []
+        for item in limit_up_list:
+            price = _price_for_filter(item)
+            if price is None:
+                continue
+            if min_price is not None and price < min_price:
+                continue
+            if max_price is not None and price > max_price:
+                continue
+            filtered_list.append(item)
+        limit_up_list = filtered_list
 
     reverse = _sort_desc(sort_by, sort_order)
     if sort_by == "time":
@@ -235,6 +284,9 @@ async def _get_database_limit_up_response(
     status: Optional[str],
     sort_by: str,
     sort_order: Optional[str],
+    continuous_days_exact: Optional[int] = None,
+    min_price: Optional[float] = None,
+    max_price: Optional[float] = None,
 ) -> LimitUpRealtimeResponse:
     actual_date, is_fallback = await get_trade_date_with_fallback(db, trade_date)
     query = (
@@ -276,6 +328,9 @@ async def _get_database_limit_up_response(
             status,
             sort_by,
             sort_order,
+            continuous_days_exact=continuous_days_exact,
+            min_price=min_price,
+            max_price=max_price,
         ),
     )
 
@@ -284,13 +339,21 @@ async def _get_database_limit_up_response(
 async def get_realtime_limit_up(
     trade_date: Optional[date] = Query(None, description="交易日期，默认今天"),
     continuous_days: Optional[int] = Query(None, description="连板天数筛选"),
+    continuous_days_exact: Optional[int] = Query(None, description="精确连板天数筛选"),
     reason_category: Optional[str] = Query(None, description="原因分类筛选"),
     status: Optional[str] = Query(None, description="状态筛选(sealed/opened)"),
+    min_price: Optional[float] = Query(None, description="最低涨停价筛选"),
+    max_price: Optional[float] = Query(None, description="最高涨停价筛选"),
     sort_by: str = Query("time", description="排序字段(time/seal_amount/continuous_days)"),
     sort_order: Optional[str] = Query(None, description="排序方向(asc/desc)"),
     db: AsyncSession = Depends(get_db)
 ):
     """获取实时涨停列表（东方财富数据+同花顺涨停原因）"""
+    continuous_days = _positive_int_or_none(continuous_days)
+    continuous_days_exact = _positive_int_or_none(continuous_days_exact)
+    min_price = _positive_float_or_none(min_price)
+    max_price = _positive_float_or_none(max_price)
+
     current_date = today_cn()
     if trade_date is None:
         trade_date = current_date
@@ -304,6 +367,9 @@ async def get_realtime_limit_up(
             status,
             sort_by,
             sort_order,
+            continuous_days_exact=continuous_days_exact,
+            min_price=min_price,
+            max_price=max_price,
         )
 
     raw_data = await realtime_limit_up_service.get_realtime_limit_up_list(trade_date)
@@ -317,6 +383,9 @@ async def get_realtime_limit_up(
             status,
             sort_by,
             sort_order,
+            continuous_days_exact=continuous_days_exact,
+            min_price=min_price,
+            max_price=max_price,
         )
     
     # 处理实时数据
@@ -371,6 +440,9 @@ async def get_realtime_limit_up(
             status,
             sort_by,
             sort_order,
+            continuous_days_exact=continuous_days_exact,
+            min_price=min_price,
+            max_price=max_price,
         )
     )
 

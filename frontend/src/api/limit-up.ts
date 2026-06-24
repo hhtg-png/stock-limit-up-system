@@ -16,8 +16,11 @@ const api = axios.create({
 export async function getRealtimeLimitUp(params?: {
   trade_date?: string
   continuous_days?: number
+  continuous_days_exact?: number
   reason_category?: string
   status?: string
+  min_price?: number
+  max_price?: number
   sort_by?: string
   sort_order?: string
 }): Promise<LimitUpRealtimeResponse> {

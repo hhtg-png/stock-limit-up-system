@@ -15,11 +15,12 @@
           />
         </el-form-item>
         <el-form-item label="连板天数">
-          <el-select v-model="filters.minContinuousDays" placeholder="全部" clearable style="width: 120px">
-            <el-option label="2板以上" :value="2" />
-            <el-option label="3板以上" :value="3" />
-            <el-option label="4板以上" :value="4" />
-            <el-option label="5板以上" :value="5" />
+          <el-select v-model="filters.boardScope" placeholder="全部" clearable style="width: 120px">
+            <el-option label="首板" value="first" />
+            <el-option label="2板以上" value="min-2" />
+            <el-option label="3板以上" value="min-3" />
+            <el-option label="4板以上" value="min-4" />
+            <el-option label="5板以上" value="min-5" />
           </el-select>
         </el-form-item>
         <el-form-item label="涨停原因">
@@ -32,6 +33,42 @@
             <el-option label="封板" value="sealed" />
             <el-option label="开板" value="opened" />
           </el-select>
+        </el-form-item>
+        <el-form-item label="价格" class="price-filter">
+          <div class="price-filter__content">
+            <div class="price-presets">
+              <el-button
+                v-for="range in priceRanges"
+                :key="range.label"
+                size="small"
+                :type="filters.activePriceRange === range.label ? 'primary' : 'default'"
+                @click="applyPriceRange(range)"
+              >
+                {{ range.label }}
+              </el-button>
+            </div>
+            <div class="price-inputs">
+              <el-input
+                v-model="filters.minPrice"
+                class="price-input"
+                type="number"
+                placeholder="最低"
+                size="small"
+                clearable
+                @input="handleCustomPriceChange"
+              />
+              <span class="price-separator">-</span>
+              <el-input
+                v-model="filters.maxPrice"
+                class="price-input"
+                type="number"
+                placeholder="最高"
+                size="small"
+                clearable
+                @input="handleCustomPriceChange"
+              />
+            </div>
+          </div>
         </el-form-item>
         <el-form-item class="filter-actions">
           <el-button type="primary" @click="applyFilters">查询</el-button>
@@ -157,10 +194,28 @@ const tableSort = ref<{ prop: string; order: 'ascending' | 'descending' | null }
 const RESYNC_INTERVAL = 90000
 let refreshTimer: number | null = null
 
+type BoardScope = '' | 'first' | 'min-2' | 'min-3' | 'min-4' | 'min-5'
+
+interface PriceRange {
+  label: string
+  min: number
+  max: number
+}
+
+const priceRanges: PriceRange[] = [
+  { label: '1-20', min: 1, max: 20 },
+  { label: '20-50', min: 20, max: 50 },
+  { label: '50-100', min: 50, max: 100 },
+  { label: '100-9999', min: 100, max: 9999 }
+]
+
 const filters = reactive({
-  minContinuousDays: undefined as number | undefined,
+  boardScope: '' as BoardScope,
   reasonCategory: '',
-  status: ''
+  status: '',
+  minPrice: '',
+  maxPrice: '',
+  activePriceRange: ''
 })
 
 interface FetchOptions {
@@ -186,6 +241,31 @@ const reasonCategories = computed(() => {
 
 const tableData = computed(() => limitUpStore.realtimeList)
 
+const boardFilter = computed(() => {
+  const scope = filters.boardScope || ''
+  if (scope === 'first') {
+    return { continuousDays: undefined, continuousDaysExact: 1 }
+  }
+  if (scope.startsWith('min-')) {
+    const days = Number(scope.replace('min-', ''))
+    return {
+      continuousDays: Number.isFinite(days) ? days : undefined,
+      continuousDaysExact: undefined
+    }
+  }
+  return { continuousDays: undefined, continuousDaysExact: undefined }
+})
+
+const normalizedPriceRange = computed(() => ({
+  min: parsePriceInput(filters.minPrice),
+  max: parsePriceInput(filters.maxPrice)
+}))
+
+const hasInvalidPriceRange = computed(() => {
+  const { min, max } = normalizedPriceRange.value
+  return min !== undefined && max !== undefined && min > max
+})
+
 const apiSort = computed(() => {
   if (tableSort.value.prop === 'seal_amount') {
     return { sortBy: 'seal_amount', sortOrder: tableSort.value.order === 'ascending' ? 'asc' : 'desc' }
@@ -196,8 +276,24 @@ const apiSort = computed(() => {
   return { sortBy: 'time', sortOrder: tableSort.value.order === 'descending' ? 'desc' : 'asc' }
 })
 
+function parsePriceInput(value: string): number | undefined {
+  const text = String(value ?? '').trim()
+  if (!text) return undefined
+  const parsed = Number(text)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined
+}
+
+function validatePriceRange(silent: boolean): boolean {
+  if (!hasInvalidPriceRange.value) return true
+  if (!silent) {
+    ElMessage.warning('价格区间最低价不能大于最高价')
+  }
+  return false
+}
+
 async function fetchData(options: FetchOptions = {}) {
   const { showLoading = limitUpStore.realtimeList.length === 0, silent = false } = options
+  if (!validatePriceRange(silent)) return
   if (isFetching.value) return
 
   isFetching.value = true
@@ -208,9 +304,12 @@ async function fetchData(options: FetchOptions = {}) {
   try {
     const response = await getRealtimeLimitUp({
       trade_date: selectedDate.value,
-      continuous_days: filters.minContinuousDays,
+      continuous_days: boardFilter.value.continuousDays,
+      continuous_days_exact: boardFilter.value.continuousDaysExact,
       reason_category: filters.reasonCategory || undefined,
       status: filters.status || undefined,
+      min_price: normalizedPriceRange.value.min,
+      max_price: normalizedPriceRange.value.max,
       sort_by: apiSort.value.sortBy,
       sort_order: apiSort.value.sortOrder
     })
@@ -236,6 +335,17 @@ function applyFilters() {
   fetchData({ showLoading: true })
 }
 
+function applyPriceRange(range: PriceRange) {
+  filters.minPrice = String(range.min)
+  filters.maxPrice = String(range.max)
+  filters.activePriceRange = range.label
+  applyFilters()
+}
+
+function handleCustomPriceChange() {
+  filters.activePriceRange = ''
+}
+
 function updateRealtimeMode() {
   limitUpStore.setAcceptRealtimeUpdates(isSelectedToday.value)
 }
@@ -247,9 +357,12 @@ function handleDateChange() {
 }
 
 function resetFilters() {
-  filters.minContinuousDays = undefined
+  filters.boardScope = ''
   filters.reasonCategory = ''
   filters.status = ''
+  filters.minPrice = ''
+  filters.maxPrice = ''
+  filters.activePriceRange = ''
   resetTableScroll()
   fetchData({ showLoading: true })
 }
@@ -337,7 +450,7 @@ onMounted(() => {
 })
 
 watch(
-  () => [filters.minContinuousDays, filters.reasonCategory, filters.status] as const,
+  () => [filters.boardScope, filters.reasonCategory, filters.status, filters.minPrice, filters.maxPrice] as const,
   () => resetTableScroll()
 )
 
@@ -357,6 +470,49 @@ onUnmounted(() => {
     
     :deep(.el-form-item) {
       margin-bottom: 0;
+    }
+
+    .price-filter {
+      :deep(.el-form-item__content) {
+        align-items: flex-start;
+      }
+    }
+
+    .price-filter__content {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .price-presets {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+
+      :deep(.el-button) {
+        margin-left: 0;
+        padding: 5px 9px;
+      }
+    }
+
+    .price-inputs {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .price-input {
+      width: 72px;
+
+      :deep(.el-input__inner) {
+        text-align: right;
+      }
+    }
+
+    .price-separator {
+      color: #909399;
+      line-height: 24px;
     }
   }
 
@@ -407,7 +563,8 @@ onUnmounted(() => {
       }
 
       :deep(.filter-actions),
-      :deep(.filter-date-tag) {
+      :deep(.filter-date-tag),
+      .price-filter {
         grid-column: 1 / -1;
       }
 
@@ -415,6 +572,31 @@ onUnmounted(() => {
         display: grid;
         grid-template-columns: repeat(4, minmax(0, 1fr));
         gap: 6px;
+      }
+
+      .price-filter__content {
+        width: 100%;
+        align-items: stretch;
+      }
+
+      .price-presets {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        width: 100%;
+        gap: 6px;
+
+        :deep(.el-button) {
+          padding: 6px 0;
+        }
+      }
+
+      .price-inputs {
+        width: 100%;
+      }
+
+      .price-input {
+        flex: 1;
+        width: auto;
       }
     }
 
