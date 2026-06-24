@@ -304,14 +304,14 @@ class MarketReviewSourceServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_collect_for_date_preserves_limit_up_price_and_seal_amount_for_sync(self):
         async def today_fetcher(trade_date):
-            self.assertEqual(trade_date, date(2026, 6, 19))
+            self.assertEqual(trade_date, date(2026, 6, 18))
             return [
                 {
                     "stock_code": "600001",
                     "stock_name": "Alpha",
                     "continuous_limit_up_days": 1,
                     "is_sealed": False,
-                    "first_limit_up_time": datetime(2026, 6, 19, 9, 40, 0),
+                    "first_limit_up_time": datetime(2026, 6, 18, 9, 40, 0),
                     "open_count": 2,
                     "current_price": 10.66,
                     "limit_up_price": 11.0,
@@ -343,10 +343,10 @@ class MarketReviewSourceServiceTests(unittest.IsolatedAsyncioTestCase):
             yesterday_pool_fetcher=empty_yesterday_pool,
             quote_fetcher=empty_quotes,
             market_stats_fetcher=market_stats_fetcher,
-            current_date_provider=lambda: date(2026, 6, 19),
+            current_date_provider=lambda: date(2026, 6, 18),
         )
 
-        payload = await service.collect_for_date(date(2026, 6, 19))
+        payload = await service.collect_for_date(date(2026, 6, 18))
         row = payload["stock_rows"][0]
 
         self.assertAlmostEqual(row["limit_up_price"], 11.0)

@@ -754,6 +754,8 @@ class IntelligenceService:
             "error": "",
             "result": None,
         }
+        self._cn_trading_calendar: Optional[set[date]] = None
+        self._cn_trading_calendar_unavailable = False
 
     async def sync_all(self, db: AsyncSession, *, force_daily: bool = False) -> Dict[str, Any]:
         results = {}
@@ -1679,18 +1681,43 @@ class IntelligenceService:
         result = await db.execute(
             select(MarketReviewDailyMetric.trade_date)
             .order_by(MarketReviewDailyMetric.trade_date.desc())
-            .limit(1)
         )
-        return result.scalar_one_or_none()
+        return self._first_trading_review_date(result.scalars().all())
 
     async def _previous_market_review_date(self, db: AsyncSession, trade_date: date) -> Optional[date]:
         result = await db.execute(
             select(MarketReviewDailyMetric.trade_date)
             .where(MarketReviewDailyMetric.trade_date < trade_date)
             .order_by(MarketReviewDailyMetric.trade_date.desc())
-            .limit(1)
         )
-        return result.scalar_one_or_none()
+        return self._first_trading_review_date(result.scalars().all())
+
+    def _first_trading_review_date(self, dates: Iterable[date]) -> Optional[date]:
+        ordered_dates = list(dict.fromkeys(dates))
+        if not ordered_dates:
+            return None
+
+        trading_dates = self._load_cn_trading_date_set(min(ordered_dates), max(ordered_dates))
+        if trading_dates is None:
+            return next((value for value in ordered_dates if value.weekday() < 5), None)
+        return next((value for value in ordered_dates if value in trading_dates), None)
+
+    def _load_cn_trading_date_set(self, start: date, end: date) -> Optional[set[date]]:
+        if self._cn_trading_calendar is not None:
+            return {value for value in self._cn_trading_calendar if start <= value <= end}
+        if self._cn_trading_calendar_unavailable:
+            return None
+
+        try:
+            from app.data_collectors.scheduler import _get_cn_trading_dates
+
+            calendar_end = max(end, date.today())
+            self._cn_trading_calendar = set(_get_cn_trading_dates(date(1990, 1, 1), calendar_end))
+        except Exception:
+            self._cn_trading_calendar_unavailable = True
+            return None
+
+        return {value for value in self._cn_trading_calendar if start <= value <= end}
 
     async def _get_jiege_signal(self, db: AsyncSession, trade_date: date) -> Optional[JiegeModeSignal]:
         result = await db.execute(select(JiegeModeSignal).where(JiegeModeSignal.trade_date == trade_date))

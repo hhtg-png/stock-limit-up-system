@@ -437,7 +437,7 @@ class MarketReviewPipelineServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_persist_payload_syncs_limit_up_records_from_authoritative_review_snapshot(self):
         service = MarketReviewPipelineService(session_factory=self.session_factory)
-        trade_date = date(2026, 6, 19)
+        trade_date = date(2026, 6, 18)
         normalized = self._normalized_input()
         normalized["stock_rows"][0].update(
             {
@@ -479,8 +479,8 @@ class MarketReviewPipelineServiceTests(unittest.IsolatedAsyncioTestCase):
                         continuous_limit_up_days=9,
                         is_final_sealed=True,
                         current_status="sealed",
-                        first_limit_up_time=datetime(2026, 6, 19, 9, 25),
-                        final_seal_time=datetime(2026, 6, 19, 9, 25),
+                        first_limit_up_time=datetime(2026, 6, 18, 9, 25),
+                        final_seal_time=datetime(2026, 6, 18, 9, 25),
                         limit_up_price=10.0,
                         seal_amount=1.0,
                         data_source="OLD",
@@ -519,8 +519,8 @@ class MarketReviewPipelineServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sealed.continuous_limit_up_days, 2)
         self.assertTrue(sealed.is_final_sealed)
         self.assertEqual(sealed.current_status, "sealed")
-        self.assertEqual(sealed.first_limit_up_time, datetime(2026, 6, 19, 9, 31))
-        self.assertEqual(sealed.final_seal_time, datetime(2026, 6, 19, 14, 55))
+        self.assertEqual(sealed.first_limit_up_time, datetime(2026, 6, 18, 9, 31))
+        self.assertEqual(sealed.final_seal_time, datetime(2026, 6, 18, 14, 55))
         self.assertAlmostEqual(sealed.limit_up_price, 11.2)
         self.assertAlmostEqual(sealed.seal_amount, 3000.0)
         self.assertEqual(sealed.data_source, "MARKET_REVIEW")
@@ -529,7 +529,7 @@ class MarketReviewPipelineServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(opened.continuous_limit_up_days, 1)
         self.assertFalse(opened.is_final_sealed)
         self.assertEqual(opened.current_status, "opened")
-        self.assertEqual(opened.first_limit_up_time, datetime(2026, 6, 19, 9, 38))
+        self.assertEqual(opened.first_limit_up_time, datetime(2026, 6, 18, 9, 38))
         self.assertIsNone(opened.final_seal_time)
         self.assertAlmostEqual(opened.limit_up_price, 6.6)
         self.assertEqual(opened.seal_amount, 0.0)

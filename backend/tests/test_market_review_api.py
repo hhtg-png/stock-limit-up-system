@@ -59,6 +59,7 @@ class MarketReviewApiTests(unittest.TestCase):
         asyncio.run(self._create_schema())
         asyncio.run(self._seed_data())
         self.review_module = _load_review_module()
+        self._mark_only_seed_dates_as_trading()
 
         self.app = FastAPI()
         self.app.include_router(self.review_module.router, prefix="/api/v1/statistics/review")
@@ -212,6 +213,59 @@ class MarketReviewApiTests(unittest.TestCase):
             limit_up_reason=limit_up_reason,
         )
 
+    async def _add_non_trading_review_rows(self):
+        async with self.session_factory() as session:
+            session.add(
+                MarketReviewDailyMetric(
+                    trade_date=date(2026, 4, 29),
+                    limit_up_count=0,
+                    limit_down_count=0,
+                    continuous_count=0,
+                    max_board_height=0,
+                    second_board_height=0,
+                    gem_board_height=0,
+                    first_to_second_rate=0.0,
+                    continuous_promotion_rate=0.0,
+                    seal_rate=0.0,
+                    yesterday_limit_up_avg_change=0.0,
+                    yesterday_continuous_avg_change=0.0,
+                    market_turnover=0.0,
+                    up_count_ex_st=0,
+                    down_count_ex_st=0,
+                    limit_up_amount=0.0,
+                    broken_amount=0.0,
+                    source_status="placeholder",
+                )
+            )
+            session.add(
+                MarketReviewStockDaily(
+                    trade_date=date(2026, 4, 29),
+                    stock_id=6,
+                    stock_code="600006",
+                    stock_name="Zeta",
+                    board_type="main",
+                    is_st=False,
+                    yesterday_limit_up=False,
+                    yesterday_continuous_days=0,
+                    today_touched_limit_up=True,
+                    today_sealed_close=True,
+                    today_opened_close=False,
+                    today_broken=False,
+                    today_continuous_days=1,
+                    first_limit_time=time(9, 25),
+                    change_pct=10.0,
+                    amount=1.0,
+                    limit_up_reason="Bad holiday row",
+                )
+            )
+            await session.commit()
+
+    def _mark_only_seed_dates_as_trading(self):
+        self.review_module._TRADING_DAY_CACHE.clear()
+        self.review_module._load_cn_trading_dates = Mock(
+            return_value={date(2026, 4, 26), date(2026, 4, 27), date(2026, 4, 28)}
+        )
+
     def test_daily_endpoint_returns_filtered_rows_and_ascending_series(self):
         response = self.client.get(
             "/api/v1/statistics/review/daily",
@@ -296,6 +350,23 @@ class MarketReviewApiTests(unittest.TestCase):
         self.assertEqual(payload["latest_trade_date"], "2026-04-28")
         self.assertTrue(payload["is_fallback"])
 
+    def test_daily_endpoint_excludes_non_trading_metric_rows_from_all_series(self):
+        asyncio.run(self._add_non_trading_review_rows())
+        self._mark_only_seed_dates_as_trading()
+
+        response = self.client.get(
+            "/api/v1/statistics/review/daily",
+            params={"start_date": "2026-04-27", "end_date": "2026-04-29"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["data"]["series"], ["2026-04-27", "2026-04-28"])
+        self.assertEqual([row["trade_date"] for row in payload["data"]["rows"]], ["2026-04-27", "2026-04-28"])
+        self.assertEqual(payload["end_date"], "2026-04-28")
+        self.assertEqual(payload["latest_trade_date"], "2026-04-28")
+        self.assertTrue(payload["is_fallback"])
+
     def test_daily_endpoint_days_returns_latest_available_trading_rows(self):
         response = self.client.get(
             "/api/v1/statistics/review/daily",
@@ -308,6 +379,22 @@ class MarketReviewApiTests(unittest.TestCase):
         self.assertEqual(payload["start_date"], "2026-04-27")
         self.assertEqual(payload["end_date"], "2026-04-28")
         self.assertEqual(payload["requested_end_date"], "2026-05-02")
+        self.assertEqual(payload["latest_trade_date"], "2026-04-28")
+        self.assertTrue(payload["is_fallback"])
+
+    def test_daily_endpoint_days_skips_non_trading_metric_rows_before_limiting(self):
+        asyncio.run(self._add_non_trading_review_rows())
+        self._mark_only_seed_dates_as_trading()
+
+        response = self.client.get(
+            "/api/v1/statistics/review/daily",
+            params={"days": 2, "end_date": "2026-04-29"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["data"]["series"], ["2026-04-27", "2026-04-28"])
+        self.assertEqual(payload["end_date"], "2026-04-28")
         self.assertEqual(payload["latest_trade_date"], "2026-04-28")
         self.assertTrue(payload["is_fallback"])
 
@@ -353,6 +440,21 @@ class MarketReviewApiTests(unittest.TestCase):
         self.assertEqual(payload["trade_date"], "2026-04-28")
         self.assertEqual(payload["is_fallback"], True)
         self.assertEqual(payload["stocks"][0]["stock_code"], "600002")
+
+    def test_detail_endpoint_skips_non_trading_review_rows(self):
+        asyncio.run(self._add_non_trading_review_rows())
+        self._mark_only_seed_dates_as_trading()
+
+        response = self.client.get(
+            "/api/v1/statistics/review/detail",
+            params={"trade_date": "2026-04-29"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["trade_date"], "2026-04-28")
+        self.assertTrue(payload["is_fallback"])
+        self.assertNotEqual(payload["stocks"][0]["limit_up_reason"], "Bad holiday row")
 
     def test_ladder_endpoint_groups_descending_and_excludes_opened_rows(self):
         response = self.client.get(
@@ -436,6 +538,26 @@ class MarketReviewApiTests(unittest.TestCase):
         self.assertEqual(payload["trade_date"], "2026-04-28")
         self.assertEqual(payload["is_fallback"], True)
         self.assertEqual(payload["ladders"][0]["stocks"][0]["stock_code"], "600001")
+
+    def test_intraday_endpoint_skips_stored_non_trading_snapshot(self):
+        asyncio.run(self._add_non_trading_review_rows())
+        self._mark_only_seed_dates_as_trading()
+        self.review_module._collect_intraday_source = AsyncMock(
+            side_effect=AssertionError("non-trading stored row should not be collected")
+        )
+
+        response = self.client.get(
+            "/api/v1/statistics/review/intraday",
+            params={"trade_date": "2026-04-29"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["data"]["series"], ["2026-04-28"])
+        self.assertEqual(payload["end_date"], "2026-04-28")
+        self.assertEqual(payload["detail"]["trade_date"], "2026-04-28")
+        self.assertTrue(payload["is_fallback"])
+        self.review_module._collect_intraday_source.assert_not_awaited()
 
     def test_live_intraday_detection_uses_trading_calendar_and_closes_at_market_end(self):
         class MarketOpenDatetime(datetime):

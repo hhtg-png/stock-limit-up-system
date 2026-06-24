@@ -27,6 +27,8 @@ class IntelligenceApiTests(unittest.TestCase):
         )
         self.Session = async_sessionmaker(self.engine, expire_on_commit=False)
         asyncio.run(self._create_schema_and_seed())
+        intelligence_api.intelligence_service._cn_trading_calendar = {date(2026, 5, 18), date(2026, 5, 19)}
+        intelligence_api.intelligence_service._cn_trading_calendar_unavailable = False
 
         app = FastAPI()
         app.include_router(intelligence_router, prefix="/intelligence")
@@ -472,6 +474,38 @@ class IntelligenceApiTests(unittest.TestCase):
         self.assertEqual(yesterday_prediction["target_date"], "2026-05-19")
         self.assertEqual(yesterday_prediction["candidates"][0]["stock_code"], "000001")
         self.assertNotEqual(yesterday_prediction["candidates"][0]["stock_code"], "000002")
+
+    def test_get_jiege_mode_default_skips_non_trading_latest_review_metric(self):
+        async def seed_non_trading_metric():
+            async with self.Session() as session:
+                session.add(
+                    MarketReviewDailyMetric(
+                        trade_date=date(2026, 5, 20),
+                        limit_up_count=0,
+                        limit_down_count=0,
+                        max_board_height=0,
+                        seal_rate=0,
+                        up_count_ex_st=0,
+                        down_count_ex_st=0,
+                        source_status="placeholder",
+                    )
+                )
+                await session.commit()
+
+        asyncio.run(seed_non_trading_metric())
+
+        with patch.object(
+            intelligence_api.intelligence_service,
+            "_load_cn_trading_date_set",
+            return_value={date(2026, 5, 18), date(2026, 5, 19)},
+            create=True,
+        ):
+            response = self.client.get("/intelligence/jiege-mode")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["trade_date"], "2026-05-19")
+        self.assertEqual(payload["data"]["review"]["max_board_height"], 2)
 
     def test_get_jiege_mode_enriches_legacy_cache_without_yesterday_prediction(self):
         async def seed_legacy_signal():

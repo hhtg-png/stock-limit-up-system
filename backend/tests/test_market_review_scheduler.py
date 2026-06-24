@@ -420,7 +420,7 @@ class MarketReviewSchedulerTests(unittest.IsolatedAsyncioTestCase):
             return_value=date(2026, 6, 21),
         ), patch(
             "app.data_collectors.scheduler._get_cn_trading_dates",
-            return_value=[date(2026, 6, 19)],
+            return_value=[date(2026, 6, 18)],
         ) as get_trading_dates, patch.object(
             scheduler,
             "_build_market_review",
@@ -437,9 +437,9 @@ class MarketReviewSchedulerTests(unittest.IsolatedAsyncioTestCase):
             await scheduler._run_after_close_catchup()
 
         get_trading_dates.assert_called_once_with(date(2026, 6, 11), date(2026, 6, 21))
-        build_market_review.assert_awaited_once_with(date(2026, 6, 19))
-        calculate_daily_analysis.assert_awaited_once_with(date(2026, 6, 19))
-        archive_classification.assert_awaited_once_with(date(2026, 6, 19))
+        build_market_review.assert_awaited_once_with(date(2026, 6, 18))
+        calculate_daily_analysis.assert_awaited_once_with(date(2026, 6, 18))
+        archive_classification.assert_awaited_once_with(date(2026, 6, 18))
 
     async def test_after_close_catchup_skips_before_build_time(self):
         scheduler = self._create_scheduler()

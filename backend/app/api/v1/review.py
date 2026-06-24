@@ -2,10 +2,10 @@
 市场复盘API
 """
 from datetime import date, datetime, time, timedelta, timezone
-from typing import Any
+from typing import Any, Iterable
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import desc, select
+from sqlalchemy import desc, distinct, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
@@ -39,15 +39,30 @@ async def _resolve_review_trade_date(
 ) -> tuple[date, bool]:
     """按复盘明细表解析实际可用的交易日期。"""
     result = await db.execute(
-        select(MarketReviewStockDaily.trade_date)
+        select(distinct(MarketReviewStockDaily.trade_date))
         .where(MarketReviewStockDaily.trade_date <= requested_date)
         .order_by(desc(MarketReviewStockDaily.trade_date))
-        .limit(1)
     )
-    resolved_date = result.scalar_one_or_none()
+    candidate_dates = result.scalars().all()
+    trading_dates = set(_filter_cn_trading_dates(candidate_dates))
+    resolved_date = next((candidate for candidate in candidate_dates if candidate in trading_dates), None)
     if resolved_date is None:
         return requested_date, False
     return resolved_date, resolved_date != requested_date
+
+
+async def _resolve_latest_metric_trade_date(
+    db: AsyncSession,
+    end_date: date | None,
+) -> date | None:
+    query = select(distinct(MarketReviewDailyMetric.trade_date)).order_by(desc(MarketReviewDailyMetric.trade_date))
+    if end_date is not None:
+        query = query.where(MarketReviewDailyMetric.trade_date <= end_date)
+
+    result = await db.execute(query)
+    candidate_dates = result.scalars().all()
+    trading_dates = set(_filter_cn_trading_dates(candidate_dates))
+    return next((candidate for candidate in candidate_dates if candidate in trading_dates), None)
 
 
 async def _resolve_daily_metric_range(
@@ -56,16 +71,7 @@ async def _resolve_daily_metric_range(
     end_date: date | None,
 ) -> tuple[date | None, date | None, date | None, bool]:
     """把日线查询锚定到最新已有复盘指标，避免今日未生成时返回空图。"""
-    latest_query = (
-        select(MarketReviewDailyMetric.trade_date)
-        .order_by(desc(MarketReviewDailyMetric.trade_date))
-        .limit(1)
-    )
-    if end_date is not None:
-        latest_query = latest_query.where(MarketReviewDailyMetric.trade_date <= end_date)
-
-    result = await db.execute(latest_query)
-    latest_trade_date = result.scalar_one_or_none()
+    latest_trade_date = await _resolve_latest_metric_trade_date(db, end_date)
     if latest_trade_date is None:
         return start_date, end_date, None, False
 
@@ -293,15 +299,48 @@ def _load_cn_trading_dates(start_date: date, end_date: date) -> set[date]:
     return trading_dates
 
 
-def _is_cn_trading_day(trade_date: date) -> bool:
-    if trade_date.weekday() >= 5:
-        return False
-    if trade_date not in _TRADING_DAY_CACHE:
+def _cache_cn_trading_dates(start_date: date, end_date: date, trading_dates: set[date]) -> None:
+    current = start_date
+    while current <= end_date:
+        _TRADING_DAY_CACHE[current] = current.weekday() < 5 and current in trading_dates
+        current += timedelta(days=1)
+
+
+def _filter_cn_trading_dates(dates: Iterable[date]) -> list[date]:
+    candidate_dates = list(dates)
+    if not candidate_dates:
+        return []
+
+    unique_dates = sorted(set(candidate_dates))
+    missing_weekdays = [
+        trade_date
+        for trade_date in unique_dates
+        if trade_date.weekday() < 5 and trade_date not in _TRADING_DAY_CACHE
+    ]
+    for trade_date in unique_dates:
+        if trade_date.weekday() >= 5:
+            _TRADING_DAY_CACHE[trade_date] = False
+
+    if missing_weekdays:
+        start_date = missing_weekdays[0]
+        end_date = missing_weekdays[-1]
         try:
-            _TRADING_DAY_CACHE[trade_date] = trade_date in _load_cn_trading_dates(trade_date, trade_date)
+            _cache_cn_trading_dates(start_date, end_date, _load_cn_trading_dates(start_date, end_date))
         except Exception:
-            _TRADING_DAY_CACHE[trade_date] = True
-    return _TRADING_DAY_CACHE[trade_date]
+            for trade_date in missing_weekdays:
+                _TRADING_DAY_CACHE[trade_date] = True
+
+    return [trade_date for trade_date in candidate_dates if _TRADING_DAY_CACHE.get(trade_date, False)]
+
+
+def _filter_trading_metric_rows(rows: Iterable[MarketReviewDailyMetric]) -> list[MarketReviewDailyMetric]:
+    metric_rows = list(rows)
+    trading_dates = set(_filter_cn_trading_dates(row.trade_date for row in metric_rows))
+    return [row for row in metric_rows if row.trade_date in trading_dates]
+
+
+def _is_cn_trading_day(trade_date: date) -> bool:
+    return bool(_filter_cn_trading_dates([trade_date]))
 
 
 def _should_collect_live_intraday(trade_date: date) -> bool:
@@ -404,27 +443,20 @@ async def _build_stored_intraday_snapshot(
     db: AsyncSession,
     requested_date: date,
 ) -> MarketReviewIntradayResponse | None:
+    resolved_date = await _resolve_latest_metric_trade_date(db, requested_date)
+    if resolved_date is None:
+        return None
+
     result = await db.execute(
         select(MarketReviewDailyMetric)
-        .where(MarketReviewDailyMetric.trade_date == requested_date)
+        .where(MarketReviewDailyMetric.trade_date == resolved_date)
         .limit(1)
     )
     metric_row = result.scalar_one_or_none()
-    is_fallback = False
-
-    if metric_row is None:
-        result = await db.execute(
-            select(MarketReviewDailyMetric)
-            .where(MarketReviewDailyMetric.trade_date <= requested_date)
-            .order_by(desc(MarketReviewDailyMetric.trade_date))
-            .limit(1)
-        )
-        metric_row = result.scalar_one_or_none()
-        is_fallback = metric_row is not None
-
     if metric_row is None:
         return None
 
+    is_fallback = metric_row.trade_date != requested_date
     rows = await _attach_board_height_labels(db, [metric_row])
     daily_row = rows[0] if rows else MarketReviewDailyMetricRow.model_validate(metric_row)
     detail = await _build_detail_response_from_db(db, daily_row.trade_date, is_fallback)
@@ -536,9 +568,10 @@ async def get_market_review_daily(
         if resolved_end_date:
             query = query.where(MarketReviewDailyMetric.trade_date <= resolved_end_date)
         result = await db.execute(
-            query.order_by(MarketReviewDailyMetric.trade_date.desc()).limit(days)
+            query.order_by(MarketReviewDailyMetric.trade_date.desc())
         )
-        rows = await _attach_board_height_labels(db, list(reversed(result.scalars().all())))
+        metric_rows = _filter_trading_metric_rows(result.scalars().all())
+        rows = await _attach_board_height_labels(db, list(reversed(metric_rows[:days])))
         return MarketReviewDailyResponse(
             data=MarketReviewDailyData(
                 series=[row.trade_date for row in rows],
@@ -559,7 +592,7 @@ async def get_market_review_daily(
         query = query.where(MarketReviewDailyMetric.trade_date <= resolved_end_date)
 
     result = await db.execute(query.order_by(MarketReviewDailyMetric.trade_date.asc()))
-    rows = await _attach_board_height_labels(db, list(result.scalars().all()))
+    rows = await _attach_board_height_labels(db, _filter_trading_metric_rows(result.scalars().all()))
 
     return MarketReviewDailyResponse(
         data=MarketReviewDailyData(
