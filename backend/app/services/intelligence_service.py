@@ -755,6 +755,7 @@ class IntelligenceService:
             "result": None,
         }
         self._cn_trading_calendar: Optional[set[date]] = None
+        self._cn_trading_calendar_end: Optional[date] = None
         self._cn_trading_calendar_unavailable = False
 
     async def sync_all(self, db: AsyncSession, *, force_daily: bool = False) -> Dict[str, Any]:
@@ -1703,7 +1704,10 @@ class IntelligenceService:
         return next((value for value in ordered_dates if value in trading_dates), None)
 
     def _load_cn_trading_date_set(self, start: date, end: date) -> Optional[set[date]]:
-        if self._cn_trading_calendar is not None:
+        if (
+            self._cn_trading_calendar is not None
+            and (self._cn_trading_calendar_end is None or end <= self._cn_trading_calendar_end)
+        ):
             return {value for value in self._cn_trading_calendar if start <= value <= end}
         if self._cn_trading_calendar_unavailable:
             return None
@@ -1713,6 +1717,7 @@ class IntelligenceService:
 
             calendar_end = max(end, date.today())
             self._cn_trading_calendar = set(_get_cn_trading_dates(date(1990, 1, 1), calendar_end))
+            self._cn_trading_calendar_end = calendar_end
         except Exception:
             self._cn_trading_calendar_unavailable = True
             return None

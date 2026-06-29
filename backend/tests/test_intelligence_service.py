@@ -2,6 +2,7 @@ import asyncio
 import unittest
 from datetime import date, datetime
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -128,6 +129,39 @@ class StockAnalysisSummaryClient(FakeSummaryClient):
             ],
             "stock_analysis_status": "ready",
         }
+
+
+class IntelligenceServiceCalendarTests(unittest.TestCase):
+    def test_trading_calendar_cache_refreshes_when_requested_range_extends_past_cached_end(self):
+        class FrozenDate(date):
+            @classmethod
+            def today(cls):
+                return cls(2026, 6, 24)
+
+        service = IntelligenceService(ima_client=FakeImaClient({}), summary_client=FakeSummaryClient(), sources=[])
+        calls = []
+
+        def fake_get_cn_trading_dates(start_date, end_date):
+            calls.append((start_date, end_date))
+            if end_date == date(2026, 6, 24):
+                return [date(2026, 6, 24)]
+            return [
+                date(2026, 6, 24),
+                date(2026, 6, 25),
+                date(2026, 6, 26),
+                date(2026, 6, 29),
+            ]
+
+        with patch("app.services.intelligence_service.date", FrozenDate), patch(
+            "app.data_collectors.scheduler._get_cn_trading_dates",
+            side_effect=fake_get_cn_trading_dates,
+        ):
+            initial_dates = service._load_cn_trading_date_set(date(2026, 6, 1), date(2026, 6, 24))
+            later_dates = service._load_cn_trading_date_set(date(2026, 6, 25), date(2026, 6, 29))
+
+        self.assertEqual(initial_dates, {date(2026, 6, 24)})
+        self.assertEqual(later_dates, {date(2026, 6, 25), date(2026, 6, 26), date(2026, 6, 29)})
+        self.assertEqual(len(calls), 2)
 
 
 def md_item(**overrides):

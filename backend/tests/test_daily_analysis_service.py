@@ -1,8 +1,10 @@
 import unittest
 from datetime import date, datetime
+from unittest.mock import patch
 
 from app.services.daily_analysis_service import (
     DAILY_ANALYSIS_COLUMNS,
+    DailyAnalysisService,
     DailyAnalysisRuleEngine,
     DailyAnalysisStockFact,
 )
@@ -532,6 +534,39 @@ class DailyAnalysisRuleEngineTests(unittest.TestCase):
         }
 
         self.assertIn("002081", second_wave_codes)
+
+
+class DailyAnalysisServiceCalendarTests(unittest.TestCase):
+    def test_trading_calendar_cache_refreshes_when_requested_range_extends_past_cached_end(self):
+        class FrozenDate(date):
+            @classmethod
+            def today(cls):
+                return cls(2026, 6, 24)
+
+        service = DailyAnalysisService()
+        calls = []
+
+        def fake_get_cn_trading_dates(start_date, end_date):
+            calls.append((start_date, end_date))
+            if end_date == date(2026, 6, 24):
+                return [date(2026, 6, 24)]
+            return [
+                date(2026, 6, 24),
+                date(2026, 6, 25),
+                date(2026, 6, 26),
+                date(2026, 6, 29),
+            ]
+
+        with patch("app.services.daily_analysis_service.date", FrozenDate), patch(
+            "app.data_collectors.scheduler._get_cn_trading_dates",
+            side_effect=fake_get_cn_trading_dates,
+        ):
+            initial_dates = service._load_cn_trading_date_set(date(2026, 6, 1), date(2026, 6, 24))
+            later_dates = service._load_cn_trading_date_set(date(2026, 6, 25), date(2026, 6, 29))
+
+        self.assertEqual(initial_dates, {date(2026, 6, 24)})
+        self.assertEqual(later_dates, {date(2026, 6, 25), date(2026, 6, 26), date(2026, 6, 29)})
+        self.assertEqual(len(calls), 2)
 
 
 if __name__ == "__main__":
