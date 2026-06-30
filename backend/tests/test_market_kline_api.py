@@ -186,6 +186,13 @@ class MarketKlineApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(opened_point["is_limit_up"])
         self.assertTrue(sealed_point["is_limit_up"])
 
+    def test_format_kline_item_marks_threshold_close_at_high_as_limit_up(self):
+        raw = "2026-06-23,12.61,13.57,13.57,12.27,3680392,4874317549,10.54,10.06,1.24,11.36"
+
+        point = market._format_kline_item(raw, "600707")
+
+        self.assertTrue(point["is_limit_up"])
+
     def test_apply_change_pct_requires_close_at_limit_up_price(self):
         points = [
             {"date": date(2026, 6, 26), "open": 13.64, "close": 13.96, "high": 14.91, "low": 13.63},
@@ -196,6 +203,17 @@ class MarketKlineApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertAlmostEqual(normalized[1]["change_pct"], 9.96)
         self.assertFalse(normalized[1]["is_limit_up"])
+
+    def test_apply_change_pct_marks_threshold_close_at_high_as_limit_up(self):
+        points = [
+            {"date": date(2026, 6, 22), "open": 12.22, "close": 12.33, "high": 12.73, "low": 12.13},
+            {"date": date(2026, 6, 23), "open": 12.61, "close": 13.57, "high": 13.57, "low": 12.27},
+        ]
+
+        normalized = market._apply_change_pct(points, "600707")
+
+        self.assertAlmostEqual(normalized[1]["change_pct"], 10.06)
+        self.assertTrue(normalized[1]["is_limit_up"])
 
     def test_format_kline_item_uses_twenty_percent_board_for_chinext(self):
         raw = "2026-05-12,10.00,11.00,11.00,9.90,1000,1100000,11.00,10.00,1.00,3.20"

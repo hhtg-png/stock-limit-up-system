@@ -207,6 +207,34 @@ def _is_close_at_limit_up_price(
     )
 
 
+def _is_limit_up_kline_point(
+    *,
+    close: float,
+    high: float,
+    pre_close: Optional[float],
+    change_pct: Optional[float],
+    stock_code: str,
+    market: Optional[str] = None,
+    stock_name: Optional[str] = None,
+    is_st: Optional[int] = None,
+) -> bool:
+    if _is_close_at_limit_up_price(
+        close,
+        pre_close,
+        stock_code,
+        market=market,
+        stock_name=stock_name,
+        is_st=is_st,
+    ):
+        return True
+
+    return (
+        change_pct is not None
+        and change_pct >= _limit_up_threshold(stock_code, market=market, stock_name=stock_name, is_st=is_st)
+        and _price_decimal(close) == _price_decimal(high)
+    )
+
+
 def _eastmoney_market_prefix(market: str) -> str:
     return "1" if market.upper() == "SH" else "0"
 
@@ -316,19 +344,22 @@ def _format_kline_item(
     change_pct = float(parts[8]) if parts[8] not in ("", "-") else None
     change_amount = float(parts[9]) if parts[9] not in ("", "-") else None
     pre_close = close - change_amount if change_amount is not None else None
+    high = float(parts[3])
     return {
         "date": date.fromisoformat(parts[0]),
         "open": float(parts[1]),
         "close": close,
-        "high": float(parts[3]),
+        "high": high,
         "low": float(parts[4]),
         "volume": int(float(parts[5] or 0)),
         "amount": float(parts[6] or 0),
         "change_pct": change_pct,
-        "is_limit_up": _is_close_at_limit_up_price(
-            close,
-            pre_close,
-            stock_code,
+        "is_limit_up": _is_limit_up_kline_point(
+            close=close,
+            high=high,
+            pre_close=pre_close,
+            change_pct=change_pct,
+            stock_code=stock_code,
             market=market,
             stock_name=stock_name,
             is_st=is_st,
@@ -354,10 +385,12 @@ def _apply_change_pct(
         normalized = {
             **point,
             "change_pct": change_pct,
-            "is_limit_up": _is_close_at_limit_up_price(
-                close,
-                previous_close,
-                stock_code,
+            "is_limit_up": _is_limit_up_kline_point(
+                close=close,
+                high=float(point.get("high") or close),
+                pre_close=previous_close,
+                change_pct=change_pct,
+                stock_code=stock_code,
                 market=market,
                 stock_name=stock_name,
                 is_st=is_st,
