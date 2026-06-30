@@ -3,6 +3,7 @@
 """
 import json
 import re
+from decimal import Decimal, ROUND_HALF_UP
 
 from fastapi import APIRouter, Depends, Query, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -121,6 +122,7 @@ PERIOD_TO_KLT = {
     "month": "103",
 }
 MAX_COMPARE_SYMBOLS = 5
+PRICE_QUANT = Decimal("0.01")
 EASTMONEY_KLINE_URL = "http://push2his.eastmoney.com/api/qt/stock/kline/get"
 EASTMONEY_DETAILS_URL = "http://push2.eastmoney.com/api/qt/stock/details/get"
 EASTMONEY_SEARCH_URL = "https://searchapi.eastmoney.com/api/suggest/get"
@@ -154,6 +156,55 @@ def _limit_up_threshold(
     if _is_st_stock(stock_name, is_st):
         return 4.9
     return 9.9
+
+
+def _limit_up_ratio(
+    stock_code: str,
+    market: Optional[str] = None,
+    stock_name: Optional[str] = None,
+    is_st: Optional[int] = None,
+) -> Decimal:
+    if (market or "").upper() in ("BJ", "BSE") or stock_code.startswith(("4", "8", "920")):
+        return Decimal("0.30")
+    if stock_code.startswith("3") or stock_code.startswith("68"):
+        return Decimal("0.20")
+    if _is_st_stock(stock_name, is_st):
+        return Decimal("0.05")
+    return Decimal("0.10")
+
+
+def _price_decimal(value: float) -> Decimal:
+    return Decimal(str(value)).quantize(PRICE_QUANT, rounding=ROUND_HALF_UP)
+
+
+def _calculate_limit_up_price(
+    pre_close: float,
+    stock_code: str,
+    market: Optional[str] = None,
+    stock_name: Optional[str] = None,
+    is_st: Optional[int] = None,
+) -> Decimal:
+    ratio = _limit_up_ratio(stock_code, market=market, stock_name=stock_name, is_st=is_st)
+    return (Decimal(str(pre_close)) * (Decimal("1") + ratio)).quantize(PRICE_QUANT, rounding=ROUND_HALF_UP)
+
+
+def _is_close_at_limit_up_price(
+    close: float,
+    pre_close: Optional[float],
+    stock_code: str,
+    market: Optional[str] = None,
+    stock_name: Optional[str] = None,
+    is_st: Optional[int] = None,
+) -> bool:
+    if pre_close is None or pre_close <= 0:
+        return False
+    return _price_decimal(close) == _calculate_limit_up_price(
+        pre_close,
+        stock_code,
+        market=market,
+        stock_name=stock_name,
+        is_st=is_st,
+    )
 
 
 def _eastmoney_market_prefix(market: str) -> str:
@@ -261,17 +312,22 @@ def _format_kline_item(
     if len(parts) < 11:
         raise ValueError(f"K线数据字段不足: {raw}")
 
+    close = float(parts[2])
     change_pct = float(parts[8]) if parts[8] not in ("", "-") else None
+    change_amount = float(parts[9]) if parts[9] not in ("", "-") else None
+    pre_close = close - change_amount if change_amount is not None else None
     return {
         "date": date.fromisoformat(parts[0]),
         "open": float(parts[1]),
-        "close": float(parts[2]),
+        "close": close,
         "high": float(parts[3]),
         "low": float(parts[4]),
         "volume": int(float(parts[5] or 0)),
         "amount": float(parts[6] or 0),
         "change_pct": change_pct,
-        "is_limit_up": change_pct is not None and change_pct >= _limit_up_threshold(
+        "is_limit_up": _is_close_at_limit_up_price(
+            close,
+            pre_close,
             stock_code,
             market=market,
             stock_name=stock_name,
@@ -298,7 +354,9 @@ def _apply_change_pct(
         normalized = {
             **point,
             "change_pct": change_pct,
-            "is_limit_up": change_pct is not None and change_pct >= _limit_up_threshold(
+            "is_limit_up": _is_close_at_limit_up_price(
+                close,
+                previous_close,
                 stock_code,
                 market=market,
                 stock_name=stock_name,

@@ -547,7 +547,10 @@ function formatWanAmount(valueWan?: number | null): string {
 }
 
 function isHighlightedLimitUpPoint(point: KlinePoint): boolean {
-  return Boolean(point.is_limit_up || (stockInfo.value.trade_date && point.date === stockInfo.value.trade_date))
+  return Boolean(
+    point.is_limit_up ||
+    (stockInfo.value.is_final_sealed && stockInfo.value.trade_date && point.date === stockInfo.value.trade_date)
+  )
 }
 
 function getLimitUpColor(point: KlinePoint): string {
