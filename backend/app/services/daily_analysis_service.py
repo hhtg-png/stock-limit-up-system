@@ -135,11 +135,20 @@ class DailyAnalysisRuleEngine:
         return sum(1 for value in trade_dates if start_date < value < end_date)
 
     def _build_unique_board_items(self, today_facts: List[DailyAnalysisStockFact]) -> List[Dict[str, Any]]:
-        if not today_facts:
+        continuous_facts = [
+            fact
+            for fact in today_facts
+            if self._final_sealed_board_height(fact) >= 2
+        ]
+        if not continuous_facts:
             return []
 
-        max_height = max(max(fact.continuous_days, 1) for fact in today_facts)
-        top_facts = [fact for fact in today_facts if max(fact.continuous_days, 1) == max_height]
+        max_height = max(self._final_sealed_board_height(fact) for fact in continuous_facts)
+        top_facts = [
+            fact
+            for fact in continuous_facts
+            if self._final_sealed_board_height(fact) == max_height
+        ]
         tags = ["唯一", f"{max_height}板"] if len(top_facts) == 1 else ["竞争", f"{max_height}板"]
         return [self._stock_item(fact, tags=tags, score=self._recognition_score(fact)) for fact in top_facts]
 
@@ -257,7 +266,7 @@ class DailyAnalysisRuleEngine:
         items = []
         for sector, stocks in grouped.items():
             stocks.sort(key=lambda fact: self._recognition_score(fact), reverse=True)
-            continuous_count = sum(1 for fact in stocks if fact.continuous_days >= 2)
+            continuous_count = sum(1 for fact in stocks if self._final_sealed_board_height(fact) >= 2)
             twenty_count = sum(1 for fact in stocks if fact.is_20cm)
             score = len(stocks) * 10 + continuous_count * 4 + twenty_count * 3
             items.append(
@@ -579,7 +588,7 @@ class DailyAnalysisRuleEngine:
         return max(previous_scores or [self._recognition_score(today)])
 
     def _recognition_score(self, fact: DailyAnalysisStockFact) -> float:
-        score = fact.continuous_days * 12
+        score = self._final_sealed_board_height(fact) * 12
         if fact.is_final_sealed:
             score += 8
         if self._clock(fact.first_limit_time) and self._clock(fact.first_limit_time) <= time(9, 35):
@@ -593,8 +602,9 @@ class DailyAnalysisRuleEngine:
 
     def _recognition_tags(self, fact: DailyAnalysisStockFact) -> List[str]:
         tags = []
-        if fact.continuous_days >= 2:
-            tags.append(f"{fact.continuous_days}板")
+        height = self._final_sealed_board_height(fact)
+        if height >= 2:
+            tags.append(f"{height}板")
         if fact.is_20cm:
             tags.append("20cm")
         if self._clock(fact.first_limit_time) and self._clock(fact.first_limit_time) <= time(9, 35):
@@ -602,6 +612,11 @@ class DailyAnalysisRuleEngine:
         if fact.open_count > 0:
             tags.append(f"开{fact.open_count}")
         return tags or ["辨识度"]
+
+    def _final_sealed_board_height(self, fact: DailyAnalysisStockFact) -> int:
+        if not fact.is_final_sealed:
+            return 1
+        return max(fact.continuous_days, 1)
 
     def _stock_item(
         self,

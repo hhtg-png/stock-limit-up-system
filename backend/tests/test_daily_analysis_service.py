@@ -137,6 +137,78 @@ class DailyAnalysisRuleEngineTests(unittest.TestCase):
 
         self.assertEqual(result["连板唯一性"]["items"][0]["time"], "09:25:02")
 
+    def test_unique_board_uses_only_final_sealed_continuous_boards(self):
+        trade_day = date(2026, 6, 29)
+        facts = [
+            fact(
+                "002674",
+                trade_day,
+                stock_name="兴业科技",
+                reason_category="纺织制造",
+                limit_up_reason="纺织制造",
+                continuous_days=7,
+                open_count=4,
+                sealed=False,
+                first_time="14:11:00",
+                final_time=None,
+                amount=185326,
+                turnover_rate=4,
+            ),
+            fact(
+                "603956",
+                trade_day,
+                stock_name="威派格",
+                reason_category="机器人",
+                limit_up_reason="机器人",
+                continuous_days=3,
+                sealed=True,
+                amount=44232,
+            ),
+        ]
+
+        result = DailyAnalysisRuleEngine().build_daily_result(trade_day, facts)
+
+        unique_items = result["连板唯一性"]["items"]
+        self.assertEqual(len(unique_items), 1)
+        self.assertEqual(unique_items[0]["stock_code"], "603956")
+        self.assertEqual(unique_items[0]["tags"], ["唯一", "3板"])
+
+    def test_opened_high_board_does_not_receive_board_tag_or_sector_continuous_count(self):
+        trade_day = date(2026, 6, 29)
+        facts = [
+            fact(
+                "002674",
+                trade_day,
+                stock_name="兴业科技",
+                reason_category="纺织制造",
+                limit_up_reason="纺织制造",
+                continuous_days=7,
+                open_count=4,
+                sealed=False,
+                first_time="14:11:00",
+                final_time=None,
+                amount=185326,
+                turnover_rate=4,
+            ),
+        ]
+
+        result = DailyAnalysisRuleEngine().build_daily_result(trade_day, facts)
+
+        recognition_by_code = {
+            item["stock_code"]: item
+            for item in result["辨识度"]["items"]
+        }
+        self.assertIn("002674", recognition_by_code)
+        self.assertNotIn("7板", recognition_by_code["002674"]["tags"])
+        self.assertIn("开4", recognition_by_code["002674"]["tags"])
+
+        sector_by_label = {
+            item["label"]: item
+            for item in result["板块"]["items"]
+        }
+        self.assertIn("纺织制造", sector_by_label)
+        self.assertIn("连板0只", sector_by_label["纺织制造"]["tags"])
+
     def test_rebound_requires_one_plus_one_and_broken_rebound_requires_first_yesterday_break(self):
         trade_day = date(2026, 4, 24)
         yesterday = date(2026, 4, 23)
