@@ -11,6 +11,8 @@
             <el-radio-button label="7">近7天</el-radio-button>
             <el-radio-button label="30">近30天</el-radio-button>
             <el-radio-button label="3m">近3月</el-radio-button>
+            <el-radio-button label="6m">近6月</el-radio-button>
+            <el-radio-button label="1y">近1年</el-radio-button>
           </el-radio-group>
         </div>
       </div>
@@ -1227,6 +1229,12 @@ onUnmounted(() => {
   justify-content: flex-end;
   gap: 8px;
   flex-wrap: wrap;
+
+  :deep(.el-radio-group) {
+    justify-content: flex-end;
+    flex-wrap: wrap;
+    row-gap: 6px;
+  }
 }
 
 .chart-card,

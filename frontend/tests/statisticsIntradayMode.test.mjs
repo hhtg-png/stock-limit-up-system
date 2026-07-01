@@ -20,6 +20,8 @@ test('statistics view automatically merges live intraday data into the selected 
   assert.doesNotMatch(statisticsSource, /label="intraday"/, 'manual intraday button should not be rendered')
   assert.doesNotMatch(statisticsSource, /label="daily"/, 'manual daily button should not be rendered')
   assert.match(statisticsSource, /<el-radio-group v-model="timeRange" size="small">/, 'range picker should always be available')
+  assert.match(statisticsSource, /label="6m"[\s\S]*近6月/, 'range picker should include a half-year shortcut')
+  assert.match(statisticsSource, /label="1y"[\s\S]*近1年/, 'range picker should include a one-year shortcut')
   assert.match(statisticsSource, /getMarketReviewDaily\(query\)/, 'daily history should be fetched for the selected range')
   assert.match(statisticsSource, /getMarketReviewIntraday\(today\)/, 'today intraday snapshot should be checked automatically')
   assert.match(

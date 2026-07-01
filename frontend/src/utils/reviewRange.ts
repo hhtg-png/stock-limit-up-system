@@ -12,7 +12,9 @@ export interface ReviewRange {
 const QUICK_RANGE_TRADING_DAYS: Record<string, number> = {
   '7': 7,
   '30': 30,
-  '3m': 60
+  '3m': 60,
+  '6m': 120,
+  '1y': 250
 }
 
 export function buildReviewRange(timeRange: string, currentDate: string): ReviewRange {
