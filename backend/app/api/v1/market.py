@@ -128,6 +128,7 @@ EASTMONEY_DETAILS_URL = "http://push2.eastmoney.com/api/qt/stock/details/get"
 EASTMONEY_SEARCH_URL = "https://searchapi.eastmoney.com/api/suggest/get"
 EASTMONEY_SEARCH_TOKEN = "D43BF722C8E33E6D9237BAE1524BBE7E"
 SINA_KLINE_URL = "https://quotes.sina.cn/cn/api/jsonp.php/var%20_=/CN_MarketDataService.getKLineData"
+SUPPORTED_STOCK_SECURITY_TYPES = {"沪A", "深A", "科创板", "京A"}
 
 
 def _is_st_stock(stock_name: Optional[str], is_st: Optional[int]) -> bool:
@@ -283,12 +284,18 @@ def _market_from_search_item(item: dict) -> str:
 
 def _format_search_item(item: dict) -> Optional[dict]:
     classify = str(item.get("Classify") or "")
-    if classify not in {"AStock", "Index"}:
-        return None
-
     code = str(item.get("Code") or item.get("UnifiedCode") or "").strip().upper()
     name = str(item.get("Name") or "").strip()
     if not code or not name:
+        return None
+
+    security_type = str(item.get("SecurityTypeName") or "").strip()
+    is_index = classify == "Index"
+    is_supported_stock = (
+        re.fullmatch(r"\d{6}", code) is not None
+        and security_type in SUPPORTED_STOCK_SECURITY_TYPES
+    )
+    if not is_index and not is_supported_stock:
         return None
 
     market = _market_from_search_item(item)
@@ -299,7 +306,7 @@ def _format_search_item(item: dict) -> Optional[dict]:
         "symbol": f"{code}.{market}",
         "pinyin": str(item.get("PinYin") or "").strip().upper(),
         "classify": classify,
-        "security_type": str(item.get("SecurityTypeName") or "").strip(),
+        "security_type": security_type,
     }
 
 

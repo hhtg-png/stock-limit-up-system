@@ -160,6 +160,57 @@ class SuggestAsyncClient:
         return SuggestResponse()
 
 
+class AllShareSuggestResponse:
+    def json(self):
+        return {
+            "QuotationCodeTable": {
+                "Data": [
+                    {
+                        "Code": "688001",
+                        "Name": "华兴源创",
+                        "PinYin": "HXYC",
+                        "Classify": "23",
+                        "SecurityTypeName": "科创板",
+                        "SecurityType": "25",
+                        "QuoteID": "1.688001",
+                    },
+                    {
+                        "Code": "920001",
+                        "Name": "纬达光电",
+                        "PinYin": "WDGD",
+                        "Classify": "NEEQ",
+                        "SecurityTypeName": "京A",
+                        "SecurityType": "27",
+                        "QuoteID": "0.920001",
+                    },
+                    {
+                        "Code": "000001",
+                        "Name": "华夏成长混合",
+                        "PinYin": "HXCZHH",
+                        "Classify": "OTCFUND",
+                        "SecurityTypeName": "基金",
+                        "SecurityType": "17",
+                        "QuoteID": "150.000001",
+                    },
+                ]
+            }
+        }
+
+
+class AllShareSuggestAsyncClient:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def get(self, *args, **kwargs):
+        return AllShareSuggestResponse()
+
+
 class MarketKlineApiTests(unittest.IsolatedAsyncioTestCase):
     def test_format_kline_item_marks_main_board_limit_up(self):
         raw = "2026-05-12,96.10,103.42,103.42,95.60,560000,1820000000,8.20,10.00,9.40,17.42"
@@ -323,6 +374,15 @@ class MarketKlineApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(suffix_results[0].symbol, "000001.SH")
         self.assertEqual(suffix_results[0].stock_name, "上证指数")
         self.assertNotIn("OTCFUND", [item.classify for item in pinyin_results])
+
+    async def test_search_symbols_supports_all_a_share_boards(self):
+        with patch.object(market.httpx, "AsyncClient", AllShareSuggestAsyncClient):
+            results = await market.search_symbols("stock", 10)
+
+        self.assertEqual([item.symbol for item in results], ["688001.SH", "920001.BJ"])
+        self.assertEqual(results[0].security_type, "科创板")
+        self.assertEqual(results[1].security_type, "京A")
+        self.assertNotIn("OTCFUND", [item.classify for item in results])
 
     async def test_get_compare_data_fetches_each_symbol(self):
         with patch.object(
