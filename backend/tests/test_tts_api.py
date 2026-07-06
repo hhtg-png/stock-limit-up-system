@@ -40,6 +40,16 @@ class TtsApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 422)
 
+    def test_speech_endpoint_returns_503_for_unexpected_tts_failure(self):
+        with patch(
+            "app.api.v1.tts.edge_tts_service.synthesize_to_file",
+            AsyncMock(side_effect=Exception("No audio was received")),
+        ):
+            response = self.client.get("/tts/speech", params={"text": "XD联德股涨停"})
+
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("TTS", response.json()["detail"])
+
     def test_playback_log_endpoint_records_client_status(self):
         payload = {
             "stage": "audio_playing",

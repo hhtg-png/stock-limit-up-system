@@ -21,6 +21,8 @@ class EdgeTtsService:
         volume: str = "+0%",
         pitch: str = "+0Hz",
         max_text_length: int = 180,
+        timeout_seconds: float = 4.0,
+        max_concurrent_synthesis: int = 2,
     ):
         self.cache_dir = Path(cache_dir or "data/tts-cache")
         self.voice = voice
@@ -28,7 +30,9 @@ class EdgeTtsService:
         self.volume = volume
         self.pitch = pitch
         self.max_text_length = max_text_length
+        self.timeout_seconds = timeout_seconds
         self._locks: Dict[str, asyncio.Lock] = {}
+        self._synthesis_semaphore = asyncio.Semaphore(max(1, max_concurrent_synthesis))
 
     async def synthesize_to_file(self, text: str, *, voice: Optional[str] = None) -> Path:
         clean_text = self._normalize_text(text)
@@ -59,7 +63,17 @@ class EdgeTtsService:
                     volume=self.volume,
                     pitch=self.pitch,
                 )
-                await communicate.save(str(tmp_path))
+                try:
+                    await asyncio.wait_for(
+                        self._save_with_synthesis_limit(communicate, tmp_path),
+                        timeout=self.timeout_seconds,
+                    )
+                except asyncio.TimeoutError as exc:
+                    raise RuntimeError(
+                        f"edge-tts timed out after {self.timeout_seconds:g}s"
+                    ) from exc
+                except Exception as exc:
+                    raise RuntimeError(f"edge-tts synthesis failed: {exc}") from exc
                 if not self._is_valid_audio_file(tmp_path):
                     raise RuntimeError("edge-tts returned empty audio")
                 tmp_path.replace(target_path)
@@ -68,6 +82,10 @@ class EdgeTtsService:
                     tmp_path.unlink(missing_ok=True)
 
         return target_path
+
+    async def _save_with_synthesis_limit(self, communicate, tmp_path: Path) -> None:
+        async with self._synthesis_semaphore:
+            await communicate.save(str(tmp_path))
 
     def _normalize_text(self, text: str) -> str:
         return re.sub(r"\s+", " ", str(text or "")).strip()[: self.max_text_length]

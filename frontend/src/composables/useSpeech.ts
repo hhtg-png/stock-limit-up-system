@@ -226,26 +226,36 @@ function reportSpeechPlaybackStatus(
   }
 
   try {
+    if (typeof fetch === 'function') {
+      fetch(SPEECH_PLAYBACK_LOG_ENDPOINT, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body,
+        keepalive: true
+      }).catch(() => {
+        sendSpeechPlaybackBeacon(body)
+      })
+      return
+    }
+  } catch {
+    // 老 WebView 对 keepalive fetch 支持不完整时回退到 beacon。
+  }
+
+  sendSpeechPlaybackBeacon(body)
+}
+
+function sendSpeechPlaybackBeacon(body: string) {
+  try {
     if (
       typeof navigator !== 'undefined' &&
       typeof navigator.sendBeacon === 'function' &&
       typeof Blob !== 'undefined'
     ) {
-      const blob = new Blob([body], { type: 'application/json' })
-      if (navigator.sendBeacon(SPEECH_PLAYBACK_LOG_ENDPOINT, blob)) return
+      navigator.sendBeacon(
+        SPEECH_PLAYBACK_LOG_ENDPOINT,
+        new Blob([body], { type: 'application/json' })
+      )
     }
-  } catch {
-    // 老 WebView 不支持 sendBeacon 时继续尝试 fetch。
-  }
-
-  try {
-    if (typeof fetch !== 'function') return
-    fetch(SPEECH_PLAYBACK_LOG_ENDPOINT, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body,
-      keepalive: true
-    }).catch(() => {})
   } catch {
     // 播放诊断不能影响真实播报。
   }

@@ -33,6 +33,9 @@ async def get_speech_audio(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.warning(f"TTS synthesis failed unexpectedly: {exc}")
+        raise HTTPException(status_code=503, detail="TTS synthesis unavailable") from exc
 
     return FileResponse(
         audio_path,
