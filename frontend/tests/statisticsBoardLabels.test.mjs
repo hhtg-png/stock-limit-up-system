@@ -102,3 +102,12 @@ test('ladder seal rate and average change use same-cohort metrics from backend',
   assert.match(source, /return formatRate\(ladder\.cohort_seal_rate\)/)
   assert.match(source, /return ladder\.cohort_avg_change/)
 })
+
+test('ladder stock chips show same-cohort stocks with realtime change pct', () => {
+  const typeSource = readFileSync('src/types/market.ts', 'utf8').replace(/\r\n/g, '\n')
+  assert.match(typeSource, /cohort_stocks:\s*MarketReviewDetailStock\[\]/)
+  assert.match(source, /v-for="stock in getLadderDisplayStocks\(ladder\)"/)
+  assert.match(source, /function getLadderDisplayStocks\(ladder: MarketReviewLadderLevel\)/)
+  assert.match(source, /function getLadderStockStatusLabel\(stock: MarketReviewDetailStock\)/)
+  assert.match(source, /class="stock-change"[\s\S]*formatPercent\(stock\.change_pct\)/)
+})

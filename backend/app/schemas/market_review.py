@@ -86,6 +86,7 @@ class MarketReviewLadderItem(BaseModel):
     cohort_seal_rate: float = Field(0.0, description="同梯队封板率")
     cohort_avg_change: float | None = Field(None, description="同梯队平均涨幅")
     stocks: list[MarketReviewStockItem] = Field(default_factory=list)
+    cohort_stocks: list[MarketReviewStockItem] = Field(default_factory=list, description="同梯队样本股票，包含未晋级个股")
 
 
 class MarketReviewLadderResponse(BaseModel):

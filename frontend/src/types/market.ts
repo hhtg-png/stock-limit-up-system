@@ -226,6 +226,7 @@ export interface MarketReviewLadderLevel {
   cohort_seal_rate: number
   cohort_avg_change: number | null
   stocks: MarketReviewDetailStock[]
+  cohort_stocks: MarketReviewDetailStock[]
 }
 
 export interface MarketReviewLadderResponse {

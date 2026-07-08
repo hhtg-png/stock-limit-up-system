@@ -197,6 +197,17 @@ def _is_same_ladder_cohort_row(row: MarketReviewStockDaily | dict[str, Any], con
     )
 
 
+def _get_ladder_cohort_sort_key(row: MarketReviewStockDaily | dict[str, Any]) -> tuple[float, int, int, str]:
+    change_pct = _get_stock_float(row, "change_pct")
+    change_sort = -change_pct if change_pct is not None else float("inf")
+    return (
+        change_sort,
+        -_get_stock_int(row, "today_continuous_days"),
+        0 if bool(_get_stock_value(row, "today_sealed_close")) else 1,
+        str(_get_stock_value(row, "stock_code", "")),
+    )
+
+
 def _apply_ladder_cohort_metrics(
     ladders: list[MarketReviewLadderItem],
     stock_rows: list[MarketReviewStockDaily | dict[str, Any]],
@@ -228,6 +239,10 @@ def _apply_ladder_cohort_metrics(
         ladder.cohort_opened_count = cohort_opened_count
         ladder.cohort_seal_rate = round(cohort_sealed_count * 100 / cohort_count, 2) if cohort_count else 0.0
         ladder.cohort_avg_change = round(sum(changes) / len(changes), 2) if changes else None
+        ladder.cohort_stocks = [
+            _build_stock_item(row)
+            for row in sorted(cohort_rows, key=_get_ladder_cohort_sort_key)
+        ]
 
 
 def _build_ladder_response_from_rows(

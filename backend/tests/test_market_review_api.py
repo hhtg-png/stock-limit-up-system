@@ -526,6 +526,14 @@ class MarketReviewApiTests(unittest.TestCase):
         self.assertEqual(ladder["cohort_opened_count"], 1)
         self.assertAlmostEqual(ladder["cohort_seal_rate"], 33.33)
         self.assertAlmostEqual(ladder["cohort_avg_change"], 4.63)
+        self.assertEqual(
+            [stock["stock_code"] for stock in ladder["cohort_stocks"]],
+            ["600002", "600001", "600007"],
+        )
+        unpromoted = ladder["cohort_stocks"][2]
+        self.assertEqual(unpromoted["stock_code"], "600007")
+        self.assertEqual(unpromoted["today_continuous_days"], 0)
+        self.assertAlmostEqual(unpromoted["change_pct"], -2.0)
 
     def test_ladder_endpoint_falls_back_to_latest_available_review_date(self):
         response = self.client.get(

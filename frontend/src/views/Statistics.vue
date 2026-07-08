@@ -105,7 +105,7 @@
                 <span class="days-badge" :class="'days-' + Math.min(ladder.continuous_days, 10)">
                   {{ ladder.continuous_days }}连板
                 </span>
-                <span class="count">{{ ladder.count }}只</span>
+                <span class="count">晋级 {{ ladder.count }}只 / 样本 {{ getLadderDisplayStocks(ladder).length }}只</span>
               </div>
 
               <div class="ladder-metrics">
@@ -125,7 +125,7 @@
 
               <div class="stock-chip-list">
                 <button
-                  v-for="stock in ladder.stocks"
+                  v-for="stock in getLadderDisplayStocks(ladder)"
                   :key="stock.stock_code"
                   type="button"
                   class="stock-chip"
@@ -133,9 +133,12 @@
                 >
                   <span class="code">{{ stock.stock_code }}</span>
                   <span class="name">{{ stock.stock_name }}</span>
-                  <el-tag :type="getStockStatusType(stock)" size="small">
-                    {{ getStockStatusLabel(stock) }}
+                  <el-tag :type="getLadderStockStatusType(stock)" size="small">
+                    {{ getLadderStockStatusLabel(stock) }}
                   </el-tag>
+                  <span class="stock-change" :class="getChangeClass(stock.change_pct)">
+                    {{ formatPercent(stock.change_pct) }}
+                  </span>
                 </button>
               </div>
             </div>
@@ -423,6 +426,33 @@ function getStockStatusLabel(stock: MarketReviewDetailStock) {
     return '炸板'
   }
   return '观察'
+}
+
+function getLadderDisplayStocks(ladder: MarketReviewLadderLevel) {
+  return ladder.cohort_stocks?.length ? ladder.cohort_stocks : ladder.stocks
+}
+
+function getLadderStockStatusType(stock: MarketReviewDetailStock) {
+  if (stock.today_sealed_close) {
+    return 'danger'
+  }
+  if (stock.today_opened_close) {
+    return 'warning'
+  }
+  return 'info'
+}
+
+function getLadderStockStatusLabel(stock: MarketReviewDetailStock) {
+  if (stock.today_sealed_close) {
+    return '封板'
+  }
+  if (stock.today_opened_close) {
+    return '炸板'
+  }
+  if (stock.today_continuous_days <= 0) {
+    return '断板'
+  }
+  return '触板'
 }
 
 function getSealedCount(ladder: MarketReviewLadderLevel) {
@@ -1399,6 +1429,8 @@ onUnmounted(() => {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  max-width: 100%;
+  min-width: 0;
   border: none;
   border-radius: 6px;
   background: #fff;
@@ -1417,9 +1449,20 @@ onUnmounted(() => {
   }
 
   .name {
+    min-width: 0;
+    max-width: 92px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
     color: #262626;
     font-size: 13px;
     font-weight: 500;
+  }
+
+  .stock-change {
+    font-size: 12px;
+    font-weight: 600;
+    white-space: nowrap;
   }
 }
 
