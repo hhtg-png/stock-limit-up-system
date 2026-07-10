@@ -21,6 +21,7 @@ const targetTtsAudioId = 'tdx-target-tts-audio'
 const targetNeuralTtsEndpoint = '/api/v1/tts/speech'
 const targetNeuralTtsVoice = 'zh-CN-XiaoyiNeural'
 const targetAudioFallbackVolume = 0.9
+const targetSilentAudioUrl = 'data:audio/wav;base64,UklGRrQBAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YZABAACAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA'
 const NEURAL_TTS_START_TIMEOUT_MS = 5000
 const SPEECH_PLAYBACK_LOG_ENDPOINT = '/api/v1/tts/playback-log'
 const SPEECH_PLAYBACK_LOG_TEXT_LIMIT = 120
@@ -33,8 +34,10 @@ const speechRate = ref(targetSpeechProfile.rate)
 const speechPitch = ref(targetSpeechProfile.pitch)
 const speechVolume = ref(targetSpeechProfile.volume)
 const speechVoiceName = ref('')
-const speechUnlocked = ref(readStoredSpeechUnlocked())
+const speechPreferenceEnabled = ref(readStoredSpeechUnlocked())
+const speechUnlocked = ref(false)
 let voicesListenerReady = false
+let reportedSessionLock = false
 
 type UnlockSpeechOptions = {
   silent?: boolean
@@ -225,13 +228,14 @@ function reportSpeechPlaybackStatus(
     // 控制台不可用不影响播报。
   }
 
+  if (sendSpeechPlaybackXhr(body)) return
+
   try {
     if (typeof fetch === 'function') {
       fetch(SPEECH_PLAYBACK_LOG_ENDPOINT, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body,
-        keepalive: true
+        body
       }).catch(() => {
         sendSpeechPlaybackBeacon(body)
       })
@@ -242,6 +246,19 @@ function reportSpeechPlaybackStatus(
   }
 
   sendSpeechPlaybackBeacon(body)
+}
+
+function sendSpeechPlaybackXhr(body: string) {
+  try {
+    if (typeof XMLHttpRequest === 'undefined') return false
+    const request = new XMLHttpRequest()
+    request.open('POST', SPEECH_PLAYBACK_LOG_ENDPOINT, true)
+    request.setRequestHeader('Content-Type', 'application/json')
+    request.send(body)
+    return true
+  } catch {
+    return false
+  }
 }
 
 function sendSpeechPlaybackBeacon(body: string) {
@@ -497,6 +514,58 @@ function playWithNeuralTts(text: string, token = currentSpeechToken) {
   }, token)
 }
 
+function resetTargetAudioAfterPrime(audio: HTMLAudioElement) {
+  try {
+    audio.pause()
+    audio.removeAttribute('src')
+    audio.load?.()
+  } catch {
+    // 音频预热失败时只影响当前页面的语音解锁状态。
+  }
+  audio.volume = targetAudioFallbackVolume
+  audio.muted = false
+}
+
+function primeTargetTtsAudio() {
+  const audio = ensureTargetTtsAudio()
+  if (!audio) return false
+
+  try {
+    audio.pause()
+    audio.muted = false
+    audio.volume = 0.01
+    audio.src = targetSilentAudioUrl
+    const playPromise = audio.play()
+    if (playPromise?.then) {
+      playPromise
+        .then(() => {
+          resetTargetAudioAfterPrime(audio)
+          reportSpeechPlaybackStatus('speech_unlock_prime_ok', '', { mode: 'neural-audio' })
+        })
+        .catch((error) => {
+          speechUnlocked.value = false
+          resetTargetAudioAfterPrime(audio)
+          reportSpeechPlaybackStatus('speech_unlock_prime_rejected', '', {
+            mode: 'neural-audio',
+            error: error instanceof Error ? error.message : String(error)
+          })
+        })
+    } else {
+      resetTargetAudioAfterPrime(audio)
+      reportSpeechPlaybackStatus('speech_unlock_prime_ok', '', { mode: 'neural-audio' })
+    }
+    return true
+  } catch (error) {
+    speechUnlocked.value = false
+    resetTargetAudioAfterPrime(audio)
+    reportSpeechPlaybackStatus('speech_unlock_prime_exception', '', {
+      mode: 'neural-audio',
+      error: error instanceof Error ? error.message : String(error)
+    })
+    return false
+  }
+}
+
 function stopCurrentSpeechPlayback() {
   currentSpeechToken += 1
   isSpeaking = false
@@ -554,7 +623,16 @@ function speak(text: string): boolean {
 
 function enqueuePluginSpeech(text: string, key?: string, options: PluginSpeechOptions = {}): boolean {
   if (!(options.force || getSpeechEnabled()) || !text) return false
-  if (!speechUnlocked.value) return false
+  if (!speechPreferenceEnabled.value) return false
+  if (!speechUnlocked.value) {
+    if (!reportedSessionLock) {
+      reportedSessionLock = true
+      reportSpeechPlaybackStatus('speech_session_locked', text, {
+        reason: 'user_activation_required'
+      })
+    }
+    return false
+  }
   if (!canSpeakNow()) return false
   const speechKey = key || `plugin-${text}-${new Date().toDateString()}`
   if (pluginSpeechKeys.has(speechKey)) return false
@@ -594,10 +672,13 @@ function unlockSpeech(options: UnlockSpeechOptions | Event = {}): boolean {
   if (!hasSpeechSupport()) return false
   normalizeUnlockSpeechOptions(options)
 
+  speechPreferenceEnabled.value = true
   speechUnlocked.value = true
+  reportedSessionLock = false
   persistSpeechUnlocked(true)
   setupSpeechVoices()
   ensureTargetTtsAudio()
+  primeTargetTtsAudio()
   if (hasWebSpeechSupport()) {
     window.speechSynthesis.resume()
   }
@@ -605,7 +686,9 @@ function unlockSpeech(options: UnlockSpeechOptions | Event = {}): boolean {
 }
 
 function lockSpeech() {
+  speechPreferenceEnabled.value = false
   speechUnlocked.value = false
+  reportedSessionLock = false
   persistSpeechUnlocked(false)
   speechQueue.splice(0)
   stopCurrentSpeechPlayback()
