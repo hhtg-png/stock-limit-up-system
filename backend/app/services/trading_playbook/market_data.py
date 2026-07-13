@@ -20,6 +20,8 @@ from app.services.trading_playbook.domain import (
 )
 from app.utils.market_data_sanitizer import normalize_change_pct
 
+QuoteFieldQuality = Dict[str, Dict[str, str]]
+
 
 class TradingPlaybookMarketDataProvider:
     """Collect normalized quote and K-line facts through injectable clients."""
@@ -46,8 +48,7 @@ class TradingPlaybookMarketDataProvider:
         )
         self.realtime_limit_up_loader = realtime_limit_up_loader
         self._previous_prices: Dict[str, float] = {}
-        self._last_timestamp_fallback_codes = set()
-        self._last_speed_baseline_codes = set()
+        self._quote_state_lock = asyncio.Lock()
 
     async def quote_snapshot(
         self,
@@ -60,6 +61,32 @@ class TradingPlaybookMarketDataProvider:
         The first observation for a code uses ``0.0`` as a speed-delta baseline;
         it is not evidence that the market itself had zero speed.
         """
+        snapshot, _field_quality = await self._quote_snapshot_with_quality(
+            stock_codes,
+            trade_date,
+            as_of,
+        )
+        return snapshot
+
+    async def _quote_snapshot_with_quality(
+        self,
+        stock_codes: List[str],
+        trade_date: date,
+        as_of: datetime,
+    ) -> Tuple[QuoteSnapshot, QuoteFieldQuality]:
+        async with self._quote_state_lock:
+            return await self._collect_quote_snapshot(
+                stock_codes,
+                trade_date,
+                as_of,
+            )
+
+    async def _collect_quote_snapshot(
+        self,
+        stock_codes: List[str],
+        trade_date: date,
+        as_of: datetime,
+    ) -> Tuple[QuoteSnapshot, QuoteFieldQuality]:
         requested_codes = sorted(
             {
                 normalized
@@ -68,16 +95,17 @@ class TradingPlaybookMarketDataProvider:
             }
         )
         if not requested_codes:
-            self._last_timestamp_fallback_codes = set()
-            self._last_speed_baseline_codes = set()
-            return QuoteSnapshot(
-                trade_date=trade_date,
-                quotes={},
-                quality=DataQuality(
-                    status="ready",
-                    as_of=as_of,
-                    source="tencent",
+            return (
+                QuoteSnapshot(
+                    trade_date=trade_date,
+                    quotes={},
+                    quality=DataQuality(
+                        status="ready",
+                        as_of=as_of,
+                        source="tencent",
+                    ),
                 ),
+                {},
             )
 
         semaphore = asyncio.Semaphore(self.max_concurrency)
@@ -118,9 +146,10 @@ class TradingPlaybookMarketDataProvider:
                     raw_quotes[code] = raw_quote
 
         quotes: Dict[str, QuotePoint] = {}
-        fallback_codes = set()
-        speed_baseline_codes = set()
+        field_quality: QuoteFieldQuality = {}
         stale_codes = []
+        future_quote_found = False
+        invalid_price_found = False
         for code in requested_codes:
             raw_quote = raw_quotes.get(code)
             if raw_quote is None:
@@ -137,20 +166,38 @@ class TradingPlaybookMarketDataProvider:
                     "time",
                 )
             )
+            quality: Dict[str, str] = {}
             if not valid_timestamp:
                 captured_at = as_of
-                fallback_codes.add(code)
+                quality["timestamp"] = "fallback"
                 warnings.append(
                     f"invalid quote timestamp for {code}; used as_of fallback"
                 )
-            elif self._age_seconds(as_of, captured_at) > self.STALE_AFTER_SECONDS:
-                stale_codes.append(code)
-                warnings.append(f"stale quote for {code} at {captured_at.isoformat()}")
+            else:
+                age_seconds = self._age_seconds(as_of, captured_at)
+                if age_seconds < 0:
+                    future_quote_found = True
+                    warnings.append(
+                        f"future quote for {code} at {captured_at.isoformat()}"
+                    )
+                    continue
+                quality["timestamp"] = "ready"
+                if age_seconds > self.STALE_AFTER_SECONDS:
+                    stale_codes.append(code)
+                    warnings.append(
+                        f"stale quote for {code} at {captured_at.isoformat()}"
+                    )
 
-            price = self._to_float(
+            price = self._optional_float(
                 self._pick(raw_quote, "price", "current_price", "last_price")
             )
-            pre_close = self._to_float(
+            if price is None or price <= 0:
+                invalid_price_found = True
+                warnings.append(f"missing or invalid quote price for {code}")
+                continue
+            quality["price"] = "ready"
+
+            pre_close = self._optional_float(
                 self._pick(
                     raw_quote,
                     "pre_close",
@@ -159,8 +206,56 @@ class TradingPlaybookMarketDataProvider:
                     "last_close",
                 )
             )
-            amount = self._to_float(
+            if pre_close is None or pre_close <= 0:
+                pre_close = None
+                quality["pre_close"] = "missing"
+            else:
+                quality["pre_close"] = "ready"
+
+            amount = self._optional_float(
                 self._pick(raw_quote, "amount", "turnover", "trade_amount")
+            )
+            if amount is None or amount < 0:
+                amount = None
+                quality["amount"] = "missing"
+            else:
+                quality["amount"] = "ready"
+
+            open_price = self._optional_float(
+                self._pick(raw_quote, "open", "open_price")
+            )
+            quality["open_price"] = (
+                "ready" if open_price is not None and open_price >= 0 else "missing"
+            )
+            turnover_rate = self._optional_float(
+                self._pick(raw_quote, "turnover_rate", "turnover_pct")
+            )
+            quality["turnover_rate"] = (
+                "ready"
+                if turnover_rate is not None and turnover_rate >= 0
+                else "missing"
+            )
+            bid1_price = self._optional_float(
+                self._pick(raw_quote, "bid1_price", "bid_price_1")
+            )
+            quality["bid1_price"] = (
+                "ready"
+                if bid1_price is not None and bid1_price >= 0
+                else "missing"
+            )
+            bid1_volume = self._optional_float(
+                self._pick(raw_quote, "bid1_volume", "bid_volume_1")
+            )
+            quality["bid1_volume"] = (
+                "ready"
+                if bid1_volume is not None and bid1_volume >= 0
+                else "missing"
+            )
+            limit_up = self._optional_float(
+                self._pick(raw_quote, "limit_up", "limit_up_price")
+            )
+            quality["limit_up"] = (
+                "ready" if limit_up is not None and limit_up > 0 else "missing"
             )
             raw_change_pct = self._pick(
                 raw_quote,
@@ -173,21 +268,32 @@ class TradingPlaybookMarketDataProvider:
                 price=price,
                 amount=amount,
             )
-            if change_pct is None:
-                change_pct = (
-                    round((price / pre_close - 1) * 100, 4)
-                    if pre_close > 0
-                    else 0.0
-                )
+            if change_pct is not None:
+                quality["change_pct"] = "ready"
+            elif pre_close is not None:
+                computed_change = (price / pre_close - 1) * 100
+                if math.isfinite(computed_change):
+                    change_pct = round(computed_change, 4)
+                    quality["change_pct"] = "computed"
+                else:
+                    change_pct = math.nan
+                    quality["change_pct"] = "missing"
+            else:
+                change_pct = math.nan
+                quality["change_pct"] = "missing"
 
             previous_price = self._previous_prices.get(code)
             if previous_price is None or previous_price <= 0:
-                speed_baseline_codes.add(code)
-            speed_pct = (
-                round((price / previous_price - 1) * 100, 4)
-                if previous_price is not None and previous_price > 0
-                else 0.0
-            )
+                quality["speed_pct"] = "baseline"
+                speed_pct = 0.0
+            else:
+                computed_speed = (price / previous_price - 1) * 100
+                if math.isfinite(computed_speed):
+                    speed_pct = round(computed_speed, 4)
+                    quality["speed_pct"] = "ready"
+                else:
+                    speed_pct = math.nan
+                    quality["speed_pct"] = "missing"
             quotes[code] = QuotePoint(
                 stock_code=code,
                 stock_name=str(
@@ -195,46 +301,60 @@ class TradingPlaybookMarketDataProvider:
                     or ""
                 ),
                 price=price,
-                pre_close=pre_close,
-                open_price=self._to_float(
-                    self._pick(raw_quote, "open", "open_price")
-                ),
+                pre_close=pre_close if pre_close is not None else math.nan,
+                open_price=open_price if open_price is not None else math.nan,
                 change_pct=change_pct,
                 speed_pct=speed_pct,
-                amount=amount,
-                turnover_rate=self._to_float(
-                    self._pick(raw_quote, "turnover_rate", "turnover_pct")
+                amount=amount if amount is not None else math.nan,
+                turnover_rate=(
+                    turnover_rate if turnover_rate is not None else math.nan
                 ),
-                bid1_price=self._to_float(
-                    self._pick(raw_quote, "bid1_price", "bid_price_1")
+                bid1_price=bid1_price if bid1_price is not None else math.nan,
+                bid1_volume=(
+                    bid1_volume if bid1_volume is not None else math.nan
                 ),
-                bid1_volume=self._to_float(
-                    self._pick(raw_quote, "bid1_volume", "bid_volume_1")
-                ),
-                limit_up=self._to_float(
-                    self._pick(raw_quote, "limit_up", "limit_up_price")
-                ),
+                limit_up=limit_up if limit_up is not None else math.nan,
                 captured_at=captured_at,
             )
+            field_quality[code] = quality
+            missing_fields = sorted(
+                field
+                for field, status in quality.items()
+                if status == "missing"
+            )
+            if missing_fields:
+                warnings.append(
+                    f"missing quote fields for {code}: {','.join(missing_fields)}"
+                )
 
         for code, point in quotes.items():
             if point.price > 0:
                 self._previous_prices[code] = point.price
-        self._last_timestamp_fallback_codes = fallback_codes
-        self._last_speed_baseline_codes = speed_baseline_codes
 
         coverage = len(quotes) / len(requested_codes)
-        status = "degraded" if coverage < 0.9 or chunk_failed else "ready"
-        return QuoteSnapshot(
-            trade_date=trade_date,
-            quotes=quotes,
-            quality=DataQuality(
-                status=status,
-                as_of=as_of,
-                source="tencent",
-                stale=bool(stale_codes),
-                warnings=warnings,
+        status = (
+            "degraded"
+            if (
+                coverage < 0.9
+                or chunk_failed
+                or future_quote_found
+                or invalid_price_found
+            )
+            else "ready"
+        )
+        return (
+            QuoteSnapshot(
+                trade_date=trade_date,
+                quotes=quotes,
+                quality=DataQuality(
+                    status=status,
+                    as_of=as_of,
+                    source="tencent",
+                    stale=bool(stale_codes),
+                    warnings=warnings,
+                ),
             ),
+            field_quality,
         )
 
     async def kline_features(
@@ -259,11 +379,14 @@ class TradingPlaybookMarketDataProvider:
                 60,
                 stock_name=stock_name,
             )
-            closes = [
-                float(point["close"])
-                for point in points
-                if point.get("close")
-            ]
+            closes = []
+            for point in points:
+                try:
+                    close = float(point.get("close"))
+                except (AttributeError, TypeError, ValueError):
+                    continue
+                if math.isfinite(close) and close > 0:
+                    closes.append(close)
             if len(closes) < 6:
                 return missing
             prior_high = max(closes[:-1])
@@ -298,21 +421,27 @@ class TradingPlaybookMarketDataProvider:
             for stock in eligible_stocks
         }
         universe_codes = sorted(stock_by_code)
-        quote_snapshot = await self.quote_snapshot(
+        quote_snapshot, quote_field_quality = await self._quote_snapshot_with_quality(
             universe_codes,
             min(target_trade_date, as_of.date()),
             as_of,
         )
 
         change_order = sorted(
-            quote_snapshot.quotes.values(),
+            (
+                quote
+                for quote in quote_snapshot.quotes.values()
+                if quote_field_quality.get(quote.stock_code, {}).get("change_pct")
+                in {"ready", "computed"}
+            ),
             key=lambda quote: (-quote.change_pct, quote.stock_code),
         )
         speed_order = sorted(
             (
                 quote
                 for quote in quote_snapshot.quotes.values()
-                if quote.stock_code not in self._last_speed_baseline_codes
+                if quote_field_quality.get(quote.stock_code, {}).get("speed_pct")
+                == "ready"
             ),
             key=lambda quote: (-quote.speed_pct, quote.stock_code),
         )
@@ -351,7 +480,11 @@ class TradingPlaybookMarketDataProvider:
 
         review_dates_result = await db.execute(
             select(MarketReviewStockDaily.trade_date)
-            .where(MarketReviewStockDaily.trade_date <= source_trade_date)
+            .where(
+                MarketReviewStockDaily.trade_date <= source_trade_date,
+                MarketReviewStockDaily.created_at <= as_of,
+                MarketReviewStockDaily.updated_at <= as_of,
+            )
             .distinct()
             .order_by(desc(MarketReviewStockDaily.trade_date))
             .limit(10)
@@ -361,7 +494,11 @@ class TradingPlaybookMarketDataProvider:
         if review_dates:
             review_result = await db.execute(
                 select(MarketReviewStockDaily)
-                .where(MarketReviewStockDaily.trade_date.in_(review_dates))
+                .where(
+                    MarketReviewStockDaily.trade_date.in_(review_dates),
+                    MarketReviewStockDaily.created_at <= as_of,
+                    MarketReviewStockDaily.updated_at <= as_of,
+                )
                 .order_by(
                     desc(MarketReviewStockDaily.trade_date),
                     MarketReviewStockDaily.stock_code,
@@ -427,32 +564,16 @@ class TradingPlaybookMarketDataProvider:
             features: Dict[str, Any] = {}
             evidence: List[Dict[str, Any]] = []
             if quote is not None:
-                features.update(
-                    {
-                        "price": quote.price,
-                        "pre_close": quote.pre_close,
-                        "open_price": quote.open_price,
-                        "change_pct": quote.change_pct,
-                        "speed_pct": quote.speed_pct,
-                        "speed_quality": "baseline"
-                        if code in self._last_speed_baseline_codes
-                        else "ready",
-                        "amount": quote.amount,
-                        "turnover_rate": quote.turnover_rate,
-                        "bid1_price": quote.bid1_price,
-                        "bid1_volume": quote.bid1_volume,
-                        "limit_up": quote.limit_up,
-                        "captured_at": quote.captured_at,
-                    }
-                )
+                quality = quote_field_quality.get(code, {})
+                features.update(self._quote_features(quote, quality))
                 evidence.append(
                     {
                         "source": "tencent",
                         "as_of": quote.captured_at,
                         "quality": self._quote_evidence_quality(
-                            code,
                             quote,
                             as_of,
+                            quality,
                         ),
                     }
                 )
@@ -573,6 +694,7 @@ class TradingPlaybookMarketDataProvider:
             self._add_auction_features(
                 candidates,
                 quote_snapshot,
+                quote_field_quality,
                 target_trade_date,
                 warnings,
             )
@@ -582,14 +704,18 @@ class TradingPlaybookMarketDataProvider:
             quote_snapshot.quotes.values(),
             key=lambda item: item.stock_code,
         ):
-            item = {
-                "stock_code": quote.stock_code,
-                "change_rank": change_ranks[quote.stock_code],
-            }
+            item = {"stock_code": quote.stock_code}
+            if quote.stock_code in change_ranks:
+                item["change_rank"] = change_ranks[quote.stock_code]
+            else:
+                item["change_quality"] = "missing"
             if quote.stock_code in speed_ranks:
                 item["speed_rank"] = speed_ranks[quote.stock_code]
             else:
-                item["speed_quality"] = "baseline"
+                item["speed_quality"] = quote_field_quality.get(
+                    quote.stock_code,
+                    {},
+                ).get("speed_pct", "missing")
             rank_evidence.append(item)
         market_features = {
             "quote_requested_count": len(universe_codes),
@@ -642,30 +768,60 @@ class TradingPlaybookMarketDataProvider:
 
     def _quote_evidence_quality(
         self,
-        stock_code: str,
         quote: QuotePoint,
         as_of: datetime,
+        field_quality: Dict[str, str],
     ) -> str:
-        if stock_code in self._last_timestamp_fallback_codes:
+        if field_quality.get("timestamp") != "ready":
             return "degraded"
         if self._age_seconds(as_of, quote.captured_at) > self.STALE_AFTER_SECONDS:
             return "stale"
+        if "missing" in field_quality.values():
+            return "degraded"
         return "ready"
+
+    @staticmethod
+    def _quote_features(
+        quote: QuotePoint,
+        field_quality: Dict[str, str],
+    ) -> Dict[str, Any]:
+        features: Dict[str, Any] = {
+            "price": quote.price,
+            "speed_quality": field_quality.get("speed_pct", "missing"),
+            "captured_at": quote.captured_at,
+        }
+        if field_quality.get("speed_pct") in {"ready", "baseline"}:
+            features["speed_pct"] = quote.speed_pct
+        optional_fields = (
+            "pre_close",
+            "open_price",
+            "change_pct",
+            "amount",
+            "turnover_rate",
+            "bid1_price",
+            "bid1_volume",
+            "limit_up",
+        )
+        for field in optional_fields:
+            if field_quality.get(field) in {"ready", "computed"}:
+                features[field] = getattr(quote, field)
+        return features
 
     def _add_auction_features(
         self,
         candidates: List[CandidateSnapshot],
         quote_snapshot: QuoteSnapshot,
+        quote_field_quality: QuoteFieldQuality,
         target_trade_date: date,
         warnings: List[str],
     ) -> None:
         valid_by_theme: Dict[str, List[CandidateSnapshot]] = {}
         for candidate in candidates:
             quote = quote_snapshot.quotes.get(candidate.stock_code)
+            field_quality = quote_field_quality.get(candidate.stock_code, {})
             valid_timestamp = (
                 quote is not None
-                and candidate.stock_code
-                not in self._last_timestamp_fallback_codes
+                and field_quality.get("timestamp") == "ready"
                 and self._is_auction_timestamp(
                     quote.captured_at,
                     target_trade_date,
@@ -687,30 +843,54 @@ class TradingPlaybookMarketDataProvider:
                 )
                 continue
 
-            candidate.features.update(
-                {
-                    "auction_quality": "ready",
-                    "auction_change_pct": quote.change_pct,
-                    "auction_amount": quote.amount,
-                    "auction_bid1_volume": quote.bid1_volume,
-                }
+            metric_fields = (
+                ("auction_change_pct", "change_pct", quote.change_pct),
+                ("auction_amount", "amount", quote.amount),
+                ("auction_bid1_volume", "bid1_volume", quote.bid1_volume),
             )
-            candidate.evidence.append(
-                {
-                    "source": "auction",
-                    "as_of": quote.captured_at,
-                    "quality": "ready",
-                }
+            missing_metrics = []
+            available_metrics = 0
+            for feature_name, source_field, value in metric_fields:
+                if field_quality.get(source_field) in {"ready", "computed"}:
+                    candidate.features[feature_name] = value
+                    available_metrics += 1
+                else:
+                    missing_metrics.append(source_field)
+
+            auction_quality = (
+                "ready"
+                if not missing_metrics
+                else "degraded"
+                if available_metrics
+                else "missing"
             )
-            if candidate.theme_name:
-                valid_by_theme.setdefault(candidate.theme_name, []).append(candidate)
-            else:
-                candidate.features["auction_quality"] = "degraded"
-                warning = f"missing auction theme for {candidate.stock_code}"
-                warnings.append(warning)
-                candidate.evidence[-1].update(
-                    {"quality": "degraded", "warning": warning}
+            warning_parts = []
+            if missing_metrics:
+                warning_parts.append(
+                    f"missing auction metrics: {','.join(missing_metrics)}"
                 )
+            if not candidate.theme_name:
+                if auction_quality == "ready":
+                    auction_quality = "degraded"
+                warning_parts.append("missing auction theme")
+
+            candidate.features["auction_quality"] = auction_quality
+            evidence = {
+                "source": "auction",
+                "as_of": quote.captured_at,
+                "quality": auction_quality,
+            }
+            if warning_parts:
+                warning = f"{candidate.stock_code}: {'; '.join(warning_parts)}"
+                warnings.append(warning)
+                evidence["warning"] = warning
+            candidate.evidence.append(evidence)
+
+            if (
+                candidate.theme_name
+                and "auction_change_pct" in candidate.features
+            ):
+                valid_by_theme.setdefault(candidate.theme_name, []).append(candidate)
 
         for theme_candidates in valid_by_theme.values():
             ordered = sorted(
@@ -830,12 +1010,12 @@ class TradingPlaybookMarketDataProvider:
         return None
 
     @staticmethod
-    def _to_float(value: Any) -> float:
+    def _optional_float(value: Any) -> Optional[float]:
         try:
             number = float(value)
-            return number if math.isfinite(number) else 0.0
+            return number if math.isfinite(number) else None
         except (TypeError, ValueError):
-            return 0.0
+            return None
 
     @staticmethod
     def _parse_quote_datetime(value: Any) -> Tuple[Optional[datetime], bool]:

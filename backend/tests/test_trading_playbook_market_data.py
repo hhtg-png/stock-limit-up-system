@@ -1,5 +1,6 @@
 import asyncio
 import importlib.util
+import math
 import unittest
 from dataclasses import FrozenInstanceError, fields
 from datetime import date, datetime, timedelta, timezone
@@ -347,6 +348,56 @@ class TradingPlaybookQuoteSnapshotTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(snapshot.quality.stale)
 
+    async def test_future_quote_is_rejected_and_degrades_even_at_90_percent_coverage(self):
+        from app.services.trading_playbook.market_data import (
+            TradingPlaybookMarketDataProvider,
+        )
+
+        as_of = datetime(2026, 7, 13, 9, 30)
+        codes = [f"{index:06d}" for index in range(10)]
+        payload = {
+            code: _quote_payload(code, 10, "20260713093000")
+            for code in codes
+        }
+        payload[codes[-1]] = _quote_payload(
+            codes[-1],
+            10,
+            datetime(2026, 7, 13, 1, 30, 1, tzinfo=timezone.utc),
+        )
+
+        snapshot = await TradingPlaybookMarketDataProvider(
+            quote_api=_FakeQuoteAPI(payload)
+        ).quote_snapshot(codes, as_of.date(), as_of)
+
+        self.assertNotIn(codes[-1], snapshot.quotes)
+        self.assertEqual(snapshot.quality.status, "degraded")
+        self.assertTrue(
+            any(
+                codes[-1] in warning and "future quote" in warning
+                for warning in snapshot.quality.warnings
+            )
+        )
+
+    async def test_missing_numeric_fields_are_unavailable_not_fake_zero(self):
+        from app.services.trading_playbook.market_data import (
+            TradingPlaybookMarketDataProvider,
+        )
+
+        as_of = datetime(2026, 7, 13, 9, 30)
+        payload = _quote_payload("000001", 10, "20260713093000")
+        for key in ("pre_close", "amount", "bid1_volume"):
+            payload.pop(key)
+
+        snapshot = await TradingPlaybookMarketDataProvider(
+            quote_api=_FakeQuoteAPI({"000001": payload})
+        ).quote_snapshot(["000001"], as_of.date(), as_of)
+
+        quote = snapshot.quotes["000001"]
+        self.assertTrue(math.isnan(quote.pre_close))
+        self.assertTrue(math.isnan(quote.change_pct))
+        self.assertTrue(math.isnan(quote.amount))
+        self.assertTrue(math.isnan(quote.bid1_volume))
+
     async def test_empty_quote_snapshot_is_ready_without_upstream_call(self):
         from app.services.trading_playbook.market_data import (
             TradingPlaybookMarketDataProvider,
@@ -410,13 +461,39 @@ class TradingPlaybookKlineFeatureTests(unittest.IsolatedAsyncioTestCase):
         async def malformed_loader(*args, **kwargs):
             return [{"close": "bad"}] * 6
 
+        async def nan_loader(*args, **kwargs):
+            return [
+                {"close": value}
+                for value in [10, 10.1, 10.2, 10.3, 10.4, float("nan")]
+            ]
+
+        async def infinite_loader(*args, **kwargs):
+            return [
+                {"close": value}
+                for value in [10, 10.1, 10.2, 10.3, 10.4, float("inf")]
+            ]
+
+        async def negative_loader(*args, **kwargs):
+            return [
+                {"close": value}
+                for value in [10, 10.1, 10.2, 10.3, 10.4, -1]
+            ]
+
         expected = {
             "n_day_high": False,
             "consolidation_days": 0,
             "trend_established": False,
             "kline_quality": "missing",
         }
-        for loader in (None, short_loader, failed_loader, malformed_loader):
+        for loader in (
+            None,
+            short_loader,
+            failed_loader,
+            malformed_loader,
+            nan_loader,
+            infinite_loader,
+            negative_loader,
+        ):
             with self.subTest(loader=loader):
                 provider = TradingPlaybookMarketDataProvider(
                     quote_api=_FakeQuoteAPI(),
@@ -477,7 +554,8 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
             await db.flush()
             stock_by_code = {stock.stock_code: stock for stock in stocks}
 
-            for offset in range(10):
+            available_at = datetime(2026, 7, 10, 16)
+            for offset in range(9):
                 db.add(
                     MarketReviewStockDaily(
                         trade_date=source_date - timedelta(days=offset),
@@ -486,17 +564,51 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
                         stock_name="Review Candidate",
                         today_touched_limit_up=True,
                         limit_up_reason="AI review",
+                        created_at=available_at,
+                        updated_at=available_at,
                     )
                 )
             db.add_all(
                 [
                     MarketReviewStockDaily(
                         trade_date=source_date - timedelta(days=10),
+                        stock_id=stock_by_code["000200"].id,
+                        stock_code="000200",
+                        stock_name="Tenth Available Review Date",
+                        today_touched_limit_up=True,
+                        limit_up_reason="AI review",
+                        created_at=available_at,
+                        updated_at=available_at,
+                    ),
+                    MarketReviewStockDaily(
+                        trade_date=source_date - timedelta(days=11),
                         stock_id=stock_by_code["000201"].id,
                         stock_code="000201",
                         stock_name="Eleventh Review Date",
                         today_touched_limit_up=True,
                         limit_up_reason="too old",
+                        created_at=available_at,
+                        updated_at=available_at,
+                    ),
+                    MarketReviewStockDaily(
+                        trade_date=source_date,
+                        stock_id=stock_by_code["000204"].id,
+                        stock_code="000204",
+                        stock_name="Updated After Snapshot",
+                        today_touched_limit_up=True,
+                        limit_up_reason="late update theme",
+                        created_at=available_at,
+                        updated_at=as_of + timedelta(minutes=1),
+                    ),
+                    MarketReviewStockDaily(
+                        trade_date=source_date - timedelta(days=9),
+                        stock_id=stock_by_code["000205"].id,
+                        stock_code="000205",
+                        stock_name="Created After Snapshot",
+                        today_touched_limit_up=True,
+                        limit_up_reason="late created theme",
+                        created_at=as_of + timedelta(minutes=1),
+                        updated_at=as_of + timedelta(minutes=1),
                     ),
                     MarketReviewStockDaily(
                         trade_date=target_date,
@@ -505,6 +617,8 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
                         stock_name="Future Review",
                         today_touched_limit_up=True,
                         limit_up_reason="future",
+                        created_at=available_at,
+                        updated_at=available_at,
                     ),
                 ]
             )
@@ -611,7 +725,7 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
             await provider.quote_snapshot(
                 eligible_codes,
                 target_date,
-                as_of - timedelta(seconds=3),
+                as_of,
             )
             quote_api.calls.clear()
             snapshot = await provider.build_market_snapshot(
@@ -635,6 +749,7 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("000201", candidates)
         self.assertNotIn("000203", candidates)
         self.assertNotIn("000204", candidates)
+        self.assertNotIn("000205", candidates)
         self.assertEqual(candidates["000003"].features["change_rank"], 1)
         self.assertEqual(candidates["000001"].features["change_rank"], 2)
         self.assertEqual(candidates["000002"].features["change_rank"], 3)
@@ -722,12 +837,160 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("auction_change_pct", invalid.features)
         self.assertNotIn("auction_amount", invalid.features)
         self.assertNotIn("auction_theme_rank", invalid.features)
+        self.assertNotIn(
+            "000003",
+            snapshot.market_features["full_market_change_ranks"],
+        )
+        self.assertTrue(
+            any("future quote" in warning for warning in snapshot.quality.warnings)
+        )
         self.assertTrue(
             any(
                 evidence["source"] == "auction"
                 and evidence["quality"] == "missing"
                 for evidence in invalid.evidence
             )
+        )
+
+    async def test_auction_omits_missing_metrics_but_preserves_valid_zero(self):
+        from app.services.trading_playbook.market_data import (
+            TradingPlaybookMarketDataProvider,
+        )
+
+        source_date = date(2026, 7, 10)
+        target_date = date(2026, 7, 13)
+        as_of = datetime(2026, 7, 13, 9, 25)
+        codes = [
+            "000010",
+            "000011",
+            "000012",
+            "000013",
+            "000014",
+            "000015",
+        ]
+        async with self.session_factory() as db:
+            db.add_all(
+                [
+                    Stock(
+                        stock_code=code,
+                        stock_name=f"Auction Name {code}",
+                        market="SZ",
+                        is_st=0,
+                    )
+                    for code in codes
+                ]
+            )
+            await db.commit()
+
+            missing = _quote_payload("000010", 10, "20260713092000")
+            for key in ("pre_close", "amount", "bid1_volume"):
+                missing.pop(key)
+
+            valid_zero = _quote_payload("000011", 10, "20260713092000")
+            valid_zero.pop("pre_close")
+            valid_zero["change_pct"] = 0
+            valid_zero["amount"] = 0
+            valid_zero["bid1_volume"] = 0
+
+            partial = _quote_payload("000012", 10.5, "20260713092000")
+            partial["amount"] = "bad"
+            partial["bid1_volume"] = float("nan")
+
+            invalid_price = _quote_payload("000013", 10, "20260713092000")
+            invalid_price["price"] = "bad"
+
+            raw_change = _quote_payload("000014", 10.2, "20260713092000")
+            raw_change.pop("pre_close")
+            raw_change["change_pct"] = 2
+
+            overflow_change = _quote_payload(
+                "000015",
+                1e308,
+                "20260713092000",
+                pre_close=1e-308,
+            )
+
+            async def kline_loader(*args, **kwargs):
+                return [
+                    {"close": close}
+                    for close in [10, 10.1, 10.2, 10.2, 10.3, 10.4]
+                ]
+
+            async def realtime_loader(trade_date):
+                return [
+                    {
+                        "stock_code": code,
+                        "stock_name": f"Auction Name {code}",
+                        "reason_category": "AI",
+                    }
+                    for code in codes
+                ]
+
+            snapshot = await TradingPlaybookMarketDataProvider(
+                quote_api=_FakeQuoteAPI(
+                    {
+                        "000010": missing,
+                        "000011": valid_zero,
+                        "000012": partial,
+                        "000013": invalid_price,
+                        "000014": raw_change,
+                        "000015": overflow_change,
+                    }
+                ),
+                kline_loader=kline_loader,
+                realtime_limit_up_loader=realtime_loader,
+            ).build_market_snapshot(
+                db=db,
+                source_trade_date=source_date,
+                target_trade_date=target_date,
+                stage="auction",
+                as_of=as_of,
+            )
+
+        candidates = {item.stock_code: item for item in snapshot.candidates}
+        missing_features = candidates["000010"].features
+        self.assertEqual(missing_features["auction_quality"], "missing")
+        self.assertNotIn("auction_change_pct", missing_features)
+        self.assertNotIn("auction_amount", missing_features)
+        self.assertNotIn("auction_bid1_volume", missing_features)
+        self.assertNotIn("auction_theme_rank", missing_features)
+
+        zero_features = candidates["000011"].features
+        self.assertEqual(zero_features["auction_quality"], "ready")
+        self.assertEqual(zero_features["auction_change_pct"], 0.0)
+        self.assertEqual(zero_features["auction_amount"], 0.0)
+        self.assertEqual(zero_features["auction_bid1_volume"], 0.0)
+        self.assertEqual(zero_features["auction_theme_rank"], 3)
+
+        partial_features = candidates["000012"].features
+        self.assertEqual(partial_features["auction_quality"], "degraded")
+        self.assertEqual(partial_features["auction_change_pct"], 5.0)
+        self.assertNotIn("auction_amount", partial_features)
+        self.assertNotIn("auction_bid1_volume", partial_features)
+        self.assertEqual(partial_features["auction_theme_rank"], 1)
+
+        invalid_price_features = candidates["000013"].features
+        self.assertEqual(invalid_price_features["auction_quality"], "missing")
+        self.assertNotIn("price", invalid_price_features)
+        self.assertNotIn("auction_change_pct", invalid_price_features)
+        self.assertNotIn(
+            "000013",
+            snapshot.market_features["full_market_change_ranks"],
+        )
+
+        raw_change_features = candidates["000014"].features
+        self.assertEqual(raw_change_features["auction_quality"], "ready")
+        self.assertEqual(raw_change_features["auction_change_pct"], 2.0)
+        self.assertNotIn("pre_close", raw_change_features)
+        self.assertEqual(raw_change_features["auction_theme_rank"], 2)
+
+        overflow_features = candidates["000015"].features
+        self.assertEqual(overflow_features["auction_quality"], "degraded")
+        self.assertNotIn("auction_change_pct", overflow_features)
+        self.assertNotIn("auction_theme_rank", overflow_features)
+        self.assertNotIn(
+            "000015",
+            snapshot.market_features["full_market_change_ranks"],
         )
 
     async def test_force_degraded_overrides_otherwise_ready_snapshot(self):
