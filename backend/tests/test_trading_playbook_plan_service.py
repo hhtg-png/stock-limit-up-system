@@ -1,0 +1,904 @@
+import asyncio
+import copy
+import hashlib
+import math
+import unittest
+from datetime import date, datetime, timedelta
+from unittest.mock import AsyncMock, patch
+from zoneinfo import ZoneInfo
+
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.pool import StaticPool
+
+from app.database import Base
+from app.models.trading_playbook import (
+    TradingPlanCandidate,
+    TradingPlanVersion,
+    TradingPlaybookSettings,
+)
+from app.services.trading_playbook.domain import (
+    CandidateSnapshot,
+    DataQuality,
+    MarketSnapshot,
+    ModeEvaluation,
+)
+from app.services.trading_playbook.plan_service import TradingPlanService
+
+
+SOURCE_DATE = date(2026, 7, 10)
+TARGET_DATE = date(2026, 7, 13)
+AS_OF = datetime(2026, 7, 10, 14, 40)
+
+
+def _rule_hash(mode_key: str) -> str:
+    return hashlib.sha256(mode_key.encode("utf-8")).hexdigest()
+
+
+def _rule_snapshot(*mode_keys: str) -> list[dict]:
+    return [
+        {
+            "mode_key": mode_key,
+            "version": 1,
+            "content_hash": _rule_hash(mode_key),
+            "source_refs": [{"source_key": "test", "excerpt": mode_key}],
+        }
+        for mode_key in reversed(sorted(set(mode_keys)))
+    ]
+
+
+def _evaluation(
+    mode_key: str,
+    stock_code: str,
+    *,
+    status: str = "matched",
+    score: float = 100,
+    risk_level: str = "confirmed",
+    reference_price=10.0,
+    action_scope: str = "target",
+) -> ModeEvaluation:
+    return ModeEvaluation(
+        mode_key=mode_key,
+        stock_code=stock_code,
+        status=status,
+        score=score,
+        role="leader",
+        risk_level=risk_level,
+        entry_trigger={
+            "label": "进入",
+            "reference_price": reference_price,
+            "sealed": True,
+        },
+        invalidation={"label": "逻辑失效", "price_lte": 8.88},
+        exit_trigger={"label": "退出", "change_pct_lte": -5.0},
+        evidence=[
+            {
+                "source": "test",
+                "quality": "ready",
+                "captured_at": AS_OF,
+            }
+        ],
+        rule_version=1,
+        rule_hash=_rule_hash(mode_key),
+        action_scope=action_scope,
+    )
+
+
+def _snapshot(
+    *,
+    stage: str = "preclose",
+    quality_status: str = "ready",
+    stale: bool = False,
+    warnings: list[str] | None = None,
+    quality_as_of: datetime = AS_OF,
+) -> MarketSnapshot:
+    candidates = [
+        CandidateSnapshot(
+            stock_code=f"00000{i}",
+            stock_name=f"快照股票{i}",
+            theme_name="机器人" if i % 2 else "芯片",
+            features={
+                "recognition_rank": i,
+                "recognition_score": 6 - i,
+                "recognition_evidence": {"fastest": {"rank": i}},
+            },
+            evidence=[{"source": "snapshot", "captured_at": AS_OF}],
+        )
+        for i in range(1, 6)
+    ]
+    return MarketSnapshot(
+        source_trade_date=SOURCE_DATE,
+        target_trade_date=TARGET_DATE,
+        stage=stage,
+        as_of=AS_OF,
+        market_features={
+            "style": "board_flow",
+            "window": "outbreak",
+            "quality": quality_status,
+        },
+        candidates=candidates,
+        theme_rankings=[
+            {"theme_name": "机器人", "rank": 1, "score": 57},
+            {"theme_name": "芯片", "rank": 2, "score": 18},
+        ],
+        quality=DataQuality(
+            quality_status,
+            quality_as_of,
+            "test",
+            stale=stale,
+            warnings=warnings or [],
+        ),
+    )
+
+
+class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.engine = create_async_engine(
+            "sqlite+aiosqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        self.Session = async_sessionmaker(self.engine, expire_on_commit=False)
+        async with self.engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        self.service = TradingPlanService()
+
+    async def asyncTearDown(self):
+        await self.engine.dispose()
+
+    async def _generate(
+        self,
+        db,
+        evaluations,
+        *,
+        snapshot=None,
+        rule_snapshot=None,
+    ):
+        snapshot = snapshot or _snapshot()
+        return await self.service.generate(
+            db,
+            snapshot,
+            evaluations,
+            stock_names={f"00000{i}": f"股票{i}" for i in range(1, 6)},
+            rule_snapshot=rule_snapshot
+            if rule_snapshot is not None
+            else _rule_snapshot(*(row.mode_key for row in evaluations)),
+        )
+
+    async def test_generate_limits_unique_action_candidates_and_preserves_radar(self):
+        evaluations = [
+            _evaluation("leader", "000001", score=100),
+            _evaluation(
+                "support",
+                "000001",
+                score=90,
+                risk_level="trial",
+            ),
+            _evaluation("tail", "000002", score=99, action_scope="tail"),
+            _evaluation("third", "000003", score=98, risk_level="trial"),
+            _evaluation("fourth", "000004", score=97),
+            _evaluation("waiting", "000005", status="waiting", risk_level="watch"),
+            _evaluation(
+                "manual",
+                "000005",
+                status="manual_review",
+                risk_level="watch",
+            ),
+            _evaluation(
+                "failed",
+                "000005",
+                status="not_matched",
+                risk_level="avoid",
+            ),
+        ]
+        original_snapshot = copy.deepcopy(_snapshot())
+        original_evaluations = copy.deepcopy(evaluations)
+        rules = _rule_snapshot(*(row.mode_key for row in evaluations))
+        original_rules = copy.deepcopy(rules)
+
+        async with self.Session() as db:
+            plan = await self._generate(
+                db,
+                evaluations,
+                snapshot=original_snapshot,
+                rule_snapshot=rules,
+            )
+
+        self.assertEqual(len(plan["candidates"]), 3)
+        self.assertEqual(len({row["stock_code"] for row in plan["candidates"]}), 3)
+        self.assertEqual(
+            [row["stock_code"] for row in plan["candidates"]],
+            ["000001", "000002", "000003"],
+        )
+        self.assertEqual(len(plan["mode_radar"]), len(evaluations))
+        self.assertEqual(
+            {row["status"] for row in plan["mode_radar"]},
+            {"matched", "waiting", "manual_review", "not_matched"},
+        )
+        first, tail, third = plan["candidates"]
+        self.assertEqual(first["supporting_mode_keys_json"], ["support"])
+        self.assertEqual(first["position_reference"], 30.0)
+        self.assertEqual(third["position_reference"], 10.0)
+        self.assertEqual(first["invalidation_json"]["label"], "逻辑失效")
+        self.assertEqual(first["invalidation_json"]["price_lte"], 9.5)
+        self.assertEqual(tail["action_trade_date"], SOURCE_DATE.isoformat())
+        self.assertEqual(first["action_trade_date"], TARGET_DATE.isoformat())
+        self.assertEqual(plan["risk_settings"]["max_candidates"], 3)
+        self.assertEqual(len(plan["rule_snapshot"]), len(rules))
+        self.assertEqual(original_snapshot, _snapshot())
+        self.assertEqual(evaluations, original_evaluations)
+        self.assertEqual(rules, original_rules)
+
+        async with self.Session() as db:
+            settings_count = await db.scalar(
+                select(func.count()).select_from(TradingPlaybookSettings)
+            )
+            self.assertEqual(settings_count, 1)
+
+    async def test_generate_is_idempotent_and_hashes_every_effective_input(self):
+        evaluation = _evaluation("leader", "000001")
+        rules = _rule_snapshot("leader")
+        async with self.Session() as db:
+            first = await self._generate(db, [evaluation], rule_snapshot=rules)
+            same = await self.service.generate(
+                db,
+                _snapshot(),
+                [copy.deepcopy(evaluation)],
+                stock_names={"000001": "股票1"},
+                rule_snapshot=list(reversed(copy.deepcopy(rules))),
+            )
+            self.assertEqual(same["id"], first["id"])
+
+            changed_snapshot = _snapshot()
+            changed_snapshot.market_features["limit_up_count"] = 88
+            snapshot_plan = await self._generate(
+                db,
+                [evaluation],
+                snapshot=changed_snapshot,
+                rule_snapshot=rules,
+            )
+
+            changed_evaluation = copy.deepcopy(evaluation)
+            object.__setattr__(changed_evaluation, "score", 101)
+            radar_plan = await self._generate(
+                db,
+                [changed_evaluation],
+                rule_snapshot=rules,
+            )
+
+            changed_rules = copy.deepcopy(rules)
+            changed_rules[0]["description"] = "完整规则快照的变化"
+            rule_plan = await self._generate(
+                db,
+                [evaluation],
+                rule_snapshot=changed_rules,
+            )
+
+            settings_row = await db.get(TradingPlaybookSettings, 1)
+            settings_row.hard_stop_pct = 6
+            await db.commit()
+            risk_plan = await self._generate(
+                db,
+                [evaluation],
+                rule_snapshot=rules,
+            )
+
+            ids = {
+                first["id"],
+                snapshot_plan["id"],
+                radar_plan["id"],
+                rule_plan["id"],
+                risk_plan["id"],
+            }
+            self.assertEqual(len(ids), 5)
+            versions = (
+                await db.scalars(
+                    select(TradingPlanVersion).order_by(
+                        TradingPlanVersion.version_no
+                    )
+                )
+            ).all()
+            self.assertEqual([row.version_no for row in versions], [1, 2, 3, 4, 5])
+            self.assertEqual(len({row.input_hash for row in versions}), 5)
+
+    async def test_rule_snapshot_order_and_dict_order_have_a_stable_hash(self):
+        evaluations = [
+            _evaluation("alpha", "000001"),
+            _evaluation("beta", "000002", score=99),
+        ]
+        first_rules = _rule_snapshot("alpha", "beta")
+        second_rules = [
+            {key: value for key, value in reversed(list(row.items()))}
+            for row in reversed(copy.deepcopy(first_rules))
+        ]
+
+        async with self.Session() as db:
+            first = await self._generate(
+                db,
+                evaluations,
+                rule_snapshot=first_rules,
+            )
+            second = await self._generate(
+                db,
+                list(reversed(evaluations)),
+                rule_snapshot=second_rules,
+            )
+
+        self.assertEqual(first["id"], second["id"])
+        self.assertEqual(first["input_hash"], second["input_hash"])
+        self.assertEqual(
+            [row["mode_key"] for row in first["rule_snapshot"]],
+            ["alpha", "beta"],
+        )
+
+    async def test_invalid_prices_remain_in_radar_but_never_become_candidates(self):
+        evaluations = [
+            _evaluation("missing", "000001", reference_price=None),
+            _evaluation("negative", "000002", reference_price=-1),
+            _evaluation("text", "000003", reference_price="10"),
+            _evaluation(
+                "waiting",
+                "000004",
+                status="waiting",
+                risk_level="watch",
+            ),
+        ]
+        async with self.Session() as db:
+            plan = await self._generate(db, evaluations)
+
+        self.assertEqual(plan["candidates"], [])
+        self.assertEqual(len(plan["mode_radar"]), 4)
+
+    async def test_rejects_non_json_and_incomplete_rule_evidence_without_writes(self):
+        invalid_cases = []
+
+        nan_snapshot = _snapshot()
+        nan_snapshot.market_features["bad"] = math.nan
+        invalid_cases.append((nan_snapshot, [_evaluation("leader", "000001")], _rule_snapshot("leader")))
+
+        bad_evaluation = _evaluation("leader", "000001")
+        object.__setattr__(bad_evaluation, "evidence", [{"value": object()}])
+        invalid_cases.append((_snapshot(), [bad_evaluation], _rule_snapshot("leader")))
+
+        invalid_cases.extend(
+            [
+                (
+                    _snapshot(),
+                    [_evaluation("leader", "000001")],
+                    [{"mode_key": "leader", "version": 1}],
+                ),
+                (
+                    _snapshot(),
+                    [_evaluation("leader", "000001")],
+                    [
+                        {
+                            "mode_key": "leader",
+                            "version": 1,
+                            "content_hash": "not-a-sha256",
+                        }
+                    ],
+                ),
+            ]
+        )
+
+        async with self.Session() as db:
+            for snapshot, evaluations, rules in invalid_cases:
+                with self.subTest(rules=rules):
+                    with self.assertRaises(ValueError):
+                        await self._generate(
+                            db,
+                            evaluations,
+                            snapshot=snapshot,
+                            rule_snapshot=rules,
+                        )
+                    await db.rollback()
+
+            count = await db.scalar(
+                select(func.count()).select_from(TradingPlanVersion)
+            )
+            self.assertEqual(count, 0)
+
+    async def test_unrelated_aggregate_degradation_does_not_block_confirmed(self):
+        snapshot = _snapshot(
+            quality_status="degraded",
+            warnings=["theme member coverage is partial for an unrelated theme"],
+        )
+        async with self.Session() as db:
+            plan = await self._generate(
+                db,
+                [_evaluation("leader", "000001", risk_level="confirmed")],
+                snapshot=snapshot,
+            )
+
+        self.assertEqual(len(plan["candidates"]), 1)
+        self.assertEqual(plan["candidates"][0]["risk_level"], "confirmed")
+
+    async def test_global_time_unsafety_blocks_confirmed_but_not_trial(self):
+        evaluations = [
+            _evaluation("confirmed", "000001", risk_level="confirmed"),
+            _evaluation("trial", "000002", score=99, risk_level="trial"),
+        ]
+        snapshots = [
+            _snapshot(stale=True),
+            _snapshot(quality_as_of=AS_OF + timedelta(seconds=1)),
+        ]
+        invalid_point_in_time = _snapshot()
+        invalid_point_in_time.market_features["_point_in_time_valid"] = False
+        snapshots.append(invalid_point_in_time)
+
+        async with self.Session() as db:
+            for index, snapshot in enumerate(snapshots):
+                snapshot.market_features["case"] = index
+                plan = await self._generate(
+                    db,
+                    evaluations,
+                    snapshot=snapshot,
+                )
+                self.assertEqual(
+                    [row["stock_code"] for row in plan["candidates"]],
+                    ["000002"],
+                )
+                self.assertEqual(plan["candidates"][0]["risk_level"], "trial")
+
+    async def test_revise_creates_child_and_only_changes_controlled_candidate_fields(self):
+        evaluations = [
+            _evaluation("leader", "000001"),
+            _evaluation("second", "000002", score=99, risk_level="trial"),
+        ]
+        async with self.Session() as db:
+            generated = await self._generate(db, evaluations)
+            parent_id = generated["id"]
+            parent_before = await self.service.serialize(db, parent_id)
+            first = parent_before["candidates"][0]
+            changes = {
+                "change_note": "人工调整触发位",
+                "candidate_overrides": [
+                    {
+                        "candidate_id": first["id"],
+                        "action_trade_date": SOURCE_DATE.isoformat(),
+                        "entry_trigger": {
+                            "label": "人工突破",
+                            "reference_price": 12.0,
+                            "price_gte": 12.2,
+                        },
+                        "invalidation": {"label": "人工止损"},
+                        "exit_trigger": {
+                            "label": "人工退出",
+                            "change_pct_lte": -3.0,
+                        },
+                        "manual_note": "只按书面条件执行",
+                    }
+                ],
+            }
+            original_changes = copy.deepcopy(changes)
+
+            child = await self.service.revise(db, parent_id, changes)
+            child_payload = await self.service.serialize(db, child.id)
+            parent_after = await self.service.serialize(db, parent_id)
+
+        self.assertEqual(changes, original_changes)
+        self.assertEqual(parent_before, parent_after)
+        self.assertEqual(child.parent_plan_version_id, parent_id)
+        self.assertEqual(child.version_no, 2)
+        self.assertEqual(child.status, "draft")
+        self.assertIsNone(child.confirmed_at)
+        self.assertIsNone(child.confirmed_by)
+        self.assertEqual(len(child_payload["candidates"]), 2)
+        revised = child_payload["candidates"][0]
+        untouched = child_payload["candidates"][1]
+        self.assertNotEqual(revised["id"], first["id"])
+        self.assertEqual(revised["action_trade_date"], SOURCE_DATE.isoformat())
+        self.assertEqual(revised["entry_trigger_json"]["reference_price"], 12.0)
+        self.assertEqual(revised["invalidation_json"]["label"], "人工止损")
+        self.assertEqual(revised["invalidation_json"]["price_lte"], 11.4)
+        self.assertEqual(
+            revised["manual_overrides_json"]["manual_note"],
+            "只按书面条件执行",
+        )
+        self.assertEqual(
+            untouched["entry_trigger_json"],
+            parent_before["candidates"][1]["entry_trigger_json"],
+        )
+        self.assertEqual(child_payload["change_summary_json"]["manual"], True)
+        self.assertEqual(
+            child_payload["change_summary_json"]["change_note"],
+            "人工调整触发位",
+        )
+
+    async def test_revise_accepts_stock_and_mode_as_a_unique_locator(self):
+        async with self.Session() as db:
+            generated = await self._generate(
+                db,
+                [_evaluation("leader", "000001")],
+            )
+            child = await self.service.revise(
+                db,
+                generated["id"],
+                {
+                    "change_note": "按代码和模式定位",
+                    "candidate_overrides": [
+                        {
+                            "stock_code": "000001",
+                            "primary_mode_key": "leader",
+                            "manual_note": "已复核",
+                        }
+                    ],
+                },
+            )
+            payload = await self.service.serialize(db, child.id)
+
+        self.assertEqual(
+            payload["candidates"][0]["manual_overrides_json"]["manual_note"],
+            "已复核",
+        )
+
+    async def test_revise_rejects_unknown_duplicate_and_missing_overrides(self):
+        async with self.Session() as db:
+            generated = await self._generate(
+                db,
+                [_evaluation("leader", "000001")],
+            )
+            candidate = generated["candidates"][0]
+            bad_changes = [
+                {"change_note": "x", "unknown": True},
+                {
+                    "change_note": "x",
+                    "candidate_overrides": [
+                        {"candidate_id": candidate["id"], "stock_name": "污染"}
+                    ],
+                },
+                {
+                    "change_note": "x",
+                    "candidate_overrides": [{"manual_note": "没有定位符"}],
+                },
+                {
+                    "change_note": "x",
+                    "candidate_overrides": [
+                        {
+                            "candidate_id": candidate["id"],
+                            "stock_code": "000001",
+                            "primary_mode_key": "leader",
+                        }
+                    ],
+                },
+                {
+                    "change_note": "x",
+                    "candidate_overrides": [
+                        {"candidate_id": 999999, "manual_note": "不存在"}
+                    ],
+                },
+                {
+                    "change_note": "x",
+                    "candidate_overrides": [
+                        {"candidate_id": candidate["id"], "manual_note": "a"},
+                        {"candidate_id": candidate["id"], "manual_note": "b"},
+                    ],
+                },
+                {
+                    "change_note": "x",
+                    "candidate_overrides": [
+                        {
+                            "candidate_id": candidate["id"],
+                            "action_trade_date": "2026-07-14",
+                        }
+                    ],
+                },
+                {
+                    "change_note": "x",
+                    "candidate_overrides": [
+                        {
+                            "candidate_id": candidate["id"],
+                            "entry_trigger": {"label": "x", "arbitrary": 1},
+                        }
+                    ],
+                },
+            ]
+
+            for changes in bad_changes:
+                with self.subTest(changes=changes):
+                    with self.assertRaises(ValueError):
+                        await self.service.revise(db, generated["id"], changes)
+                    await db.rollback()
+
+            plan_count = await db.scalar(
+                select(func.count()).select_from(TradingPlanVersion)
+            )
+            candidate_count = await db.scalar(
+                select(func.count()).select_from(TradingPlanCandidate)
+            )
+
+        self.assertEqual(plan_count, 1)
+        self.assertEqual(candidate_count, 1)
+
+    async def test_confirm_activates_target_and_supersedes_old_target_active(self):
+        other_target = TARGET_DATE + timedelta(days=1)
+        async with self.Session() as db:
+            old_active = TradingPlanVersion(
+                source_trade_date=SOURCE_DATE,
+                target_trade_date=TARGET_DATE,
+                stage="preclose",
+                version_no=1,
+                status="active",
+                input_hash="old",
+            )
+            target = TradingPlanVersion(
+                source_trade_date=SOURCE_DATE,
+                target_trade_date=TARGET_DATE,
+                stage="after_close",
+                version_no=1,
+                status="draft",
+                input_hash="target",
+            )
+            other_active = TradingPlanVersion(
+                source_trade_date=TARGET_DATE,
+                target_trade_date=other_target,
+                stage="preclose",
+                version_no=1,
+                status="active",
+                input_hash="other",
+            )
+            db.add_all([old_active, target, other_active])
+            await db.commit()
+            old_active_id = old_active.id
+            target_id = target.id
+            other_active_id = other_active.id
+
+            activated = await self.service.confirm(db, target_id, "local-user")
+
+            self.assertEqual(activated.status, "active")
+            self.assertEqual(activated.confirmed_by, "local-user")
+            self.assertIsNotNone(activated.confirmed_at)
+            self.assertEqual(
+                activated.confirmed_at.utcoffset(),
+                timedelta(hours=8),
+            )
+            self.assertEqual(old_active.status, "superseded")
+            self.assertEqual(other_active.status, "active")
+
+            with self.assertRaises(ValueError):
+                await self.service.confirm(db, target_id, "local-user")
+            with self.assertRaises(ValueError):
+                await self.service.confirm(db, old_active_id, "local-user")
+            with self.assertRaises(ValueError):
+                await self.service.confirm(db, other_active_id, "")
+
+    async def test_confirm_rolls_back_all_status_changes_when_commit_fails(self):
+        async with self.Session() as db:
+            old_active = TradingPlanVersion(
+                source_trade_date=SOURCE_DATE,
+                target_trade_date=TARGET_DATE,
+                stage="preclose",
+                version_no=1,
+                status="active",
+                input_hash="old",
+            )
+            target = TradingPlanVersion(
+                source_trade_date=SOURCE_DATE,
+                target_trade_date=TARGET_DATE,
+                stage="after_close",
+                version_no=1,
+                status="draft",
+                input_hash="target",
+            )
+            db.add_all([old_active, target])
+            await db.commit()
+            old_active_id = old_active.id
+            target_id = target.id
+            original_rollback = db.rollback
+            with patch.object(
+                db,
+                "commit",
+                AsyncMock(side_effect=RuntimeError("commit failed")),
+            ), patch.object(
+                db,
+                "rollback",
+                AsyncMock(wraps=original_rollback),
+            ) as rollback:
+                with self.assertRaisesRegex(RuntimeError, "commit failed"):
+                    await self.service.confirm(db, target.id, "local-user")
+                rollback.assert_awaited_once()
+
+        async with self.Session() as db:
+            persisted_old = await db.get(TradingPlanVersion, old_active_id)
+            persisted_target = await db.get(TradingPlanVersion, target_id)
+            self.assertEqual(persisted_old.status, "active")
+            self.assertEqual(persisted_target.status, "draft")
+            self.assertIsNone(persisted_target.confirmed_at)
+
+    async def test_concurrent_confirmations_leave_only_one_target_active(self):
+        async with self.Session() as db:
+            first = TradingPlanVersion(
+                source_trade_date=SOURCE_DATE,
+                target_trade_date=TARGET_DATE,
+                stage="preclose",
+                version_no=1,
+                status="draft",
+                input_hash="first",
+            )
+            second = TradingPlanVersion(
+                source_trade_date=SOURCE_DATE,
+                target_trade_date=TARGET_DATE,
+                stage="after_close",
+                version_no=1,
+                status="draft",
+                input_hash="second",
+            )
+            db.add_all([first, second])
+            await db.commit()
+            first_id, second_id = first.id, second.id
+
+        async def confirm(plan_id, user):
+            async with self.Session() as session:
+                return await self.service.confirm(session, plan_id, user)
+
+        await asyncio.gather(
+            confirm(first_id, "first-user"),
+            confirm(second_id, "second-user"),
+        )
+
+        async with self.Session() as db:
+            plans = (
+                await db.scalars(
+                    select(TradingPlanVersion).where(
+                        TradingPlanVersion.target_trade_date == TARGET_DATE
+                    )
+                )
+            ).all()
+        self.assertEqual(sum(row.status == "active" for row in plans), 1)
+        self.assertEqual(sum(row.status == "superseded" for row in plans), 1)
+
+    async def test_invalid_persisted_settings_are_rejected(self):
+        invalid_settings = [
+            {"max_action_candidates": 4},
+            {"max_action_candidates": 0},
+            {"trial_position_pct": -1},
+            {"confirmed_position_pct": 101},
+            {"trial_position_pct": 40, "confirmed_position_pct": 30},
+            {"hard_stop_pct": 0},
+            {"hard_stop_pct": 21},
+        ]
+        for index, overrides in enumerate(invalid_settings):
+            async with self.Session() as db:
+                row = await db.get(TradingPlaybookSettings, 1)
+                if row is None:
+                    row = TradingPlaybookSettings(id=1)
+                    db.add(row)
+                for key, value in overrides.items():
+                    setattr(row, key, value)
+                await db.commit()
+                with self.subTest(index=index, overrides=overrides):
+                    with self.assertRaises(ValueError):
+                        await self._generate(
+                            db,
+                            [_evaluation("leader", "000001")],
+                        )
+                await db.rollback()
+                await db.delete(row)
+                await db.commit()
+
+    async def test_version_number_conflict_rolls_back_and_retries_cleanly(self):
+        async with self.Session() as db:
+            db.add(TradingPlaybookSettings(id=1))
+            db.add(
+                TradingPlanVersion(
+                    source_trade_date=SOURCE_DATE,
+                    target_trade_date=TARGET_DATE,
+                    stage="preclose",
+                    version_no=1,
+                    status="draft",
+                    input_hash="different-input",
+                )
+            )
+            await db.commit()
+
+            with patch.object(
+                self.service,
+                "_next_version_no",
+                AsyncMock(side_effect=[1, 2]),
+            ):
+                plan = await self._generate(
+                    db,
+                    [_evaluation("leader", "000001")],
+                )
+
+            self.assertEqual(plan["version_no"], 2)
+            versions = (
+                await db.scalars(
+                    select(TradingPlanVersion).order_by(
+                        TradingPlanVersion.version_no
+                    )
+                )
+            ).all()
+            self.assertEqual([row.version_no for row in versions], [1, 2])
+
+    async def test_settings_insert_conflict_retries_without_an_unbound_hash(self):
+        settings_row = TradingPlaybookSettings(
+            id=1,
+            trial_position_pct=10,
+            confirmed_position_pct=30,
+            hard_stop_pct=5,
+            max_action_candidates=3,
+        )
+        conflict = IntegrityError("insert settings", {}, RuntimeError("race"))
+        async with self.Session() as db:
+            with patch.object(
+                self.service,
+                "_get_or_create_settings",
+                AsyncMock(side_effect=[conflict, (settings_row, False)]),
+            ):
+                plan = await self._generate(
+                    db,
+                    [_evaluation("leader", "000001")],
+                )
+
+        self.assertEqual(plan["version_no"], 1)
+
+    async def test_mixed_timezone_quality_timestamp_is_treated_as_time_unsafe(self):
+        aware_quality_time = AS_OF.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+        snapshot = _snapshot(quality_as_of=aware_quality_time)
+        evaluations = [
+            _evaluation("confirmed", "000001", risk_level="confirmed"),
+            _evaluation("trial", "000002", score=99, risk_level="trial"),
+        ]
+        async with self.Session() as db:
+            plan = await self._generate(db, evaluations, snapshot=snapshot)
+
+        self.assertEqual(
+            [row["stock_code"] for row in plan["candidates"]],
+            ["000002"],
+        )
+
+    async def test_non_string_rule_keys_and_malformed_theme_rows_are_rejected(self):
+        bad_rule = _rule_snapshot("leader")
+        bad_rule[0][1] = "not-json-object-key"
+        bad_theme = _snapshot()
+        bad_theme.theme_rankings.append({"theme_name": "坏数据", "rank": "first"})
+        async with self.Session() as db:
+            with self.assertRaises(ValueError):
+                await self._generate(
+                    db,
+                    [_evaluation("leader", "000001")],
+                    rule_snapshot=bad_rule,
+                )
+            await db.rollback()
+            with self.assertRaises(ValueError):
+                await self._generate(
+                    db,
+                    [_evaluation("leader", "000001")],
+                    snapshot=bad_theme,
+                )
+
+    async def test_revision_hash_includes_actual_override_values(self):
+        async with self.Session() as db:
+            generated = await self._generate(
+                db,
+                [_evaluation("leader", "000001")],
+            )
+            parent = await db.get(TradingPlanVersion, generated["id"])
+            candidates = await self.service._load_candidates(db, parent.id)
+            first = generated["candidates"][0]
+            first_changes = self.service._normalize_revision_changes(
+                parent,
+                candidates,
+                {
+                    "change_note": "同一说明",
+                    "candidate_overrides": [
+                        {"candidate_id": first["id"], "manual_note": "甲"}
+                    ],
+                },
+            )
+            second_changes = self.service._normalize_revision_changes(
+                parent,
+                candidates,
+                {
+                    "change_note": "同一说明",
+                    "candidate_overrides": [
+                        {"candidate_id": first["id"], "manual_note": "乙"}
+                    ],
+                },
+            )
+
+        first_child = self.service._clone_plan_for_revision(parent, first_changes, 2)
+        second_child = self.service._clone_plan_for_revision(parent, second_changes, 2)
+        self.assertNotEqual(first_child.input_hash, second_child.input_hash)
