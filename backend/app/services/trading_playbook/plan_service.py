@@ -8,6 +8,7 @@ import hashlib
 import json
 import math
 import re
+from contextlib import asynccontextmanager
 from datetime import date, datetime
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
@@ -91,10 +92,45 @@ def _china_iso(value: datetime) -> str:
     return value.isoformat()
 
 
+class _LockEntry:
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.users = 0
+
+
+class _KeyedLockManager:
+    def __init__(self) -> None:
+        self._entries: Dict[Tuple[Any, Any], _LockEntry] = {}
+
+    @property
+    def entry_count(self) -> int:
+        return len(self._entries)
+
+    @asynccontextmanager
+    async def hold(self, key: Any):
+        scoped_key = (asyncio.get_running_loop(), key)
+        entry = self._entries.get(scoped_key)
+        if entry is None:
+            entry = _LockEntry()
+            self._entries[scoped_key] = entry
+        entry.users += 1
+        try:
+            await entry.lock.acquire()
+            try:
+                yield entry.lock
+            finally:
+                entry.lock.release()
+        finally:
+            entry.users -= 1
+            if entry.users == 0 and self._entries.get(scoped_key) is entry:
+                self._entries.pop(scoped_key, None)
+
+
 class TradingPlanService:
     """Create immutable plan versions and controlled child revisions."""
 
-    _generation_locks: Dict[Tuple[int, date, str], asyncio.Lock] = {}
+    def __init__(self, lock_manager: Optional[_KeyedLockManager] = None) -> None:
+        self._lock_manager = lock_manager or _KeyedLockManager()
 
     async def generate(
         self,
@@ -110,9 +146,8 @@ class TradingPlanService:
         normalized_names = self._stock_names(stock_names, radar)
         self._validate_rule_coverage(normalized_rules, radar)
 
-        lock_key = (id(db.bind), snapshot.target_trade_date, snapshot.stage)
-        lock = self._generation_locks.setdefault(lock_key, asyncio.Lock())
-        async with lock:
+        lock_key = (db.bind, snapshot.target_trade_date)
+        async with self._lock_manager.hold(lock_key):
             for attempt in range(3):
                 created_settings = False
                 risk_settings = None
@@ -173,8 +208,7 @@ class TradingPlanService:
                         risk_settings_json=copy.deepcopy(risk_settings),
                         data_quality_json=copy.deepcopy(snapshot_payload["quality"]),
                         change_summary_json=await self._change_summary(
-                            db,
-                            snapshot.target_trade_date,
+                            parent,
                             radar,
                         ),
                         input_hash=input_hash,
@@ -911,42 +945,46 @@ class TradingPlanService:
             stage_index = _STAGE_SEQUENCE.index(stage)
         except ValueError as exc:
             raise ValueError("invalid plan stage") from exc
-        eligible_stages = _STAGE_SEQUENCE[: stage_index + 1]
-        rows = (
-            await db.scalars(
-                select(TradingPlanVersion).where(
-                    TradingPlanVersion.target_trade_date == target_trade_date,
-                    TradingPlanVersion.stage.in_(eligible_stages),
-                )
-            )
-        ).all()
-        if not rows:
-            return None
-        stage_rank = {name: index for index, name in enumerate(_STAGE_SEQUENCE)}
-        return max(
-            rows,
-            key=lambda row: (
-                stage_rank[row.stage],
-                row.version_no,
-                row.id,
-            ),
-        )
-
-    @staticmethod
-    async def _change_summary(
-        db,
-        target_trade_date: date,
-        radar: Sequence[Mapping[str, Any]],
-    ) -> Dict[str, Any]:
-        previous = await db.scalar(
+        same_stage = await db.scalar(
             select(TradingPlanVersion)
-            .where(TradingPlanVersion.target_trade_date == target_trade_date)
+            .where(
+                TradingPlanVersion.target_trade_date == target_trade_date,
+                TradingPlanVersion.stage == stage,
+            )
             .order_by(
-                TradingPlanVersion.generated_at.desc(),
+                TradingPlanVersion.version_no.desc(),
                 TradingPlanVersion.id.desc(),
             )
             .limit(1)
         )
+        if same_stage is not None:
+            return same_stage
+        if stage_index == 0:
+            return None
+        predecessor_stage = _STAGE_SEQUENCE[stage_index - 1]
+        predecessor = await db.scalar(
+            select(TradingPlanVersion)
+            .where(
+                TradingPlanVersion.target_trade_date == target_trade_date,
+                TradingPlanVersion.stage == predecessor_stage,
+            )
+            .order_by(
+                TradingPlanVersion.version_no.desc(),
+                TradingPlanVersion.id.desc(),
+            )
+            .limit(1)
+        )
+        if predecessor is None:
+            raise ValueError(
+                f"missing predecessor stage {predecessor_stage}; retry generation"
+            )
+        return predecessor
+
+    @staticmethod
+    async def _change_summary(
+        previous: Optional[TradingPlanVersion],
+        radar: Sequence[Mapping[str, Any]],
+    ) -> Dict[str, Any]:
         current_matches = sorted(
             {
                 (row["stock_code"], row["mode_key"])
@@ -1074,9 +1112,8 @@ class TradingPlanService:
             parent_candidates,
             changes,
         )
-        lock_key = (id(db.bind), parent.target_trade_date, parent.stage)
-        lock = self._generation_locks.setdefault(lock_key, asyncio.Lock())
-        async with lock:
+        lock_key = (db.bind, parent.target_trade_date)
+        async with self._lock_manager.hold(lock_key):
             for attempt in range(3):
                 try:
                     current_parent = await db.get(TradingPlanVersion, plan_id)
@@ -1306,8 +1343,40 @@ class TradingPlanService:
                     raise ValueError(f"invalid {field}.{key}")
                 if key in {"reference_price", "price_gte", "price_lte"} and number <= 0:
                     raise ValueError(f"invalid {field}.{key}")
+                if key in {"change_pct_gte", "change_pct_lte"} and not (
+                    -100 <= number <= 100
+                ):
+                    raise ValueError(f"invalid {field}.{key}")
+                if (
+                    field == "exit_trigger"
+                    and key == "change_pct_lte"
+                    and not -100 <= number <= 0
+                ):
+                    raise ValueError(f"invalid {field}.{key}")
+                if (
+                    field == "entry_trigger"
+                    and key == "change_pct_gte"
+                    and not 0 <= number <= 100
+                ):
+                    raise ValueError(f"invalid {field}.{key}")
                 normalized[key] = number
         return normalized
+
+    @staticmethod
+    def _validate_trigger_bounds(
+        value: Mapping[str, Any],
+        field: str,
+    ) -> None:
+        for lower_key, upper_key in (
+            ("price_gte", "price_lte"),
+            ("change_pct_gte", "change_pct_lte"),
+        ):
+            lower = _finite_number(value.get(lower_key))
+            upper = _finite_number(value.get(upper_key))
+            if lower is not None and upper is not None and lower > upper:
+                raise ValueError(
+                    f"contradictory {field}: {lower_key} exceeds {upper_key}"
+                )
 
     @staticmethod
     def _clone_plan_for_revision(
@@ -1394,6 +1463,15 @@ class TradingPlanService:
                     merged = copy.deepcopy(values[key])
                     merged.update(copy.deepcopy(override[key]))
                     values[key] = merged
+            for key in (
+                "entry_trigger_json",
+                "invalidation_json",
+                "exit_trigger_json",
+            ):
+                cls._validate_trigger_bounds(
+                    values[key],
+                    key.removesuffix("_json"),
+                )
             audit = copy.deepcopy(values["manual_overrides_json"])
             for key, value in override.items():
                 if key == "action_trade_date":
@@ -1462,9 +1540,8 @@ class TradingPlanService:
         plan = await db.get(TradingPlanVersion, plan_id)
         if plan is None:
             raise ValueError("plan not found")
-        lock_key = (id(db.bind), plan.target_trade_date, "__confirm__")
-        lock = self._generation_locks.setdefault(lock_key, asyncio.Lock())
-        async with lock:
+        lock_key = (db.bind, plan.target_trade_date)
+        async with self._lock_manager.hold(lock_key):
             try:
                 await db.refresh(plan)
                 if plan.status not in {"draft", "confirmed"}:

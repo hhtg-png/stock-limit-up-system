@@ -83,6 +83,35 @@ def ensure_sqlite_schema_compat(sync_connection) -> None:
     _ensure_trading_plan_active_unique_index(sync_connection)
 
 
+def ensure_postgresql_schema_compat(sync_connection) -> None:
+    """Apply idempotent PostgreSQL migrations for an existing schema."""
+    table_name = sync_connection.exec_driver_sql(
+        "SELECT to_regclass('trading_plan_versions')"
+    ).scalar_one_or_none()
+    if table_name is None:
+        return
+    sync_connection.exec_driver_sql(
+        "LOCK TABLE trading_plan_versions IN ACCESS EXCLUSIVE MODE"
+    )
+    sync_connection.exec_driver_sql(
+        "WITH ranked AS ("
+        "SELECT id, ROW_NUMBER() OVER ("
+        "PARTITION BY target_trade_date "
+        "ORDER BY generated_at DESC NULLS LAST, id DESC"
+        ") AS active_rank "
+        "FROM trading_plan_versions WHERE status='active'"
+        ") "
+        "UPDATE trading_plan_versions AS plan SET status='superseded' "
+        "FROM ranked WHERE plan.id=ranked.id AND ranked.active_rank > 1"
+    )
+    sync_connection.exec_driver_sql(
+        "CREATE UNIQUE INDEX IF NOT EXISTS "
+        "uq_trading_plan_one_active_target "
+        "ON trading_plan_versions (target_trade_date) "
+        "WHERE status='active'"
+    )
+
+
 def _ensure_trading_plan_active_unique_index(sync_connection) -> None:
     table = sync_connection.exec_driver_sql(
         "SELECT 1 FROM sqlite_master "
@@ -157,6 +186,8 @@ async def init_db():
         await conn.run_sync(Base.metadata.create_all)
         if settings.DATABASE_URL.startswith("sqlite"):
             await conn.run_sync(ensure_sqlite_schema_compat)
+        elif settings.DATABASE_URL.startswith(("postgresql", "postgres")):
+            await conn.run_sync(ensure_postgresql_schema_compat)
 
 
 async def close_db():

@@ -348,6 +348,139 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(auction["parent_plan_version_id"], overnight["id"])
         self.assertEqual(same["id"], preclose_v1["id"])
 
+    async def test_change_summary_compares_the_same_selected_parent(self):
+        async with self.Session() as db:
+            await self._generate(
+                db,
+                [_evaluation("preclose-old", "000001")],
+            )
+            after_close_v1 = await self._generate(
+                db,
+                [_evaluation("after-old", "000001")],
+                snapshot=_snapshot(stage="after_close"),
+            )
+            later_preclose = _snapshot()
+            later_preclose.market_features["revision"] = "later-preclose"
+            await self._generate(
+                db,
+                [_evaluation("pre-new", "000002")],
+                snapshot=later_preclose,
+            )
+            after_close_v2_snapshot = _snapshot(stage="after_close")
+            after_close_v2_snapshot.market_features["revision"] = 2
+            after_close_v2 = await self._generate(
+                db,
+                [_evaluation("after-new", "000003")],
+                snapshot=after_close_v2_snapshot,
+            )
+
+        self.assertEqual(
+            after_close_v2["parent_plan_version_id"],
+            after_close_v1["id"],
+        )
+        summary = after_close_v2["change_summary_json"]
+        self.assertEqual(
+            summary["previous_plan_version_id"],
+            after_close_v1["id"],
+        )
+        self.assertEqual(
+            summary["added_matches"],
+            [{"stock_code": "000003", "mode_key": "after-new"}],
+        )
+        self.assertEqual(
+            summary["removed_matches"],
+            [{"stock_code": "000001", "mode_key": "after-old"}],
+        )
+
+    async def test_first_non_preclose_stage_requires_immediate_predecessor(self):
+        async with self.Session() as db:
+            for offset, stage in enumerate(
+                ("after_close", "overnight", "auction"),
+                start=1,
+            ):
+                snapshot = _snapshot(stage=stage)
+                snapshot.target_trade_date = TARGET_DATE + timedelta(days=offset)
+                snapshot.market_features["missing_predecessor_case"] = stage
+                with self.subTest(stage=stage):
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "predecessor|previous stage|retry",
+                    ):
+                        await self._generate(
+                            db,
+                            [_evaluation(f"missing-{stage}", "000001")],
+                            snapshot=snapshot,
+                        )
+                    await db.rollback()
+
+            count = await db.scalar(
+                select(func.count()).select_from(TradingPlanVersion)
+            )
+
+        self.assertEqual(count, 0)
+
+    async def test_same_target_generation_serializes_across_stages(self):
+        class BlockingSettingsService(TradingPlanService):
+            def __init__(self):
+                super().__init__()
+                self.entered = 0
+                self.first_entered = asyncio.Event()
+                self.second_entered = asyncio.Event()
+                self.release_first = asyncio.Event()
+
+            async def _get_or_create_settings(self, db):
+                self.entered += 1
+                if self.entered == 1:
+                    self.first_entered.set()
+                    await self.release_first.wait()
+                else:
+                    self.second_entered.set()
+                return await super()._get_or_create_settings(db)
+
+        service = BlockingSettingsService()
+        preclose_evaluation = _evaluation("preclose", "000001")
+        after_close_evaluation = _evaluation("after-close", "000001")
+        async with self.Session() as first_db, self.Session() as second_db:
+            preclose_task = asyncio.create_task(
+                service.generate(
+                    first_db,
+                    _snapshot(),
+                    [preclose_evaluation],
+                    {"000001": "股票1"},
+                    _rule_snapshot("preclose"),
+                )
+            )
+            await service.first_entered.wait()
+            after_close_task = asyncio.create_task(
+                service.generate(
+                    second_db,
+                    _snapshot(stage="after_close"),
+                    [after_close_evaluation],
+                    {"000001": "股票1"},
+                    _rule_snapshot("after-close"),
+                )
+            )
+            try:
+                await asyncio.wait_for(
+                    service.second_entered.wait(),
+                    timeout=0.05,
+                )
+                serialized = False
+            except asyncio.TimeoutError:
+                serialized = True
+            finally:
+                service.release_first.set()
+            preclose, after_close = await asyncio.gather(
+                preclose_task,
+                after_close_task,
+            )
+
+        self.assertTrue(serialized)
+        self.assertEqual(
+            after_close["parent_plan_version_id"],
+            preclose["id"],
+        )
+
     async def test_rule_snapshot_order_and_dict_order_have_a_stable_hash(self):
         evaluations = [
             _evaluation("alpha", "000001"),
@@ -888,6 +1021,61 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(plan_count, 1)
 
+    async def test_revise_rejects_unsafe_or_contradictory_trigger_overrides(self):
+        evaluation = _evaluation("leader", "000001")
+        object.__setattr__(
+            evaluation,
+            "entry_trigger",
+            {
+                "label": "突破进入",
+                "reference_price": 10.0,
+                "price_gte": 12.0,
+            },
+        )
+        bad_overrides = [
+            ("positive-exit", "exit_trigger", {"change_pct_lte": 50}),
+            ("out-of-range-exit", "exit_trigger", {"change_pct_lte": -500}),
+            ("negative-entry", "entry_trigger", {"change_pct_gte": -1}),
+            ("out-of-range-entry", "entry_trigger", {"change_pct_gte": 101}),
+            (
+                "out-of-range-invalidation",
+                "invalidation",
+                {"change_pct_gte": -101},
+            ),
+            ("merged-price-contradiction", "entry_trigger", {"price_lte": 11}),
+            (
+                "merged-change-contradiction",
+                "exit_trigger",
+                {"change_pct_gte": -3},
+            ),
+        ]
+        async with self.Session() as db:
+            generated = await self._generate(db, [evaluation])
+            candidate_id = generated["candidates"][0]["id"]
+            for case, trigger_name, trigger in bad_overrides:
+                with self.subTest(case=case):
+                    with self.assertRaises(ValueError):
+                        await self.service.revise(
+                            db,
+                            generated["id"],
+                            {
+                                "change_note": case,
+                                "candidate_overrides": [
+                                    {
+                                        "candidate_id": candidate_id,
+                                        trigger_name: trigger,
+                                    }
+                                ],
+                            },
+                        )
+                    await db.rollback()
+
+            plan_count = await db.scalar(
+                select(func.count()).select_from(TradingPlanVersion)
+            )
+
+        self.assertEqual(plan_count, 1)
+
     async def test_confirm_activates_target_and_supersedes_old_target_active(self):
         other_target = TARGET_DATE + timedelta(days=1)
         async with self.Session() as db:
@@ -1301,3 +1489,65 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
         first_child = self.service._clone_plan_for_revision(parent, first_changes, 2)
         second_child = self.service._clone_plan_for_revision(parent, second_changes, 2)
         self.assertNotEqual(first_child.input_hash, second_child.input_hash)
+
+
+class TradingPlanLockManagerTests(unittest.TestCase):
+    def test_waiters_share_one_lock_and_entry_is_cleaned_after_last_user(self):
+        manager = TradingPlanService()._lock_manager
+
+        async def exercise():
+            key = ("lineage", TARGET_DATE)
+            holder_entered = asyncio.Event()
+            release_holder = asyncio.Event()
+            waiter_entered = asyncio.Event()
+            release_waiter = asyncio.Event()
+            third_entered = asyncio.Event()
+            locks = []
+
+            async def holder():
+                async with manager.hold(key) as lock:
+                    locks.append(lock)
+                    holder_entered.set()
+                    await release_holder.wait()
+
+            async def waiter():
+                async with manager.hold(key) as lock:
+                    locks.append(lock)
+                    waiter_entered.set()
+                    await release_waiter.wait()
+
+            async def third():
+                async with manager.hold(key) as lock:
+                    locks.append(lock)
+                    third_entered.set()
+
+            holder_task = asyncio.create_task(holder())
+            await holder_entered.wait()
+            waiter_task = asyncio.create_task(waiter())
+            await asyncio.sleep(0)
+            release_holder.set()
+            await waiter_entered.wait()
+            third_task = asyncio.create_task(third())
+            await asyncio.sleep(0)
+            self.assertFalse(third_entered.is_set())
+            release_waiter.set()
+            await asyncio.gather(holder_task, waiter_task, third_task)
+
+            self.assertIs(locks[0], locks[1])
+            self.assertIs(locks[1], locks[2])
+            self.assertEqual(manager.entry_count, 0)
+
+        asyncio.run(exercise())
+
+    def test_sequential_event_loops_do_not_reuse_an_asyncio_lock(self):
+        manager = TradingPlanService()._lock_manager
+
+        async def acquire_once():
+            async with manager.hold(("lineage", TARGET_DATE)) as lock:
+                return lock
+
+        first = asyncio.run(acquire_once())
+        second = asyncio.run(acquire_once())
+
+        self.assertIsNot(first, second)
+        self.assertEqual(manager.entry_count, 0)
