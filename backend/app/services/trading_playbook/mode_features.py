@@ -76,6 +76,62 @@ class _PeerSet:
     unknown_count: int = 0
 
 
+_EVIDENCE_SOURCES = {
+    "quote": {"tencent", "quote", "market_quote"},
+    "realtime": {"realtime_limit_up_pool"},
+    "review": {"market_review_stock_daily"},
+    "kline": {"kline", "validated_support", "support", "technical_support"},
+    "plan": {"trading_plan_candidate"},
+    "computed": {
+        "computed",
+        "ranker",
+        "market_state",
+        "full_market_quote_rank",
+        "auction",
+        "theme_ranker",
+        "recognition_ranker",
+    },
+}
+
+_QUOTE_FACTS = {
+    "price",
+    "captured_at",
+    "pre_close",
+    "open_price",
+    "change_pct",
+    "amount",
+    "turnover_rate",
+    "bid1_price",
+    "bid1_volume",
+    "limit_up",
+    "speed_pct",
+    "speed_quality",
+}
+_KLINE_FACTS = {
+    "kline_quality",
+    "n_day_high",
+    "consolidation_days",
+    "trend_established",
+    "validated_support",
+    "support_price",
+    "five_day_low",
+    "five_day_low_price",
+    "prior_n_day_high",
+    "n_day_high_price",
+    "prior_high",
+}
+_RECOGNITION_FACTS = {
+    "recognition_rank",
+    "resilience_rank",
+    "influence_rank",
+    "fastest_rank",
+    "highest_rank",
+    "hardest_rank",
+    "recognition_score",
+    "recognition_evidence",
+}
+
+
 def _finite_number(
     value: Any,
     *,
@@ -231,18 +287,39 @@ class ModeFeatureBuilder:
         snapshot: MarketSnapshot,
         candidate: CandidateSnapshot,
     ) -> Dict[str, Any]:
-        raw = copy.deepcopy(candidate.features)
+        source_quality = self._evidence_index(snapshot, candidate)
+        raw = self._trusted_facts(snapshot, candidate, source_quality)
         result: Dict[str, Any] = {key: None for key in FEATURE_KEYS}
         result["planned_pullback_quality"] = "missing"
         quality: Dict[str, str] = {}
 
-        point_in_time_valid = self._point_in_time_valid(snapshot, candidate, raw)
+        point_in_time_valid = self._point_in_time_valid(
+            snapshot,
+            raw,
+            source_quality,
+        )
+        trust_quality = raw.get("_trust_quality")
+        trust_states = (
+            trust_quality.values()
+            if isinstance(trust_quality, Mapping)
+            else ()
+        )
+        candidate_quality = (
+            "degraded"
+            if any(
+                state in {"degraded", "invalid"}
+                for state in (*source_quality.values(), *trust_states)
+            )
+            else "ready"
+        )
         result.update(
             {
                 "_snapshot_quality_status": snapshot.quality.status,
                 "_snapshot_stale": bool(snapshot.quality.stale),
                 "_point_in_time_valid": point_in_time_valid,
                 "_stage": snapshot.stage,
+                "_source_quality": source_quality,
+                "_candidate_quality_status": candidate_quality,
             }
         )
 
@@ -275,25 +352,32 @@ class ModeFeatureBuilder:
                 )
             )
 
-            theme_peers = self._theme_peers(snapshot, candidate)
+            trusted_candidate = CandidateSnapshot(
+                stock_code=candidate.stock_code,
+                stock_name=candidate.stock_name,
+                theme_name=candidate.theme_name,
+                features=raw,
+                evidence=copy.deepcopy(candidate.evidence),
+            )
+            theme_peers = self._theme_peers(snapshot, trusted_candidate)
             result["high_position"] = self._high_position(
-                candidate,
+                trusted_candidate,
                 theme_peers,
             )
             result["same_level_turnover"] = self._same_level_turnover(
-                candidate,
+                trusted_candidate,
                 theme_peers,
             )
             result["middle_army"] = self._middle_army(
-                candidate,
+                trusted_candidate,
                 theme_peers,
             )
             result["started_before_theme"] = self._started_before_theme(
                 snapshot,
-                candidate,
+                trusted_candidate,
             )
             result["unique_survivor"] = self._unique_survivor(
-                candidate,
+                trusted_candidate,
                 theme_peers,
                 result["recognition_rank"],
             )
@@ -350,7 +434,7 @@ class ModeFeatureBuilder:
             )
             result["linkage_confirmed"] = self._linkage_confirmed(
                 snapshot,
-                candidate,
+                trusted_candidate,
                 raw,
             )
             result["middle_army_linkage"] = self._middle_army_linkage(
@@ -370,7 +454,7 @@ class ModeFeatureBuilder:
 
             result["theme_alive"] = self._theme_alive(theme_peers)
             result["theme_dead"] = self._theme_dead(
-                candidate,
+                trusted_candidate,
                 raw,
                 theme_peers,
             )
@@ -384,13 +468,13 @@ class ModeFeatureBuilder:
             )
             result["external_switch"] = self._external_switch(
                 snapshot,
-                candidate,
+                trusted_candidate,
                 raw,
                 result["theme_rank"],
             )
             result["tail_action_eligible"] = self._tail_action_eligible(
                 snapshot,
-                candidate,
+                trusted_candidate,
                 raw,
             )
 
@@ -405,6 +489,130 @@ class ModeFeatureBuilder:
         return result
 
     @classmethod
+    def _evidence_index(
+        cls,
+        snapshot: MarketSnapshot,
+        candidate: CandidateSnapshot,
+    ) -> Dict[str, str]:
+        return {
+            family: cls._evidence_state(
+                snapshot,
+                candidate.evidence,
+                sources,
+                accept_ok=family == "review",
+            )
+            for family, sources in _EVIDENCE_SOURCES.items()
+        }
+
+    @staticmethod
+    def _evidence_state(
+        snapshot: MarketSnapshot,
+        evidence_rows: Iterable[Mapping[str, Any]],
+        sources: set[str],
+        *,
+        accept_ok: bool = False,
+    ) -> str:
+        matched = []
+        for item in evidence_rows:
+            if not isinstance(item, Mapping):
+                continue
+            if str(item.get("source") or "").strip() in sources:
+                matched.append(item)
+        if not matched:
+            return "missing"
+
+        accepted = {"ready", "computed"}
+        if accept_ok:
+            accepted.add("ok")
+        saw_ready = False
+        saw_degraded = False
+        for item in matched:
+            observed_at = _parse_datetime(item.get("as_of"))
+            if observed_at is None:
+                saw_degraded = True
+                continue
+            if _comparable_datetime(observed_at, snapshot.as_of) > snapshot.as_of:
+                return "invalid"
+            if (
+                _strict_flag(item.get("stale")) is True
+                or item.get("quality") not in accepted
+            ):
+                saw_degraded = True
+            else:
+                saw_ready = True
+        if saw_degraded:
+            return "degraded"
+        return "ready" if saw_ready else "degraded"
+
+    @classmethod
+    def _trusted_facts(
+        cls,
+        snapshot: MarketSnapshot,
+        candidate: CandidateSnapshot,
+        source_quality: Optional[Mapping[str, str]] = None,
+    ) -> Dict[str, Any]:
+        del snapshot  # evidence times were normalized into source_quality
+        raw = copy.deepcopy(candidate.features)
+        states = dict(source_quality or {})
+        explicit_quality = raw.get("_feature_quality")
+        explicit_quality = (
+            explicit_quality if isinstance(explicit_quality, Mapping) else {}
+        )
+        trusted: Dict[str, Any] = {}
+        trust_quality: Dict[str, str] = {}
+
+        for key, value in raw.items():
+            if key == "_feature_quality":
+                continue
+            family = cls._feature_family(key)
+            if family == "recognition":
+                state = cls._normalized_quality(raw.get("recognition_quality"))
+            elif family == "theme":
+                state = cls._normalized_quality(raw.get("theme_quality"))
+            elif family is not None:
+                state = states.get(family, "missing")
+            else:
+                state = cls._normalized_quality(explicit_quality.get(key))
+                if state == "missing":
+                    state = states.get("computed", "missing")
+
+            trust_quality[key] = state
+            if state == "ready":
+                trusted[key] = value
+
+        for metadata in ("recognition_quality", "theme_quality"):
+            if metadata in raw:
+                trusted[metadata] = raw[metadata]
+        trusted["_trust_quality"] = trust_quality
+        return trusted
+
+    @staticmethod
+    def _feature_family(key: str) -> Optional[str]:
+        if key == "realtime_limit_up_fact":
+            return "realtime"
+        if key in {"review_history", "latest_review_fact"} or key.startswith(
+            "review_"
+        ):
+            return "review"
+        if key == "plan_candidate_fact":
+            return "plan"
+        if key in _KLINE_FACTS:
+            return "kline"
+        if key in _QUOTE_FACTS:
+            return "quote"
+        if key in _RECOGNITION_FACTS:
+            return "recognition"
+        if key in {"theme_rank", "theme_score", "theme_evidence"}:
+            return "theme"
+        return None
+
+    @staticmethod
+    def _normalized_quality(value: Any) -> str:
+        return "ready" if value in {"ready", "computed"} else (
+            "missing" if value in {None, "", "missing"} else "degraded"
+        )
+
+    @classmethod
     def _theme_peers(
         cls,
         snapshot: MarketSnapshot,
@@ -412,7 +620,11 @@ class ModeFeatureBuilder:
     ) -> _PeerSet:
         theme = str(candidate.theme_name or "").strip()
         peers = (
-            (candidate,)
+            tuple(
+                peer
+                for peer in snapshot.candidates
+                if peer.stock_code == candidate.stock_code
+            )
             if not theme
             else tuple(
                 peer
@@ -420,22 +632,28 @@ class ModeFeatureBuilder:
                 if str(peer.theme_name or "").strip() == theme
             )
         )
-        ready = tuple(
-            peer for peer in peers if cls._candidate_evidence_ready(snapshot, peer)
-        )
-        return _PeerSet(ready=ready, unknown_count=len(peers) - len(ready))
-
-    @classmethod
-    def _candidate_evidence_ready(
-        cls,
-        snapshot: MarketSnapshot,
-        candidate: CandidateSnapshot,
-    ) -> bool:
-        return cls._has_ready_evidence(
-            snapshot,
-            candidate.evidence,
-            ready_qualities={"ready", "computed", "ok"},
-        )
+        ready = []
+        unknown_count = 0
+        for peer in peers:
+            source_quality = cls._evidence_index(snapshot, peer)
+            features = cls._trusted_facts(snapshot, peer, source_quality)
+            if any(
+                not key.startswith("_")
+                and key not in {"recognition_quality", "theme_quality"}
+                for key in features
+            ):
+                ready.append(
+                    CandidateSnapshot(
+                        stock_code=peer.stock_code,
+                        stock_name=peer.stock_name,
+                        theme_name=peer.theme_name,
+                        features=features,
+                        evidence=copy.deepcopy(peer.evidence),
+                    )
+                )
+            else:
+                unknown_count += 1
+        return _PeerSet(ready=tuple(ready), unknown_count=unknown_count)
 
     @staticmethod
     def _has_ready_evidence(
@@ -469,15 +687,10 @@ class ModeFeatureBuilder:
     @staticmethod
     def _point_in_time_valid(
         snapshot: MarketSnapshot,
-        candidate: CandidateSnapshot,
         raw: Mapping[str, Any],
+        source_quality: Mapping[str, str],
     ) -> bool:
         times = [_parse_datetime(raw.get("captured_at"))]
-        times.extend(
-            _parse_datetime(item.get("as_of"))
-            for item in candidate.evidence
-            if isinstance(item, Mapping)
-        )
         for observed_at in times:
             if observed_at is None:
                 continue
@@ -487,6 +700,8 @@ class ModeFeatureBuilder:
         if quality_as_of is not None and (
             _comparable_datetime(quality_as_of, snapshot.as_of) > snapshot.as_of
         ):
+            return False
+        if source_quality.get("quote") == "invalid":
             return False
         return True
 
@@ -756,7 +971,7 @@ class ModeFeatureBuilder:
         theme_name = str(candidate.theme_name or "").strip()
         for row in snapshot.theme_rankings:
             if str(row.get("theme_name") or "").strip() == theme_name:
-                return row
+                return row if row.get("quality") == "ready" else None
         return None
 
     @classmethod
@@ -1244,8 +1459,18 @@ class ModeFeatureBuilder:
         raw: Mapping[str, Any],
         value: Any,
     ) -> str:
+        trust_quality = raw.get("_trust_quality")
+        source_state = (
+            trust_quality.get(key)
+            if isinstance(trust_quality, Mapping)
+            else None
+        )
         if value is None:
-            return "missing"
+            return (
+                "degraded"
+                if source_state in {"degraded", "invalid"}
+                else "missing"
+            )
         if key in {"theme_rank"} and raw.get("theme_quality") not in {
             None,
             "ready",

@@ -35,19 +35,20 @@ def _candidate(
     features: dict | None = None,
     evidence: list | None = None,
 ) -> CandidateSnapshot:
+    normalized_features = copy.deepcopy(features or {})
+    if "recognition_rank" in normalized_features:
+        normalized_features.setdefault("recognition_quality", "ready")
+    if "resilience_rank" in normalized_features:
+        normalized_features.setdefault("recognition_quality", "ready")
+    if "theme_rank" in normalized_features:
+        normalized_features.setdefault("theme_quality", "ready")
     if evidence is None:
-        evidence = [
-            {
-                "source": "tencent",
-                "as_of": AS_OF,
-                "quality": "ready",
-            }
-        ]
+        evidence = _ready_all_evidence()
     return CandidateSnapshot(
         stock_code=code,
         stock_name=f"样本{code}",
         theme_name=theme,
-        features=copy.deepcopy(features or {}),
+        features=normalized_features,
         evidence=copy.deepcopy(evidence),
     )
 
@@ -96,7 +97,38 @@ def _ready_quote_and_kline_evidence(
     return [
         *_ready_quote_evidence(captured_at),
         {"source": "kline", "as_of": captured_at, "quality": "ready"},
+        {"source": "computed", "as_of": captured_at, "quality": "ready"},
     ]
+
+
+def _ready_all_evidence(captured_at: datetime = AS_OF) -> list[dict]:
+    return [
+        *_ready_quote_evidence(captured_at),
+        _source_evidence("computed", as_of=captured_at),
+        _source_evidence(
+            "market_review_stock_daily",
+            quality="ok",
+            as_of=captured_at,
+        ),
+        _source_evidence("kline", as_of=captured_at),
+        _source_evidence("realtime_limit_up_pool", as_of=captured_at),
+        _source_evidence("trading_plan_candidate", as_of=captured_at),
+    ]
+
+
+def _source_evidence(
+    source: str,
+    *,
+    quality: str = "ready",
+    as_of: datetime = AS_OF,
+    stale: bool = False,
+) -> dict:
+    return {
+        "source": source,
+        "as_of": as_of,
+        "quality": quality,
+        "stale": stale,
+    }
 
 
 def test_tri_value_helpers_preserve_unknowns_without_masking_true_or_false():
@@ -185,7 +217,7 @@ class TestModeFeatureBuilder:
                 "captured_at": AS_OF,
                 "speed_rank": bad_value,
             },
-            evidence=_ready_quote_evidence(),
+            evidence=_ready_all_evidence(),
         )
 
         result = ModeFeatureBuilder().build(_snapshot(candidate), candidate)
@@ -203,7 +235,7 @@ class TestModeFeatureBuilder:
                 "turnover_rate": 4,
                 "sealed": True,
             },
-            evidence=_ready_quote_evidence(),
+            evidence=_ready_all_evidence(),
         )
         same_level = _candidate(
             "000002",
@@ -243,7 +275,7 @@ class TestModeFeatureBuilder:
                 "recognition_rank": 1,
                 "former_high_position": True,
             },
-            evidence=_ready_quote_evidence(),
+            evidence=_ready_all_evidence(),
         )
         eliminated = _candidate(
             "000002",
@@ -287,7 +319,7 @@ class TestModeFeatureBuilder:
                 "influence_rank": 1,
                 "recognition_rank": 1,
             },
-            evidence=_ready_quote_evidence(),
+            evidence=_ready_all_evidence(),
         )
         builder = ModeFeatureBuilder()
 
@@ -383,7 +415,7 @@ class TestModeFeatureBuilder:
                 "recognition_rank": 1,
                 "started_after_leader": True,
             },
-            evidence=_ready_quote_evidence(),
+            evidence=_ready_all_evidence(),
         )
         snapshot = _snapshot(
             candidate,
@@ -395,6 +427,7 @@ class TestModeFeatureBuilder:
             theme_rankings=[
                 {
                     "theme_name": "机器人",
+                    "quality": "ready",
                     "outbreak_start_seconds": 36000,
                 }
             ],
@@ -407,6 +440,261 @@ class TestModeFeatureBuilder:
         assert result["supplement"] is True
         assert result["turn_confirmed"] is True
 
+    def test_realtime_degraded_cannot_borrow_ready_quote_quality(self):
+        candidate = _candidate(
+            features={
+                "price": 10,
+                "captured_at": AS_OF,
+                "recognition_rank": 1,
+                "plan_candidate_fact": {
+                    "role": "survivor",
+                    "primary_mode_key": "unique_survivor_trial",
+                },
+                "realtime_limit_up_fact": {"resealed": True},
+            },
+            evidence=[
+                _source_evidence("tencent"),
+                _source_evidence("trading_plan_candidate"),
+                _source_evidence(
+                    "realtime_limit_up_pool",
+                    quality="degraded",
+                ),
+            ],
+        )
+        snapshot = _snapshot(
+            candidate,
+            market_features={
+                "style": "board_flow",
+                "window": "divergence_to_consensus",
+                "quality": "ready",
+            },
+        )
+        built = ModeFeatureBuilder().build(snapshot, candidate)
+
+        assert built["turn_confirmed"] is None
+        assert built["_source_quality"]["quote"] == "ready"
+        assert built["_source_quality"]["realtime"] == "degraded"
+        assert built["_candidate_quality_status"] == "degraded"
+
+        candidate.features.update(built)
+        leader_rule = next(
+            rule
+            for rule in _catalog_payload()["rules"]
+            if rule["mode_key"] == "leader_turn_two"
+        )
+        row = ModeMatcher([leader_rule]).evaluate(
+            snapshot.market_features,
+            candidate,
+        )[0]
+        assert (row.status, row.risk_level) == ("waiting", "watch")
+
+    @pytest.mark.parametrize(
+        "bad_realtime",
+        [
+            _source_evidence("realtime_limit_up_pool", quality="stale", stale=True),
+            _source_evidence(
+                "realtime_limit_up_pool",
+                as_of=AS_OF + timedelta(minutes=1),
+            ),
+        ],
+        ids=["stale", "future"],
+    )
+    def test_realtime_stale_or_future_exact_source_is_untrusted(self, bad_realtime):
+        candidate = _candidate(
+            features={
+                "price": 10,
+                "captured_at": AS_OF,
+                "plan_candidate_fact": {"role": "survivor"},
+                "realtime_limit_up_fact": {"reversal_limit_up": True},
+            },
+            evidence=[
+                _source_evidence("tencent"),
+                _source_evidence("trading_plan_candidate"),
+                bad_realtime,
+            ],
+        )
+
+        result = ModeFeatureBuilder().build(_snapshot(candidate), candidate)
+
+        assert result["turn_confirmed"] is None
+
+    @pytest.mark.parametrize(
+        "bad_review",
+        [
+            _source_evidence(
+                "market_review_stock_daily",
+                quality="degraded",
+            ),
+            _source_evidence(
+                "market_review_stock_daily",
+                quality="stale",
+                stale=True,
+            ),
+            _source_evidence(
+                "market_review_stock_daily",
+                as_of=AS_OF + timedelta(minutes=1),
+            ),
+        ],
+        ids=["degraded", "stale", "future"],
+    )
+    def test_bad_review_cannot_borrow_peer_quote_or_computed_quality(
+        self,
+        bad_review,
+    ):
+        survivor = _candidate(
+            features={
+                "price": 10,
+                "captured_at": AS_OF,
+                "recognition_rank": 1,
+            },
+        )
+        eliminated = _candidate(
+            "000002",
+            features={
+                "former_high_position": True,
+                "review_today_broken": True,
+            },
+            evidence=[
+                _source_evidence("tencent"),
+                _source_evidence("computed"),
+                bad_review,
+            ],
+        )
+
+        result = ModeFeatureBuilder().build(
+            _snapshot(survivor, eliminated),
+            survivor,
+        )
+
+        assert result["unique_survivor"] is None
+
+    def test_degraded_kline_cannot_prove_trend_linkage_or_pullback(self):
+        candidate = _candidate(
+            features={
+                "price": 9.6,
+                "captured_at": AS_OF,
+                "kline_quality": "ready",
+                "trend_established": True,
+                "n_day_high": True,
+                "consolidation_days": 5,
+                "five_day_low": 9.4,
+                "prior_n_day_high": 10,
+            },
+            evidence=[
+                _source_evidence("tencent"),
+                _source_evidence("kline", quality="degraded"),
+            ],
+        )
+
+        result = ModeFeatureBuilder().build(_snapshot(candidate), candidate)
+
+        assert result["trend_established"] is None
+        assert result["consolidation_rebreak"] is None
+        assert result["pullback"] is None
+        assert result["planned_pullback_quality"] == "fallback"
+
+    def test_degraded_plan_cannot_supply_prior_mode_state(self):
+        candidate = _candidate(
+            features={
+                "price": 10,
+                "captured_at": AS_OF,
+                "plan_candidate_fact": {"role": "survivor"},
+                "realtime_limit_up_fact": {"resealed": True},
+            },
+            evidence=[
+                _source_evidence("tencent"),
+                _source_evidence(
+                    "trading_plan_candidate",
+                    quality="degraded",
+                ),
+                _source_evidence("realtime_limit_up_pool"),
+            ],
+        )
+
+        result = ModeFeatureBuilder().build(_snapshot(candidate), candidate)
+
+        assert result["turn_confirmed"] is None
+
+    def test_degraded_quote_cannot_borrow_computed_quality_for_reference_price(self):
+        candidate = _candidate(
+            features={"price": 10, "captured_at": AS_OF},
+            evidence=[
+                _source_evidence("tencent", quality="degraded"),
+                _source_evidence("computed"),
+            ],
+        )
+
+        result = ModeFeatureBuilder().build(_snapshot(candidate), candidate)
+
+        assert result["reference_price"] is None
+
+    def test_task4_rank_requires_its_explicit_ready_quality(self):
+        candidate = _candidate(
+            features={
+                "price": 10,
+                "captured_at": AS_OF,
+                "recognition_rank": 1,
+                "recognition_quality": "degraded",
+                "theme_rank": 1,
+                "theme_quality": "degraded",
+            },
+        )
+
+        result = ModeFeatureBuilder().build(_snapshot(candidate), candidate)
+
+        assert result["recognition_rank"] is None
+        assert result["theme_rank"] is None
+        assert result["_candidate_quality_status"] == "degraded"
+
+    def test_degraded_theme_row_cannot_prove_linkage_or_external_expansion(self):
+        candidate = _candidate(
+            features={
+                "price": 10,
+                "captured_at": AS_OF,
+                "theme_rank": 1,
+                "theme_quality": "ready",
+                "is_external_theme": True,
+            },
+        )
+        snapshot = _snapshot(
+            candidate,
+            theme_rankings=[
+                {
+                    "theme_name": "机器人",
+                    "quality": "degraded",
+                    "new_high_count": 3,
+                    "middle_army_strength": 2,
+                    "limit_up_count": 4,
+                }
+            ],
+        )
+
+        result = ModeFeatureBuilder().build(snapshot, candidate)
+
+        assert result["linkage_confirmed"] is None
+        assert result["external_switch"] is None
+
+    def test_direct_derived_flags_require_feature_quality_or_computed_evidence(self):
+        candidate = _candidate(
+            features={
+                "price": 10,
+                "captured_at": AS_OF,
+                "prior_mode_state": "survivor",
+                "resealed": True,
+            },
+            evidence=[_source_evidence("tencent")],
+        )
+
+        untrusted = ModeFeatureBuilder().build(_snapshot(candidate), candidate)
+        assert untrusted["turn_confirmed"] is None
+
+        candidate.features["_feature_quality"] = {
+            "prior_mode_state": "ready",
+            "resealed": "computed",
+        }
+        trusted = ModeFeatureBuilder().build(_snapshot(candidate), candidate)
+        assert trusted["turn_confirmed"] is True
+
     def test_former_high_position_can_be_proven_by_yesterday_review_height(self):
         survivor = _candidate(
             features={
@@ -414,7 +702,7 @@ class TestModeFeatureBuilder:
                 "captured_at": AS_OF,
                 "recognition_rank": 1,
             },
-            evidence=_ready_quote_evidence(),
+            evidence=_ready_all_evidence(),
         )
         eliminated = _candidate(
             "000002",
@@ -450,7 +738,8 @@ class TestModeFeatureBuilder:
                     "source": "market_review_stock_daily",
                     "as_of": AS_OF,
                     "quality": "ok",
-                }
+                },
+                _source_evidence("computed"),
             ],
         )
 
@@ -513,7 +802,7 @@ class TestModeFeatureBuilder:
                 "linkage_confirmed": True,
                 "middle_army_linkage": True,
             },
-            evidence=_ready_quote_evidence(),
+            evidence=_ready_all_evidence(),
         )
 
         result = ModeFeatureBuilder().build(_snapshot(candidate), candidate)
@@ -538,7 +827,7 @@ class TestModeFeatureBuilder:
                 "theme_expanding": True,
                 "theme_rank": 1,
             },
-            evidence=_ready_quote_and_kline_evidence(),
+            evidence=_ready_all_evidence(),
         )
         snapshot = _snapshot(
             candidate,
@@ -550,6 +839,7 @@ class TestModeFeatureBuilder:
             theme_rankings=[
                 {
                     "theme_name": "机器人",
+                    "quality": "ready",
                     "new_high_count": 2,
                     "middle_army_strength": 3,
                     "limit_up_count": 4,
@@ -597,7 +887,7 @@ class TestModeFeatureBuilder:
                 "snake_pattern": True,
                 "right_side_breakout": True,
             },
-            evidence=_ready_quote_evidence(),
+            evidence=_ready_all_evidence(),
         )
 
         result = ModeFeatureBuilder().build(_snapshot(candidate), candidate)
@@ -616,7 +906,7 @@ class TestModeFeatureBuilder:
                 "sealed": False,
                 "n_day_high": False,
             },
-            evidence=_ready_quote_evidence(),
+            evidence=_ready_all_evidence(),
         )
         supplement = _candidate(
             "000002",
@@ -663,7 +953,7 @@ class TestModeFeatureBuilder:
                 "tail_invalidation_satisfied": False,
                 "automation_level": "assisted",
             },
-            evidence=_ready_quote_evidence(AS_OF - timedelta(seconds=30)),
+            evidence=_ready_all_evidence(AS_OF - timedelta(seconds=30)),
         )
         builder = ModeFeatureBuilder()
 
@@ -686,7 +976,7 @@ class TestModeFeatureBuilder:
                 "tail_entry_satisfied": True,
                 "tail_invalidation_satisfied": False,
             },
-            evidence=_ready_quote_evidence(),
+            evidence=_ready_all_evidence(),
         )
 
         result = ModeFeatureBuilder().build(

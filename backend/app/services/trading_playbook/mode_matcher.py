@@ -383,6 +383,8 @@ class ModeMatcher:
             return False
         if features.get("_point_in_time_valid", True) is not True:
             return False
+        if features.get("_candidate_quality_status", "ready") != "ready":
+            return False
         return True
 
     @staticmethod
