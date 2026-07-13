@@ -21,7 +21,9 @@ from app.services.trading_playbook.mode_features import (
     _tri_and,
     _tri_or,
 )
+from app.services.trading_playbook.market_state import MarketStateAnalyzer
 from app.services.trading_playbook.mode_matcher import ModeMatcher
+from app.services.trading_playbook import rule_catalog as rule_catalog_module
 
 
 CATALOG_PATH = Path("app/data/trading_playbook_rules_v1.json")
@@ -44,6 +46,16 @@ def _candidate(
         normalized_features.setdefault("theme_quality", "ready")
     if evidence is None:
         evidence = _ready_all_evidence()
+    evidence = copy.deepcopy(evidence)
+    for row in evidence:
+        if (
+            row.get("source") == "computed"
+            and "fields" not in row
+            and "field_quality" not in row
+        ):
+            row["fields"] = sorted(
+                key for key in normalized_features if key != "_feature_quality"
+            )
     return CandidateSnapshot(
         stock_code=code,
         stock_name=f"样本{code}",
@@ -122,13 +134,20 @@ def _source_evidence(
     quality: str = "ready",
     as_of: datetime = AS_OF,
     stale: bool = False,
+    fields: list[str] | None = None,
+    field_quality: dict[str, str] | None = None,
 ) -> dict:
-    return {
+    row = {
         "source": source,
         "as_of": as_of,
         "quality": quality,
         "stale": stale,
     }
+    if fields is not None:
+        row["fields"] = fields
+    if field_quality is not None:
+        row["field_quality"] = field_quality
+    return row
 
 
 def test_tri_value_helpers_preserve_unknowns_without_masking_true_or_false():
@@ -191,6 +210,12 @@ class TestModeFeatureBuilder:
                 "prior_n_day_high": 10.5,
             },
             evidence=_ready_quote_and_kline_evidence(),
+        )
+        candidate.evidence.append(
+            _source_evidence(
+                "full_market_quote_rank",
+                fields=["speed_rank", "change_rank"],
+            )
         )
 
         result = ModeFeatureBuilder().build(_snapshot(candidate), candidate)
@@ -301,6 +326,10 @@ class TestModeFeatureBuilder:
                 "review_today_broken": False,
                 "opened": False,
                 "trend_broken": False,
+                "_feature_quality": {
+                    "opened": "computed",
+                    "trend_broken": "computed",
+                },
             }
         )
         assert builder.build(
@@ -375,6 +404,11 @@ class TestModeFeatureBuilder:
                 "prior_accelerated": True,
                 "opened": False,
                 "review_today_broken": True,
+                "_feature_quality": {
+                    "confirmed_leader_fact": "computed",
+                    "prior_accelerated": "computed",
+                    "opened": "computed",
+                },
             }
         )
         assert builder.build(
@@ -695,6 +729,195 @@ class TestModeFeatureBuilder:
         trusted = ModeFeatureBuilder().build(_snapshot(candidate), candidate)
         assert trusted["turn_confirmed"] is True
 
+    def test_field_quality_keeps_ready_quote_price_when_optional_quote_is_missing(self):
+        candidate = _candidate(
+            features={
+                "price": 10,
+                "captured_at": AS_OF,
+                "amount": 1200,
+            },
+            evidence=[
+                _source_evidence(
+                    "tencent",
+                    quality="degraded",
+                    field_quality={
+                        "price": "ready",
+                        "captured_at": "ready",
+                        "amount": "missing",
+                    },
+                )
+            ],
+        )
+
+        result = ModeFeatureBuilder().build(_snapshot(candidate), candidate)
+
+        assert result["reference_price"] == 10
+        assert result["_source_quality"]["quote"] == "degraded"
+
+    @pytest.mark.parametrize(
+        "bad_quality",
+        ["degraded", "stale", "future"],
+    )
+    def test_only_evidence_rows_covering_price_can_degrade_price(self, bad_quality):
+        if bad_quality == "future":
+            bad = _source_evidence(
+                "tencent",
+                as_of=AS_OF + timedelta(minutes=1),
+                fields=["price"],
+            )
+        else:
+            bad = _source_evidence(
+                "tencent",
+                quality=bad_quality,
+                stale=bad_quality == "stale",
+                fields=["price" if bad_quality == "degraded" else "amount"],
+            )
+        candidate = _candidate(
+            features={"price": 10, "captured_at": AS_OF, "amount": 1200},
+            evidence=[
+                _source_evidence(
+                    "tencent",
+                    fields=["price", "captured_at"],
+                ),
+                bad,
+            ],
+        )
+
+        result = ModeFeatureBuilder().build(_snapshot(candidate), candidate)
+
+        expected = None if bad_quality in {"degraded", "future"} else 10
+        assert result["reference_price"] == expected
+
+    def test_full_market_rank_evidence_cannot_certify_unrelated_direct_facts(self):
+        candidate = _candidate(
+            features={
+                "price": 10,
+                "captured_at": AS_OF,
+                "speed_rank": 1,
+                "prior_mode_state": "survivor",
+                "resealed": True,
+                "snake_pattern": True,
+                "tail_entry_satisfied": True,
+            },
+            evidence=[
+                _source_evidence("tencent"),
+                _source_evidence("full_market_quote_rank"),
+            ],
+        )
+
+        result = ModeFeatureBuilder().build(_snapshot(candidate), candidate)
+
+        assert result["high_volatility"] is False
+        assert result["turn_confirmed"] is None
+        assert result["snake_setup"] is None
+        assert "prior_mode_state" not in result.get("_trusted_facts", {})
+
+    def test_unknown_direct_fact_needs_exact_field_declaration(self):
+        candidate = _candidate(
+            features={
+                "price": 10,
+                "captured_at": AS_OF,
+                "prior_mode_state": "survivor",
+                "resealed": True,
+            },
+            evidence=[
+                _source_evidence("tencent"),
+                _source_evidence(
+                    "computed",
+                    fields=["prior_mode_state", "resealed"],
+                ),
+            ],
+        )
+
+        result = ModeFeatureBuilder().build(_snapshot(candidate), candidate)
+
+        assert result["turn_confirmed"] is True
+
+    def test_partial_recognition_quality_preserves_ready_dimension_rank_only(self):
+        candidate = _candidate(
+            features={
+                "price": 10,
+                "captured_at": AS_OF,
+                "resilience_rank": 1,
+                "recognition_rank": 1,
+                "recognition_quality": "degraded",
+                "recognition_evidence": {
+                    "resilient": {
+                        "field": "resilience",
+                        "value": 9,
+                        "rank": 1,
+                    },
+                    "fastest": {
+                        "field": "first_limit_seconds",
+                        "value": None,
+                        "rank": None,
+                    },
+                },
+            },
+        )
+
+        result = ModeFeatureBuilder().build(_snapshot(candidate), candidate)
+
+        assert result["resilience_rank"] == 1
+        assert result["recognition_rank"] is None
+
+    def test_historical_review_today_is_prior_and_realtime_is_current(self):
+        candidate = _candidate(
+            features={
+                "price": 10,
+                "captured_at": AS_OF,
+                "review_trade_date": date(2026, 7, 9),
+                "review_today_continuous_days": 1,
+                "review_today_sealed_close": True,
+                "realtime_limit_up_fact": {
+                    "trade_date": date(2026, 7, 10),
+                    "board_height": 3,
+                    "sealed": False,
+                },
+            },
+            evidence=[
+                _source_evidence("tencent"),
+                _source_evidence("market_review_stock_daily", quality="ok"),
+                _source_evidence("realtime_limit_up_pool"),
+            ],
+        )
+
+        result = ModeFeatureBuilder().build(_snapshot(candidate), candidate)
+
+        assert result["_current_board_height"] == 3
+        assert result["_current_sealed"] is False
+        assert result["low_position_new_start"] is False
+
+    def test_same_day_ready_review_realtime_conflict_makes_current_unknown(self):
+        candidate = _candidate(
+            features={
+                "price": 10,
+                "captured_at": AS_OF,
+                "review_trade_date": date(2026, 7, 10),
+                "review_today_continuous_days": 1,
+                "review_today_sealed_close": True,
+                "realtime_limit_up_fact": {
+                    "trade_date": date(2026, 7, 10),
+                    "board_height": 3,
+                    "sealed": False,
+                },
+            },
+            evidence=[
+                _source_evidence("tencent"),
+                _source_evidence("market_review_stock_daily", quality="ok"),
+                _source_evidence("realtime_limit_up_pool"),
+            ],
+        )
+
+        result = ModeFeatureBuilder().build(_snapshot(candidate), candidate)
+
+        assert result["_current_board_height"] is None
+        assert result["_current_sealed"] is None
+        assert result["low_position_new_start"] is None
+        assert result["_current_board_height_quality"] == "degraded"
+        assert result["_current_sealed_quality"] == "degraded"
+        assert result["_feature_quality"]["low_position_new_start"] == "degraded"
+
     def test_former_high_position_can_be_proven_by_yesterday_review_height(self):
         survivor = _candidate(
             features={
@@ -879,6 +1102,29 @@ class TestModeFeatureBuilder:
         assert supported["planned_pullback_quality"] == "ready"
         assert supported["pullback"] is True
 
+    @pytest.mark.parametrize(
+        ("support", "expected_quality"),
+        [(9.5, "invalid"), (9.4, "invalid"), (9.6, "ready")],
+    )
+    def test_planned_pullback_marks_support_at_or_below_stop_invalid(
+        self,
+        support,
+        expected_quality,
+    ):
+        candidate = _candidate(
+            features={
+                "price": 10,
+                "captured_at": AS_OF,
+                "validated_support": support,
+            },
+            evidence=_ready_quote_and_kline_evidence(),
+        )
+
+        result = ModeFeatureBuilder().build(_snapshot(candidate), candidate)
+
+        assert result["planned_pullback_price"] == support
+        assert result["planned_pullback_quality"] == expected_quality
+
     def test_snake_and_right_reversal_wait_without_their_distinct_theme_evidence(self):
         candidate = _candidate(
             features={
@@ -944,14 +1190,12 @@ class TestModeFeatureBuilder:
         assert result["theme_dead"] is True
         assert result["right_reversal"] is True
 
-    def test_tail_action_requires_preclose_fresh_entry_not_invalidated_and_non_manual(self):
+    def test_tail_base_requires_only_preclose_fresh_quote_and_nonstale_snapshot(self):
         candidate = _candidate(
             features={
                 "price": 10,
                 "captured_at": AS_OF - timedelta(seconds=30),
-                "tail_entry_satisfied": True,
-                "tail_invalidation_satisfied": False,
-                "automation_level": "assisted",
+                "automation_level": "manual_only",
             },
             evidence=_ready_all_evidence(AS_OF - timedelta(seconds=30)),
         )
@@ -963,9 +1207,8 @@ class TestModeFeatureBuilder:
         assert builder.build(
             _snapshot(candidate, stage="auction"), candidate
         )["tail_action_eligible"] is False
-        candidate.features["automation_level"] = "manual_only"
         assert builder.build(
-            _snapshot(candidate, stage="preclose"), candidate
+            _snapshot(candidate, stage="preclose", stale=True), candidate
         )["tail_action_eligible"] is False
 
     def test_tail_base_eligibility_can_defer_automation_level_to_the_rule_matcher(self):
@@ -973,8 +1216,6 @@ class TestModeFeatureBuilder:
             features={
                 "price": 10,
                 "captured_at": AS_OF,
-                "tail_entry_satisfied": True,
-                "tail_invalidation_satisfied": False,
             },
             evidence=_ready_all_evidence(),
         )
@@ -1041,6 +1282,27 @@ class TestModeFeatureBuilder:
         assert result["_point_in_time_valid"] is False
         assert result["reference_price"] is None
 
+    def test_future_known_nonquote_evidence_is_a_global_point_in_time_failure(self):
+        candidate = _candidate(
+            features={
+                "price": 10,
+                "captured_at": AS_OF,
+                "realtime_limit_up_fact": {"sealed": True},
+            },
+            evidence=[
+                _source_evidence("tencent"),
+                _source_evidence(
+                    "realtime_limit_up_pool",
+                    as_of=AS_OF + timedelta(seconds=1),
+                ),
+            ],
+        )
+
+        result = ModeFeatureBuilder().build(_snapshot(candidate), candidate)
+
+        assert result["_point_in_time_valid"] is False
+        assert result["reference_price"] is None
+
 
 def _rule(
     mode_key: str = "example",
@@ -1073,7 +1335,8 @@ def _matcher_candidate(**overrides) -> CandidateSnapshot:
     features = {
         "flag": True,
         "reference_price": 10.0,
-        "planned_pullback_price": 9.5,
+        "planned_pullback_price": 9.6,
+        "planned_pullback_quality": "ready",
         "planned_breakout_price": 10.51,
         "hard_stop_price": 9.5,
         "exit_change_pct_floor": -5.0,
@@ -1116,20 +1379,42 @@ class TestModeMatcherContract:
         failed = matcher.evaluate(market, _matcher_candidate(flag=False))
         assert {row.status for row in failed} == {"not_matched"}
 
-    def test_degraded_or_stale_quality_never_produces_actionable_match(self):
+    def test_unrelated_aggregate_degradation_does_not_block_but_stale_does(self):
         matcher = ModeMatcher([_rule(automation_level="automatic")])
 
         degraded = matcher.evaluate(
-            {"style": "dual_active", "window": "outbreak", "quality": "degraded"},
-            _matcher_candidate(),
+            {
+                "style": "dual_active",
+                "window": "outbreak",
+                "quality": "degraded",
+            },
+            _matcher_candidate(
+                _snapshot_quality_status="degraded",
+                _candidate_quality_status="degraded",
+                _feature_quality={"unused_kline_fact": "degraded"},
+            ),
         )[0]
         stale = matcher.evaluate(
             {"style": "dual_active", "window": "outbreak", "quality": "ready"},
             _matcher_candidate(_snapshot_stale=True),
         )[0]
 
-        assert (degraded.status, degraded.risk_level) == ("waiting", "watch")
+        assert (degraded.status, degraded.risk_level) == ("matched", "confirmed")
         assert (stale.status, stale.risk_level) == ("waiting", "watch")
+
+    def test_implicit_style_and_window_use_their_own_field_quality(self):
+        matcher = ModeMatcher([_rule(automation_level="automatic")])
+        candidate = _matcher_candidate()
+        market = {
+            "style": "dual_active",
+            "window": "outbreak",
+            "quality": "degraded",
+            "_feature_quality": {"style": "degraded", "window": "ready"},
+        }
+
+        assert matcher.evaluate(market, candidate)[0].status == "waiting"
+        market["_feature_quality"] = {"style": "ready", "window": "ready"}
+        assert matcher.evaluate(market, candidate)[0].status == "matched"
 
     def test_required_feature_quality_and_missing_trigger_price_wait(self):
         matcher = ModeMatcher([_rule()])
@@ -1171,11 +1456,17 @@ class TestModeMatcherContract:
         market = {"style": "dual_active", "window": "outbreak", "quality": "ready"}
         assisted = ModeMatcher([_rule()]).evaluate(
             market,
-            _matcher_candidate(tail_action_eligible=True),
+            _matcher_candidate(
+                reference_price=9.6,
+                tail_action_eligible=True,
+            ),
         )[0]
         manual = ModeMatcher([_rule(automation_level="manual_only")]).evaluate(
             market,
-            _matcher_candidate(tail_action_eligible=True),
+            _matcher_candidate(
+                reference_price=9.6,
+                tail_action_eligible=True,
+            ),
         )[0]
 
         assert assisted.action_scope == "tail"
@@ -1183,9 +1474,97 @@ class TestModeMatcherContract:
 
         auction = ModeMatcher([_rule()]).evaluate(
             market,
-            _matcher_candidate(tail_action_eligible=True, _stage="auction"),
+            _matcher_candidate(
+                reference_price=9.6,
+                tail_action_eligible=True,
+                _stage="auction",
+            ),
         )[0]
         assert auction.action_scope == "target"
+
+    @pytest.mark.parametrize(
+        "role",
+        ["survivor", "resilient_core", "snake_arbitrage"],
+    )
+    @pytest.mark.parametrize(
+        ("pullback", "quality"),
+        [
+            (9.5, "ready"),
+            (9.4, "ready"),
+            (10.01, "ready"),
+            (9.6, "fallback"),
+            (9.6, "invalid"),
+        ],
+    )
+    def test_pullback_entry_requires_ready_price_strictly_above_stop(
+        self,
+        role,
+        pullback,
+        quality,
+    ):
+        row = ModeMatcher([_rule(role=role)]).evaluate(
+            {"style": "dual_active", "window": "outbreak"},
+            _matcher_candidate(
+                reference_price=10,
+                planned_pullback_price=pullback,
+                planned_pullback_quality=quality,
+                hard_stop_price=9.5,
+            ),
+        )[0]
+
+        assert row.status == "waiting"
+        assert "price_lte" not in row.entry_trigger
+
+    @pytest.mark.parametrize(
+        "role",
+        ["survivor", "resilient_core", "snake_arbitrage"],
+    )
+    def test_pullback_entry_accepts_ready_price_between_stop_and_reference(self, role):
+        row = ModeMatcher([_rule(role=role)]).evaluate(
+            {"style": "dual_active", "window": "outbreak"},
+            _matcher_candidate(
+                reference_price=10,
+                planned_pullback_price=9.6,
+                planned_pullback_quality="ready",
+                hard_stop_price=9.5,
+            ),
+        )[0]
+
+        assert row.status == "matched"
+        assert row.entry_trigger["price_lte"] == 9.6
+
+    @pytest.mark.parametrize(
+        ("role", "current_price", "sealed", "expected_scope"),
+        [
+            ("leader", 10.0, True, "tail"),
+            ("leader", 10.0, False, "target"),
+            ("survivor", 9.6, None, "tail"),
+            ("survivor", 9.7, None, "target"),
+            ("middle_army", 10.51, None, "tail"),
+            ("middle_army", 10.50, None, "target"),
+            ("survivor", 9.5, None, "target"),
+        ],
+    )
+    def test_tail_scope_checks_each_materialized_rule_entry_and_stop(
+        self,
+        role,
+        current_price,
+        sealed,
+        expected_scope,
+    ):
+        row = ModeMatcher([_rule(role=role)]).evaluate(
+            {"style": "dual_active", "window": "outbreak"},
+            _matcher_candidate(
+                reference_price=current_price,
+                planned_pullback_price=9.6,
+                planned_breakout_price=10.51,
+                hard_stop_price=9.5,
+                tail_action_eligible=True,
+                _current_sealed=sealed,
+            ),
+        )[0]
+
+        assert row.action_scope == expected_scope
 
     def test_normalizes_rules_without_mutation_and_hashes_deterministically(self):
         original = _rule()
@@ -1205,6 +1584,97 @@ class TestModeMatcherContract:
             }
         ]
         assert len(first.rules[0]["content_hash"]) == 64
+
+    def test_uses_the_shared_catalog_hash_and_rejects_noncanonical_hashes(self):
+        helper = getattr(
+            rule_catalog_module,
+            "canonical_rule_content_hash",
+            None,
+        )
+        assert callable(helper)
+        rule = _rule()
+        expected = helper(rule)
+
+        assert ModeMatcher([rule]).rules[0]["content_hash"] == expected
+        assert ModeMatcher(
+            [{**rule, "content_hash": expected}],
+        ).rules[0]["content_hash"] == expected
+        for bad_hash in (
+            None,
+            "",
+            expected.upper(),
+            "0" * 64,
+            "g" * 64,
+            "short",
+        ):
+            with pytest.raises(ValueError, match="content_hash"):
+                ModeMatcher([{**rule, "content_hash": bad_hash}])
+
+    @pytest.mark.parametrize(
+        "mutate",
+        [
+            lambda rule: rule.update(requirements=[]),
+            lambda rule: rule.update(requirements=["not-a-mapping"]),
+            lambda rule: rule.update(
+                requirements=[
+                    {"feature": "other.flag", "op": "eq", "value": True}
+                ]
+            ),
+            lambda rule: rule.update(
+                requirements=[
+                    {"feature": "candidate.", "op": "eq", "value": True}
+                ]
+            ),
+            lambda rule: rule.update(
+                requirements=[
+                    {"feature": "candidate.flag", "op": "contains", "value": True}
+                ]
+            ),
+            lambda rule: rule.update(
+                requirements=[
+                    {"feature": "candidate.flag", "op": "in", "value": []}
+                ]
+            ),
+            lambda rule: rule.update(
+                requirements=[
+                    {"feature": "candidate.flag", "op": "in", "value": ""}
+                ]
+            ),
+            lambda rule: rule.update(
+                requirements=[
+                    {"feature": "candidate.flag", "op": "eq", "value": []}
+                ]
+            ),
+            lambda rule: rule.update(
+                requirements=[
+                    {"feature": "candidate.flag", "op": "gte", "value": "1"}
+                ]
+            ),
+            lambda rule: rule.update(
+                requirements=[
+                    {"feature": "candidate.flag", "op": "in", "value": [math.nan]}
+                ]
+            ),
+        ],
+        ids=[
+            "empty-requirements",
+            "non-mapping-requirement",
+            "unsupported-owner",
+            "empty-feature-key",
+            "unsupported-op",
+            "empty-in-list",
+            "empty-in-string",
+            "malformed-eq-expected",
+            "malformed-numeric-expected",
+            "nonfinite-in-choice",
+        ],
+    )
+    def test_rejects_malformed_automatic_rules_at_compile_time(self, mutate):
+        rule = _rule(automation_level="automatic")
+        mutate(rule)
+
+        with pytest.raises(ValueError):
+            ModeMatcher([rule])
 
     def test_rejects_duplicate_mode_keys(self):
         with pytest.raises(ValueError, match="duplicate mode_key"):
@@ -1276,6 +1746,68 @@ class TestModeMatcherContract:
             _matcher_candidate(value=actual),
         )[0]
         assert row.status == status
+
+
+class TestRealTailChain:
+    @staticmethod
+    def _evaluate(role: str, *, price: float, sealed: bool):
+        raw = _candidate(
+            features={
+                "price": price,
+                "captured_at": AS_OF,
+                "realtime_limit_up_fact": {"sealed": sealed},
+                "validated_support": 9.6,
+                "prior_n_day_high": 10.5,
+            },
+            evidence=[
+                _source_evidence("tencent", as_of=AS_OF),
+                _source_evidence(
+                    "realtime_limit_up_pool",
+                    as_of=AS_OF,
+                    fields=["realtime_limit_up_fact"],
+                ),
+                _source_evidence(
+                    "kline",
+                    as_of=AS_OF,
+                    fields=["validated_support", "prior_n_day_high"],
+                ),
+            ],
+        )
+        snapshot = _snapshot(
+            raw,
+            market_features={
+                "style": "dual_active",
+                "window": "outbreak",
+                "quality": "degraded",
+            },
+            quality="degraded",
+        )
+        enriched = MarketStateAnalyzer().enrich_snapshot(snapshot)
+        analyzed = enriched.candidates[0]
+        features = ModeFeatureBuilder().build(enriched, analyzed)
+        candidate = CandidateSnapshot(
+            stock_code=analyzed.stock_code,
+            stock_name=analyzed.stock_name,
+            theme_name=analyzed.theme_name,
+            features={**features, "flag": True},
+            evidence=copy.deepcopy(analyzed.evidence),
+        )
+        return ModeMatcher([_rule(role=role)]).evaluate(
+            {
+                "style": "dual_active",
+                "window": "outbreak",
+                "quality": "degraded",
+            },
+            candidate,
+        )[0]
+
+    def test_snapshot_analyzer_builder_matcher_tail_uses_current_sealed(self):
+        assert self._evaluate("leader", price=10, sealed=True).action_scope == "tail"
+        assert self._evaluate("leader", price=10, sealed=False).action_scope == "target"
+
+    def test_snapshot_analyzer_builder_matcher_tail_uses_current_price(self):
+        assert self._evaluate("survivor", price=9.6, sealed=False).action_scope == "tail"
+        assert self._evaluate("survivor", price=9.7, sealed=False).action_scope == "target"
 
 
 def _catalog_payload() -> dict:

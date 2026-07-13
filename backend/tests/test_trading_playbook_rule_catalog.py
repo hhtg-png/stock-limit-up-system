@@ -11,7 +11,9 @@ from sqlalchemy.pool import StaticPool
 
 from app.database import Base
 from app.models import TradingModeRule, TradingRuleSource
+from app.services.trading_playbook.mode_matcher import ModeMatcher
 from app.services.trading_playbook.rule_catalog import RuleCatalog
+from app.services.trading_playbook import rule_catalog as rule_catalog_module
 
 
 CATALOG_PATH = (
@@ -252,6 +254,31 @@ class TradingPlaybookRuleCatalogSeedTests(unittest.IsolatedAsyncioTestCase):
                     self.source_root,
                 )
         self.assertEqual(await self._counts(), (8, 19))
+
+    async def test_seed_and_matcher_share_the_exact_canonical_rule_hash(self):
+        self._write_all_transcripts()
+        helper = getattr(
+            rule_catalog_module,
+            "canonical_rule_content_hash",
+            None,
+        )
+        self.assertTrue(callable(helper))
+        rule = self.catalog_data["rules"][0]
+
+        async with self.session_factory() as session:
+            await self.catalog.seed(session, self.source_root)
+            stored = await session.scalar(
+                select(TradingModeRule).where(
+                    TradingModeRule.mode_key == rule["mode_key"]
+                )
+            )
+
+        expected = helper(rule)
+        self.assertEqual(stored.content_hash, expected)
+        self.assertEqual(
+            ModeMatcher([rule]).rules[0]["content_hash"],
+            expected,
+        )
 
     async def test_changed_transcript_appends_source_hash_and_preserves_rules(self):
         self._write_all_transcripts()

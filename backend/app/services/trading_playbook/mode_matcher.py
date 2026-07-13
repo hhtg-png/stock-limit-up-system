@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import copy
-import hashlib
-import json
 import math
+import re
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from .domain import CandidateSnapshot, ModeEvaluation
+from .rule_catalog import canonical_rule_content_hash
 
 
 _SUPPORTED_OPERATORS = {"eq", "in", "lte", "gte"}
@@ -30,22 +30,6 @@ def _finite_number(value: Any) -> Optional[float]:
     except (TypeError, ValueError, OverflowError):
         return None
     return number if math.isfinite(number) else None
-
-
-def _canonical_hash(rule: Mapping[str, Any]) -> str:
-    payload = {
-        key: value
-        for key, value in rule.items()
-        if key != "content_hash"
-    }
-    serialized = json.dumps(
-        payload,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        default=str,
-    )
-    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
 class ModeMatcher:
@@ -74,23 +58,43 @@ class ModeMatcher:
             if automation not in {"automatic", "assisted", "manual_only"}:
                 raise ValueError(f"invalid automation_level for {mode_key}")
             requirements = rule.get("requirements")
-            if not isinstance(requirements, list):
-                raise ValueError(f"requirements must be a list for {mode_key}")
+            if not isinstance(requirements, list) or not requirements:
+                raise ValueError(
+                    f"requirements must be a non-empty list for {mode_key}"
+                )
             for requirement in requirements:
-                if requirement.get("op") not in _SUPPORTED_OPERATORS:
+                if not isinstance(requirement, Mapping):
                     raise ValueError(
-                        f"unsupported operator for {mode_key}: {requirement.get('op')}"
+                        f"requirement must be a mapping for {mode_key}"
+                    )
+                operator = requirement.get("op")
+                if operator not in _SUPPORTED_OPERATORS:
+                    raise ValueError(
+                        f"unsupported operator for {mode_key}: {operator}"
                     )
                 feature = requirement.get("feature")
                 if not isinstance(feature, str) or "." not in feature:
                     raise ValueError(f"invalid feature for {mode_key}")
+                owner, key = feature.split(".", 1)
+                if owner not in {"market", "candidate"} or not key.strip():
+                    raise ValueError(f"invalid feature for {mode_key}")
+                self._validate_expected(
+                    mode_key,
+                    operator,
+                    requirement.get("value"),
+                )
+            canonical_hash = canonical_rule_content_hash(rule)
+            supplied_hash = rule.get("content_hash")
+            if "content_hash" in rule:
+                if (
+                    not isinstance(supplied_hash, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", supplied_hash) is None
+                    or supplied_hash != canonical_hash
+                ):
+                    raise ValueError(f"invalid content_hash for {mode_key}")
             rule["mode_key"] = mode_key
             rule["version"] = int(version)
-            rule["content_hash"] = str(
-                rule.get("content_hash") or _canonical_hash(rule)
-            )
-            if len(rule["content_hash"]) != 64:
-                raise ValueError(f"invalid content_hash for {mode_key}")
+            rule["content_hash"] = canonical_hash
             normalized.append(rule)
         self.rules = tuple(
             sorted(
@@ -101,6 +105,44 @@ class ModeMatcher:
                 ),
             )
         )
+
+    @staticmethod
+    def _validate_expected(mode_key: str, operator: str, expected: Any) -> None:
+        scalar = isinstance(expected, (str, int, float, bool))
+        if operator == "in":
+            if isinstance(expected, str):
+                choices = [item.strip() for item in expected.split(",")]
+                valid = bool(choices) and all(choices)
+            elif isinstance(expected, Sequence) and not isinstance(
+                expected,
+                (str, bytes, bytearray),
+            ):
+                choices = list(expected)
+                valid = bool(choices) and all(
+                    isinstance(item, (str, int, float, bool))
+                    and (not isinstance(item, str) or bool(item.strip()))
+                    and (
+                        not isinstance(item, float)
+                        or math.isfinite(item)
+                    )
+                    for item in choices
+                )
+            else:
+                valid = False
+        elif operator in {"lte", "gte"}:
+            valid = (
+                not isinstance(expected, bool)
+                and _finite_number(expected) is not None
+                and not isinstance(expected, str)
+            )
+        else:
+            valid = scalar and (
+                not isinstance(expected, str) or bool(expected.strip())
+            )
+            if isinstance(expected, float):
+                valid = valid and math.isfinite(expected)
+        if not valid:
+            raise ValueError(f"invalid expected value for {mode_key}")
 
     def evaluate(
         self,
@@ -192,6 +234,11 @@ class ModeMatcher:
             and rule["automation_level"] != "manual_only"
             and features.get("tail_action_eligible") is True
             and features.get("_stage", "preclose") == "preclose"
+            and self._tail_conditions_satisfied(
+                entry_trigger,
+                invalidation,
+                features,
+            )
         ):
             action_scope = "tail"
 
@@ -211,8 +258,9 @@ class ModeMatcher:
             action_scope=action_scope,
         )
 
-    @staticmethod
+    @classmethod
     def _implicit_rule_conditions(
+        cls,
         rule: Mapping[str, Any],
         market: Mapping[str, Any],
     ) -> List[Dict[str, Any]]:
@@ -221,21 +269,27 @@ class ModeMatcher:
         if window:
             allowed = [item.strip() for item in window.split(",") if item.strip()]
             rows.append(
-                ModeMatcher._direct_condition(
-                    "market.window",
-                    "in",
-                    allowed,
-                    market.get("window"),
+                cls._condition(
+                    {
+                        "feature": "market.window",
+                        "op": "in",
+                        "value": allowed,
+                    },
+                    market,
+                    {},
                 )
             )
         style = str(rule.get("style") or "").strip()
         if style:
             rows.append(
-                ModeMatcher._direct_condition(
-                    "market.style",
-                    "eq",
-                    style,
-                    market.get("style"),
+                cls._condition(
+                    {
+                        "feature": "market.style",
+                        "op": "eq",
+                        "value": style,
+                    },
+                    market,
+                    {},
                 )
             )
         return rows
@@ -375,15 +429,9 @@ class ModeMatcher:
         market: Mapping[str, Any],
         features: Mapping[str, Any],
     ) -> bool:
-        if market.get("quality", "ready") != "ready":
-            return False
-        if features.get("_snapshot_quality_status", "ready") != "ready":
-            return False
         if features.get("_snapshot_stale", False) is True:
             return False
         if features.get("_point_in_time_valid", True) is not True:
-            return False
-        if features.get("_candidate_quality_status", "ready") != "ready":
             return False
         return True
 
@@ -396,12 +444,26 @@ class ModeMatcher:
         role = str(rule.get("role") or "")
         reference = _finite_number(features.get("reference_price"))
         trigger: Dict[str, Any] = {"label": label}
-        if reference is None or reference <= 0:
+        if (
+            reference is None
+            or reference <= 0
+            or not ModeMatcher._field_ready(features, "reference_price")
+        ):
             return trigger, False
         trigger["reference_price"] = reference
         if role in _PULLBACK_ROLES:
             price = _finite_number(features.get("planned_pullback_price"))
-            if price is None or price <= 0:
+            hard_stop = _finite_number(features.get("hard_stop_price"))
+            if (
+                price is None
+                or hard_stop is None
+                or features.get("planned_pullback_quality") != "ready"
+                or not ModeMatcher._field_ready(
+                    features,
+                    "planned_pullback_price",
+                )
+                or not hard_stop < price <= reference
+            ):
                 return trigger, False
             trigger["price_lte"] = price
         elif role in _SEALED_ROLES:
@@ -422,10 +484,47 @@ class ModeMatcher:
             "label": str((rule.get("invalidation") or {}).get("label") or "")
         }
         hard_stop = _finite_number(features.get("hard_stop_price"))
-        if hard_stop is None or hard_stop <= 0:
+        if (
+            hard_stop is None
+            or hard_stop <= 0
+            or not ModeMatcher._field_ready(features, "hard_stop_price")
+        ):
             return trigger, False
         trigger["price_lte"] = hard_stop
         return trigger, True
+
+    @staticmethod
+    def _field_ready(features: Mapping[str, Any], key: str) -> bool:
+        quality = features.get("_feature_quality")
+        if not isinstance(quality, Mapping) or key not in quality:
+            return True
+        return quality.get(key) in {"ready", "computed"}
+
+    @staticmethod
+    def _tail_conditions_satisfied(
+        entry: Mapping[str, Any],
+        invalidation: Mapping[str, Any],
+        features: Mapping[str, Any],
+    ) -> bool:
+        current = _finite_number(features.get("reference_price"))
+        hard_stop = _finite_number(invalidation.get("price_lte"))
+        if (
+            current is None
+            or hard_stop is None
+            or current <= hard_stop
+            or not ModeMatcher._field_ready(features, "reference_price")
+            or not ModeMatcher._field_ready(features, "hard_stop_price")
+        ):
+            return False
+        if entry.get("sealed") is True:
+            return features.get("_current_sealed") is True
+        price_lte = _finite_number(entry.get("price_lte"))
+        if price_lte is not None:
+            return current <= price_lte
+        price_gte = _finite_number(entry.get("price_gte"))
+        if price_gte is not None:
+            return current >= price_gte
+        return False
 
     @staticmethod
     def _exit_trigger(

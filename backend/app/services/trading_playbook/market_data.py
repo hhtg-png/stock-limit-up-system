@@ -771,7 +771,27 @@ class TradingPlaybookMarketDataProvider:
             evidence: List[Dict[str, Any]] = []
             if quote is not None:
                 quality = quote_field_quality.get(code, {})
-                features.update(self._quote_features(quote, quality))
+                quote_features = self._quote_features(quote, quality)
+                features.update(quote_features)
+                quote_evidence_field_quality = {
+                    "price": quality.get("price", "missing"),
+                    "captured_at": quality.get("timestamp", "missing"),
+                    "speed_pct": quality.get("speed_pct", "missing"),
+                    "speed_quality": "ready",
+                    **{
+                        key: quality.get(key, "missing")
+                        for key in (
+                            "pre_close",
+                            "open_price",
+                            "change_pct",
+                            "amount",
+                            "turnover_rate",
+                            "bid1_price",
+                            "bid1_volume",
+                            "limit_up",
+                        )
+                    },
+                }
                 evidence.append(
                     {
                         "source": "tencent",
@@ -781,6 +801,7 @@ class TradingPlaybookMarketDataProvider:
                             as_of,
                             quality,
                         ),
+                        "field_quality": quote_evidence_field_quality,
                     }
                 )
             else:
@@ -815,6 +836,11 @@ class TradingPlaybookMarketDataProvider:
                         code,
                         {},
                     ).get("speed_pct", "missing")
+                rank_evidence["field_quality"] = {
+                    key: rank_evidence["quality"]
+                    for key in ("change_rank", "speed_rank")
+                    if key in rank_evidence
+                }
                 evidence.append(rank_evidence)
 
             kline_result = kline_by_code[code]
@@ -1097,6 +1123,7 @@ class TradingPlaybookMarketDataProvider:
                         "source": "auction",
                         "as_of": quote.captured_at if quote else quote_snapshot.quality.as_of,
                         "quality": "missing",
+                        "field_quality": {"auction_quality": "ready"},
                         "warning": warning,
                     }
                 )
@@ -1138,6 +1165,14 @@ class TradingPlaybookMarketDataProvider:
                 "source": "auction",
                 "as_of": quote.captured_at,
                 "quality": auction_quality,
+                "field_quality": {
+                    "auction_quality": "ready",
+                    **{
+                        feature_name: field_quality.get(source_field, "missing")
+                        for feature_name, source_field, _ in metric_fields
+                        if feature_name in candidate.features
+                    },
+                },
             }
             if warning_parts:
                 warning = f"{candidate.stock_code}: {'; '.join(warning_parts)}"
@@ -1161,6 +1196,13 @@ class TradingPlaybookMarketDataProvider:
             )
             for rank, candidate in enumerate(ordered, start=1):
                 candidate.features["auction_theme_rank"] = rank
+                for evidence in reversed(candidate.evidence):
+                    if evidence.get("source") != "auction":
+                        continue
+                    evidence.setdefault("field_quality", {})[
+                        "auction_theme_rank"
+                    ] = "computed"
+                    break
 
     @staticmethod
     def _is_auction_timestamp(

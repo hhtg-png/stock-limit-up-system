@@ -18,6 +18,22 @@ EXPECTED_SOURCE_COUNT = 8
 EXPECTED_RULE_COUNT = 19
 
 
+def canonical_rule_content_hash(rule: dict[str, Any]) -> str:
+    """Hash immutable rule content while ignoring matcher runtime metadata."""
+    payload = {
+        key: value
+        for key, value in rule.items()
+        if key not in {"version", "content_hash"}
+    }
+    canonical_rule = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical_rule.encode("utf-8")).hexdigest()
+
+
 class RuleCatalog:
     """Access and persist one immutable version of the trading rule catalog."""
 
@@ -115,15 +131,7 @@ class RuleCatalog:
             version = catalog["catalog_version"]
             hashed_rules = []
             for rule in catalog["rules"]:
-                canonical_rule = json.dumps(
-                    rule,
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-                content_hash = hashlib.sha256(
-                    canonical_rule.encode("utf-8")
-                ).hexdigest()
+                content_hash = canonical_rule_content_hash(rule)
                 hashed_rules.append((rule, content_hash))
 
             existing_rules = (

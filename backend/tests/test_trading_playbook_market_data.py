@@ -1283,6 +1283,21 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first["bid1_volume"], 88.0)
         self.assertEqual(first["auction_theme_rank"], 1)
         self.assertEqual(second["auction_theme_rank"], 2)
+        first_auction_evidence = next(
+            evidence
+            for evidence in candidates["000001"].evidence
+            if evidence["source"] == "auction"
+        )
+        self.assertEqual(
+            first_auction_evidence["field_quality"],
+            {
+                "auction_amount": "ready",
+                "auction_bid1_volume": "ready",
+                "auction_change_pct": "computed",
+                "auction_quality": "ready",
+                "auction_theme_rank": "computed",
+            },
+        )
         self.assertEqual(invalid.features["auction_quality"], "missing")
         self.assertNotIn("auction_change_pct", invalid.features)
         self.assertNotIn("auction_amount", invalid.features)
@@ -1511,6 +1526,11 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
                         for evidence in candidate.evidence
                         if evidence["source"] == "full_market_quote_rank"
                     )
+                    quote_evidence = next(
+                        evidence
+                        for evidence in candidate.evidence
+                        if evidence["source"] == "tencent"
+                    )
                     market_rank_evidence = snapshot.market_features[
                         "full_market_rank_evidence"
                     ][0]
@@ -1525,6 +1545,22 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
                         "missing",
                     )
                     self.assertEqual(rank_evidence["speed_quality"], "missing")
+                    self.assertEqual(
+                        rank_evidence["field_quality"],
+                        {"change_rank": "ready"},
+                    )
+                    self.assertEqual(
+                        quote_evidence["field_quality"]["price"],
+                        "ready",
+                    )
+                    self.assertEqual(
+                        quote_evidence["field_quality"]["captured_at"],
+                        "ready",
+                    )
+                    self.assertEqual(
+                        quote_evidence["field_quality"]["speed_pct"],
+                        "missing",
+                    )
                     self.assertEqual(
                         market_rank_evidence["speed_quality"],
                         "missing",

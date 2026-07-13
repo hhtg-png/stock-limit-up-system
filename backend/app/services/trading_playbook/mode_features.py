@@ -130,6 +130,21 @@ _RECOGNITION_FACTS = {
     "recognition_score",
     "recognition_evidence",
 }
+_RANK_SOURCE_FIELDS = {"change_rank", "speed_rank", "speed_quality"}
+_AUCTION_SOURCE_FIELDS = {
+    "auction_quality",
+    "auction_change_pct",
+    "auction_amount",
+    "auction_bid1_volume",
+    "auction_theme_rank",
+}
+_RECOGNITION_DIMENSIONS = {
+    "fastest_rank": "fastest",
+    "highest_rank": "highest",
+    "hardest_rank": "hardest",
+    "resilience_rank": "resilient",
+    "influence_rank": "influential",
+}
 
 
 def _finite_number(
@@ -233,13 +248,16 @@ def _fact_sources(source: Mapping[str, Any]) -> Tuple[Mapping[str, Any], ...]:
 
 
 def _fact_flag(source: Mapping[str, Any], names: Sequence[str]) -> Optional[bool]:
-    return _tri_or(
-        *(
-            _first_flag(facts, names)
-            for facts in _fact_sources(source)
-            if any(name in facts for name in names)
-        )
-    )
+    values = [
+        _strict_flag(facts.get(name))
+        for facts in _fact_sources(source)
+        for name in names
+        if name in facts
+    ]
+    observed = {value for value in values if isinstance(value, bool)}
+    if len(observed) != 1:
+        return None
+    return observed.pop()
 
 
 def _seconds_since_midnight(value: Any) -> Optional[int]:
@@ -288,7 +306,17 @@ class ModeFeatureBuilder:
         candidate: CandidateSnapshot,
     ) -> Dict[str, Any]:
         source_quality = self._evidence_index(snapshot, candidate)
-        raw = self._trusted_facts(snapshot, candidate, source_quality)
+        field_source_quality = self._evidence_field_index(snapshot, candidate)
+        raw = self._trusted_facts(
+            snapshot,
+            candidate,
+            source_quality,
+            field_source_quality,
+        )
+        current_board_height_quality = self._board_height_quality(raw)
+        current_sealed_quality = self._sealed_quality(raw)
+        raw["_current_board_height_quality"] = current_board_height_quality
+        raw["_current_sealed_quality"] = current_sealed_quality
         result: Dict[str, Any] = {key: None for key in FEATURE_KEYS}
         result["planned_pullback_quality"] = "missing"
         quality: Dict[str, str] = {}
@@ -319,7 +347,16 @@ class ModeFeatureBuilder:
                 "_point_in_time_valid": point_in_time_valid,
                 "_stage": snapshot.stage,
                 "_source_quality": source_quality,
+                "_field_source_quality": field_source_quality,
                 "_candidate_quality_status": candidate_quality,
+                "_current_board_height": self._board_height(raw)
+                if point_in_time_valid
+                else None,
+                "_current_board_height_quality": current_board_height_quality,
+                "_current_sealed": self._sealed(raw)
+                if point_in_time_valid
+                else None,
+                "_current_sealed_quality": current_sealed_quality,
             }
         )
 
@@ -504,6 +541,124 @@ class ModeFeatureBuilder:
             for family, sources in _EVIDENCE_SOURCES.items()
         }
 
+    @classmethod
+    def _evidence_field_index(
+        cls,
+        snapshot: MarketSnapshot,
+        candidate: CandidateSnapshot,
+    ) -> Dict[str, str]:
+        return {
+            key: cls._evidence_field_state(
+                snapshot,
+                candidate.evidence,
+                key,
+            )
+            for key in candidate.features
+            if key != "_feature_quality"
+        }
+
+    @classmethod
+    def _evidence_field_state(
+        cls,
+        snapshot: MarketSnapshot,
+        evidence_rows: Iterable[Mapping[str, Any]],
+        key: str,
+    ) -> str:
+        states = []
+        for item in evidence_rows:
+            if not isinstance(item, Mapping):
+                continue
+            source = str(item.get("source") or "").strip()
+            if not cls._source_can_certify(source, key):
+                continue
+            field_quality = item.get("field_quality")
+            fields = item.get("fields")
+            has_field_quality = isinstance(field_quality, Mapping)
+            has_fields = isinstance(fields, Sequence) and not isinstance(
+                fields,
+                (str, bytes, bytearray),
+            )
+            if has_field_quality and key in field_quality:
+                stated_quality = field_quality.get(key)
+            elif has_fields and key in fields:
+                stated_quality = item.get("quality")
+            elif has_field_quality or has_fields:
+                continue
+            elif cls._default_source_covers(source, key):
+                stated_quality = item.get("quality")
+            else:
+                continue
+
+            observed_at = _parse_datetime(item.get("as_of"))
+            if observed_at is None:
+                states.append("degraded")
+                continue
+            if _comparable_datetime(observed_at, snapshot.as_of) > snapshot.as_of:
+                states.append("invalid")
+                continue
+            if (
+                _strict_flag(item.get("stale")) is True
+                or item.get("quality") == "stale"
+            ):
+                states.append("degraded")
+                continue
+            accepted = {"ready", "computed"}
+            if source in _EVIDENCE_SOURCES["review"]:
+                accepted.add("ok")
+            if stated_quality in accepted:
+                states.append("ready")
+            elif stated_quality in {None, "", "missing"}:
+                states.append("missing")
+            else:
+                states.append("degraded")
+
+        if "invalid" in states:
+            return "invalid"
+        if "degraded" in states:
+            return "degraded"
+        if "ready" in states and "missing" in states:
+            return "degraded"
+        if "ready" in states:
+            return "ready"
+        return "missing"
+
+    @classmethod
+    def _source_can_certify(cls, source: str, key: str) -> bool:
+        family = cls._feature_family(key)
+        if family in {"quote", "realtime", "review", "kline", "plan"}:
+            return source in _EVIDENCE_SOURCES[family]
+        if key in _RANK_SOURCE_FIELDS:
+            return source == "full_market_quote_rank"
+        if key in _AUCTION_SOURCE_FIELDS:
+            return source == "auction"
+        return source in {
+            "computed",
+            "ranker",
+            "market_state",
+            "theme_ranker",
+            "recognition_ranker",
+        }
+
+    @staticmethod
+    def _default_source_covers(source: str, key: str) -> bool:
+        if source in _EVIDENCE_SOURCES["quote"]:
+            return key in _QUOTE_FACTS
+        if source in _EVIDENCE_SOURCES["realtime"]:
+            return key == "realtime_limit_up_fact"
+        if source in _EVIDENCE_SOURCES["review"]:
+            return key in {"review_history", "latest_review_fact"} or key.startswith(
+                "review_"
+            )
+        if source in _EVIDENCE_SOURCES["kline"]:
+            return key in _KLINE_FACTS
+        if source in _EVIDENCE_SOURCES["plan"]:
+            return key == "plan_candidate_fact"
+        if source == "full_market_quote_rank":
+            return key in _RANK_SOURCE_FIELDS
+        if source == "auction":
+            return key in _AUCTION_SOURCE_FIELDS
+        return False
+
     @staticmethod
     def _evidence_state(
         snapshot: MarketSnapshot,
@@ -550,10 +705,11 @@ class ModeFeatureBuilder:
         snapshot: MarketSnapshot,
         candidate: CandidateSnapshot,
         source_quality: Optional[Mapping[str, str]] = None,
+        field_source_quality: Optional[Mapping[str, str]] = None,
     ) -> Dict[str, Any]:
-        del snapshot  # evidence times were normalized into source_quality
         raw = copy.deepcopy(candidate.features)
-        states = dict(source_quality or {})
+        del source_quality  # retained by callers as family-level diagnostics
+        field_states = dict(field_source_quality or {})
         explicit_quality = raw.get("_feature_quality")
         explicit_quality = (
             explicit_quality if isinstance(explicit_quality, Mapping) else {}
@@ -566,15 +722,13 @@ class ModeFeatureBuilder:
                 continue
             family = cls._feature_family(key)
             if family == "recognition":
-                state = cls._normalized_quality(raw.get("recognition_quality"))
+                state = cls._recognition_field_state(raw, key)
             elif family == "theme":
                 state = cls._normalized_quality(raw.get("theme_quality"))
-            elif family is not None:
-                state = states.get(family, "missing")
             else:
-                state = cls._normalized_quality(explicit_quality.get(key))
-                if state == "missing":
-                    state = states.get("computed", "missing")
+                state = field_states.get(key, "missing")
+                if family is None and state == "missing":
+                    state = cls._normalized_quality(explicit_quality.get(key))
 
             trust_quality[key] = state
             if state == "ready":
@@ -583,8 +737,74 @@ class ModeFeatureBuilder:
         for metadata in ("recognition_quality", "theme_quality"):
             if metadata in raw:
                 trusted[metadata] = raw[metadata]
+        cls._normalize_review_context(snapshot, trusted, trust_quality)
         trusted["_trust_quality"] = trust_quality
         return trusted
+
+    @classmethod
+    def _recognition_field_state(
+        cls,
+        raw: Mapping[str, Any],
+        key: str,
+    ) -> str:
+        if key == "recognition_evidence":
+            return "ready" if isinstance(raw.get(key), Mapping) else "missing"
+        dimension = _RECOGNITION_DIMENSIONS.get(key)
+        evidence = raw.get("recognition_evidence")
+        if dimension and isinstance(evidence, Mapping):
+            row = evidence.get(dimension)
+            if (
+                isinstance(row, Mapping)
+                and row.get("rank") is not None
+                and row.get("rank") == raw.get(key)
+            ):
+                return "ready"
+        return cls._normalized_quality(raw.get("recognition_quality"))
+
+    @classmethod
+    def _normalize_review_context(
+        cls,
+        snapshot: MarketSnapshot,
+        trusted: Dict[str, Any],
+        trust_quality: Dict[str, str],
+    ) -> None:
+        review_date = cls._fact_date(trusted.get("review_trade_date"))
+        if review_date is not None and review_date != snapshot.source_trade_date:
+            for key in tuple(trusted):
+                if not key.startswith("review_today_"):
+                    continue
+                prior_key = "review_yesterday_" + key[len("review_today_"):]
+                trusted[prior_key] = trusted.pop(key)
+                trust_quality[prior_key] = trust_quality.get(key, "ready")
+                trust_quality[key] = "missing"
+
+        latest = trusted.get("latest_review_fact")
+        if not isinstance(latest, Mapping):
+            return
+        latest_date = cls._fact_date(latest.get("trade_date"))
+        if latest_date is None or latest_date == snapshot.source_trade_date:
+            return
+        for key, value in latest.items():
+            if not key.startswith("today_"):
+                continue
+            prior_key = "review_yesterday_" + key[len("today_"):]
+            trusted[prior_key] = copy.deepcopy(value)
+            trust_quality[prior_key] = "ready"
+        trusted.pop("latest_review_fact", None)
+        trust_quality["latest_review_fact"] = "missing"
+
+    @staticmethod
+    def _fact_date(value: Any) -> Optional[date]:
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, date):
+            return value
+        if value in {None, ""}:
+            return None
+        try:
+            return date.fromisoformat(str(value).strip()[:10])
+        except ValueError:
+            return None
 
     @staticmethod
     def _feature_family(key: str) -> Optional[str]:
@@ -636,7 +856,13 @@ class ModeFeatureBuilder:
         unknown_count = 0
         for peer in peers:
             source_quality = cls._evidence_index(snapshot, peer)
-            features = cls._trusted_facts(snapshot, peer, source_quality)
+            field_source_quality = cls._evidence_field_index(snapshot, peer)
+            features = cls._trusted_facts(
+                snapshot,
+                peer,
+                source_quality,
+                field_source_quality,
+            )
             if any(
                 not key.startswith("_")
                 and key not in {"recognition_quality", "theme_quality"}
@@ -701,7 +927,7 @@ class ModeFeatureBuilder:
             _comparable_datetime(quality_as_of, snapshot.as_of) > snapshot.as_of
         ):
             return False
-        if source_quality.get("quote") == "invalid":
+        if "invalid" in source_quality.values():
             return False
         return True
 
@@ -718,10 +944,10 @@ class ModeFeatureBuilder:
             return None
         if _comparable_datetime(captured_at, snapshot.as_of) > snapshot.as_of:
             return None
-        if not cls._has_ready_evidence(
-            snapshot,
-            candidate.evidence,
-            allowed_sources={"tencent", "quote", "market_quote"},
+        trust_quality = raw.get("_trust_quality")
+        if not isinstance(trust_quality, Mapping) or any(
+            trust_quality.get(key) != "ready"
+            for key in ("price", "captured_at")
         ):
             return None
         return price
@@ -773,6 +999,19 @@ class ModeFeatureBuilder:
         pullback = max(valid_supports) if valid_supports else (
             reference_price * (1 - self.hard_stop_pct / 100)
         )
+        rounded_pullback = round(pullback, 2)
+        hard_stop = round(
+            reference_price * (1 - self.hard_stop_pct / 100),
+            2,
+        )
+        if valid_supports:
+            pullback_quality = (
+                "ready"
+                if hard_stop < rounded_pullback <= reference_price
+                else "invalid"
+            )
+        else:
+            pullback_quality = "fallback"
         prior_high = _first_number(
             raw,
             ("prior_n_day_high", "n_day_high_price", "prior_high"),
@@ -785,18 +1024,13 @@ class ModeFeatureBuilder:
             maximum=0,
         )
         return {
-            "planned_pullback_price": round(pullback, 2),
-            "planned_pullback_quality": "ready"
-            if valid_supports
-            else "fallback",
+            "planned_pullback_price": rounded_pullback,
+            "planned_pullback_quality": pullback_quality,
             "planned_breakout_price": round(
                 breakout_base + self.market_tick,
                 2,
             ),
-            "hard_stop_price": round(
-                reference_price * (1 - self.hard_stop_pct / 100),
-                2,
-            ),
+            "hard_stop_price": hard_stop,
             "exit_change_pct_floor": max(-5.0, raw_exit)
             if raw_exit is not None
             else -5.0,
@@ -828,30 +1062,49 @@ class ModeFeatureBuilder:
 
     @staticmethod
     def _board_height(raw: Mapping[str, Any]) -> Optional[int]:
-        number = _first_number(
-            raw,
-            (
-                "board_height",
-                "review_today_continuous_days",
-                "today_continuous_days",
-                "continuous_days",
-            ),
-            minimum=0,
-            maximum=100,
-            integer=True,
-        )
-        if number is not None:
-            return int(number)
-        realtime = raw.get("realtime_limit_up_fact")
-        if isinstance(realtime, Mapping):
+        values = []
+        for facts in _fact_sources(raw):
             number = _first_number(
-                realtime,
-                ("board_height", "continuous_days", "consecutive_days"),
+                facts,
+                (
+                    "board_height",
+                    "review_today_continuous_days",
+                    "today_continuous_days",
+                    "continuous_days",
+                    "consecutive_days",
+                ),
                 minimum=0,
                 maximum=100,
                 integer=True,
             )
-        return int(number) if number is not None else None
+            if number is not None:
+                values.append(int(number))
+        unique = set(values)
+        return unique.pop() if len(unique) == 1 else None
+
+    @staticmethod
+    def _board_height_quality(raw: Mapping[str, Any]) -> str:
+        values = []
+        for facts in _fact_sources(raw):
+            number = _first_number(
+                facts,
+                (
+                    "board_height",
+                    "review_today_continuous_days",
+                    "today_continuous_days",
+                    "continuous_days",
+                    "consecutive_days",
+                ),
+                minimum=0,
+                maximum=100,
+                integer=True,
+            )
+            if number is not None:
+                values.append(int(number))
+        unique = set(values)
+        if len(unique) > 1:
+            return "degraded"
+        return "ready" if unique else "missing"
 
     @staticmethod
     def _sealed(raw: Mapping[str, Any]) -> Optional[bool]:
@@ -864,6 +1117,24 @@ class ModeFeatureBuilder:
                 "is_sealed",
             ),
         )
+
+    @staticmethod
+    def _sealed_quality(raw: Mapping[str, Any]) -> str:
+        values = {
+            value
+            for facts in _fact_sources(raw)
+            for name in (
+                "sealed",
+                "review_today_sealed_close",
+                "today_sealed_close",
+                "is_sealed",
+            )
+            for value in (_strict_flag(facts.get(name)),)
+            if name in facts and isinstance(value, bool)
+        }
+        if len(values) > 1:
+            return "degraded"
+        return "ready" if values else "missing"
 
     @classmethod
     def _high_position(
@@ -1423,17 +1694,14 @@ class ModeFeatureBuilder:
     ) -> Optional[bool]:
         if snapshot.stage != "preclose":
             return False
-        if raw.get("automation_level") == "manual_only":
-            return False
-        entry = _first_flag(raw, ("tail_entry_satisfied",))
-        invalidated = _first_flag(raw, ("tail_invalidation_satisfied",))
-        if invalidated is True:
+        if snapshot.quality.stale:
             return False
         captured_at = _parse_datetime(raw.get("captured_at"))
-        quote_ready = self._has_ready_evidence(
-            snapshot,
-            candidate.evidence,
-            allowed_sources={"tencent", "quote", "market_quote"},
+        trust_quality = raw.get("_trust_quality")
+        quote_ready = (
+            isinstance(trust_quality, Mapping)
+            and trust_quality.get("price") == "ready"
+            and trust_quality.get("captured_at") == "ready"
         )
         if captured_at is None or not quote_ready:
             fresh = None
@@ -1442,12 +1710,7 @@ class ModeFeatureBuilder:
                 snapshot.as_of - _comparable_datetime(captured_at, snapshot.as_of)
             ).total_seconds()
             fresh = 0 <= age <= self.quote_fresh_seconds
-        return self._all_flags(
-            snapshot.quality.status == "ready" and not snapshot.quality.stale,
-            fresh,
-            entry,
-            not invalidated if invalidated is not None else None,
-        )
+        return fresh
 
     @staticmethod
     def _all_flags(*values: Optional[bool]) -> Optional[bool]:
@@ -1466,6 +1729,16 @@ class ModeFeatureBuilder:
             else None
         )
         if value is None:
+            if (
+                key
+                in {
+                    "high_position",
+                    "same_level_turnover",
+                    "low_position_new_start",
+                }
+                and raw.get("_current_board_height_quality") == "degraded"
+            ):
+                return "degraded"
             return (
                 "degraded"
                 if source_state in {"degraded", "invalid"}
