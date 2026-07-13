@@ -1488,6 +1488,15 @@ class TradingPlanService:
             reference_price * (1 - hard_stop / 100),
             2,
         )
+        for key in (
+            "entry_trigger_json",
+            "invalidation_json",
+            "exit_trigger_json",
+        ):
+            cls._validate_trigger_bounds(
+                values[key],
+                key.removesuffix("_json"),
+            )
         if override:
             audit = values["manual_overrides_json"]
             for key in (

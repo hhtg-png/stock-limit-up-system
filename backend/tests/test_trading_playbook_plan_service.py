@@ -1076,6 +1076,81 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(plan_count, 1)
 
+    async def test_revise_rejects_post_reprice_invalidation_contradiction_without_child(self):
+        async with self.Session() as db:
+            generated = await self._generate(
+                db,
+                [_evaluation("leader", "000001")],
+            )
+            parent_before = await self.service.serialize(db, generated["id"])
+            candidate_id = generated["candidates"][0]["id"]
+
+            with self.assertRaisesRegex(ValueError, "contradictory invalidation"):
+                await self.service.revise(
+                    db,
+                    generated["id"],
+                    {
+                        "change_note": "重算后止损矛盾",
+                        "candidate_overrides": [
+                            {
+                                "candidate_id": candidate_id,
+                                "entry_trigger": {"reference_price": 5},
+                                "invalidation": {"price_gte": 9},
+                            }
+                        ],
+                    },
+                )
+
+            parent_after = await self.service.serialize(db, generated["id"])
+            plan_count = await db.scalar(
+                select(func.count()).select_from(TradingPlanVersion)
+            )
+
+        self.assertEqual(plan_count, 1)
+        self.assertEqual(parent_after, parent_before)
+
+    async def test_revise_allows_final_stop_boundaries_and_reference_only_change(self):
+        cases = [
+            ("equal", {"reference_price": 10}, {"price_gte": 9.5}, 9.5),
+            ("below", {"reference_price": 10}, {"price_gte": 9}, 9.5),
+            ("reference-only", {"reference_price": 5}, None, 4.75),
+        ]
+        async with self.Session() as db:
+            generated = await self._generate(
+                db,
+                [_evaluation("leader", "000001")],
+            )
+            candidate_id = generated["candidates"][0]["id"]
+            for case, entry, invalidation, expected_stop in cases:
+                override = {
+                    "candidate_id": candidate_id,
+                    "entry_trigger": entry,
+                }
+                if invalidation is not None:
+                    override["invalidation"] = invalidation
+                child = await self.service.revise(
+                    db,
+                    generated["id"],
+                    {
+                        "change_note": case,
+                        "candidate_overrides": [override],
+                    },
+                )
+                payload = await self.service.serialize(db, child.id)
+                revised = payload["candidates"][0]
+
+                with self.subTest(case=case):
+                    self.assertEqual(
+                        revised["invalidation_json"]["price_lte"],
+                        expected_stop,
+                    )
+                    self.assertEqual(
+                        revised["manual_overrides_json"]["invalidation_json"][
+                            "price_lte"
+                        ],
+                        expected_stop,
+                    )
+
     async def test_confirm_activates_target_and_supersedes_old_target_active(self):
         other_target = TARGET_DATE + timedelta(days=1)
         async with self.Session() as db:
