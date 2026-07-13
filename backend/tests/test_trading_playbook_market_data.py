@@ -1759,7 +1759,7 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
 
         trade_date = date(2026, 7, 10)
         as_of = datetime(2026, 7, 13, 9, 30)
-        codes = ("000001", "000002", "000003")
+        codes = ("000001", "000002", "000003", "000004")
         accepted_at = datetime(2026, 7, 10, 15)
         async with self.session_factory() as db:
             db.add_all(
@@ -1789,22 +1789,32 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
                     {
                         "stock_code": "000001",
                         "reason_category": "future",
-                        "captured_at": as_of + timedelta(seconds=1),
+                        "_collected_at": as_of + timedelta(seconds=1),
                     },
                     {
                         "stock_code": "000002",
-                        "reason_category": "unproven historical",
-                        "updated_at": trade_date.isoformat(),
+                        "reason_category": "event times only",
+                        "first_limit_up_time": datetime(2026, 7, 10, 9, 31),
+                        "final_seal_time": datetime(2026, 7, 10, 10, 5),
+                        "datetime": datetime(2026, 7, 10, 10, 5),
+                        "timestamp": datetime(2026, 7, 10, 10, 5),
+                        "quote_time": datetime(2026, 7, 10, 10, 5),
+                        "time": "10:05:00",
                     },
                     {
                         "stock_code": "000003",
                         "reason_category": "accepted",
-                        "updated_at": accepted_at,
+                        "_collected_at": accepted_at,
                         "seal_amount": math.nan,
                         "nested_quality": {
                             "valid_ratio": 1.0,
                             "invalid_ratio": math.inf,
                         },
+                    },
+                    {
+                        "stock_code": "000004",
+                        "reason_category": "date only",
+                        "updated_at": trade_date.isoformat(),
                     },
                 ]
 
@@ -1826,7 +1836,14 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
             )
 
         candidates = {item.stock_code: item for item in snapshot.candidates}
-        for code in ("000001", "000002"):
+        self.assertEqual(snapshot.quality.status, "degraded")
+        self.assertTrue(
+            any(
+                "future realtime row for 000001" in warning
+                for warning in snapshot.quality.warnings
+            )
+        )
+        for code in ("000001", "000002", "000004"):
             self.assertNotIn(
                 "realtime_limit_up_fact",
                 candidates[code].features,

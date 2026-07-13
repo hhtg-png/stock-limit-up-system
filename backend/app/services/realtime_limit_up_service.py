@@ -14,6 +14,7 @@ import copy
 import time
 from datetime import date, datetime
 from typing import Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 import httpx
 from loguru import logger
@@ -225,7 +226,14 @@ class RealtimeLimitUpService:
 
             sealed_data = em_crawler.parse(sealed_resp.json(), is_sealed=True)
             opened_data = em_crawler.parse(opened_resp.json(), is_sealed=False)
-            merged = sealed_data + opened_data
+            collected_at = datetime.now(ZoneInfo("Asia/Shanghai"))
+            merged = []
+            for item in sealed_data + opened_data:
+                stamped = dict(item)
+                # Contract: this aware timestamp records the successful pool
+                # refresh and remains unchanged for the lifetime of the cache.
+                stamped["_collected_at"] = collected_at
+                merged.append(stamped)
 
             self._pool_cache[trade_date] = merged
             self._pool_cache_time[trade_date] = time.time()

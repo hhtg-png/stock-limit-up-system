@@ -1242,12 +1242,6 @@ class TradingPlaybookMarketDataProvider:
             "collected_at",
             "collection_time",
             "generated_at",
-            "datetime",
-            "timestamp",
-            "quote_time",
-            "time",
-            "final_seal_time",
-            "first_limit_up_time",
         ):
             if key not in row or row[key] in (None, ""):
                 continue

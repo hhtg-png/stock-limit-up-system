@@ -1,13 +1,73 @@
 import time
 import unittest
 from datetime import date, datetime
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
+from zoneinfo import ZoneInfo
 
 import app.services.realtime_limit_up_service as realtime_limit_up_module
 from app.services.realtime_limit_up_service import RealtimeLimitUpService
 
 
 class RealtimeLimitUpServiceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_successful_pool_refresh_stamps_rows_once_and_cache_preserves_it(self):
+        service = RealtimeLimitUpService()
+        trade_date = date(2026, 7, 13)
+        collected_at = datetime(
+            2026,
+            7,
+            13,
+            9,
+            30,
+            tzinfo=ZoneInfo("Asia/Shanghai"),
+        )
+        sealed_response = MagicMock()
+        sealed_response.json.return_value = {"pool": "sealed"}
+        opened_response = MagicMock()
+        opened_response.json.return_value = {"pool": "opened"}
+        client = MagicMock()
+        client.get = AsyncMock(
+            side_effect=[sealed_response, opened_response]
+        )
+        client_context = MagicMock()
+        client_context.__aenter__ = AsyncMock(return_value=client)
+        client_context.__aexit__ = AsyncMock(return_value=None)
+
+        with patch.object(
+            realtime_limit_up_module.httpx,
+            "AsyncClient",
+            return_value=client_context,
+        ), patch.object(
+            realtime_limit_up_module.em_crawler,
+            "parse",
+            side_effect=[
+                [{"stock_code": "000001"}],
+                [{"stock_code": "000002"}],
+            ],
+        ), patch.object(
+            realtime_limit_up_module,
+            "datetime",
+            wraps=datetime,
+        ) as datetime_mock:
+            datetime_mock.now.return_value = collected_at
+            refreshed = await service._refresh_pool_cache(trade_date)
+            datetime_mock.now.return_value = collected_at.replace(
+                minute=31
+            )
+            cached = await service.get_fast_limit_up_pool(trade_date)
+
+        self.assertEqual(
+            [row["_collected_at"] for row in refreshed],
+            [collected_at, collected_at],
+        )
+        self.assertEqual(
+            [row["_collected_at"] for row in cached],
+            [collected_at, collected_at],
+        )
+        self.assertEqual(
+            [row["_collected_at"] for row in service._pool_cache[trade_date]],
+            [collected_at, collected_at],
+        )
+
     async def test_get_fast_limit_up_pool_can_wait_for_stale_refresh_before_returning(self):
         service = RealtimeLimitUpService()
         trade_date = date(2026, 4, 23)
