@@ -427,8 +427,8 @@ class TradingPlaybookOrchestratorTests(unittest.IsolatedAsyncioTestCase):
         valid_cases = (
             ("preclose", SOURCE_DATE, datetime(2026, 7, 10, 14, 40, tzinfo=CN_TZ)),
             ("after_close", SOURCE_DATE, datetime(2026, 7, 10, 15, 30, tzinfo=CN_TZ)),
-            ("overnight", TARGET_DATE, datetime(2026, 7, 13, 0, 0, tzinfo=CN_TZ)),
-            ("auction", TARGET_DATE, datetime(2026, 7, 13, 9, 15, tzinfo=CN_TZ)),
+            ("overnight", TARGET_DATE, datetime(2026, 7, 13, 8, 50, tzinfo=CN_TZ)),
+            ("auction", TARGET_DATE, datetime(2026, 7, 13, 9, 26, tzinfo=CN_TZ)),
         )
         for stage, source, as_of in valid_cases:
             with self.subTest(stage=stage, as_of=as_of):
@@ -478,16 +478,6 @@ class TradingPlaybookOrchestratorTests(unittest.IsolatedAsyncioTestCase):
                 SOURCE_DATE,
                 datetime(2026, 7, 10, 15, 29, 59, tzinfo=CN_TZ),
             ),
-            (
-                "overnight",
-                TARGET_DATE,
-                datetime(2026, 7, 13, 9, 15, tzinfo=CN_TZ),
-            ),
-            (
-                "auction",
-                TARGET_DATE,
-                datetime(2026, 7, 13, 9, 30, tzinfo=CN_TZ),
-            ),
         )
         for stage, source, as_of in invalid_cases:
             with self.subTest(stage=stage, as_of=as_of):
@@ -507,6 +497,82 @@ class TradingPlaybookOrchestratorTests(unittest.IsolatedAsyncioTestCase):
                     )
                 provider.build_market_snapshot.assert_not_awaited()
                 resolver.assert_not_called()
+
+    async def test_overnight_and_auction_catchup_windows_require_degraded_late_runs(self):
+        accepted = (
+            ("overnight", 9, 15, False),
+            ("overnight", 9, 25, False),
+            ("auction", 9, 26, False),
+            ("auction", 9, 29, False),
+            ("auction", 9, 30, True),
+            ("auction", 10, 0, True),
+        )
+        for stage, hour, minute, degraded in accepted:
+            with self.subTest(
+                accepted=True,
+                stage=stage,
+                hour=hour,
+                minute=minute,
+                degraded=degraded,
+            ):
+                as_of = datetime(
+                    2026, 7, 13, hour, minute, tzinfo=CN_TZ
+                )
+                provider = _EchoMarketData()
+                orchestrator = TradingPlaybookOrchestrator(
+                    market_data=provider,
+                    analyzer=_CopyAnalyzer(),
+                    feature_builder=_FeatureBuilder(),
+                    matcher=_Matcher(),
+                    plan_service=_PlanService(),
+                    next_trade_date=lambda value: TARGET_DATE,
+                )
+                await orchestrator.build_stage(
+                    object(), TARGET_DATE, stage, as_of, degraded=degraded
+                )
+                self.assertIs(provider.calls[0]["as_of"], as_of)
+                self.assertIs(
+                    provider.calls[0]["force_degraded"], degraded
+                )
+
+        rejected = (
+            ("overnight", 9, 26, False),
+            ("auction", 9, 15, False),
+            ("auction", 9, 25, False),
+            ("auction", 9, 30, False),
+            ("auction", 10, 0, False),
+            ("auction", 15, 0, True),
+        )
+        for stage, hour, minute, degraded in rejected:
+            with self.subTest(
+                accepted=False,
+                stage=stage,
+                hour=hour,
+                minute=minute,
+                degraded=degraded,
+            ):
+                provider = AsyncMock()
+                orchestrator = TradingPlaybookOrchestrator(
+                    market_data=provider,
+                    analyzer=_CopyAnalyzer(),
+                    feature_builder=_FeatureBuilder(),
+                    matcher=_Matcher(),
+                    plan_service=_PlanService(),
+                    next_trade_date=lambda value: TARGET_DATE,
+                )
+                with self.assertRaisesRegex(
+                    ValueError, "window|degraded"
+                ):
+                    await orchestrator.build_stage(
+                        object(),
+                        TARGET_DATE,
+                        stage,
+                        datetime(
+                            2026, 7, 13, hour, minute, tzinfo=CN_TZ
+                        ),
+                        degraded=degraded,
+                    )
+                provider.build_market_snapshot.assert_not_awaited()
 
     async def test_invalid_inputs_and_calendar_results_stop_before_provider(self):
         invalid_inputs = (

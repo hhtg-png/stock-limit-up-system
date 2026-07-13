@@ -175,11 +175,13 @@ class TradingPlaybookOrchestrator:
         valid_window = {
             "preclose": time(14, 40) <= local_time < time(15, 0),
             "after_close": local_time >= time(15, 30),
-            "overnight": time(0, 0) <= local_time < time(9, 15),
-            "auction": time(9, 15) <= local_time < time(9, 30),
+            "overnight": time(8, 50) <= local_time < time(9, 26),
+            "auction": time(9, 26) <= local_time < time(15, 0),
         }[stage]
         if not valid_window:
             raise ValueError(f"as_of is outside the {stage} Beijing window")
+        if stage == "auction" and local_time >= time(9, 30) and not degraded:
+            raise ValueError("auction catch-up at or after 09:30 must be degraded")
 
     def _target_trade_date(self, source_trade_date: date, stage: str) -> date:
         if stage not in self._NEXT_DAY_STAGES:
