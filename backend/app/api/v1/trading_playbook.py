@@ -1,0 +1,537 @@
+"""REST API for the standalone, manually confirmed trading playbook."""
+
+from __future__ import annotations
+
+import copy
+import math
+from collections.abc import Mapping
+from datetime import date, datetime
+from typing import Any
+from zoneinfo import ZoneInfo
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.database import get_db
+from app.models.trading_playbook import (
+    TradingAlertEvent,
+    TradingModeRule,
+    TradingPlanVersion,
+    TradingPlaybookSettings,
+)
+from app.schemas.trading_playbook import (
+    ManualExecutionUpdate,
+    PlanConfirmRequest,
+    PlanGenerateRequest,
+    PlanRevisionRequest,
+    TradingPlaybookSettingsUpdate,
+)
+from app.services.trading_playbook.plan_service import TradingPlanService
+
+
+router = APIRouter()
+CN_TZ = ZoneInfo("Asia/Shanghai")
+_plan_service = TradingPlanService()
+
+
+def get_trading_playbook_now() -> datetime:
+    """Injectable Beijing clock shared by all API-side state changes."""
+    return datetime.now(CN_TZ)
+
+
+def get_trading_playbook_orchestrator(request: Request):
+    """Return the one app-owned pipeline; Task 9 wires it during startup."""
+    orchestrator = getattr(
+        request.app.state,
+        "trading_playbook_orchestrator",
+        None,
+    )
+    if orchestrator is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Trading playbook orchestrator is not configured",
+        )
+    return orchestrator
+
+
+def get_trading_playbook_review_service(request: Request):
+    """Return the app-owned review service once Task 11 installs it."""
+    service = getattr(
+        request.app.state,
+        "trading_playbook_review_service",
+        None,
+    )
+    if service is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Trading playbook review service is not configured",
+        )
+    return service
+
+
+def _china_iso(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    if value.tzinfo is None or value.utcoffset() is None:
+        value = value.replace(tzinfo=CN_TZ)
+    else:
+        value = value.astimezone(CN_TZ)
+    return value.isoformat()
+
+
+def _json_value(value: Any) -> Any:
+    """Detach JSON columns and keep malformed-but-readable audit values visible."""
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else str(value)
+    if isinstance(value, datetime):
+        return _china_iso(value)
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, Mapping):
+        return {str(key): _json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_value(item) for item in value]
+    return str(value)
+
+
+def _priority(rule: TradingModeRule) -> tuple[int, float]:
+    prerequisites = rule.prerequisites_json
+    if not isinstance(prerequisites, Mapping):
+        return (1, 0)
+    value = prerequisites.get("priority")
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+    ):
+        return (1, 0)
+    return (0, float(value))
+
+
+def _serialize_rule(rule: TradingModeRule) -> dict[str, Any]:
+    return {
+        "id": rule.id,
+        "mode_key": rule.mode_key,
+        "version": rule.version,
+        "name": rule.name,
+        "family": rule.family,
+        "style": rule.style,
+        "window": rule.window,
+        "automation_level": rule.automation_level,
+        "description": rule.description,
+        "prerequisites_json": _json_value(rule.prerequisites_json),
+        "candidate_filters_json": _json_value(rule.candidate_filters_json),
+        "entry_trigger_json": _json_value(rule.entry_trigger_json),
+        "invalidation_json": _json_value(rule.invalidation_json),
+        "exit_trigger_json": _json_value(rule.exit_trigger_json),
+        "risk_guidance_json": _json_value(rule.risk_guidance_json),
+        "source_refs_json": _json_value(rule.source_refs_json),
+        "enabled": bool(rule.enabled),
+        "content_hash": rule.content_hash,
+        "created_at": _china_iso(rule.created_at),
+    }
+
+
+def _serialize_alert(alert: TradingAlertEvent) -> dict[str, Any]:
+    return {
+        "id": alert.id,
+        "plan_version_id": alert.plan_version_id,
+        "candidate_id": alert.candidate_id,
+        "event_type": alert.event_type,
+        "severity": alert.severity,
+        "dedup_key": alert.dedup_key,
+        "triggered_at": _china_iso(alert.triggered_at),
+        "market_snapshot_json": _json_value(alert.market_snapshot_json or {}),
+        "message": alert.message,
+        "channel_status_json": _json_value(alert.channel_status_json or {}),
+        "acknowledged_at": _china_iso(alert.acknowledged_at),
+    }
+
+
+def _serialize_settings(row: TradingPlaybookSettings) -> dict[str, Any]:
+    return {
+        "id": row.id,
+        "enabled": bool(row.enabled),
+        "trial_position_pct": row.trial_position_pct,
+        "confirmed_position_pct": row.confirmed_position_pct,
+        "hard_stop_pct": row.hard_stop_pct,
+        "max_action_candidates": row.max_action_candidates,
+        "in_app_enabled": bool(row.in_app_enabled),
+        "wechat_enabled": bool(row.wechat_enabled),
+        "updated_at": _china_iso(row.updated_at),
+    }
+
+
+def _serialize_review(review: Any) -> dict[str, Any]:
+    if isinstance(review, Mapping):
+        return _json_value(copy.deepcopy(dict(review)))
+    fields = (
+        "id",
+        "trade_date",
+        "plan_version_id",
+        "signal_review_json",
+        "manual_execution_json",
+        "plan_compliance_json",
+        "outcome_snapshot_json",
+        "data_quality_json",
+        "generated_at",
+        "finalized_at",
+    )
+    return _json_value({field: getattr(review, field) for field in fields})
+
+
+async def _settings_row(
+    db: AsyncSession,
+) -> tuple[TradingPlaybookSettings, bool]:
+    return await _plan_service._get_or_create_settings(db)
+
+
+@router.get("/rules", summary="查询交易模式规则")
+async def list_rules(db: AsyncSession = Depends(get_db)):
+    rows = list(
+        (
+            await db.scalars(
+                select(TradingModeRule).where(TradingModeRule.enabled.is_(True))
+            )
+        ).all()
+    )
+    rows.sort(
+        key=lambda row: (
+            str(row.family or ""),
+            _priority(row),
+            str(row.mode_key or ""),
+            row.version,
+            row.id,
+        )
+    )
+    return {"items": [_serialize_rule(row) for row in rows]}
+
+
+@router.post("/plans/generate", summary="补跑指定预案阶段")
+async def generate_plan(
+    request: PlanGenerateRequest,
+    db: AsyncSession = Depends(get_db),
+    orchestrator: Any = Depends(get_trading_playbook_orchestrator),
+    now: datetime = Depends(get_trading_playbook_now),
+):
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise HTTPException(status_code=503, detail="Trading playbook clock is invalid")
+    try:
+        result = await orchestrator.build_stage(
+            db,
+            request.source_trade_date,
+            request.stage,
+            now.astimezone(CN_TZ),
+        )
+        if isinstance(result, TradingPlanVersion):
+            return await _plan_service.serialize(db, result)
+        if isinstance(result, Mapping):
+            return _json_value(copy.deepcopy(dict(result)))
+        raise HTTPException(
+            status_code=503,
+            detail="Trading playbook pipeline returned an invalid result",
+        )
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail="Plan generation conflict") from exc
+    except RuntimeError as exc:
+        await db.rollback()
+        message = str(exc).lower()
+        conflict = any(
+            marker in message
+            for marker in (
+                "unique plan version",
+                "singleton playbook settings",
+                "could not generate plan",
+            )
+        )
+        raise HTTPException(
+            status_code=409 if conflict else 503,
+            detail=str(exc) if conflict else "Trading playbook pipeline failed",
+        ) from exc
+    except (ConnectionError, TimeoutError, OSError) as exc:
+        await db.rollback()
+        raise HTTPException(
+            status_code=503,
+            detail="Trading playbook market data is unavailable",
+        ) from exc
+    except Exception:
+        await db.rollback()
+        raise
+
+
+@router.get("/plans", summary="查询交易日全部预案版本")
+async def list_plans(
+    trade_date: date = Query(...),
+    db: AsyncSession = Depends(get_db),
+):
+    plans = list(
+        (
+            await db.scalars(
+                select(TradingPlanVersion)
+                .where(TradingPlanVersion.target_trade_date == trade_date)
+                .order_by(
+                    TradingPlanVersion.generated_at.desc(),
+                    TradingPlanVersion.id.desc(),
+                )
+            )
+        ).all()
+    )
+    return {
+        "items": [await _plan_service.serialize(db, plan) for plan in plans]
+    }
+
+
+@router.get("/plans/{plan_id}", summary="查询预案详情")
+async def get_plan(plan_id: int, db: AsyncSession = Depends(get_db)):
+    payload = await _plan_service.serialize(db, plan_id)
+    if payload is None:
+        raise HTTPException(status_code=404, detail="Trading plan not found")
+    return payload
+
+
+@router.put("/plans/{plan_id}", summary="创建人工修订版本")
+async def revise_plan(
+    plan_id: int,
+    request: PlanRevisionRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    if await db.get(TradingPlanVersion, plan_id) is None:
+        raise HTTPException(status_code=404, detail="Trading plan not found")
+    changes = request.model_dump(mode="python", exclude_unset=True)
+    try:
+        child = await _plan_service.revise(db, plan_id, changes)
+        return await _plan_service.serialize(db, child)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (IntegrityError, RuntimeError) as exc:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail="Plan revision conflict") from exc
+    except Exception:
+        await db.rollback()
+        raise
+
+
+@router.post("/plans/{plan_id}/confirm", summary="确认并激活预案")
+async def confirm_plan(
+    plan_id: int,
+    request: PlanConfirmRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    if await db.get(TradingPlanVersion, plan_id) is None:
+        raise HTTPException(status_code=404, detail="Trading plan not found")
+    try:
+        plan = await _plan_service.confirm(db, plan_id, request.confirmed_by)
+        return await _plan_service.serialize(db, plan)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (IntegrityError, RuntimeError) as exc:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail="Plan confirmation conflict") from exc
+    except Exception:
+        await db.rollback()
+        raise
+
+
+@router.post("/plans/{plan_id}/cancel", summary="取消预案")
+async def cancel_plan(plan_id: int, db: AsyncSession = Depends(get_db)):
+    plan = await db.get(TradingPlanVersion, plan_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="Trading plan not found")
+    if plan.status not in {"draft", "active"}:
+        raise HTTPException(status_code=409, detail="Trading plan cannot be cancelled")
+    plan.status = "expired"
+    try:
+        await db.commit()
+        return await _plan_service.serialize(db, plan)
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail="Plan cancellation conflict") from exc
+    except SQLAlchemyError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=503, detail="Plan cancellation failed") from exc
+    except Exception:
+        await db.rollback()
+        raise
+
+
+@router.get("/alerts", summary="查询独立交易预案提醒")
+async def list_alerts(
+    unread_only: bool = Query(False),
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    db: AsyncSession = Depends(get_db),
+):
+    statement = select(TradingAlertEvent)
+    if unread_only:
+        statement = statement.where(TradingAlertEvent.acknowledged_at.is_(None))
+    statement = statement.order_by(
+        TradingAlertEvent.triggered_at.desc(),
+        TradingAlertEvent.id.desc(),
+    ).offset(offset).limit(limit)
+    rows = list((await db.scalars(statement)).all())
+    return {
+        "items": [_serialize_alert(row) for row in rows],
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+@router.post("/alerts/{alert_id}/ack", summary="确认交易预案提醒已读")
+async def acknowledge_alert(
+    alert_id: int,
+    db: AsyncSession = Depends(get_db),
+    now: datetime = Depends(get_trading_playbook_now),
+):
+    alert = await db.get(TradingAlertEvent, alert_id)
+    if alert is None:
+        raise HTTPException(status_code=404, detail="Trading alert not found")
+    if alert.acknowledged_at is not None:
+        return _serialize_alert(alert)
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise HTTPException(status_code=503, detail="Trading playbook clock is invalid")
+    alert.acknowledged_at = now.astimezone(CN_TZ)
+    try:
+        await db.commit()
+        return _serialize_alert(alert)
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail="Alert acknowledgement conflict") from exc
+    except SQLAlchemyError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=503, detail="Alert acknowledgement failed") from exc
+    except Exception:
+        await db.rollback()
+        raise
+
+
+@router.put("/reviews/{trade_date}", summary="记录人工执行情况")
+async def update_manual_execution(
+    trade_date: date,
+    request: ManualExecutionUpdate,
+    db: AsyncSession = Depends(get_db),
+    review_service: Any = Depends(get_trading_playbook_review_service),
+):
+    executions = {
+        key: value.model_dump(mode="python", exclude_unset=True)
+        for key, value in request.executions.items()
+    }
+    try:
+        review = await review_service.update_manual_execution(
+            db,
+            trade_date,
+            executions,
+        )
+        return _serialize_review(review)
+    except ValueError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail="Review update conflict") from exc
+    except SQLAlchemyError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=503, detail="Review update failed") from exc
+    except Exception:
+        await db.rollback()
+        raise
+
+
+@router.get("/settings", summary="查询交易预案设置")
+async def get_settings(
+    db: AsyncSession = Depends(get_db),
+    now: datetime = Depends(get_trading_playbook_now),
+):
+    try:
+        row, created = await _settings_row(db)
+        must_disable_wechat = row.wechat_enabled is not False
+        if created or must_disable_wechat:
+            if now.tzinfo is None or now.utcoffset() is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Trading playbook clock is invalid",
+                )
+            row.wechat_enabled = False
+            row.updated_at = now.astimezone(CN_TZ)
+            await db.commit()
+        return _serialize_settings(row)
+    except HTTPException:
+        await db.rollback()
+        raise
+    except IntegrityError:
+        await db.rollback()
+        row = await db.get(TradingPlaybookSettings, 1)
+        if row is None:
+            raise HTTPException(status_code=409, detail="Settings creation conflict")
+        return _serialize_settings(row)
+    except SQLAlchemyError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=503, detail="Settings are unavailable") from exc
+    except Exception:
+        await db.rollback()
+        raise
+
+
+@router.put("/settings", summary="修改交易预案设置")
+async def update_settings(
+    request: TradingPlaybookSettingsUpdate,
+    db: AsyncSession = Depends(get_db),
+    now: datetime = Depends(get_trading_playbook_now),
+):
+    try:
+        row, _ = await _settings_row(db)
+        patch = request.model_dump(mode="python", exclude_unset=True)
+        trial = patch.get("trial_position_pct", row.trial_position_pct)
+        confirmed = patch.get(
+            "confirmed_position_pct",
+            row.confirmed_position_pct,
+        )
+        if trial > confirmed:
+            raise HTTPException(
+                status_code=422,
+                detail="trial_position_pct must not exceed confirmed_position_pct",
+            )
+        for field_name, value in patch.items():
+            setattr(row, field_name, value)
+        row.wechat_enabled = False
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Trading playbook clock is invalid",
+            )
+        row.updated_at = now.astimezone(CN_TZ)
+        _plan_service._risk_settings(row)
+        await db.commit()
+        return _serialize_settings(row)
+    except HTTPException:
+        await db.rollback()
+        raise
+    except ValueError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail="Settings update conflict") from exc
+    except SQLAlchemyError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=503, detail="Settings update failed") from exc
+    except Exception:
+        await db.rollback()
+        raise
+
+
+__all__ = [
+    "get_trading_playbook_now",
+    "get_trading_playbook_orchestrator",
+    "get_trading_playbook_review_service",
+    "router",
+]
