@@ -1,6 +1,15 @@
 import copy
 import math
+from datetime import date, datetime
 
+import pytest
+
+from app.services.trading_playbook import market_state as market_state_module
+from app.services.trading_playbook.domain import (
+    CandidateSnapshot,
+    DataQuality,
+    MarketSnapshot,
+)
 from app.services.trading_playbook.market_state import (
     MarketStateClassifier,
     RecognitionRanker,
@@ -75,6 +84,7 @@ class TestMarketStateClassifier:
             "seal_rate": 70,
             "limit_up_count": 20,
             "limit_up_count_prev": 20,
+            "divergence_days": 0,
         }
 
         assert classifier.classify(
@@ -114,6 +124,64 @@ class TestMarketStateClassifier:
         )["window"] == "second_divergence"
         assert classifier.classify(base)["window"] == "first_divergence"
 
+    @pytest.mark.parametrize(
+        ("current", "previous"),
+        [(None, 10), (10, None), (0, 0), (1, 0), (-1, 10), (10, -1)],
+    )
+    def test_unavailable_growth_never_fabricates_a_comparable_value(
+        self,
+        current,
+        previous,
+    ):
+        result = MarketStateClassifier().classify(
+            {
+                "limit_up_count": current,
+                "limit_up_count_prev": previous,
+                "trend_new_high_count": 8,
+                "trend_new_high_count_prev": 7,
+                "max_board_height": 6,
+                "seal_rate": 79,
+                "limit_down_count": 2,
+            }
+        )
+
+        assert result["limit_up_growth"] is None
+        assert result["style"] == "unknown"
+        assert result["window"] == "unknown"
+        assert result["quality"] == "degraded"
+        assert "limit_up_growth" in result["missing_fields"]
+
+    def test_explicit_finite_growth_can_replace_unavailable_count_history(self):
+        result = MarketStateClassifier().classify(
+            {
+                "limit_up_count": 82,
+                "limit_up_count_prev": 0,
+                "limit_up_growth": 0.95,
+                "max_board_height": 6,
+                "seal_rate": 79,
+                "limit_down_count": 2,
+                "trend_new_high_count": 8,
+                "trend_new_high_count_prev": 0,
+                "trend_growth": 0.14,
+            }
+        )
+
+        assert result["limit_up_growth"] == 0.95
+        assert result["trend_growth"] == 0.14
+        assert result["style"] == "board_flow"
+        assert result["window"] == "outbreak"
+
+    def test_direct_negative_rules_survive_other_missing_evidence(self):
+        chaos = MarketStateClassifier().classify({"limit_down_count": 10})
+        decline = MarketStateClassifier().classify({"negative_feedback": True})
+
+        assert chaos["style"] == "chaos_retreat"
+        assert chaos["window"] == "unknown"
+        assert chaos["quality"] == "degraded"
+        assert decline["style"] == "unknown"
+        assert decline["window"] == "decline"
+        assert decline["quality"] == "degraded"
+
     def test_missing_non_finite_and_zero_denominator_are_safe_and_deterministic(self):
         features = {
             "limit_up_count": 0,
@@ -131,18 +199,70 @@ class TestMarketStateClassifier:
         second = classifier.classify(features)
 
         assert first == second
-        assert first == {
-            "style": "dual_active",
-            "window": "first_divergence",
-            "limit_up_growth": 0.0,
-            "trend_growth": 0.0,
-        }
+        assert first["style"] == "unknown"
+        assert first["window"] == "unknown"
+        assert first["limit_up_growth"] is None
+        assert first["trend_growth"] is None
+        assert first["quality"] == "degraded"
+        assert first["missing_fields"] == sorted(first["missing_fields"])
+        assert {
+            "divergence_days",
+            "limit_down_count",
+            "limit_up_growth",
+            "seal_rate",
+            "trend_growth",
+            "trend_new_high_count",
+        }.issubset(first["missing_fields"])
         assert features.keys() == original.keys()
         for key, value in original.items():
             if isinstance(value, float) and math.isnan(value):
                 assert math.isnan(features[key])
             else:
                 assert features[key] == value
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("limit_down_count", -1),
+            ("max_board_height", -1),
+            ("seal_rate", -0.1),
+            ("seal_rate", 100.1),
+            ("divergence_days", -1),
+        ],
+    )
+    def test_out_of_range_classifier_evidence_is_missing(self, field, value):
+        features = {
+            "limit_up_count": 20,
+            "limit_up_count_prev": 10,
+            "trend_new_high_count": 8,
+            "trend_new_high_count_prev": 7,
+            "max_board_height": 3,
+            "seal_rate": 70,
+            "limit_down_count": 1,
+            "divergence_days": 0,
+        }
+        features[field] = value
+
+        result = MarketStateClassifier().classify(features)
+
+        assert result["quality"] == "degraded"
+        assert field in result["missing_fields"]
+
+    @pytest.mark.parametrize("value", [2, -1, "yes", "", object()])
+    def test_ambiguous_boolean_values_do_not_trigger_negative_rules(self, value):
+        result = MarketStateClassifier().classify(
+            {
+                "negative_feedback": value,
+                "sell_pressure_falling": value,
+                "breadth_recovered": value,
+                "sell_pressure_rising": value,
+            }
+        )
+
+        assert result["style"] == "unknown"
+        assert result["window"] == "unknown"
+        assert result["quality"] == "degraded"
+        assert "negative_feedback" in result["missing_fields"]
 
 
 class TestThemeRanker:
@@ -175,10 +295,17 @@ class TestThemeRanker:
         assert rows[1]["rank"] == 2
 
     def test_score_ties_are_broken_by_theme_name(self):
+        zero_evidence = {
+            "limit_up_count": 0,
+            "new_high_count": 0,
+            "sealed_count": 0,
+            "broken_count": 0,
+            "middle_army_strength": 0,
+        }
         rows = ThemeRanker().rank(
             [
-                {"theme_name": "Beta", "limit_up_count": 1},
-                {"theme_name": "Alpha", "limit_up_count": 1},
+                {"theme_name": "Beta", **zero_evidence},
+                {"theme_name": "Alpha", **zero_evidence},
             ]
         )
 
@@ -187,7 +314,7 @@ class TestThemeRanker:
             ("Beta", 2),
         ]
 
-    def test_invalid_numeric_evidence_is_neutral_without_mutating_input(self):
+    def test_invalid_numeric_evidence_is_missing_without_mutating_input(self):
         source = [
             {
                 "theme_name": "Beta",
@@ -206,13 +333,81 @@ class TestThemeRanker:
         second = ranker.rank(source)
 
         assert first == second
-        assert [(row["theme_name"], row["score"]) for row in first] == [
-            ("Alpha", 0.0),
-            ("Beta", 0.0),
+        assert [row["theme_name"] for row in first] == ["Alpha", "Beta"]
+        assert all(row["score"] is None and row["rank"] is None for row in first)
+        assert all(row["quality"] == "degraded" for row in first)
+        assert first[0]["missing_fields"] == [
+            "broken_count",
+            "limit_up_count",
+            "middle_army_strength",
+            "new_high_count",
+            "sealed_count",
         ]
         assert source[0].keys() == original[0].keys()
         assert math.isnan(source[0]["limit_up_count"])
         assert source[1] == original[1]
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "limit_up_count",
+            "new_high_count",
+            "sealed_count",
+            "broken_count",
+            "middle_army_strength",
+        ],
+    )
+    def test_negative_theme_evidence_is_missing(self, field):
+        evidence = {
+            "theme_name": "Alpha",
+            "limit_up_count": 1,
+            "new_high_count": 1,
+            "sealed_count": 1,
+            "broken_count": 1,
+            "middle_army_strength": 1,
+        }
+        evidence[field] = -1
+
+        row = ThemeRanker().rank([evidence])[0]
+
+        assert row["score"] is None
+        assert row["rank"] is None
+        assert row["missing_fields"] == [field]
+
+    def test_duplicate_theme_names_are_rejected(self):
+        evidence = {
+            "limit_up_count": 1,
+            "new_high_count": 1,
+            "sealed_count": 1,
+            "broken_count": 0,
+            "middle_army_strength": 1,
+        }
+
+        with pytest.raises(ValueError, match="duplicate theme_name: Alpha"):
+            ThemeRanker().rank(
+                [
+                    {"theme_name": "Alpha", **evidence},
+                    {"theme_name": "Alpha", **evidence},
+                ]
+            )
+
+    def test_empty_theme_name_is_degraded_and_unranked(self):
+        row = ThemeRanker().rank(
+            [
+                {
+                    "theme_name": "",
+                    "limit_up_count": 1,
+                    "new_high_count": 1,
+                    "sealed_count": 1,
+                    "broken_count": 0,
+                    "middle_army_strength": 1,
+                }
+            ]
+        )[0]
+
+        assert row["score"] is None
+        assert row["rank"] is None
+        assert row["missing_fields"] == ["theme_name"]
 
 
 class TestRecognitionRanker:
@@ -286,7 +481,7 @@ class TestRecognitionRanker:
         assert by_code["000001"]["influence_rank"] == 1
         assert rows[0]["stock_code"] == "000001"
 
-    def test_every_tie_is_broken_by_stock_code(self):
+    def test_equal_values_share_dense_ranks_and_stock_code_only_orders_output(self):
         common = {
             "first_limit_seconds": 34200,
             "board_height": 3,
@@ -304,8 +499,39 @@ class TestRecognitionRanker:
         assert [row["stock_code"] for row in rows] == ["000001", "000002"]
         assert rows[0]["recognition_rank"] == 1
         assert rows[0]["recognition_score"] == 5.0
-        assert rows[1]["recognition_rank"] == 2
-        assert rows[1]["recognition_score"] == 2.5
+        assert rows[1]["recognition_rank"] == 1
+        assert rows[1]["recognition_score"] == 5.0
+        for row in rows:
+            assert all(
+                row[key] == 1
+                for key in (
+                    "fastest_rank",
+                    "highest_rank",
+                    "hardest_rank",
+                    "resilience_rank",
+                    "influence_rank",
+                )
+            )
+
+    def test_dimension_ranks_are_dense_after_a_tie(self):
+        common = {
+            "board_height": 1,
+            "seal_strength": 1,
+            "resilience": 1,
+            "influence": 1,
+        }
+        rows = RecognitionRanker().rank(
+            [
+                {"stock_code": "000003", "first_limit_seconds": 35000, **common},
+                {"stock_code": "000002", "first_limit_seconds": 34000, **common},
+                {"stock_code": "000001", "first_limit_seconds": 34000, **common},
+            ]
+        )
+        by_code = {row["stock_code"]: row for row in rows}
+
+        assert by_code["000001"]["fastest_rank"] == 1
+        assert by_code["000002"]["fastest_rank"] == 1
+        assert by_code["000003"]["fastest_rank"] == 2
 
     def test_missing_and_non_finite_values_rank_last_without_mutation(self):
         source = [
@@ -353,6 +579,20 @@ class TestRecognitionRanker:
                 "influence_rank",
             )
         )
+        for row in first[1:]:
+            assert row["recognition_rank"] is None
+            assert row["recognition_score"] is None
+            assert row["quality"] == "degraded"
+            assert all(
+                row[key] is None
+                for key in (
+                    "fastest_rank",
+                    "highest_rank",
+                    "hardest_rank",
+                    "resilience_rank",
+                    "influence_rank",
+                )
+            )
         assert source[0].keys() == original[0].keys()
         assert math.isnan(source[0]["board_height"])
         assert source[1:] == original[1:]
@@ -387,3 +627,255 @@ class TestRecognitionRanker:
         ranker = RecognitionRanker()
 
         assert ranker.rank(source) == ranker.rank(list(reversed(source)))
+
+    def test_partial_evidence_omits_only_the_missing_dimensions_from_score(self):
+        rows = RecognitionRanker().rank(
+            [
+                {
+                    "stock_code": "000001",
+                    "first_limit_seconds": 34000,
+                    "board_height": None,
+                    "seal_strength": 5,
+                    "resilience": None,
+                    "influence": 2,
+                },
+                {
+                    "stock_code": "000002",
+                    "first_limit_seconds": 35000,
+                    "board_height": 2,
+                    "seal_strength": 4,
+                    "resilience": 3,
+                    "influence": 1,
+                },
+            ]
+        )
+        by_code = {row["stock_code"]: row for row in rows}
+        partial = by_code["000001"]
+
+        assert partial["highest_rank"] is None
+        assert partial["resilience_rank"] is None
+        assert partial["recognition_score"] == 3.0
+        assert partial["recognition_rank"] == 2
+        assert partial["quality"] == "degraded"
+        assert partial["missing_fields"] == ["board_height", "resilience"]
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "first_limit_seconds",
+            "board_height",
+            "seal_strength",
+            "resilience",
+            "influence",
+        ],
+    )
+    def test_negative_recognition_evidence_is_missing(self, field):
+        evidence = {
+            "stock_code": "000001",
+            "first_limit_seconds": 34000,
+            "board_height": 2,
+            "seal_strength": 4,
+            "resilience": 3,
+            "influence": 1,
+        }
+        evidence[field] = -1
+
+        row = RecognitionRanker().rank([evidence])[0]
+
+        expected_rank_key = {
+            "first_limit_seconds": "fastest_rank",
+            "board_height": "highest_rank",
+            "seal_strength": "hardest_rank",
+            "resilience": "resilience_rank",
+            "influence": "influence_rank",
+        }[field]
+        assert row[expected_rank_key] is None
+        assert field in row["missing_fields"]
+
+    def test_duplicate_stock_codes_are_rejected(self):
+        evidence = {
+            "first_limit_seconds": 34000,
+            "board_height": 2,
+            "seal_strength": 4,
+            "resilience": 3,
+            "influence": 1,
+        }
+
+        with pytest.raises(ValueError, match="duplicate stock_code: 000001"):
+            RecognitionRanker().rank(
+                [
+                    {"stock_code": "000001", **evidence},
+                    {"stock_code": "000001", **evidence},
+                ]
+            )
+
+    def test_empty_stock_code_is_degraded_and_unranked(self):
+        row = RecognitionRanker().rank(
+            [
+                {
+                    "stock_code": "",
+                    "first_limit_seconds": 34000,
+                    "board_height": 2,
+                    "seal_strength": 4,
+                    "resilience": 3,
+                    "influence": 1,
+                }
+            ]
+        )[0]
+
+        assert row["recognition_score"] is None
+        assert row["recognition_rank"] is None
+        assert row["missing_fields"] == ["stock_code"]
+
+
+class TestMarketStateAnalyzer:
+    @staticmethod
+    def _snapshot(*, complete: bool = True) -> MarketSnapshot:
+        as_of = datetime(2026, 7, 10, 15, 30)
+        if complete:
+            market_features = {
+                "limit_up_count": 82,
+                "limit_up_count_prev": 42,
+                "max_board_height": 6,
+                "seal_rate": 79,
+                "limit_down_count": 2,
+                "trend_new_high_count": 8,
+                "trend_new_high_count_prev": 7,
+                "divergence_days": 0,
+            }
+            theme_rankings = [
+                {
+                    "theme_name": "机器人",
+                    "limit_up_count": 6,
+                    "new_high_count": 4,
+                    "sealed_count": 5,
+                    "broken_count": 1,
+                    "middle_army_strength": 8,
+                },
+                {
+                    "theme_name": "芯片",
+                    "limit_up_count": 3,
+                    "new_high_count": 1,
+                    "sealed_count": 2,
+                    "broken_count": 2,
+                    "middle_army_strength": 2,
+                },
+            ]
+            candidates = [
+                CandidateSnapshot(
+                    stock_code="000001",
+                    stock_name="样本甲",
+                    theme_name="机器人",
+                    features={
+                        "first_limit_seconds": 34260,
+                        "board_height": 4,
+                        "seal_strength": 9,
+                        "resilience": 8,
+                        "influence": 7,
+                    },
+                    evidence=[{"source": "review", "value": 1}],
+                ),
+                CandidateSnapshot(
+                    stock_code="000002",
+                    stock_name="样本乙",
+                    theme_name="芯片",
+                    features={
+                        "first_limit_seconds": 36000,
+                        "board_height": 2,
+                        "seal_strength": 4,
+                        "resilience": 3,
+                        "influence": 2,
+                    },
+                ),
+            ]
+        else:
+            market_features = {}
+            theme_rankings = [
+                {
+                    "theme_name": "机器人",
+                    "candidate_count": 1,
+                    "stock_codes": ["000001"],
+                }
+            ]
+            candidates = [
+                CandidateSnapshot(
+                    stock_code="000001",
+                    stock_name="样本甲",
+                    theme_name="机器人",
+                    features={},
+                )
+            ]
+        return MarketSnapshot(
+            source_trade_date=date(2026, 7, 10),
+            target_trade_date=date(2026, 7, 13),
+            stage="after_close",
+            as_of=as_of,
+            market_features=market_features,
+            candidates=candidates,
+            theme_rankings=theme_rankings,
+            quality=DataQuality(
+                status="ready",
+                as_of=as_of,
+                source="test",
+            ),
+        )
+
+    def test_enrich_snapshot_is_a_non_mutating_task3_to_task4_bridge(self):
+        snapshot = self._snapshot()
+        original = copy.deepcopy(snapshot)
+
+        enriched = market_state_module.MarketStateAnalyzer().enrich_snapshot(
+            snapshot
+        )
+
+        assert enriched is not snapshot
+        assert snapshot == original
+        assert enriched.market_features["style"] == "board_flow"
+        assert enriched.market_features["window"] == "outbreak"
+        assert [row["theme_name"] for row in enriched.theme_rankings] == [
+            "机器人",
+            "芯片",
+        ]
+        assert enriched.theme_rankings[0]["score"] == 57
+        assert enriched.theme_rankings[0]["rank"] == 1
+        by_code = {
+            candidate.stock_code: candidate for candidate in enriched.candidates
+        }
+        leader = by_code["000001"].features
+        assert leader["theme_rank"] == 1
+        assert leader["theme_score"] == 57
+        assert leader["theme_quality"] == "ready"
+        assert leader["recognition_rank"] == 1
+        assert leader["recognition_score"] == 5.0
+        assert leader["recognition_quality"] == "ready"
+        assert leader["recognition_evidence"]["fastest"]["value"] == 34260
+        assert enriched.candidates[0].evidence is not snapshot.candidates[0].evidence
+
+    def test_enrich_snapshot_propagates_incomplete_evidence_without_zeroes(self):
+        snapshot = self._snapshot(complete=False)
+
+        enriched = market_state_module.MarketStateAnalyzer().enrich_snapshot(
+            snapshot
+        )
+
+        assert enriched.market_features["style"] == "unknown"
+        assert enriched.market_features["window"] == "unknown"
+        theme = enriched.theme_rankings[0]
+        assert theme["score"] is None
+        assert theme["rank"] is None
+        assert theme["quality"] == "degraded"
+        assert "limit_up_count" in theme["missing_fields"]
+        features = enriched.candidates[0].features
+        assert features["theme_rank"] is None
+        assert features["theme_score"] is None
+        assert features["theme_quality"] == "degraded"
+        assert features["recognition_rank"] is None
+        assert features["recognition_score"] is None
+        assert features["recognition_quality"] == "degraded"
+        assert features["recognition_missing_fields"] == [
+            "board_height",
+            "first_limit_seconds",
+            "influence",
+            "resilience",
+            "seal_strength",
+        ]
