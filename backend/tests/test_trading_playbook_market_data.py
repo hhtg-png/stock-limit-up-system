@@ -504,6 +504,67 @@ class TradingPlaybookKlineFeatureTests(unittest.IsolatedAsyncioTestCase):
                     expected,
                 )
 
+    async def test_partial_malformed_kline_is_missing_even_with_six_valid_closes(self):
+        from app.services.trading_playbook.market_data import (
+            TradingPlaybookMarketDataProvider,
+        )
+
+        class ExplodingClose:
+            def __float__(self):
+                raise RuntimeError("unexpected close conversion failure")
+
+        valid_points = [
+            {"close": close}
+            for close in [10, 10.1, 10.2, 10.3, 10.4, 10.5]
+        ]
+        malformed_points = (
+            object(),
+            {"close": "bad"},
+            {"close": float("nan")},
+            {"close": float("inf")},
+            {"close": 0},
+            {"close": -1},
+            {"close": ExplodingClose()},
+        )
+        expected = {
+            "n_day_high": False,
+            "consolidation_days": 0,
+            "trend_established": False,
+            "kline_quality": "missing",
+        }
+
+        for malformed_point in malformed_points:
+            async def loader(*args, **kwargs):
+                return [*valid_points, malformed_point]
+
+            with self.subTest(malformed_point=malformed_point):
+                provider = TradingPlaybookMarketDataProvider(
+                    quote_api=_FakeQuoteAPI(),
+                    kline_loader=loader,
+                )
+                self.assertEqual(
+                    await provider.kline_features("000001", "SZ", "Test"),
+                    expected,
+                )
+
+    async def test_kline_explicitly_incomplete_points_can_be_skipped(self):
+        from app.services.trading_playbook.market_data import (
+            TradingPlaybookMarketDataProvider,
+        )
+
+        async def loader(*args, **kwargs):
+            return [
+                {"close": close}
+                for close in [10, 10.1, 10.2, 10.3, 10.4, 10.5]
+            ] + [{}, {"close": None}]
+
+        features = await TradingPlaybookMarketDataProvider(
+            quote_api=_FakeQuoteAPI(),
+            kline_loader=loader,
+        ).kline_features("000001", "SZ", "Test")
+
+        self.assertEqual(features["kline_quality"], "ready")
+
 
 class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -992,6 +1053,176 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
             "000015",
             snapshot.market_features["full_market_change_ranks"],
         )
+
+    async def test_cached_invalid_speed_input_is_missing_never_baseline(self):
+        from app.services.trading_playbook.market_data import (
+            TradingPlaybookMarketDataProvider,
+        )
+
+        trade_date = date(2026, 7, 13)
+        as_of = datetime(2026, 7, 13, 15)
+        async with self.session_factory() as db:
+            db.add(
+                Stock(
+                    stock_code="000001",
+                    stock_name="Cached Invalid Speed",
+                    market="SZ",
+                    is_st=0,
+                )
+            )
+            await db.commit()
+
+            async def kline_loader(*args, **kwargs):
+                return [
+                    {"close": close}
+                    for close in [10, 10.1, 10.2, 10.2, 10.3, 10.4]
+                ]
+
+            for previous_price in (float("nan"), float("inf"), 0.0):
+                with self.subTest(previous_price=previous_price):
+                    provider = TradingPlaybookMarketDataProvider(
+                        quote_api=_FakeQuoteAPI(
+                            {
+                                "000001": _quote_payload(
+                                    "000001",
+                                    10,
+                                    "20260713150000",
+                                )
+                            }
+                        ),
+                        kline_loader=kline_loader,
+                        realtime_limit_up_loader=lambda trade_date: (
+                            asyncio.sleep(0, result=[])
+                        ),
+                    )
+                    provider._previous_prices["000001"] = previous_price
+
+                    snapshot = await provider.build_market_snapshot(
+                        db=db,
+                        source_trade_date=trade_date,
+                        target_trade_date=trade_date,
+                        stage="close",
+                        as_of=as_of,
+                    )
+
+                    candidate = snapshot.candidates[0]
+                    rank_evidence = next(
+                        evidence
+                        for evidence in candidate.evidence
+                        if evidence["source"] == "full_market_quote_rank"
+                    )
+                    market_rank_evidence = snapshot.market_features[
+                        "full_market_rank_evidence"
+                    ][0]
+                    self.assertEqual(
+                        snapshot.market_features["full_market_speed_ranks"],
+                        {},
+                    )
+                    self.assertNotIn("speed_rank", candidate.features)
+                    self.assertNotIn("speed_pct", candidate.features)
+                    self.assertEqual(
+                        candidate.features["speed_quality"],
+                        "missing",
+                    )
+                    self.assertEqual(rank_evidence["speed_quality"], "missing")
+                    self.assertEqual(
+                        market_rank_evidence["speed_quality"],
+                        "missing",
+                    )
+
+    async def test_review_evidence_uses_row_availability_before_snapshot(self):
+        from app.services.trading_playbook.market_data import (
+            TradingPlaybookMarketDataProvider,
+        )
+
+        trade_date = date(2026, 7, 13)
+        as_of = datetime(2026, 7, 13, 9, 30)
+        same_day_available_at = datetime(2026, 7, 13, 9, 20)
+        historical_available_at = datetime(2026, 7, 13, 8, 45)
+        async with self.session_factory() as db:
+            stocks = [
+                Stock(
+                    stock_code=code,
+                    stock_name=f"Review Evidence {code}",
+                    market="SZ",
+                    is_st=0,
+                )
+                for code in ("000001", "000002")
+            ]
+            db.add_all(stocks)
+            await db.flush()
+            stock_by_code = {stock.stock_code: stock for stock in stocks}
+            db.add_all(
+                [
+                    MarketReviewStockDaily(
+                        trade_date=trade_date,
+                        stock_id=stock_by_code["000001"].id,
+                        stock_code="000001",
+                        stock_name="Same-day Review",
+                        limit_up_reason="same-day theme",
+                        created_at=datetime(2026, 7, 13, 9, 10),
+                        updated_at=same_day_available_at,
+                    ),
+                    MarketReviewStockDaily(
+                        trade_date=trade_date - timedelta(days=1),
+                        stock_id=stock_by_code["000002"].id,
+                        stock_code="000002",
+                        stock_name="Historical Review",
+                        limit_up_reason="historical theme",
+                        created_at=datetime(2026, 7, 12, 16),
+                        updated_at=historical_available_at,
+                    ),
+                ]
+            )
+            await db.commit()
+
+            async def kline_loader(*args, **kwargs):
+                return [
+                    {"close": close}
+                    for close in [10, 10.1, 10.2, 10.2, 10.3, 10.4]
+                ]
+
+            snapshot = await TradingPlaybookMarketDataProvider(
+                quote_api=_FakeQuoteAPI(
+                    {
+                        code: _quote_payload(code, 10, "20260713093000")
+                        for code in ("000001", "000002")
+                    }
+                ),
+                kline_loader=kline_loader,
+                realtime_limit_up_loader=lambda trade_date: asyncio.sleep(
+                    0,
+                    result=[],
+                ),
+            ).build_market_snapshot(
+                db=db,
+                source_trade_date=trade_date,
+                target_trade_date=trade_date,
+                stage="close",
+                as_of=as_of,
+            )
+
+        candidates = {item.stock_code: item for item in snapshot.candidates}
+        expected_availability = {
+            "000001": same_day_available_at,
+            "000002": historical_available_at,
+        }
+        for code, candidate in candidates.items():
+            review_evidence = next(
+                evidence
+                for evidence in candidate.evidence
+                if evidence["source"] == "market_review_stock_daily"
+            )
+            self.assertEqual(
+                review_evidence["as_of"],
+                expected_availability[code],
+            )
+            self.assertTrue(
+                all(
+                    evidence["as_of"] <= snapshot.as_of
+                    for evidence in candidate.evidence
+                )
+            )
 
     async def test_force_degraded_overrides_otherwise_ready_snapshot(self):
         from app.services.trading_playbook.market_data import (

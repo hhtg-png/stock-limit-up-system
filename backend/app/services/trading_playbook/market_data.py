@@ -2,6 +2,7 @@
 
 import asyncio
 import math
+from collections.abc import Mapping
 from datetime import date, datetime, time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
@@ -282,10 +283,18 @@ class TradingPlaybookMarketDataProvider:
                 change_pct = math.nan
                 quality["change_pct"] = "missing"
 
+            first_observation = code not in self._previous_prices
             previous_price = self._previous_prices.get(code)
-            if previous_price is None or previous_price <= 0:
+            if first_observation:
                 quality["speed_pct"] = "baseline"
                 speed_pct = 0.0
+            elif (
+                previous_price is None
+                or not math.isfinite(previous_price)
+                or previous_price <= 0
+            ):
+                quality["speed_pct"] = "missing"
+                speed_pct = math.nan
             else:
                 computed_speed = (price / previous_price - 1) * 100
                 if math.isfinite(computed_speed):
@@ -381,12 +390,19 @@ class TradingPlaybookMarketDataProvider:
             )
             closes = []
             for point in points:
-                try:
-                    close = float(point.get("close"))
-                except (AttributeError, TypeError, ValueError):
+                if not isinstance(point, Mapping):
+                    return missing
+                raw_close = point.get("close")
+                # A missing/None close is an incomplete point, not bad evidence.
+                if raw_close is None:
                     continue
-                if math.isfinite(close) and close > 0:
-                    closes.append(close)
+                try:
+                    close = float(raw_close)
+                except Exception:
+                    return missing
+                if not math.isfinite(close) or close <= 0:
+                    return missing
+                closes.append(close)
             if len(closes) < 6:
                 return missing
             prior_high = max(closes[:-1])
@@ -601,7 +617,10 @@ class TradingPlaybookMarketDataProvider:
                 if code in speed_ranks:
                     rank_evidence["speed_rank"] = speed_ranks[code]
                 else:
-                    rank_evidence["speed_quality"] = "baseline"
+                    rank_evidence["speed_quality"] = quote_field_quality.get(
+                        code,
+                        {},
+                    ).get("speed_pct", "missing")
                 evidence.append(rank_evidence)
 
             kline = kline_by_code[code]
@@ -646,9 +665,9 @@ class TradingPlaybookMarketDataProvider:
                 evidence.append(
                     {
                         "source": "market_review_stock_daily",
-                        "as_of": datetime.combine(
-                            latest_row.trade_date,
-                            time(15, 0),
+                        "as_of": max(
+                            latest_row.created_at,
+                            latest_row.updated_at,
                         ),
                         "quality": latest_row.data_quality_flag or "ok",
                     }
