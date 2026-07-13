@@ -13,7 +13,7 @@ from datetime import date, datetime
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 from app.config import settings as app_settings
@@ -28,6 +28,7 @@ from .errors import (
     InvalidRequestError,
     InvalidTransitionError,
     PlaybookNotFoundError,
+    UpstreamUnavailableError,
 )
 
 
@@ -560,6 +561,118 @@ class TradingPlanService:
         db.add(row)
         await db.flush()
         return row, True
+
+    async def get_settings(self, db) -> TradingPlaybookSettings:
+        """Lock or create the singleton with bounded conflict recovery."""
+        for attempt in range(3):
+            row = await db.scalar(
+                select(TradingPlaybookSettings)
+                .where(TradingPlaybookSettings.id == 1)
+                .with_for_update()
+            )
+            if row is not None:
+                return row
+            try:
+                row, _ = await self._get_or_create_settings(db)
+                return row
+            except IntegrityError:
+                await db.rollback()
+                row = await db.get(TradingPlaybookSettings, 1)
+                if row is not None:
+                    return row
+                if attempt < 2:
+                    await asyncio.sleep(0.01 * (attempt + 1))
+        raise UpstreamUnavailableError(
+            "could not create singleton playbook settings"
+        )
+
+    async def update_settings(
+        self,
+        db,
+        changes: Mapping[str, Any],
+        updated_at: datetime,
+    ) -> TradingPlaybookSettings:
+        if not isinstance(changes, Mapping) or not changes:
+            raise InvalidRequestError("settings patch is required")
+        if (
+            not isinstance(updated_at, datetime)
+            or updated_at.tzinfo is None
+            or updated_at.utcoffset() is None
+        ):
+            raise InvalidRequestError("updated_at must be timezone-aware")
+        allowed = {
+            "enabled",
+            "trial_position_pct",
+            "confirmed_position_pct",
+            "hard_stop_pct",
+            "max_action_candidates",
+            "in_app_enabled",
+            "wechat_enabled",
+        }
+        if set(changes) - allowed:
+            raise InvalidRequestError("unknown settings fields")
+        if changes.get("wechat_enabled", False) is not False:
+            raise InvalidRequestError("wechat is disabled in v1")
+
+        row = await self.get_settings(db)
+        trial = changes.get("trial_position_pct", row.trial_position_pct)
+        confirmed = changes.get(
+            "confirmed_position_pct",
+            row.confirmed_position_pct,
+        )
+        hard_stop = changes.get("hard_stop_pct", row.hard_stop_pct)
+        maximum = changes.get(
+            "max_action_candidates",
+            row.max_action_candidates,
+        )
+        validation_row = TradingPlaybookSettings(
+            trial_position_pct=trial,
+            confirmed_position_pct=confirmed,
+            hard_stop_pct=hard_stop,
+            max_action_candidates=maximum,
+        )
+        self._risk_settings(validation_row)
+
+        conditions = [TradingPlaybookSettings.id == 1]
+        if "trial_position_pct" in changes:
+            conditions.append(
+                TradingPlaybookSettings.confirmed_position_pct >= trial
+            )
+        if "confirmed_position_pct" in changes:
+            conditions.append(
+                TradingPlaybookSettings.trial_position_pct <= confirmed
+            )
+        values = dict(changes)
+        values["wechat_enabled"] = False
+        values["updated_at"] = updated_at.astimezone(CHINA_TZ)
+        try:
+            result = await db.execute(
+                update(TradingPlaybookSettings)
+                .where(*conditions)
+                .values(**values)
+                .execution_options(synchronize_session=False)
+            )
+            if result.rowcount != 1:
+                await db.rollback()
+                raise InvalidRequestError(
+                    "settings conflict with current risk limits"
+                )
+            await db.commit()
+            return await db.scalar(
+                select(TradingPlaybookSettings)
+                .where(TradingPlaybookSettings.id == 1)
+                .execution_options(populate_existing=True)
+            )
+        except InvalidRequestError:
+            raise
+        except IntegrityError as exc:
+            await db.rollback()
+            raise InvalidRequestError(
+                "settings conflict with current risk limits"
+            ) from exc
+        except Exception:
+            await db.rollback()
+            raise
 
     @staticmethod
     def _risk_settings(settings_row: TradingPlaybookSettings) -> Dict[str, Any]:

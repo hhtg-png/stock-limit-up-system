@@ -59,6 +59,41 @@ class DatabaseSqliteConfigTests(unittest.TestCase):
         self.assertIn("ix_market_review_stock_daily_stock_id", stock_daily_indexes)
         self.assertIn("ix_market_review_limitup_event_stock_id", event_indexes)
 
+    def test_sqlite_schema_compat_repairs_and_guards_legacy_playbook_settings(self):
+        engine = create_engine("sqlite:///:memory:", future=True)
+        with engine.begin() as connection:
+            connection.exec_driver_sql(
+                "CREATE TABLE market_review_stock_daily (id INTEGER PRIMARY KEY)"
+            )
+            connection.exec_driver_sql(
+                "CREATE TABLE market_review_limitup_event (id INTEGER PRIMARY KEY)"
+            )
+            connection.exec_driver_sql(
+                "CREATE TABLE daily_analysis_records (id INTEGER PRIMARY KEY)"
+            )
+            connection.exec_driver_sql(
+                "CREATE TABLE trading_playbook_settings ("
+                "id INTEGER PRIMARY KEY, trial_position_pct FLOAT NOT NULL, "
+                "confirmed_position_pct FLOAT NOT NULL, hard_stop_pct FLOAT NOT NULL, "
+                "max_action_candidates INTEGER NOT NULL, wechat_enabled BOOLEAN NOT NULL)"
+            )
+            connection.exec_driver_sql(
+                "INSERT INTO trading_playbook_settings VALUES (1,40,30,25,4,1)"
+            )
+
+            database.ensure_sqlite_schema_compat(connection)
+
+            repaired = connection.exec_driver_sql(
+                "SELECT trial_position_pct,confirmed_position_pct,hard_stop_pct,"
+                "max_action_candidates,wechat_enabled FROM trading_playbook_settings"
+            ).one()
+            self.assertEqual(tuple(repaired), (30, 30, 5, 3, 0))
+            with self.assertRaises(Exception):
+                connection.exec_driver_sql(
+                    "UPDATE trading_playbook_settings SET "
+                    "trial_position_pct=25, confirmed_position_pct=20"
+                )
+
 
 class DatabasePostgresqlCompatTests(unittest.IsolatedAsyncioTestCase):
     def test_postgresql_schema_compat_locks_repairs_and_indexes_existing_table(self):
@@ -85,6 +120,25 @@ class DatabasePostgresqlCompatTests(unittest.IsolatedAsyncioTestCase):
             "uq_trading_plan_one_active_target "
             "ON trading_plan_versions (target_trade_date) "
             "WHERE status='active'",
+        )
+        self.assertIn(
+            "LOCK TABLE trading_playbook_settings IN ACCESS EXCLUSIVE MODE",
+            sql,
+        )
+        self.assertTrue(
+            any(
+                "trial_position_pct=LEAST(confirmed_position_pct" in statement
+                for statement in sql
+            )
+        )
+        constraint_sql = next(
+            statement
+            for statement in sql
+            if "ck_trading_playbook_settings_risk" in statement
+        )
+        self.assertIn(
+            "conrelid='trading_playbook_settings'::regclass",
+            constraint_sql,
         )
 
     async def test_init_db_runs_postgresql_compat_after_create_all(self):

@@ -10,12 +10,23 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    CheckConstraint,
 )
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.database import Base
 import app.models  # noqa: F401
 from app.models import TradingModeRule
+from app.models.trading_playbook import TradingPlaybookSettings
+
+
+def test_playbook_settings_has_database_risk_invariant_check():
+    names = {
+        constraint.name
+        for constraint in TradingPlaybookSettings.__table__.constraints
+        if isinstance(constraint, CheckConstraint)
+    }
+    assert "ck_trading_playbook_settings_risk" in names
 
 
 TABLE_COLUMNS = {

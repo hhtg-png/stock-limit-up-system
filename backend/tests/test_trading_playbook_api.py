@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
@@ -564,6 +565,7 @@ class TradingPlaybookApiTests(unittest.TestCase):
     def test_settings_get_persistently_disables_legacy_wechat_flag(self):
         async def set_legacy_flag():
             async with self.Session() as db:
+                await db.execute(text("PRAGMA ignore_check_constraints=ON"))
                 row = await db.get(TradingPlaybookSettings, 1)
                 if row is None:
                     row = TradingPlaybookSettings(id=1, wechat_enabled=True)
@@ -571,6 +573,7 @@ class TradingPlaybookApiTests(unittest.TestCase):
                 else:
                     row.wechat_enabled = True
                 await db.commit()
+                await db.execute(text("PRAGMA ignore_check_constraints=OFF"))
 
         async def read_flag():
             async with self.Session() as db:

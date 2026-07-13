@@ -27,6 +27,7 @@ from app.services.trading_playbook.domain import (
     ModeEvaluation,
 )
 from app.services.trading_playbook.plan_service import TradingPlanService
+from app.services.trading_playbook.errors import InvalidRequestError
 
 
 SOURCE_DATE = date(2026, 7, 10)
@@ -1410,7 +1411,7 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual([row[0] for row in statuses], ["superseded", "active"])
 
-    async def test_invalid_persisted_settings_are_rejected(self):
+    async def test_database_rejects_invalid_persisted_settings(self):
         invalid_settings = [
             {"max_action_candidates": 4},
             {"max_action_candidates": 0},
@@ -1428,16 +1429,58 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
                     db.add(row)
                 for key, value in overrides.items():
                     setattr(row, key, value)
-                await db.commit()
                 with self.subTest(index=index, overrides=overrides):
-                    with self.assertRaises(ValueError):
-                        await self._generate(
-                            db,
-                            [_evaluation("leader", "000001")],
-                        )
+                    with self.assertRaises(IntegrityError):
+                        await db.commit()
                 await db.rollback()
-                await db.delete(row)
-                await db.commit()
+
+    async def test_file_sqlite_concurrent_settings_updates_preserve_position_order(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            database_path = Path(directory) / "settings.db"
+            url = f"sqlite+aiosqlite:///{database_path.as_posix()}"
+            first_engine = create_async_engine(url, connect_args={"timeout": 5})
+            second_engine = create_async_engine(url, connect_args={"timeout": 5})
+            FirstSession = async_sessionmaker(first_engine, expire_on_commit=False)
+            SecondSession = async_sessionmaker(second_engine, expire_on_commit=False)
+            try:
+                async with first_engine.begin() as connection:
+                    await connection.run_sync(Base.metadata.create_all)
+                async with FirstSession() as db:
+                    db.add(
+                        TradingPlaybookSettings(
+                            id=1,
+                            trial_position_pct=10,
+                            confirmed_position_pct=30,
+                        )
+                    )
+                    await db.commit()
+
+                async def update(session_factory, changes):
+                    async with session_factory() as db:
+                        return await TradingPlanService().update_settings(
+                            db,
+                            changes,
+                            AS_OF.replace(tzinfo=ZoneInfo("Asia/Shanghai")),
+                        )
+
+                results = await asyncio.gather(
+                    update(FirstSession, {"trial_position_pct": 25.0}),
+                    update(SecondSession, {"confirmed_position_pct": 20.0}),
+                    return_exceptions=True,
+                )
+                self.assertEqual(
+                    sum(isinstance(result, InvalidRequestError) for result in results),
+                    1,
+                )
+                async with FirstSession() as db:
+                    row = await db.get(TradingPlaybookSettings, 1)
+                    self.assertLessEqual(
+                        row.trial_position_pct,
+                        row.confirmed_position_pct,
+                    )
+            finally:
+                await first_engine.dispose()
+                await second_engine.dispose()
 
     async def test_version_number_conflict_rolls_back_and_retries_cleanly(self):
         async with self.Session() as db:

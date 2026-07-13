@@ -202,8 +202,8 @@ def _serialize_review(review: Any) -> dict[str, Any]:
 
 async def _settings_row(
     db: AsyncSession,
-) -> tuple[TradingPlaybookSettings, bool]:
-    return await _plan_service._get_or_create_settings(db)
+) -> TradingPlaybookSettings:
+    return await _plan_service.get_settings(db)
 
 
 @router.get("/rules", summary="查询交易模式规则")
@@ -498,16 +498,19 @@ async def get_settings(
     now: datetime = Depends(get_trading_playbook_now),
 ):
     try:
-        row, created = await _settings_row(db)
-        must_disable_wechat = row.wechat_enabled is not False
-        if created or must_disable_wechat:
-            if now.tzinfo is None or now.utcoffset() is None:
-                raise HTTPException(
-                    status_code=503,
-                    detail="Trading playbook clock is invalid",
-                )
-            row.wechat_enabled = False
-            row.updated_at = now.astimezone(CN_TZ)
+        row = await _settings_row(db)
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Trading playbook clock is invalid",
+            )
+        if row.wechat_enabled is not False:
+            row = await _plan_service.update_settings(
+                db,
+                {"wechat_enabled": False},
+                now,
+            )
+        else:
             await db.commit()
         return _serialize_settings(row)
     except HTTPException:
@@ -522,6 +525,12 @@ async def get_settings(
     except SQLAlchemyError as exc:
         await db.rollback()
         raise HTTPException(status_code=503, detail="Settings are unavailable") from exc
+    except UpstreamUnavailableError as exc:
+        await db.rollback()
+        raise HTTPException(
+            status_code=503,
+            detail=SERVICE_UNAVAILABLE_DETAIL,
+        ) from exc
     except Exception:
         await db.rollback()
         raise
@@ -534,36 +543,18 @@ async def update_settings(
     now: datetime = Depends(get_trading_playbook_now),
 ):
     try:
-        row, _ = await _settings_row(db)
         patch = request.model_dump(mode="python", exclude_unset=True)
-        trial = patch.get("trial_position_pct", row.trial_position_pct)
-        confirmed = patch.get(
-            "confirmed_position_pct",
-            row.confirmed_position_pct,
-        )
-        if trial > confirmed:
-            raise HTTPException(
-                status_code=422,
-                detail="trial_position_pct must not exceed confirmed_position_pct",
-            )
-        for field_name, value in patch.items():
-            setattr(row, field_name, value)
-        row.wechat_enabled = False
-        if now.tzinfo is None or now.utcoffset() is None:
-            raise HTTPException(
-                status_code=503,
-                detail="Trading playbook clock is invalid",
-            )
-        row.updated_at = now.astimezone(CN_TZ)
-        _plan_service._risk_settings(row)
-        await db.commit()
+        row = await _plan_service.update_settings(db, patch, now)
         return _serialize_settings(row)
     except HTTPException:
         await db.rollback()
         raise
-    except ValueError as exc:
+    except InvalidRequestError as exc:
         await db.rollback()
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=422,
+            detail=INVALID_REQUEST_DETAIL,
+        ) from exc
     except IntegrityError as exc:
         await db.rollback()
         raise HTTPException(status_code=409, detail="Settings update conflict") from exc

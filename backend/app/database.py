@@ -81,6 +81,7 @@ def ensure_sqlite_schema_compat(sync_connection) -> None:
         "DATETIME",
     )
     _ensure_trading_plan_active_unique_index(sync_connection)
+    _ensure_sqlite_playbook_settings_guard(sync_connection)
 
 
 def ensure_postgresql_schema_compat(sync_connection) -> None:
@@ -88,27 +89,62 @@ def ensure_postgresql_schema_compat(sync_connection) -> None:
     table_name = sync_connection.exec_driver_sql(
         "SELECT to_regclass('trading_plan_versions')"
     ).scalar_one_or_none()
-    if table_name is None:
+    if table_name is not None:
+        sync_connection.exec_driver_sql(
+            "LOCK TABLE trading_plan_versions IN ACCESS EXCLUSIVE MODE"
+        )
+        sync_connection.exec_driver_sql(
+            "WITH ranked AS ("
+            "SELECT id, ROW_NUMBER() OVER ("
+            "PARTITION BY target_trade_date "
+            "ORDER BY generated_at DESC NULLS LAST, id DESC"
+            ") AS active_rank "
+            "FROM trading_plan_versions WHERE status='active'"
+            ") "
+            "UPDATE trading_plan_versions AS plan SET status='superseded' "
+            "FROM ranked WHERE plan.id=ranked.id AND ranked.active_rank > 1"
+        )
+        sync_connection.exec_driver_sql(
+            "CREATE UNIQUE INDEX IF NOT EXISTS "
+            "uq_trading_plan_one_active_target "
+            "ON trading_plan_versions (target_trade_date) "
+            "WHERE status='active'"
+        )
+
+    settings_table = sync_connection.exec_driver_sql(
+        "SELECT to_regclass('trading_playbook_settings')"
+    ).scalar_one_or_none()
+    if settings_table is None:
         return
     sync_connection.exec_driver_sql(
-        "LOCK TABLE trading_plan_versions IN ACCESS EXCLUSIVE MODE"
+        "LOCK TABLE trading_playbook_settings IN ACCESS EXCLUSIVE MODE"
     )
     sync_connection.exec_driver_sql(
-        "WITH ranked AS ("
-        "SELECT id, ROW_NUMBER() OVER ("
-        "PARTITION BY target_trade_date "
-        "ORDER BY generated_at DESC NULLS LAST, id DESC"
-        ") AS active_rank "
-        "FROM trading_plan_versions WHERE status='active'"
-        ") "
-        "UPDATE trading_plan_versions AS plan SET status='superseded' "
-        "FROM ranked WHERE plan.id=ranked.id AND ranked.active_rank > 1"
+        "UPDATE trading_playbook_settings SET "
+        "confirmed_position_pct=LEAST(100, GREATEST(0, confirmed_position_pct)), "
+        "hard_stop_pct=CASE WHEN hard_stop_pct > 0 AND hard_stop_pct <= 20 "
+        "THEN hard_stop_pct ELSE 5 END, "
+        "max_action_candidates=LEAST(3, GREATEST(1, max_action_candidates)), "
+        "wechat_enabled=false"
     )
     sync_connection.exec_driver_sql(
-        "CREATE UNIQUE INDEX IF NOT EXISTS "
-        "uq_trading_plan_one_active_target "
-        "ON trading_plan_versions (target_trade_date) "
-        "WHERE status='active'"
+        "UPDATE trading_playbook_settings SET "
+        "trial_position_pct=LEAST(confirmed_position_pct, "
+        "GREATEST(0, trial_position_pct))"
+    )
+    sync_connection.exec_driver_sql(
+        "DO $$ BEGIN "
+        "IF NOT EXISTS (SELECT 1 FROM pg_constraint "
+        "WHERE conname='ck_trading_playbook_settings_risk' AND "
+        "conrelid='trading_playbook_settings'::regclass) THEN "
+        "ALTER TABLE trading_playbook_settings ADD CONSTRAINT "
+        "ck_trading_playbook_settings_risk CHECK ("
+        "trial_position_pct >= 0 AND "
+        "trial_position_pct <= confirmed_position_pct AND "
+        "confirmed_position_pct <= 100 AND "
+        "hard_stop_pct > 0 AND hard_stop_pct <= 20 AND "
+        "max_action_candidates >= 1 AND max_action_candidates <= 3 AND "
+        "wechat_enabled = false); END IF; END $$"
     )
 
 
@@ -132,6 +168,44 @@ def _ensure_trading_plan_active_unique_index(sync_connection) -> None:
         "ON trading_plan_versions (target_trade_date) "
         "WHERE status='active'"
     )
+
+
+def _ensure_sqlite_playbook_settings_guard(sync_connection) -> None:
+    table = sync_connection.exec_driver_sql(
+        "SELECT 1 FROM sqlite_master "
+        "WHERE type='table' AND name='trading_playbook_settings'"
+    ).first()
+    if table is None:
+        return
+    sync_connection.exec_driver_sql(
+        "UPDATE trading_playbook_settings SET "
+        "confirmed_position_pct=MIN(100, MAX(0, confirmed_position_pct)), "
+        "hard_stop_pct=CASE WHEN hard_stop_pct > 0 AND hard_stop_pct <= 20 "
+        "THEN hard_stop_pct ELSE 5 END, "
+        "max_action_candidates=MIN(3, MAX(1, max_action_candidates)), "
+        "wechat_enabled=0"
+    )
+    sync_connection.exec_driver_sql(
+        "UPDATE trading_playbook_settings SET "
+        "trial_position_pct=MIN(confirmed_position_pct, "
+        "MAX(0, trial_position_pct))"
+    )
+    guard = (
+        "NEW.trial_position_pct >= 0 AND "
+        "NEW.trial_position_pct <= NEW.confirmed_position_pct AND "
+        "NEW.confirmed_position_pct <= 100 AND "
+        "NEW.hard_stop_pct > 0 AND NEW.hard_stop_pct <= 20 AND "
+        "NEW.max_action_candidates >= 1 AND "
+        "NEW.max_action_candidates <= 3 AND NEW.wechat_enabled = 0"
+    )
+    for operation in ("INSERT", "UPDATE"):
+        name = f"trg_playbook_settings_guard_{operation.lower()}"
+        sync_connection.exec_driver_sql(
+            f"CREATE TRIGGER IF NOT EXISTS {name} "
+            f"BEFORE {operation} ON trading_playbook_settings "
+            f"WHEN NOT ({guard}) BEGIN "
+            "SELECT RAISE(ABORT, 'invalid trading playbook settings'); END"
+        )
 
 
 def _add_sqlite_column_if_missing(sync_connection, table_name: str, column_name: str, column_def: str) -> None:

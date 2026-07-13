@@ -4,6 +4,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     Column,
     Date,
     DateTime,
@@ -222,6 +223,17 @@ class TradingPlaybookSettings(Base):
     """Singleton configuration for playbook sizing and alert channels."""
 
     __tablename__ = "trading_playbook_settings"
+    __table_args__ = (
+        CheckConstraint(
+            "trial_position_pct >= 0 AND "
+            "trial_position_pct <= confirmed_position_pct AND "
+            "confirmed_position_pct <= 100 AND "
+            "hard_stop_pct > 0 AND hard_stop_pct <= 20 AND "
+            "max_action_candidates >= 1 AND max_action_candidates <= 3 AND "
+            "wechat_enabled = false",
+            name="ck_trading_playbook_settings_risk",
+        ),
+    )
 
     id = Column(Integer, primary_key=True, default=1)
     enabled = Column(Boolean, default=True, nullable=False)
