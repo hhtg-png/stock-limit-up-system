@@ -12,6 +12,7 @@ class TencentStockAPI:
     """腾讯股票实时行情API"""
     
     BASE_URL = "http://qt.gtimg.cn/q="
+    MAX_BATCH_SIZE = 80
     
     # 腾讯API返回字段索引（用~分隔）
     FIELD_INDEX = {
@@ -76,10 +77,12 @@ class TencentStockAPI:
     def _format_code(self, code: str) -> str:
         """格式化股票代码为腾讯格式 (sz000001 / sh600000)"""
         code = code.strip()
-        if code.startswith(('sz', 'sh', 'SZ', 'SH')):
+        if code.startswith(('sz', 'sh', 'bj', 'SZ', 'SH', 'BJ')):
             return code.lower()
         
         # 根据股票代码判断市场
+        if code.startswith(('4', '8', '92')):
+            return f"bj{code}"
         if code.startswith(('6', '9', '5')):
             return f"sh{code}"
         else:
@@ -138,27 +141,31 @@ class TencentStockAPI:
     
     async def get_quotes_batch(self, codes: List[str]) -> Dict[str, Dict]:
         """批量获取股票行情"""
+        if not codes:
+            return {}
+
         client = await self._get_client()
-        formatted_codes = [self._format_code(c) for c in codes]
-        
         results = {}
-        
-        try:
-            # 腾讯API支持批量查询，用逗号分隔
-            codes_str = ",".join(formatted_codes)
-            response = await client.get(f"{self.BASE_URL}{codes_str}")
-            
-            if response.status_code == 200:
-                # 响应格式: v_sz000001="...";v_sz000002="...";
-                for line in response.text.strip().split(';'):
-                    if not line.strip():
-                        continue
-                    
-                    data = self._parse_response(line + ';')
-                    if data and data.get("code"):
-                        results[data["code"]] = data
-        except Exception as e:
-            logger.warning(f"Batch get quotes error: {e}")
+
+        for start in range(0, len(codes), self.MAX_BATCH_SIZE):
+            chunk = codes[start:start + self.MAX_BATCH_SIZE]
+            formatted_codes = [self._format_code(code) for code in chunk]
+            try:
+                # 腾讯API支持批量查询，用逗号分隔
+                codes_str = ",".join(formatted_codes)
+                response = await client.get(f"{self.BASE_URL}{codes_str}")
+
+                if response.status_code == 200:
+                    # 响应格式: v_sz000001="...";v_sz000002="...";
+                    for line in response.text.strip().split(';'):
+                        if not line.strip():
+                            continue
+
+                        data = self._parse_response(line + ';')
+                        if data and data.get("code"):
+                            results[data["code"]] = data
+            except Exception as e:
+                logger.warning(f"Batch get quotes error: {e}")
         
         return results
     
