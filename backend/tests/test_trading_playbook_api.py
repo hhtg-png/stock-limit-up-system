@@ -23,6 +23,7 @@ from app.models.trading_playbook import (
     TradingPlanVersion,
     TradingPlaybookSettings,
 )
+from app.services.trading_playbook.runtime import trading_playbook_runtime
 
 
 CN = ZoneInfo("Asia/Shanghai")
@@ -65,6 +66,7 @@ class _FakeReviewService:
 
 class TradingPlaybookApiTests(unittest.TestCase):
     def setUp(self):
+        trading_playbook_runtime.reset()
         self.engine = create_async_engine(
             "sqlite+aiosqlite://",
             connect_args={"check_same_thread": False},
@@ -210,6 +212,7 @@ class TradingPlaybookApiTests(unittest.TestCase):
     def tearDown(self):
         self.client.close()
         asyncio.run(self.engine.dispose())
+        trading_playbook_runtime.reset()
 
     def test_rules_are_enabled_stably_sorted_and_auditable(self):
         response = self.client.get("/trading-playbook/rules")
@@ -356,6 +359,25 @@ class TradingPlaybookApiTests(unittest.TestCase):
             )
         self.assertEqual(generated.status_code, 503)
         self.assertEqual(reviewed.status_code, 503)
+
+    def test_real_application_resolves_registered_shared_runtime(self):
+        from app.main import app as production_app
+
+        trading_playbook_runtime.install_orchestrator(self.orchestrator)
+        client = TestClient(production_app)
+        try:
+            response = client.post(
+                "/api/v1/trading-playbook/plans/generate",
+                json={
+                    "source_trade_date": date.today().isoformat(),
+                    "stage": "after_close",
+                },
+            )
+        finally:
+            client.close()
+            trading_playbook_runtime.reset()
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["id"], 901)
 
     def test_generate_maps_window_error_to_422_and_source_failure_to_503(self):
         async def bad_window(*_args, **_kwargs):

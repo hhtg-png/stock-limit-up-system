@@ -29,6 +29,7 @@ from app.schemas.trading_playbook import (
     TradingPlaybookSettingsUpdate,
 )
 from app.services.trading_playbook.plan_service import TradingPlanService
+from app.services.trading_playbook.runtime import trading_playbook_runtime
 
 
 router = APIRouter()
@@ -49,6 +50,8 @@ def get_trading_playbook_orchestrator(request: Request):
         None,
     )
     if orchestrator is None:
+        orchestrator = trading_playbook_runtime.get_orchestrator()
+    if orchestrator is None:
         raise HTTPException(
             status_code=503,
             detail="Trading playbook orchestrator is not configured",
@@ -63,6 +66,8 @@ def get_trading_playbook_review_service(request: Request):
         "trading_playbook_review_service",
         None,
     )
+    if service is None:
+        service = trading_playbook_runtime.get_review_service()
     if service is None:
         raise HTTPException(
             status_code=503,

@@ -1486,7 +1486,9 @@ git commit -m "feat: expose trading playbook API"
 
 **Files:**
 - Modify: `backend/app/data_collectors/scheduler.py`
+- Modify: `backend/app/main.py`
 - Test: `backend/tests/test_trading_playbook_scheduler.py`
+- Test: `backend/tests/test_main_lifespan.py`
 
 - [ ] **Step 1: Write failing scheduler registration and barrier tests**
 
@@ -1545,6 +1547,8 @@ self.scheduler.add_job(self._monitor_trading_playbook, IntervalTrigger(seconds=s
 ```
 
 Every method first checks `_get_cn_trading_dates`. `_wait_for_trading_playbook_data` polls for a `MarketReviewDailyMetric.updated_at` newer than 15:00 for at most 180 seconds using non-blocking waits no longer than 10 seconds. A timeout generates a degraded version; a later successful input creates a new immutable version.
+
+At application startup, build exactly one production `TradingPlaybookOrchestrator`, pass that same instance to the scheduler, and register it with `trading_playbook_runtime.install_orchestrator`. Reset the registry during shutdown. Do not construct an API-only pipeline. Add a `backend/app/main.py` integration test against the real mounted app (no dependency override) proving `/api/v1/trading-playbook/plans/generate` resolves the registered instance; the unregistered case must remain a controlled HTTP 503.
 
 `_build_trading_playbook_plan` calls `TradingPlaybookOrchestrator.build_stage`; when `send_notifications=True`, it then calls `TradingPlaybookAlertService.notify_plan_ready`, which emits isolated `plan_ready` and `confirmation_required` events without creating an action reminder. `_review_trading_playbook` calls `TradingPlaybookReviewService.build(db, today, finalized=False)` at 15:10. After `_build_trading_playbook_after_close` generates the 15:30 plan, it calls `_finalize_trading_playbook_review`, which invokes `TradingPlaybookReviewService.build(db, today, finalized=True)` so final facts reconcile into the same review row without overwriting manual execution.
 
@@ -1714,7 +1718,9 @@ git commit -m "feat: add isolated trading plan alerts"
 
 **Files:**
 - Create: `backend/app/services/trading_playbook/review_service.py`
+- Modify: `backend/app/main.py`
 - Test: `backend/tests/test_trading_playbook_review.py`
+- Test: `backend/tests/test_main_lifespan.py`
 
 - [ ] **Step 1: Write failing review classification tests**
 
@@ -1772,6 +1778,8 @@ Implement `summarize`, async `build(db, trade_date, finalized=False)`, and `upda
 ```
 
 At 15:10, store closing snapshot values with `finalized_at=None`. At 15:30, update the same `(trade_date, plan_version_id)` review with final market-review facts and set `finalized_at`; do not overwrite `manual_execution_json`.
+
+Create one shared `TradingPlaybookReviewService` during application startup, pass it to the scheduler, and register that same instance with `trading_playbook_runtime.install_review_service`; reset the registry during shutdown. Add a real `backend/app/main.py` integration test with no dependency override proving the mounted review endpoint resolves the registered service. Before registration it must return HTTP 503.
 
 - [ ] **Step 4: Run review tests**
 
