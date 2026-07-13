@@ -1,0 +1,436 @@
+{
+  "catalog_version": 1,
+  "sources": [
+    {
+      "source_key": "00-art-1123",
+      "source_path": "00-zgjys-live/01_zgjys-art-trading-1123.txt",
+      "source_title": "交易的艺术 1123"
+    },
+    {
+      "source_key": "00-art-1130",
+      "source_path": "00-zgjys-live/02_zgjys-art-trading-1130.txt",
+      "source_title": "交易的艺术 1130"
+    },
+    {
+      "source_key": "01-specialize",
+      "source_path": "01-止于心动-专精一艺/01_2025-8-3直播：止于心动，专精一艺.txt",
+      "source_title": "止于心动，专精一艺"
+    },
+    {
+      "source_key": "02-window-recognition",
+      "source_path": "02-window-recognition/01_2026-3-7小灶：窗口+辨识度.txt",
+      "source_title": "窗口与辨识度"
+    },
+    {
+      "source_key": "03-loss-qa",
+      "source_path": "03-loss-qa/01_2026-3-15直播解读：面对亏损该如何正确对待交易？.txt",
+      "source_title": "面对亏损"
+    },
+    {
+      "source_key": "04-trading-plan",
+      "source_path": "04-trading-plan/01_2026-3-22直播：如何制定交易计划表？.txt",
+      "source_title": "交易计划表"
+    },
+    {
+      "source_key": "05-new-theme",
+      "source_path": "05-new-theme/01_2025-7-27直播：新题材爆发怎么做.txt",
+      "source_title": "新题材爆发"
+    },
+    {
+      "source_key": "06-short-term-terms",
+      "source_path": "06-short-term-terms/01_2025-11-16直播：短线交易【名词解释】.txt",
+      "source_title": "短线交易名词解释"
+    }
+  ],
+  "rules": [
+    {
+      "mode_key": "new_theme_high_volatility",
+      "name": "新题材高波动套利",
+      "family": "outbreak",
+      "style": "dual_active",
+      "window": "outbreak",
+      "automation_level": "assisted",
+      "priority": 100,
+      "role": "high_volatility",
+      "requirements": [
+        {"feature": "market.window", "op": "eq", "value": "outbreak"},
+        {"feature": "candidate.high_volatility", "op": "eq", "value": true},
+        {"feature": "candidate.theme_rank", "op": "lte", "value": 2}
+      ],
+      "entry": {"label": "爆发确认后高波动先手"},
+      "invalidation": {"label": "题材扩散失败或高波动掉队"},
+      "exit": {"label": "加速兑现或次日不及预期"},
+      "source_refs": [
+        {"source_key": "05-new-theme", "excerpt": "爆发当日高波动优先于高身位，优先于同身位换手"},
+        {"source_key": "01-specialize", "excerpt": "重大题材起爆当日先选择高波动套利"}
+      ]
+    },
+    {
+      "mode_key": "new_theme_high_position",
+      "name": "新题材高身位套利",
+      "family": "outbreak",
+      "style": "board_flow",
+      "window": "outbreak",
+      "automation_level": "assisted",
+      "priority": 95,
+      "role": "high_position",
+      "requirements": [
+        {"feature": "market.window", "op": "eq", "value": "outbreak"},
+        {"feature": "candidate.high_position", "op": "eq", "value": true}
+      ],
+      "entry": {"label": "新题材确认后的高身位套利"},
+      "invalidation": {"label": "放量后不能承接"},
+      "exit": {"label": "放量兑现"},
+      "source_refs": [
+        {"source_key": "05-new-theme", "excerpt": "高波动优先于高身位，高身位优先于同身位换手"}
+      ]
+    },
+    {
+      "mode_key": "new_theme_same_level_turnover",
+      "name": "新题材同身位换手",
+      "family": "outbreak",
+      "style": "board_flow",
+      "window": "outbreak",
+      "automation_level": "assisted",
+      "priority": 85,
+      "role": "same_level_turnover",
+      "requirements": [
+        {"feature": "market.window", "op": "eq", "value": "outbreak"},
+        {"feature": "candidate.same_level_turnover", "op": "eq", "value": true}
+      ],
+      "entry": {"label": "同身位换手胜出"},
+      "invalidation": {"label": "同身位淘汰"},
+      "exit": {"label": "次日强度下降"},
+      "source_refs": [
+        {"source_key": "05-new-theme", "excerpt": "同身位换手不是不好，而是选择更难"}
+      ]
+    },
+    {
+      "mode_key": "big_middle_army_transition",
+      "name": "大中军过渡套利",
+      "family": "outbreak",
+      "style": "trend_main_wave",
+      "window": "outbreak,first_divergence",
+      "automation_level": "assisted",
+      "priority": 90,
+      "role": "middle_army",
+      "requirements": [
+        {"feature": "candidate.middle_army", "op": "eq", "value": true},
+        {"feature": "candidate.theme_rank", "op": "lte", "value": 2}
+      ],
+      "entry": {"label": "高波动兑现后的容量承接"},
+      "invalidation": {"label": "中军不能代表板块或板块扩散结束"},
+      "exit": {"label": "大中军兑现或全面分歧"},
+      "source_refs": [
+        {"source_key": "05-new-theme", "excerpt": "第一波高波动做完，再做一次大中军套利"},
+        {"source_key": "01-specialize", "excerpt": "首次分歧可以选择流动性好的中军"}
+      ]
+    },
+    {
+      "mode_key": "first_mover_leader",
+      "name": "分歧一致先于龙",
+      "family": "leader",
+      "style": "board_flow",
+      "window": "outbreak,first_divergence",
+      "automation_level": "assisted",
+      "priority": 96,
+      "role": "first_mover",
+      "requirements": [
+        {"feature": "candidate.started_before_theme", "op": "eq", "value": true},
+        {"feature": "candidate.recognition_rank", "op": "lte", "value": 3}
+      ],
+      "entry": {"label": "个股分歧转一致并带动方向"},
+      "invalidation": {"label": "失去先于性或号召力"},
+      "exit": {"label": "核心地位被取代"},
+      "source_refs": [
+        {"source_key": "02-window-recognition", "excerpt": "通过窗口寻找方向和核心辨识度"},
+        {"source_key": "06-short-term-terms", "excerpt": "先于板块启动并完成个股分歧转一致"}
+      ]
+    },
+    {
+      "mode_key": "unique_survivor_trial",
+      "name": "唯一活口试错",
+      "family": "leader",
+      "style": "dual_active",
+      "window": "divergence_exhaustion",
+      "automation_level": "assisted",
+      "priority": 98,
+      "role": "survivor",
+      "requirements": [
+        {"feature": "candidate.unique_survivor", "op": "eq", "value": true},
+        {"feature": "market.window", "op": "eq", "value": "divergence_exhaustion"}
+      ],
+      "entry": {"label": "分歧衰竭保留先手"},
+      "invalidation": {"label": "次日补跌或趋势破坏"},
+      "exit": {"label": "活口未转强"},
+      "source_refs": [
+        {"source_key": "05-new-theme", "excerpt": "全面分歧后等待杀出唯一活口"},
+        {"source_key": "06-short-term-terms", "excerpt": "都死了而它还在，这种叫活口"}
+      ]
+    },
+    {
+      "mode_key": "leader_turn_two",
+      "name": "龙头一转二",
+      "family": "leader",
+      "style": "board_flow",
+      "window": "divergence_to_consensus",
+      "automation_level": "automatic",
+      "priority": 100,
+      "role": "leader",
+      "requirements": [
+        {"feature": "candidate.turn_confirmed", "op": "eq", "value": true},
+        {"feature": "candidate.recognition_rank", "op": "eq", "value": 1}
+      ],
+      "entry": {"label": "活口分歧转一致确认"},
+      "invalidation": {"label": "转强失败"},
+      "exit": {"label": "次日不能强更强"},
+      "source_refs": [
+        {"source_key": "00-art-1123", "excerpt": "启动之后超预期，再打开第二浪"},
+        {"source_key": "06-short-term-terms", "excerpt": "转点确认之后才是推仓位的关键窗口"}
+      ]
+    },
+    {
+      "mode_key": "leader_stronger_confirmation",
+      "name": "龙头强更强确认",
+      "family": "leader",
+      "style": "board_flow",
+      "window": "stronger_confirmation",
+      "automation_level": "automatic",
+      "priority": 100,
+      "role": "confirmed_leader",
+      "requirements": [
+        {"feature": "candidate.stronger_confirmed", "op": "eq", "value": true}
+      ],
+      "entry": {"label": "转二后的继续确认"},
+      "invalidation": {"label": "强更强失败或被卡位"},
+      "exit": {"label": "加速转分歧"},
+      "source_refs": [
+        {"source_key": "06-short-term-terms", "excerpt": "转二之后隔日强更强，才能确认龙头"}
+      ]
+    },
+    {
+      "mode_key": "leader_acceleration_to_divergence",
+      "name": "龙头加速转分歧",
+      "family": "leader",
+      "style": "board_flow",
+      "window": "second_divergence",
+      "automation_level": "assisted",
+      "priority": 88,
+      "role": "leader_divergence",
+      "requirements": [
+        {"feature": "candidate.confirmed_leader", "op": "eq", "value": true},
+        {"feature": "candidate.acceleration_to_divergence", "op": "eq", "value": true}
+      ],
+      "entry": {"label": "确认龙头的计划内分歧承接"},
+      "invalidation": {"label": "板块负反馈扩散"},
+      "exit": {"label": "分歧无法修复"},
+      "source_refs": [
+        {"source_key": "06-short-term-terms", "excerpt": "龙头三个买点包括加速转分歧"}
+      ]
+    },
+    {
+      "mode_key": "stage_three_high_low_switch",
+      "name": "三阶段高低切",
+      "family": "rotation",
+      "style": "board_flow",
+      "window": "stage_three",
+      "automation_level": "assisted",
+      "priority": 86,
+      "role": "high_low_switch",
+      "requirements": [
+        {"feature": "market.window", "op": "eq", "value": "stage_three"},
+        {"feature": "candidate.low_position_new_start", "op": "eq", "value": true}
+      ],
+      "entry": {"label": "龙头分歧窗口的低位首板"},
+      "invalidation": {"label": "未能挡刀或卡位"},
+      "exit": {"label": "低位竞争失败"},
+      "source_refs": [
+        {"source_key": "01-specialize", "excerpt": "一致再一致时同时考虑高低切"},
+        {"source_key": "06-short-term-terms", "excerpt": "关键转点低位启动形成高低切"}
+      ]
+    },
+    {
+      "mode_key": "stage_transition_supplement",
+      "name": "转点补涨",
+      "family": "rotation",
+      "style": "board_flow",
+      "window": "first_divergence,stage_three",
+      "automation_level": "assisted",
+      "priority": 78,
+      "role": "supplement",
+      "requirements": [
+        {"feature": "candidate.supplement", "op": "eq", "value": true}
+      ],
+      "entry": {"label": "关键转点的题材内补涨"},
+      "invalidation": {"label": "启动时点不在关键窗口"},
+      "exit": {"label": "补涨使命完成"},
+      "source_refs": [
+        {"source_key": "06-short-term-terms", "excerpt": "转点补涨卡在关键窗口"}
+      ]
+    },
+    {
+      "mode_key": "leader_first_bearish_rebound",
+      "name": "龙头首阴或双头预期",
+      "family": "leader",
+      "style": "board_flow",
+      "window": "stage_three,decline",
+      "automation_level": "manual_only",
+      "priority": 65,
+      "role": "leader_rebound",
+      "requirements": [
+        {"feature": "candidate.confirmed_leader", "op": "eq", "value": true},
+        {"feature": "candidate.first_bearish", "op": "eq", "value": true}
+      ],
+      "entry": {"label": "只对已确认龙头人工判断"},
+      "invalidation": {"label": "普通中位股不适用"},
+      "exit": {"label": "反抽兑现"},
+      "source_refs": [
+        {"source_key": "06-short-term-terms", "excerpt": "龙头首阴低吸只适用于已确认龙头"}
+      ]
+    },
+    {
+      "mode_key": "trend_core_pullback",
+      "name": "趋势核心回调",
+      "family": "trend",
+      "style": "trend_main_wave",
+      "window": "first_divergence",
+      "automation_level": "assisted",
+      "priority": 92,
+      "role": "trend_core",
+      "requirements": [
+        {"feature": "candidate.trend_established", "op": "eq", "value": true},
+        {"feature": "candidate.resilience_rank", "op": "lte", "value": 3},
+        {"feature": "candidate.pullback", "op": "eq", "value": true}
+      ],
+      "entry": {"label": "上升趋势中的抗跌核心回调"},
+      "invalidation": {"label": "趋势角度或板块联动破坏"},
+      "exit": {"label": "反弹弱或核心被替代"},
+      "source_refs": [
+        {"source_key": "00-art-1130", "excerpt": "向上主升方向在分歧衰竭买核心辨识度"},
+        {"source_key": "02-window-recognition", "excerpt": "在正确窗口寻找相对最强的辨识度"}
+      ]
+    },
+    {
+      "mode_key": "trend_consolidation_rebreak",
+      "name": "趋势横盘再突破",
+      "family": "trend",
+      "style": "trend_main_wave",
+      "window": "divergence_to_consensus",
+      "automation_level": "automatic",
+      "priority": 96,
+      "role": "trend_rebreak",
+      "requirements": [
+        {"feature": "candidate.consolidation_rebreak", "op": "eq", "value": true},
+        {"feature": "candidate.linkage_confirmed", "op": "eq", "value": true}
+      ],
+      "entry": {"label": "横盘后新高并获得联动验证"},
+      "invalidation": {"label": "孤证突破或跌回平台"},
+      "exit": {"label": "联动减弱"},
+      "source_refs": [
+        {"source_key": "00-art-1123", "excerpt": "一波拉升横盘三到五天后的再突破"},
+        {"source_key": "00-art-1130", "excerpt": "个股突破需要板块联动交叉验证"}
+      ]
+    },
+    {
+      "mode_key": "trend_turn_two",
+      "name": "趋势一转二",
+      "family": "trend",
+      "style": "trend_main_wave",
+      "window": "divergence_to_consensus",
+      "automation_level": "automatic",
+      "priority": 99,
+      "role": "trend_turn_two",
+      "requirements": [
+        {"feature": "candidate.trend_turn_two", "op": "eq", "value": true},
+        {"feature": "candidate.middle_army_linkage", "op": "eq", "value": true}
+      ],
+      "entry": {"label": "一浪横盘后的二浪确认"},
+      "invalidation": {"label": "中军和板块不能共振"},
+      "exit": {"label": "二浪趋势破坏"},
+      "source_refs": [
+        {"source_key": "00-art-1123", "excerpt": "趋势主升浪转二，横盘后再破新高"},
+        {"source_key": "00-art-1130", "excerpt": "二浪必须由中军和板块共振确认"}
+      ]
+    },
+    {
+      "mode_key": "resilient_core_exhaustion",
+      "name": "连续分歧后的抗跌核心",
+      "family": "trend",
+      "style": "dual_active",
+      "window": "divergence_exhaustion",
+      "automation_level": "assisted",
+      "priority": 90,
+      "role": "resilient_core",
+      "requirements": [
+        {"feature": "candidate.divergence_days", "op": "gte", "value": 3},
+        {"feature": "candidate.resilience_rank", "op": "eq", "value": 1}
+      ],
+      "entry": {"label": "弱中选强后的衰竭承接"},
+      "invalidation": {"label": "分时最弱或领跌"},
+      "exit": {"label": "抗跌特征消失"},
+      "source_refs": [
+        {"source_key": "04-trading-plan", "excerpt": "低吸是弱中选强，不是买分时最弱"}
+      ]
+    },
+    {
+      "mode_key": "alive_theme_snake_arbitrage",
+      "name": "板块未死的蛇形套利",
+      "family": "trend",
+      "style": "dual_active",
+      "window": "divergence_exhaustion",
+      "automation_level": "manual_only",
+      "priority": 70,
+      "role": "snake_arbitrage",
+      "requirements": [
+        {"feature": "candidate.theme_alive", "op": "eq", "value": true},
+        {"feature": "candidate.snake_setup", "op": "eq", "value": true}
+      ],
+      "entry": {"label": "补涨仍在时的左侧套利"},
+      "invalidation": {"label": "板块已无补涨和容量"},
+      "exit": {"label": "套利反弹完成"},
+      "source_refs": [
+        {"source_key": "04-trading-plan", "excerpt": "板块没走完，行为本质是套利"}
+      ]
+    },
+    {
+      "mode_key": "dead_pile_right_confirmation",
+      "name": "死人堆反转的右侧确认",
+      "family": "trend",
+      "style": "dual_active",
+      "window": "divergence_to_consensus",
+      "automation_level": "manual_only",
+      "priority": 74,
+      "role": "right_confirmation",
+      "requirements": [
+        {"feature": "candidate.theme_dead", "op": "eq", "value": true},
+        {"feature": "candidate.right_reversal", "op": "eq", "value": true}
+      ],
+      "entry": {"label": "死人堆龙头只做右侧确认"},
+      "invalidation": {"label": "提前左侧低吸"},
+      "exit": {"label": "右侧突破失败"},
+      "source_refs": [
+        {"source_key": "04-trading-plan", "excerpt": "死人堆爬出来的只能右侧确认"}
+      ]
+    },
+    {
+      "mode_key": "external_high_low_switch",
+      "name": "题材外高低切",
+      "family": "rotation",
+      "style": "dual_active",
+      "window": "first_divergence,stage_three",
+      "automation_level": "manual_only",
+      "priority": 68,
+      "role": "external_switch",
+      "requirements": [
+        {"feature": "candidate.external_switch", "op": "eq", "value": true}
+      ],
+      "entry": {"label": "旧主线分歧时的新方向夺权"},
+      "invalidation": {"label": "新方向没有扩散"},
+      "exit": {"label": "夺权失败"},
+      "source_refs": [
+        {"source_key": "01-specialize", "excerpt": "高位分歧时题材外高低切夺权"},
+        {"source_key": "06-short-term-terms", "excerpt": "题材外新方向必须形成扩散和卡位"}
+      ]
+    }
+  ]
+}

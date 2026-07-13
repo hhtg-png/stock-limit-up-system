@@ -72,6 +72,15 @@ class Settings(BaseSettings):
     DAILY_ANALYSIS_INTRADAY_HOUR: int = 14
     DAILY_ANALYSIS_INTRADAY_MINUTE: int = 50
 
+    # 交易作战手册配置
+    TRADING_PLAYBOOK_ENABLED: bool = True
+    TRADING_PLAYBOOK_TRANSCRIPT_ROOT: Optional[str] = None
+    TRADING_PLAYBOOK_MONITOR_INTERVAL_SECONDS: int = 3
+    TRADING_PLAYBOOK_TRIAL_POSITION_PCT: float = 10.0
+    TRADING_PLAYBOOK_CONFIRMED_POSITION_PCT: float = 30.0
+    TRADING_PLAYBOOK_HARD_STOP_PCT: float = 5.0
+    TRADING_PLAYBOOK_MAX_ACTION_CANDIDATES: int = 3
+
     # DeepSeek 总结配置
     DEEPSEEK_API_KEY: Optional[str] = None
     DEEPSEEK_BASE_URL: str = "https://api.deepseek.com"
