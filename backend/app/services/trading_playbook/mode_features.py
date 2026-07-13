@@ -1108,15 +1108,24 @@ class ModeFeatureBuilder:
 
     @staticmethod
     def _sealed(raw: Mapping[str, Any]) -> Optional[bool]:
-        return _fact_flag(
-            raw,
-            (
+        values = {
+            value
+            for facts in _fact_sources(raw)
+            for name in (
                 "sealed",
                 "review_today_sealed_close",
                 "today_sealed_close",
                 "is_sealed",
-            ),
+            )
+            for value in (_strict_flag(facts.get(name)),)
+            if name in facts and isinstance(value, bool)
+        }
+        values.update(
+            facts["is_final_sealed"]
+            for facts in _fact_sources(raw)
+            if isinstance(facts.get("is_final_sealed"), bool)
         )
+        return values.pop() if len(values) == 1 else None
 
     @staticmethod
     def _sealed_quality(raw: Mapping[str, Any]) -> str:
@@ -1132,6 +1141,11 @@ class ModeFeatureBuilder:
             for value in (_strict_flag(facts.get(name)),)
             if name in facts and isinstance(value, bool)
         }
+        values.update(
+            facts["is_final_sealed"]
+            for facts in _fact_sources(raw)
+            if isinstance(facts.get("is_final_sealed"), bool)
+        )
         if len(values) > 1:
             return "degraded"
         return "ready" if values else "missing"

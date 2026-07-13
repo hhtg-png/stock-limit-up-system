@@ -888,6 +888,54 @@ class TestModeFeatureBuilder:
         assert result["_current_sealed"] is False
         assert result["low_position_new_start"] is False
 
+    @pytest.mark.parametrize(
+        ("raw_sealed", "expected", "expected_status"),
+        [
+            (True, True, "matched"),
+            ("true", None, "waiting"),
+        ],
+    )
+    def test_current_sealed_supports_only_boolean_crawler_schema(
+        self,
+        raw_sealed,
+        expected,
+        expected_status,
+    ):
+        candidate = _candidate(
+            features={
+                "price": 10,
+                "captured_at": AS_OF,
+                "realtime_limit_up_fact": {
+                    "is_final_sealed": raw_sealed,
+                    "open_count": 3,
+                },
+            },
+            evidence=[
+                _source_evidence("tencent"),
+                _source_evidence("realtime_limit_up_pool"),
+            ],
+        )
+        snapshot = _snapshot(candidate)
+        built = ModeFeatureBuilder().build(snapshot, candidate)
+        match_candidate = _matcher_candidate(**built)
+
+        row = ModeMatcher([
+            _rule(
+                role="high_volatility",
+                requirements=[{
+                    "feature": "candidate._current_sealed",
+                    "op": "eq",
+                    "value": True,
+                }],
+            )
+        ]).evaluate(
+            snapshot.market_features,
+            match_candidate,
+        )[0]
+
+        assert built["_current_sealed"] is expected
+        assert row.status == expected_status
+
     def test_same_day_ready_review_realtime_conflict_makes_current_unknown(self):
         candidate = _candidate(
             features={

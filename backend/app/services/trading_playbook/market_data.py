@@ -39,6 +39,17 @@ _FULL_MARKET_CONTEXT_FIELDS = (
     "prior_window",
     "sell_pressure_rising",
 )
+_FULL_MARKET_PRIOR_WINDOWS = {
+    "",
+    "outbreak",
+    "first_divergence",
+    "divergence_exhaustion",
+    "divergence_to_consensus",
+    "stronger_confirmation",
+    "second_divergence",
+    "stage_three",
+    "decline",
+}
 
 
 @dataclass(frozen=True)
@@ -660,7 +671,7 @@ class TradingPlaybookMarketDataProvider:
                 warnings.append(f"future realtime row for {code or 'unknown'}")
                 continue
             if code in stock_by_code:
-                realtime_by_code[code] = row
+                realtime_by_code[code] = self._normalize_realtime_row(row)
                 realtime_provenance_by_code[code] = self._evidence_datetime(
                     available_at,
                     as_of,
@@ -1132,6 +1143,7 @@ class TradingPlaybookMarketDataProvider:
             return {}, [], "stale or invalid full-market context field"
         normalized: Dict[str, Any] = {}
         accepted_quality: Dict[str, str] = {}
+        invalid_fields = []
         count_fields = {
             "limit_up_count",
             "limit_up_count_prev",
@@ -1151,22 +1163,36 @@ class TradingPlaybookMarketDataProvider:
             if declared_quality.get(key) not in {"ready", "computed"}:
                 continue
             value = payload.get(key)
+            valid = True
             if key in count_fields:
-                value = self._optional_float(value)
-                if value is None or value < 0:
-                    continue
-                value = int(value) if value.is_integer() else value
+                if isinstance(value, bool):
+                    valid = False
+                else:
+                    value = self._optional_float(value)
+                    valid = (
+                        value is not None
+                        and value >= 0
+                        and value.is_integer()
+                    )
+                if valid:
+                    value = int(value)
             elif key == "seal_rate":
-                value = self._optional_float(value)
-                if value is None or not 0 <= value <= 100:
-                    continue
+                if isinstance(value, bool):
+                    valid = False
+                else:
+                    value = self._optional_float(value)
+                    valid = value is not None and 0 <= value <= 100
             elif key in flag_fields:
-                if not isinstance(value, bool):
-                    continue
+                valid = isinstance(value, bool)
             elif key == "prior_window":
-                if not isinstance(value, str):
-                    continue
-                value = value.strip()
+                valid = isinstance(value, str)
+                if valid:
+                    value = value.strip()
+                    valid = value in _FULL_MARKET_PRIOR_WINDOWS
+            if not valid:
+                accepted_quality[key] = "invalid"
+                invalid_fields.append(key)
+                continue
             normalized[key] = value
             accepted_quality[key] = str(declared_quality[key])
         evidence = [{
@@ -1184,7 +1210,13 @@ class TradingPlaybookMarketDataProvider:
                 for key in _FULL_MARKET_CONTEXT_FIELDS
             },
         }]
-        return normalized, evidence, None
+        warning = (
+            "invalid full-market context fields: "
+            + ",".join(sorted(invalid_fields))
+            if invalid_fields
+            else None
+        )
+        return normalized, evidence, warning
 
     async def _load_realtime_limit_up(
         self,
@@ -1195,6 +1227,23 @@ class TradingPlaybookMarketDataProvider:
         from app.services.realtime_limit_up_service import realtime_limit_up_service
 
         return await realtime_limit_up_service.get_fast_limit_up_pool(trade_date)
+
+    @classmethod
+    def _normalize_realtime_row(
+        cls,
+        row: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        normalized = dict(row)
+        is_final_sealed = row.get("is_final_sealed")
+        if isinstance(is_final_sealed, bool):
+            normalized["sealed"] = is_final_sealed
+            normalized["broken"] = not is_final_sealed
+        float_market_value = row.get("float_market_value")
+        if not isinstance(float_market_value, bool):
+            market_value = cls._optional_float(float_market_value)
+            if market_value is not None and market_value >= 0:
+                normalized["tradable_market_value"] = market_value
+        return normalized
 
     def _quote_evidence_quality(
         self,

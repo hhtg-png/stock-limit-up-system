@@ -242,6 +242,39 @@ class TradingPlaybookMarketDataProviderBoundaryTests(unittest.TestCase):
         self.assertLessEqual(provider.batch_size, 80)
         self.assertLessEqual(provider.max_concurrency, 16)
 
+    def test_realtime_crawler_aliases_are_strict_and_ignore_open_count(self):
+        from app.services.trading_playbook.market_data import (
+            TradingPlaybookMarketDataProvider,
+        )
+
+        normalized = TradingPlaybookMarketDataProvider._normalize_realtime_row(
+            {
+                "is_final_sealed": True,
+                "open_count": 3,
+                "sealed": False,
+                "float_market_value": 2_000_000,
+                "provenance": "crawler",
+            }
+        )
+
+        self.assertTrue(normalized["sealed"])
+        self.assertFalse(normalized["broken"])
+        self.assertEqual(normalized["tradable_market_value"], 2_000_000)
+        self.assertEqual(normalized["open_count"], 3)
+        self.assertEqual(normalized["provenance"], "crawler")
+        for invalid_value in (True, -1, math.nan, math.inf):
+            with self.subTest(float_market_value=invalid_value):
+                invalid = TradingPlaybookMarketDataProvider._normalize_realtime_row(
+                    {
+                        "is_final_sealed": 1,
+                        "open_count": 3,
+                        "float_market_value": invalid_value,
+                    }
+                )
+                self.assertNotIn("sealed", invalid)
+                self.assertNotIn("broken", invalid)
+                self.assertNotIn("tradable_market_value", invalid)
+
 
 class TradingPlaybookQuoteSnapshotTests(unittest.IsolatedAsyncioTestCase):
     async def test_previous_price_cache_calculates_two_percent_speed_and_ready(self):
@@ -1062,9 +1095,9 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
                     ),
                     "continuous_limit_up_days": 2 if code == "300001" else 1,
                     "seal_amount": 500 if code == "300001" else 300,
-                    "sealed": True,
-                    "broken": False,
-                    "tradable_market_value": (
+                    "is_final_sealed": True,
+                    "open_count": 2 if code == "300001" else 1,
+                    "float_market_value": (
                         2_000_000 if code == "300001" else 1_000_000
                     ),
                 }
@@ -1169,6 +1202,22 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(analyzed.features["recognition_quality"], "ready")
         self.assertEqual(analyzed.features["theme_quality"], "ready")
         self.assertEqual(analyzed.features["theme_rank"], 1)
+        theme = enriched.theme_rankings[0]
+        self.assertEqual(theme["sealed_count"], 2)
+        self.assertEqual(theme["broken_count"], 0)
+        self.assertEqual(analyzed.features["tradable_market_value"], 2_000_000)
+        self.assertEqual(
+            analyzed.features["_feature_quality"]["tradable_market_value"],
+            "ready",
+        )
+        realtime_fact = analyzed.features["realtime_limit_up_fact"]
+        self.assertTrue(realtime_fact["is_final_sealed"])
+        self.assertEqual(realtime_fact["open_count"], 2)
+        self.assertEqual(realtime_fact["float_market_value"], 2_000_000)
+        self.assertTrue(realtime_fact["sealed"])
+        self.assertFalse(realtime_fact["broken"])
+        self.assertTrue(built["_current_sealed"])
+        self.assertEqual(built["_current_sealed_quality"], "ready")
         self.assertTrue(built["high_volatility"])
         self.assertEqual(
             (matches["new_theme_high_volatility"].status,
@@ -1231,6 +1280,12 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
                 "scope": "full_market",
                 "as_of": as_of,
                 "trade_date": source_date - timedelta(days=1),
+            },
+            "invalid_ready_market_field": {
+                "scope": "full_market",
+                "as_of": as_of,
+                "limit_up_count": True,
+                "_invalid_field": "limit_up_count",
             },
         }
         catalog = json.loads(
@@ -1336,6 +1391,21 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
                 )
                 with self.subTest(name=name):
                     assert_waiting(snapshot)
+                    invalid_field = header.get("_invalid_field")
+                    if invalid_field:
+                        self.assertNotIn(invalid_field, snapshot.market_features)
+                        self.assertEqual(
+                            snapshot.market_features["_feature_quality"][
+                                invalid_field
+                            ],
+                            "invalid",
+                        )
+                        self.assertTrue(
+                            any(
+                                invalid_field in warning
+                                for warning in snapshot.quality.warnings
+                            )
+                        )
             missing = await TradingPlaybookMarketDataProvider(
                 quote_api=_FakeQuoteAPI({"300001": payload}),
                 kline_loader=kline_loader,
@@ -1348,6 +1418,128 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
                 as_of=as_of,
             )
         assert_waiting(missing)
+
+    async def test_full_market_context_rejects_ready_invalid_field_values(self):
+        from app.services.trading_playbook.market_data import (
+            TradingPlaybookMarketDataProvider,
+        )
+
+        trade_date = date(2026, 7, 10)
+        as_of = datetime(2026, 7, 10, 14, 40)
+        base = {
+            "limit_up_count": 20,
+            "limit_up_count_prev": 20,
+            "trend_new_high_count": 5,
+            "trend_new_high_count_prev": 5,
+            "limit_down_count": 1,
+            "max_board_height": 3,
+            "seal_rate": 70,
+            "negative_feedback": False,
+            "divergence_days": 0,
+            "sell_pressure_falling": False,
+            "breadth_recovered": False,
+            "prior_window": "",
+            "sell_pressure_rising": False,
+        }
+        cases = (
+            ("limit_up_count", True),
+            ("limit_up_count_prev", False),
+            ("trend_new_high_count", 20.5),
+            ("trend_new_high_count_prev", 0.5),
+            ("limit_down_count", -1),
+            ("max_board_height", math.nan),
+            ("divergence_days", math.inf),
+            ("seal_rate", True),
+            ("seal_rate", -0.1),
+            ("seal_rate", 100.1),
+            ("negative_feedback", 1),
+            ("sell_pressure_falling", "true"),
+            ("breadth_recovered", 0),
+            ("sell_pressure_rising", "false"),
+            ("prior_window", "not-a-window"),
+        )
+
+        for field, invalid_value in cases:
+            values = {**base, field: invalid_value}
+
+            async def loader(requested_date, stage, captured_at, values=values):
+                return {
+                    "scope": "full_market",
+                    "trade_date": requested_date,
+                    "as_of": captured_at,
+                    **values,
+                    "field_quality": {key: "ready" for key in values},
+                }
+
+            provider = TradingPlaybookMarketDataProvider(
+                quote_api=_FakeQuoteAPI(),
+                full_market_context_loader=loader,
+            )
+            normalized, evidence, warning = await provider._load_full_market_context(
+                trade_date,
+                "preclose",
+                as_of,
+            )
+
+            with self.subTest(field=field, value=invalid_value):
+                self.assertNotIn(field, normalized)
+                self.assertEqual(evidence[0]["field_quality"][field], "invalid")
+                self.assertIn(field, warning)
+
+    async def test_full_market_context_accepts_integer_and_zero_boundaries(self):
+        from app.services.trading_playbook.market_data import (
+            TradingPlaybookMarketDataProvider,
+        )
+
+        trade_date = date(2026, 7, 10)
+        as_of = datetime(2026, 7, 10, 14, 40)
+        for seal_rate in (0, 100):
+            values = {
+                "limit_up_count": 0,
+                "limit_up_count_prev": 0,
+                "trend_new_high_count": 0,
+                "trend_new_high_count_prev": 0,
+                "limit_down_count": 0,
+                "max_board_height": 0,
+                "seal_rate": seal_rate,
+                "negative_feedback": False,
+                "divergence_days": 0,
+                "sell_pressure_falling": False,
+                "breadth_recovered": False,
+                "prior_window": "",
+                "sell_pressure_rising": False,
+            }
+
+            async def loader(
+                requested_date,
+                stage,
+                captured_at,
+                values=values,
+            ):
+                return {
+                    "scope": "full_market",
+                    "trade_date": requested_date,
+                    "as_of": captured_at,
+                    **values,
+                    "field_quality": {key: "ready" for key in values},
+                }
+
+            normalized, evidence, warning = (
+                await TradingPlaybookMarketDataProvider(
+                    quote_api=_FakeQuoteAPI(),
+                    full_market_context_loader=loader,
+                )._load_full_market_context(trade_date, "preclose", as_of)
+            )
+
+            with self.subTest(seal_rate=seal_rate):
+                self.assertEqual(normalized, values)
+                self.assertTrue(
+                    all(
+                        value == "ready"
+                        for value in evidence[0]["field_quality"].values()
+                    )
+                )
+                self.assertIsNone(warning)
 
     async def test_candidate_conflicts_and_missing_theme_facts_stay_unknown(self):
         from app.services.trading_playbook.market_data import (
@@ -1390,6 +1582,8 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
                     "first_limit_up_time": "09:31:00",
                     "continuous_limit_up_days": 2,
                     "tradable_market_value": 2_000_000,
+                    "is_final_sealed": "true",
+                    "open_count": 3,
                 }]
 
             snapshot = await TradingPlaybookMarketDataProvider(
@@ -1406,6 +1600,11 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
             )
 
         candidate = snapshot.candidates[0]
+        realtime_fact = candidate.features["realtime_limit_up_fact"]
+        self.assertEqual(realtime_fact["is_final_sealed"], "true")
+        self.assertEqual(realtime_fact["open_count"], 3)
+        self.assertNotIn("sealed", realtime_fact)
+        self.assertNotIn("broken", realtime_fact)
         for key in (
             "first_limit_seconds",
             "board_height",
