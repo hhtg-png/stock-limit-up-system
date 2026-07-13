@@ -124,6 +124,41 @@ class TestMarketStateClassifier:
         )["window"] == "second_divergence"
         assert classifier.classify(base)["window"] == "first_divergence"
 
+    @pytest.mark.parametrize("prior_window", [None, "unknown"])
+    def test_unknown_prior_window_cannot_default_to_first_divergence(
+        self,
+        prior_window,
+    ):
+        result = MarketStateClassifier().classify(
+            {
+                "limit_down_count": 1,
+                "seal_rate": 70,
+                "max_board_height": 2,
+                "limit_up_count": 20,
+                "limit_up_count_prev": 20,
+                "trend_new_high_count": 8,
+                "trend_new_high_count_prev": 8,
+                "divergence_days": 0,
+                "prior_window": prior_window,
+            }
+        )
+
+        assert result["window"] == "unknown"
+        assert result["quality"] == "degraded"
+        assert "prior_window" in result["missing_fields"]
+
+    def test_direct_window_signal_survives_unknown_prior_but_stays_degraded(self):
+        result = MarketStateClassifier().classify(
+            {
+                "negative_feedback": True,
+                "prior_window": "unknown",
+            }
+        )
+
+        assert result["window"] == "decline"
+        assert result["quality"] == "degraded"
+        assert "prior_window" in result["missing_fields"]
+
     @pytest.mark.parametrize(
         ("current", "previous"),
         [(None, 10), (10, None), (0, 0), (1, 0), (-1, 10), (10, -1)],
@@ -545,7 +580,7 @@ class TestRecognitionRanker:
             },
             {
                 "stock_code": "000001",
-                "first_limit_seconds": 0,
+                "first_limit_seconds": 33900,
                 "board_height": 0,
                 "seal_strength": 0,
                 "resilience": 0,
@@ -727,6 +762,44 @@ class TestRecognitionRanker:
         assert row["recognition_rank"] is None
         assert row["missing_fields"] == ["stock_code"]
 
+    @pytest.mark.parametrize("seconds", [33900, 54000])
+    def test_first_limit_seconds_accepts_a_share_event_boundaries(self, seconds):
+        row = RecognitionRanker().rank(
+            [
+                {
+                    "stock_code": "000001",
+                    "first_limit_seconds": seconds,
+                    "board_height": 2,
+                    "seal_strength": 4,
+                    "resilience": 3,
+                    "influence": 1,
+                }
+            ]
+        )[0]
+
+        assert row["fastest_rank"] == 1
+        assert row["quality"] == "ready"
+
+    @pytest.mark.parametrize("seconds", [-1, 0, 33899, 54001])
+    def test_first_limit_seconds_outside_a_share_session_is_missing(self, seconds):
+        row = RecognitionRanker().rank(
+            [
+                {
+                    "stock_code": "000001",
+                    "first_limit_seconds": seconds,
+                    "board_height": 2,
+                    "seal_strength": 4,
+                    "resilience": 3,
+                    "influence": 1,
+                }
+            ]
+        )[0]
+
+        assert row["fastest_rank"] is None
+        assert row["recognition_score"] == 4.0
+        assert row["quality"] == "degraded"
+        assert "first_limit_seconds" in row["missing_fields"]
+
 
 class TestMarketStateAnalyzer:
     @staticmethod
@@ -838,6 +911,7 @@ class TestMarketStateAnalyzer:
         ]
         assert enriched.theme_rankings[0]["score"] == 57
         assert enriched.theme_rankings[0]["rank"] == 1
+        assert enriched.quality.status == "ready"
         by_code = {
             candidate.stock_code: candidate for candidate in enriched.candidates
         }
@@ -849,6 +923,7 @@ class TestMarketStateAnalyzer:
         assert leader["recognition_score"] == 5.0
         assert leader["recognition_quality"] == "ready"
         assert leader["recognition_evidence"]["fastest"]["value"] == 34260
+        assert by_code["000002"].features["recognition_rank"] == 1
         assert enriched.candidates[0].evidence is not snapshot.candidates[0].evidence
 
     def test_enrich_snapshot_propagates_incomplete_evidence_without_zeroes(self):
@@ -879,3 +954,92 @@ class TestMarketStateAnalyzer:
             "resilience",
             "seal_strength",
         ]
+        assert enriched.quality.status == "degraded"
+        assert enriched.quality.as_of == snapshot.quality.as_of
+        assert enriched.quality.source == snapshot.quality.source
+        assert enriched.quality.stale is snapshot.quality.stale
+        assert len(enriched.quality.warnings) == len(
+            set(enriched.quality.warnings)
+        )
+        assert any(
+            warning.startswith("market_state missing:")
+            for warning in enriched.quality.warnings
+        )
+        assert any(
+            warning.startswith("theme 机器人 missing:")
+            for warning in enriched.quality.warnings
+        )
+        assert any(
+            warning.startswith("recognition 000001 missing:")
+            for warning in enriched.quality.warnings
+        )
+
+    def test_enrich_snapshot_preserves_missing_or_stale_quality_and_bounds_warnings(self):
+        snapshot = self._snapshot()
+        warnings = ["重复", "重复"] + [f"已有警告{i}" for i in range(100)]
+        snapshot.quality = DataQuality(
+            status="missing",
+            as_of=snapshot.as_of,
+            source="task3",
+            stale=True,
+            warnings=warnings,
+        )
+
+        enriched = market_state_module.MarketStateAnalyzer().enrich_snapshot(
+            snapshot
+        )
+
+        assert enriched.quality is not snapshot.quality
+        assert enriched.quality.status == "missing"
+        assert enriched.quality.as_of == snapshot.quality.as_of
+        assert enriched.quality.source == "task3"
+        assert enriched.quality.stale is True
+        assert len(enriched.quality.warnings) <= 50
+        assert len(enriched.quality.warnings) == len(
+            set(enriched.quality.warnings)
+        )
+
+    def test_enrich_snapshot_groups_recognition_by_normalized_theme_and_sorts_codes(self):
+        snapshot = self._snapshot()
+        snapshot.candidates[0].theme_name = " 机器人 "
+        snapshot.candidates.reverse()
+
+        enriched = market_state_module.MarketStateAnalyzer().enrich_snapshot(
+            snapshot
+        )
+
+        assert [candidate.stock_code for candidate in enriched.candidates] == [
+            "000001",
+            "000002",
+        ]
+        assert all(
+            candidate.features["recognition_rank"] == 1
+            for candidate in enriched.candidates
+        )
+
+    def test_enrich_snapshot_does_not_rank_a_candidate_without_theme(self):
+        snapshot = self._snapshot()
+        snapshot.theme_rankings = []
+        snapshot.candidates = [snapshot.candidates[0]]
+        snapshot.candidates[0].theme_name = "   "
+
+        enriched = market_state_module.MarketStateAnalyzer().enrich_snapshot(
+            snapshot
+        )
+
+        features = enriched.candidates[0].features
+        assert features["recognition_rank"] is None
+        assert features["recognition_score"] is None
+        assert features["recognition_quality"] == "degraded"
+        assert features["recognition_missing_fields"] == ["theme_name"]
+        assert all(
+            features[key] is None
+            for key in (
+                "fastest_rank",
+                "highest_rank",
+                "hardest_rank",
+                "resilience_rank",
+                "influence_rank",
+            )
+        )
+        assert enriched.quality.status == "degraded"

@@ -6,7 +6,7 @@ import copy
 import math
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
-from .domain import CandidateSnapshot, MarketSnapshot
+from .domain import CandidateSnapshot, DataQuality, MarketSnapshot
 
 
 def _finite_number(value: Any) -> Optional[float]:
@@ -209,7 +209,7 @@ class MarketStateClassifier:
         ):
             window = "second_divergence"
         elif (
-            prior_window is None
+            prior_window in {None, "unknown"}
             or (
                 prior_window == "stronger_confirmation"
                 and sell_pressure_rising is None
@@ -281,6 +281,8 @@ class MarketStateClassifier:
         if normalized not in cls._PRIOR_WINDOWS:
             missing_fields.add("prior_window")
             return None
+        if normalized == "unknown":
+            missing_fields.add("prior_window")
         return normalized
 
 
@@ -371,7 +373,7 @@ class RecognitionRanker:
             seen_codes.add(stock_code)
             record["stock_code"] = stock_code
             normalized = {
-                field: _bounded_number(source.get(field), minimum=0)
+                field: self._dimension_value(field, source.get(field))
                 for _, field, _, _ in self._DIMENSIONS
             }
             missing_fields = [
@@ -454,9 +456,17 @@ class RecognitionRanker:
             record.pop("_normalized")
         return records
 
+    @staticmethod
+    def _dimension_value(field: str, value: Any) -> Optional[float]:
+        if field == "first_limit_seconds":
+            return _bounded_number(value, minimum=33900, maximum=54000)
+        return _bounded_number(value, minimum=0)
+
 
 class MarketStateAnalyzer:
     """Enrich a Task 3 snapshot without mutating its point-in-time evidence."""
+
+    _MAX_QUALITY_WARNINGS = 50
 
     _RECOGNITION_FIELDS = tuple(
         field for _, field, _, _ in RecognitionRanker._DIMENSIONS
@@ -485,35 +495,49 @@ class MarketStateAnalyzer:
     def enrich_snapshot(self, snapshot: MarketSnapshot) -> MarketSnapshot:
         """Return a new snapshot containing classified and ranked evidence."""
         market_features = copy.deepcopy(snapshot.market_features)
-        market_features.update(self.classifier.classify(market_features))
+        market_state = self.classifier.classify(market_features)
+        market_features.update(market_state)
+        analysis_degraded = market_state["quality"] != "ready"
+        analysis_warnings = []
+        if market_state["missing_fields"]:
+            analysis_warnings.append(
+                "market_state missing: "
+                + ",".join(market_state["missing_fields"])
+            )
 
         theme_rankings = self.theme_ranker.rank(
             copy.deepcopy(snapshot.theme_rankings)
         )
+        for row in theme_rankings:
+            if row["quality"] != "ready":
+                analysis_degraded = True
+                analysis_warnings.append(
+                    f"theme {row['theme_name'] or '<missing>'} missing: "
+                    + ",".join(row["missing_fields"])
+                )
         theme_by_name = {
             row["theme_name"]: row
             for row in theme_rankings
             if row["theme_name"]
         }
 
-        recognition_rows = self.recognition_ranker.rank(
-            [
-                {
-                    "stock_code": candidate.stock_code,
-                    **{
-                        field: candidate.features.get(field)
-                        for field in self._RECOGNITION_FIELDS
-                    },
-                }
-                for candidate in snapshot.candidates
-            ]
-        )
+        recognition_rows = self._rank_recognition_by_theme(snapshot.candidates)
+        for row in recognition_rows:
+            if row["quality"] != "ready":
+                analysis_degraded = True
+                analysis_warnings.append(
+                    f"recognition {row['stock_code'] or '<missing>'} missing: "
+                    + ",".join(row["missing_fields"])
+                )
         recognition_by_code = {
             row["stock_code"]: row for row in recognition_rows
         }
 
         candidates = []
-        for candidate in snapshot.candidates:
+        for candidate in sorted(
+            snapshot.candidates,
+            key=lambda item: str(item.stock_code or "").strip(),
+        ):
             features = copy.deepcopy(candidate.features)
             recognition = recognition_by_code[
                 str(candidate.stock_code or "").strip()
@@ -527,6 +551,11 @@ class MarketStateAnalyzer:
 
             theme = theme_by_name.get(str(candidate.theme_name or "").strip())
             if theme is None:
+                analysis_degraded = True
+                analysis_warnings.append(
+                    f"candidate theme {candidate.stock_code or '<missing>'} "
+                    "missing: theme_ranking"
+                )
                 features.update(
                     {
                         "theme_rank": None,
@@ -559,6 +588,12 @@ class MarketStateAnalyzer:
                 )
             )
 
+        quality = self._analysis_quality(
+            snapshot.quality,
+            analysis_degraded=analysis_degraded,
+            analysis_warnings=analysis_warnings,
+        )
+
         return MarketSnapshot(
             source_trade_date=snapshot.source_trade_date,
             target_trade_date=snapshot.target_trade_date,
@@ -567,7 +602,96 @@ class MarketStateAnalyzer:
             market_features=market_features,
             candidates=candidates,
             theme_rankings=theme_rankings,
-            quality=copy.deepcopy(snapshot.quality),
+            quality=quality,
+        )
+
+    def _rank_recognition_by_theme(
+        self,
+        candidates: Iterable[CandidateSnapshot],
+    ) -> List[Dict[str, Any]]:
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        unranked = []
+        seen_codes = set()
+        for candidate in candidates:
+            stock_code = str(candidate.stock_code or "").strip()
+            if stock_code in seen_codes:
+                raise ValueError(f"duplicate stock_code: {stock_code}")
+            seen_codes.add(stock_code)
+            row = {
+                "stock_code": stock_code,
+                **{
+                    field: candidate.features.get(field)
+                    for field in self._RECOGNITION_FIELDS
+                },
+            }
+            theme_name = str(candidate.theme_name or "").strip()
+            if theme_name:
+                grouped.setdefault(theme_name, []).append(row)
+            else:
+                unranked.append(self._unranked_recognition(row))
+
+        ranked = list(unranked)
+        for theme_name in sorted(grouped):
+            ranked.extend(self.recognition_ranker.rank(grouped[theme_name]))
+        return sorted(ranked, key=lambda row: row["stock_code"])
+
+    @staticmethod
+    def _unranked_recognition(row: Mapping[str, Any]) -> Dict[str, Any]:
+        result = dict(row)
+        missing_fields = ["theme_name"]
+        evidence = {}
+        for dimension, field, rank_key, _ in RecognitionRanker._DIMENSIONS:
+            if RecognitionRanker._dimension_value(field, row.get(field)) is None:
+                missing_fields.append(field)
+            result[rank_key] = None
+            evidence[dimension] = {
+                "field": field,
+                "value": row.get(field),
+                "rank": None,
+            }
+        result.update(
+            {
+                "recognition_evidence": evidence,
+                "recognition_score": None,
+                "recognition_rank": None,
+                "quality": "degraded",
+                "missing_fields": sorted(set(missing_fields)),
+            }
+        )
+        return result
+
+    @classmethod
+    def _analysis_quality(
+        cls,
+        original: DataQuality,
+        *,
+        analysis_degraded: bool,
+        analysis_warnings: Iterable[str],
+    ) -> DataQuality:
+        warnings = []
+        for warning in [*original.warnings, *analysis_warnings]:
+            normalized = str(warning).strip()
+            if normalized and normalized not in warnings:
+                warnings.append(normalized)
+            if len(warnings) >= cls._MAX_QUALITY_WARNINGS:
+                break
+
+        if original.status == "missing":
+            status = "missing"
+        elif (
+            original.status != "ready"
+            or original.stale
+            or analysis_degraded
+        ):
+            status = "degraded"
+        else:
+            status = "ready"
+        return DataQuality(
+            status=status,
+            as_of=original.as_of,
+            source=original.source,
+            stale=original.stale,
+            warnings=warnings,
         )
 
 
