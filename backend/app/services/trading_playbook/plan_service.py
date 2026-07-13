@@ -677,6 +677,12 @@ class TradingPlanService:
         for field in required_candidate_fields:
             if field not in features or not isinstance(quality_map, Mapping):
                 return True
+            value = features[field]
+            if value is None or (
+                isinstance(value, str)
+                and value.strip().lower() in {"", "unknown"}
+            ):
+                return True
             if str(quality_map.get(field) or "").lower() not in {
                 "ready",
                 "computed",

@@ -517,9 +517,16 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_structured_relevant_evidence_ignores_unrelated_provider_warning(self):
         async with self.Session() as db:
-            for quality in ("ready", "computed"):
+            cases = [
+                ("ready-false", "ready", False),
+                ("computed-zero", "computed", 0),
+                ("ok-string", "ok", "valid"),
+                ("ready-list", "ready", ["valid"]),
+                ("computed-mapping", "computed", {"valid": True}),
+            ]
+            for case, quality, value in cases:
                 evaluation = _evaluation(
-                    f"leader-{quality}",
+                    f"leader-{case}",
                     "000001",
                     risk_level="confirmed",
                 )
@@ -543,14 +550,14 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
                     ],
                 )
                 snapshot = _snapshot()
-                snapshot.market_features["candidate_quality_case"] = quality
-                snapshot.candidates[0].features["flag"] = True
+                snapshot.market_features["candidate_quality_case"] = case
+                snapshot.candidates[0].features["flag"] = value
                 snapshot.candidates[0].features["_feature_quality"] = {
                     "flag": quality
                 }
                 plan = await self._generate(db, [evaluation], snapshot=snapshot)
 
-                with self.subTest(quality=quality):
+                with self.subTest(case=case):
                     self.assertEqual(len(plan["candidates"]), 1)
                     self.assertEqual(
                         plan["candidates"][0]["risk_level"], "confirmed"
@@ -558,7 +565,27 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_required_candidate_field_and_quality_are_mandatory_for_confirmed(self):
         cases = [
-            ("missing-value", {"_feature_quality": {"flag": "ready"}}),
+            ("absent-value", {"_feature_quality": {"flag": "ready"}}),
+            (
+                "missing-value",
+                {"flag": None, "_feature_quality": {"flag": "ready"}},
+            ),
+            (
+                "empty-string",
+                {"flag": "", "_feature_quality": {"flag": "ready"}},
+            ),
+            (
+                "blank-string",
+                {"flag": " \t", "_feature_quality": {"flag": "ready"}},
+            ),
+            (
+                "unknown",
+                {"flag": "unknown", "_feature_quality": {"flag": "ready"}},
+            ),
+            (
+                "unknown-variant",
+                {"flag": "  UnKnOwN  ", "_feature_quality": {"flag": "ready"}},
+            ),
             ("missing-quality", {"flag": True}),
             (
                 "quality-missing",
