@@ -24,6 +24,11 @@ from app.models.trading_playbook import (
 )
 
 from .domain import MarketSnapshot, ModeEvaluation
+from .errors import (
+    InvalidRequestError,
+    InvalidTransitionError,
+    PlaybookNotFoundError,
+)
 
 
 CHINA_TZ = ZoneInfo("Asia/Shanghai")
@@ -1103,15 +1108,18 @@ class TradingPlanService:
     ) -> TradingPlanVersion:
         parent = await db.get(TradingPlanVersion, plan_id)
         if parent is None:
-            raise ValueError("plan not found")
+            raise PlaybookNotFoundError("plan not found")
         if parent.status not in {"draft", "confirmed", "active"}:
-            raise ValueError("plan cannot be revised")
+            raise InvalidTransitionError("plan cannot be revised")
         parent_candidates = await self._load_candidates(db, parent.id)
-        normalized_changes = self._normalize_revision_changes(
-            parent,
-            parent_candidates,
-            changes,
-        )
+        try:
+            normalized_changes = self._normalize_revision_changes(
+                parent,
+                parent_candidates,
+                changes,
+            )
+        except ValueError as exc:
+            raise InvalidRequestError(str(exc)) from exc
         lock_key = (db.bind, parent.target_trade_date)
         async with self._lock_manager.hold(lock_key):
             for attempt in range(3):
@@ -1122,7 +1130,9 @@ class TradingPlanService:
                         "confirmed",
                         "active",
                     }:
-                        raise ValueError("plan cannot be revised")
+                        raise InvalidTransitionError(
+                            "plan cannot be revised"
+                        )
                     current_candidates = await self._load_candidates(
                         db,
                         current_parent.id,
@@ -1154,7 +1164,7 @@ class TradingPlanService:
                 except IntegrityError:
                     await db.rollback()
                     if attempt == 2:
-                        raise RuntimeError(
+                        raise InvalidTransitionError(
                             "could not allocate a unique revision version"
                         )
                 except Exception:
@@ -1545,16 +1555,16 @@ class TradingPlanService:
             not isinstance(confirmed_by, str)
             or not 1 <= len(confirmed_by.strip()) <= 80
         ):
-            raise ValueError("confirmed_by is required")
+            raise InvalidRequestError("confirmed_by is required")
         plan = await db.get(TradingPlanVersion, plan_id)
         if plan is None:
-            raise ValueError("plan not found")
+            raise PlaybookNotFoundError("plan not found")
         lock_key = (db.bind, plan.target_trade_date)
         async with self._lock_manager.hold(lock_key):
             try:
                 await db.refresh(plan)
                 if plan.status not in {"draft", "confirmed"}:
-                    raise ValueError("plan cannot be confirmed")
+                    raise InvalidTransitionError("plan cannot be confirmed")
                 active_plans = (
                     await db.scalars(
                         select(TradingPlanVersion).where(
@@ -1574,13 +1584,13 @@ class TradingPlanService:
                 return plan
             except IntegrityError as exc:
                 await db.rollback()
-                raise ValueError(
+                raise InvalidTransitionError(
                     "another plan is already active for this target trade date"
                 ) from exc
             except OperationalError as exc:
                 await db.rollback()
                 if "locked" in str(exc).lower():
-                    raise ValueError(
+                    raise InvalidTransitionError(
                         "confirmation conflict; another worker is updating this date"
                     ) from exc
                 raise

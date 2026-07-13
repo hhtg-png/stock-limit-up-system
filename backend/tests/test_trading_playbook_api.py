@@ -24,6 +24,7 @@ from app.models.trading_playbook import (
     TradingPlaybookSettings,
 )
 from app.services.trading_playbook.runtime import trading_playbook_runtime
+from app.services.trading_playbook.errors import InvalidRequestError
 
 
 CN = ZoneInfo("Asia/Shanghai")
@@ -381,7 +382,7 @@ class TradingPlaybookApiTests(unittest.TestCase):
 
     def test_generate_maps_window_error_to_422_and_source_failure_to_503(self):
         async def bad_window(*_args, **_kwargs):
-            raise ValueError("outside stage window")
+            raise InvalidRequestError("outside stage window secret")
 
         self.orchestrator.build_stage = bad_window
         response = self.client.post(
@@ -389,6 +390,25 @@ class TradingPlaybookApiTests(unittest.TestCase):
             json={"source_trade_date": "2026-07-10", "stage": "after_close"},
         )
         self.assertEqual(response.status_code, 422)
+        self.assertEqual(
+            response.json()["detail"],
+            "Invalid trading playbook request",
+        )
+
+        async def invalid_snapshot(*_args, **_kwargs):
+            raise ValueError("candidate 000001 missing 19 internal rules")
+
+        self.orchestrator.build_stage = invalid_snapshot
+        response = self.client.post(
+            "/trading-playbook/plans/generate",
+            json={"source_trade_date": "2026-07-10", "stage": "after_close"},
+        )
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(
+            response.json()["detail"],
+            "Trading playbook service is unavailable",
+        )
+        self.assertNotIn("000001", response.text)
 
         async def failed_source(*_args, **_kwargs):
             raise ConnectionError("market feed unavailable")
@@ -450,6 +470,42 @@ class TradingPlaybookApiTests(unittest.TestCase):
             headers={"content-type": "application/json"},
         )
         self.assertEqual(response.status_code, 422)
+
+    def test_revision_distinguishes_invalid_request_from_state_conflict(self):
+        plan = self.client.get(
+            "/trading-playbook/plans", params={"trade_date": "2026-07-13"}
+        ).json()["items"][0]
+        invalid = self.client.put(
+            f"/trading-playbook/plans/{plan['id']}",
+            json={
+                "change_note": "尝试覆盖刚性止损",
+                "candidate_overrides": [
+                    {
+                        "candidate_id": plan["candidates"][0]["id"],
+                        "invalidation": {"price_lte": 9.0},
+                    }
+                ],
+            },
+        )
+        self.assertEqual(invalid.status_code, 422, invalid.text)
+        self.assertEqual(
+            invalid.json()["detail"],
+            "Invalid trading playbook request",
+        )
+
+        cancelled = self.client.post(
+            f"/trading-playbook/plans/{plan['id']}/cancel"
+        )
+        self.assertEqual(cancelled.status_code, 200, cancelled.text)
+        conflict = self.client.put(
+            f"/trading-playbook/plans/{plan['id']}",
+            json={"change_note": "过期后不可修改"},
+        )
+        self.assertEqual(conflict.status_code, 409, conflict.text)
+        self.assertEqual(
+            conflict.json()["detail"],
+            "Trading plan state conflict",
+        )
 
     def test_alerts_have_stable_pagination_filter_and_idempotent_ack(self):
         response = self.client.get(

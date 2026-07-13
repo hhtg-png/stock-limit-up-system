@@ -28,6 +28,13 @@ from app.schemas.trading_playbook import (
     PlanRevisionRequest,
     TradingPlaybookSettingsUpdate,
 )
+from app.services.trading_playbook.errors import (
+    InvalidRequestError,
+    InvalidTransitionError,
+    PlaybookNotFoundError,
+    UnsafePlanDataError,
+    UpstreamUnavailableError,
+)
 from app.services.trading_playbook.plan_service import TradingPlanService
 from app.services.trading_playbook.runtime import trading_playbook_runtime
 
@@ -35,6 +42,10 @@ from app.services.trading_playbook.runtime import trading_playbook_runtime
 router = APIRouter()
 CN_TZ = ZoneInfo("Asia/Shanghai")
 _plan_service = TradingPlanService()
+INVALID_REQUEST_DETAIL = "Invalid trading playbook request"
+STATE_CONFLICT_DETAIL = "Trading plan state conflict"
+NOT_FOUND_DETAIL = "Trading plan not found"
+SERVICE_UNAVAILABLE_DETAIL = "Trading playbook service is unavailable"
 
 
 def get_trading_playbook_now() -> datetime:
@@ -242,36 +253,44 @@ async def generate_plan(
         )
     except HTTPException:
         raise
-    except ValueError as exc:
+    except InvalidRequestError as exc:
         await db.rollback()
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=422,
+            detail=INVALID_REQUEST_DETAIL,
+        ) from exc
+    except PlaybookNotFoundError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=404, detail=NOT_FOUND_DETAIL) from exc
+    except InvalidTransitionError as exc:
+        await db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=STATE_CONFLICT_DETAIL,
+        ) from exc
     except IntegrityError as exc:
         await db.rollback()
         raise HTTPException(status_code=409, detail="Plan generation conflict") from exc
-    except RuntimeError as exc:
-        await db.rollback()
-        message = str(exc).lower()
-        conflict = any(
-            marker in message
-            for marker in (
-                "unique plan version",
-                "singleton playbook settings",
-                "could not generate plan",
-            )
-        )
-        raise HTTPException(
-            status_code=409 if conflict else 503,
-            detail=str(exc) if conflict else "Trading playbook pipeline failed",
-        ) from exc
-    except (ConnectionError, TimeoutError, OSError) as exc:
+    except (
+        UnsafePlanDataError,
+        UpstreamUnavailableError,
+        ValueError,
+        RuntimeError,
+        ConnectionError,
+        TimeoutError,
+        OSError,
+    ) as exc:
         await db.rollback()
         raise HTTPException(
             status_code=503,
-            detail="Trading playbook market data is unavailable",
+            detail=SERVICE_UNAVAILABLE_DETAIL,
         ) from exc
-    except Exception:
+    except Exception as exc:
         await db.rollback()
-        raise
+        raise HTTPException(
+            status_code=503,
+            detail=SERVICE_UNAVAILABLE_DETAIL,
+        ) from exc
 
 
 @router.get("/plans", summary="查询交易日全部预案版本")
@@ -310,20 +329,31 @@ async def revise_plan(
     request: PlanRevisionRequest,
     db: AsyncSession = Depends(get_db),
 ):
-    if await db.get(TradingPlanVersion, plan_id) is None:
-        raise HTTPException(status_code=404, detail="Trading plan not found")
     changes = request.model_dump(mode="python", exclude_unset=True)
     try:
         child = await _plan_service.revise(db, plan_id, changes)
         return await _plan_service.serialize(db, child)
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except (IntegrityError, RuntimeError) as exc:
+    except PlaybookNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=NOT_FOUND_DETAIL) from exc
+    except InvalidRequestError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=INVALID_REQUEST_DETAIL,
+        ) from exc
+    except InvalidTransitionError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=STATE_CONFLICT_DETAIL,
+        ) from exc
+    except IntegrityError as exc:
         await db.rollback()
         raise HTTPException(status_code=409, detail="Plan revision conflict") from exc
-    except Exception:
+    except Exception as exc:
         await db.rollback()
-        raise
+        raise HTTPException(
+            status_code=503,
+            detail=SERVICE_UNAVAILABLE_DETAIL,
+        ) from exc
 
 
 @router.post("/plans/{plan_id}/confirm", summary="确认并激活预案")
@@ -332,19 +362,30 @@ async def confirm_plan(
     request: PlanConfirmRequest,
     db: AsyncSession = Depends(get_db),
 ):
-    if await db.get(TradingPlanVersion, plan_id) is None:
-        raise HTTPException(status_code=404, detail="Trading plan not found")
     try:
         plan = await _plan_service.confirm(db, plan_id, request.confirmed_by)
         return await _plan_service.serialize(db, plan)
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except (IntegrityError, RuntimeError) as exc:
+    except PlaybookNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=NOT_FOUND_DETAIL) from exc
+    except InvalidRequestError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=INVALID_REQUEST_DETAIL,
+        ) from exc
+    except InvalidTransitionError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=STATE_CONFLICT_DETAIL,
+        ) from exc
+    except IntegrityError as exc:
         await db.rollback()
         raise HTTPException(status_code=409, detail="Plan confirmation conflict") from exc
-    except Exception:
+    except Exception as exc:
         await db.rollback()
-        raise
+        raise HTTPException(
+            status_code=503,
+            detail=SERVICE_UNAVAILABLE_DETAIL,
+        ) from exc
 
 
 @router.post("/plans/{plan_id}/cancel", summary="取消预案")

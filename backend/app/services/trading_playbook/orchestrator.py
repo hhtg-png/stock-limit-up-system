@@ -10,6 +10,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from .domain import MarketSnapshot, ModeEvaluation
+from .errors import InvalidRequestError
 from .market_data import TradingPlaybookMarketDataProvider
 from .market_state import MarketStateAnalyzer
 from .mode_features import ModeFeatureBuilder
@@ -159,18 +160,20 @@ class TradingPlaybookOrchestrator:
         degraded: bool,
     ) -> None:
         if type(source_trade_date) is not date:
-            raise TypeError("source_trade_date must be a date")
+            raise InvalidRequestError("source_trade_date must be a date")
         if stage not in cls.VALID_STAGES:
-            raise ValueError(f"unsupported stage: {stage}")
+            raise InvalidRequestError(f"unsupported stage: {stage}")
         if not isinstance(as_of, datetime):
-            raise TypeError("as_of must be a datetime")
+            raise InvalidRequestError("as_of must be a datetime")
         if as_of.tzinfo is None or as_of.utcoffset() is None:
-            raise ValueError("as_of must be timezone-aware")
+            raise InvalidRequestError("as_of must be timezone-aware")
         if type(degraded) is not bool:
-            raise TypeError("degraded must be a boolean")
+            raise InvalidRequestError("degraded must be a boolean")
         local_as_of = as_of.astimezone(cls._CN_TZ)
         if local_as_of.date() != source_trade_date:
-            raise ValueError("as_of Beijing date must match source_trade_date")
+            raise InvalidRequestError(
+                "as_of Beijing date must match source_trade_date"
+            )
         local_time = local_as_of.time()
         valid_window = {
             "preclose": time(14, 40) <= local_time < time(15, 0),
@@ -179,9 +182,13 @@ class TradingPlaybookOrchestrator:
             "auction": time(9, 26) <= local_time < time(15, 0),
         }[stage]
         if not valid_window:
-            raise ValueError(f"as_of is outside the {stage} Beijing window")
+            raise InvalidRequestError(
+                f"as_of is outside the {stage} Beijing window"
+            )
         if stage == "auction" and local_time >= time(9, 30) and not degraded:
-            raise ValueError("auction catch-up at or after 09:30 must be degraded")
+            raise InvalidRequestError(
+                "auction catch-up at or after 09:30 must be degraded"
+            )
 
     def _target_trade_date(self, source_trade_date: date, stage: str) -> date:
         if stage not in self._NEXT_DAY_STAGES:
