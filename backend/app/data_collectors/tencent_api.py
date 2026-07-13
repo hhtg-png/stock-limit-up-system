@@ -1,6 +1,8 @@
 """
 腾讯股票API - 获取实时行情数据（包括准确的换手率）
 """
+import math
+
 import httpx
 from typing import Dict, List, Optional
 from loguru import logger
@@ -102,15 +104,20 @@ class TencentStockAPI:
                 return {}
             
             result = {}
+            missing_fields = set()
             for name, idx in self.FIELD_INDEX.items():
                 if idx < len(fields):
                     value = fields[idx]
                     # 尝试转换为数字
                     if name not in ("market", "name", "code", "datetime"):
                         try:
-                            result[name] = float(value) if value else 0
-                        except:
+                            number = float(value)
+                            if not math.isfinite(number):
+                                raise ValueError("non-finite numeric field")
+                            result[name] = number
+                        except (TypeError, ValueError):
                             result[name] = 0
+                            missing_fields.add(name)
                     else:
                         result[name] = value
 
@@ -119,6 +126,7 @@ class TencentStockAPI:
                 price=result.get("price"),
                 amount=result.get("amount"),
             )
+            result["_missing_fields"] = sorted(missing_fields)
             
             return result
         except Exception as e:

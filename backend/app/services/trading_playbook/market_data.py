@@ -3,7 +3,8 @@
 import asyncio
 import math
 from collections.abc import Mapping
-from datetime import date, datetime, time
+from dataclasses import dataclass
+from datetime import date, datetime, time, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
@@ -22,6 +23,20 @@ from app.services.trading_playbook.domain import (
 from app.utils.market_data_sanitizer import normalize_change_pct
 
 QuoteFieldQuality = Dict[str, Dict[str, str]]
+_NONFINITE = object()
+
+
+@dataclass(frozen=True)
+class _QuoteCacheRecord:
+    price: float
+    captured_at: datetime
+
+
+@dataclass(frozen=True)
+class _KlineBuildResult:
+    features: Dict[str, Any]
+    available_at: Optional[datetime]
+    reason: Optional[str] = None
 
 
 class TradingPlaybookMarketDataProvider:
@@ -30,6 +45,7 @@ class TradingPlaybookMarketDataProvider:
     MAX_QUOTE_BATCH_SIZE = 80
     MAX_CONCURRENCY = 16
     STALE_AFTER_SECONDS = 10
+    SPEED_MAX_INTERVAL_SECONDS = 60
 
     def __init__(
         self,
@@ -48,8 +64,10 @@ class TradingPlaybookMarketDataProvider:
             self.MAX_CONCURRENCY,
         )
         self.realtime_limit_up_loader = realtime_limit_up_loader
-        self._previous_prices: Dict[str, float] = {}
+        self._previous_prices: Dict[str, _QuoteCacheRecord] = {}
         self._quote_state_lock = asyncio.Lock()
+        self._quote_semaphore = asyncio.Semaphore(self.max_concurrency)
+        self._kline_semaphore = asyncio.Semaphore(self.max_concurrency)
 
     async def quote_snapshot(
         self,
@@ -75,12 +93,11 @@ class TradingPlaybookMarketDataProvider:
         trade_date: date,
         as_of: datetime,
     ) -> Tuple[QuoteSnapshot, QuoteFieldQuality]:
-        async with self._quote_state_lock:
-            return await self._collect_quote_snapshot(
-                stock_codes,
-                trade_date,
-                as_of,
-            )
+        return await self._collect_quote_snapshot(
+            stock_codes,
+            trade_date,
+            as_of,
+        )
 
     async def _collect_quote_snapshot(
         self,
@@ -109,14 +126,13 @@ class TradingPlaybookMarketDataProvider:
                 {},
             )
 
-        semaphore = asyncio.Semaphore(self.max_concurrency)
         chunks = [
             requested_codes[start:start + self.batch_size]
             for start in range(0, len(requested_codes), self.batch_size)
         ]
 
         async def fetch_chunk(chunk: List[str]) -> Tuple[Dict[str, Dict], Optional[str]]:
-            async with semaphore:
+            async with self._quote_semaphore:
                 try:
                     response = await self.quote_api.get_quotes_batch(chunk)
                     if not isinstance(response, dict):
@@ -190,7 +206,12 @@ class TradingPlaybookMarketDataProvider:
                     )
 
             price = self._optional_float(
-                self._pick(raw_quote, "price", "current_price", "last_price")
+                self._quote_source_value(
+                    raw_quote,
+                    "price",
+                    "current_price",
+                    "last_price",
+                )
             )
             if price is None or price <= 0:
                 invalid_price_found = True
@@ -199,7 +220,7 @@ class TradingPlaybookMarketDataProvider:
             quality["price"] = "ready"
 
             pre_close = self._optional_float(
-                self._pick(
+                self._quote_source_value(
                     raw_quote,
                     "pre_close",
                     "previous_close",
@@ -214,7 +235,12 @@ class TradingPlaybookMarketDataProvider:
                 quality["pre_close"] = "ready"
 
             amount = self._optional_float(
-                self._pick(raw_quote, "amount", "turnover", "trade_amount")
+                self._quote_source_value(
+                    raw_quote,
+                    "amount",
+                    "turnover",
+                    "trade_amount",
+                )
             )
             if amount is None or amount < 0:
                 amount = None
@@ -223,13 +249,17 @@ class TradingPlaybookMarketDataProvider:
                 quality["amount"] = "ready"
 
             open_price = self._optional_float(
-                self._pick(raw_quote, "open", "open_price")
+                self._quote_source_value(raw_quote, "open", "open_price")
             )
             quality["open_price"] = (
                 "ready" if open_price is not None and open_price >= 0 else "missing"
             )
             turnover_rate = self._optional_float(
-                self._pick(raw_quote, "turnover_rate", "turnover_pct")
+                self._quote_source_value(
+                    raw_quote,
+                    "turnover_rate",
+                    "turnover_pct",
+                )
             )
             quality["turnover_rate"] = (
                 "ready"
@@ -237,7 +267,11 @@ class TradingPlaybookMarketDataProvider:
                 else "missing"
             )
             bid1_price = self._optional_float(
-                self._pick(raw_quote, "bid1_price", "bid_price_1")
+                self._quote_source_value(
+                    raw_quote,
+                    "bid1_price",
+                    "bid_price_1",
+                )
             )
             quality["bid1_price"] = (
                 "ready"
@@ -245,7 +279,11 @@ class TradingPlaybookMarketDataProvider:
                 else "missing"
             )
             bid1_volume = self._optional_float(
-                self._pick(raw_quote, "bid1_volume", "bid_volume_1")
+                self._quote_source_value(
+                    raw_quote,
+                    "bid1_volume",
+                    "bid_volume_1",
+                )
             )
             quality["bid1_volume"] = (
                 "ready"
@@ -253,12 +291,16 @@ class TradingPlaybookMarketDataProvider:
                 else "missing"
             )
             limit_up = self._optional_float(
-                self._pick(raw_quote, "limit_up", "limit_up_price")
+                self._quote_source_value(
+                    raw_quote,
+                    "limit_up",
+                    "limit_up_price",
+                )
             )
             quality["limit_up"] = (
                 "ready" if limit_up is not None and limit_up > 0 else "missing"
             )
-            raw_change_pct = self._pick(
+            raw_change_pct = self._quote_source_value(
                 raw_quote,
                 "change_pct",
                 "change_percent",
@@ -283,26 +325,12 @@ class TradingPlaybookMarketDataProvider:
                 change_pct = math.nan
                 quality["change_pct"] = "missing"
 
-            first_observation = code not in self._previous_prices
-            previous_price = self._previous_prices.get(code)
-            if first_observation:
-                quality["speed_pct"] = "baseline"
-                speed_pct = 0.0
-            elif (
-                previous_price is None
-                or not math.isfinite(previous_price)
-                or previous_price <= 0
-            ):
-                quality["speed_pct"] = "missing"
-                speed_pct = math.nan
-            else:
-                computed_speed = (price / previous_price - 1) * 100
-                if math.isfinite(computed_speed):
-                    speed_pct = round(computed_speed, 4)
-                    quality["speed_pct"] = "ready"
-                else:
-                    speed_pct = math.nan
-                    quality["speed_pct"] = "missing"
+            speed_pct, quality["speed_pct"] = await self._speed_and_cache(
+                code,
+                price,
+                captured_at,
+                timestamp_ready=quality["timestamp"] == "ready",
+            )
             quotes[code] = QuotePoint(
                 stock_code=code,
                 stock_name=str(
@@ -335,10 +363,6 @@ class TradingPlaybookMarketDataProvider:
                 warnings.append(
                     f"missing quote fields for {code}: {','.join(missing_fields)}"
                 )
-
-        for code, point in quotes.items():
-            if point.price > 0:
-                self._previous_prices[code] = point.price
 
         coverage = len(quotes) / len(requested_codes)
         status = (
@@ -381,13 +405,27 @@ class TradingPlaybookMarketDataProvider:
         if self.kline_loader is None:
             return missing
         try:
-            points = await self.kline_loader(
-                stock_code,
-                market,
-                "day",
-                60,
-                stock_name=stock_name,
-            )
+            async with self._kline_semaphore:
+                points = await self.kline_loader(
+                    stock_code,
+                    market,
+                    "day",
+                    60,
+                    stock_name=stock_name,
+                )
+            return self._calculate_kline_features(points)
+        except Exception:
+            return missing
+
+    @staticmethod
+    def _calculate_kline_features(points: Any) -> Dict[str, Any]:
+        missing = {
+            "n_day_high": False,
+            "consolidation_days": 0,
+            "trend_established": False,
+            "kline_quality": "missing",
+        }
+        try:
             closes = []
             for point in points:
                 if not isinstance(point, Mapping):
@@ -417,6 +455,79 @@ class TradingPlaybookMarketDataProvider:
         except Exception:
             return missing
 
+    async def _kline_features_as_of(
+        self,
+        stock_code: str,
+        market: str,
+        stock_name: str,
+        source_trade_date: date,
+        as_of: datetime,
+    ) -> _KlineBuildResult:
+        missing = self._calculate_kline_features([])
+        if self.kline_loader is None:
+            return _KlineBuildResult(missing, None, "kline loader unavailable")
+        try:
+            async with self._kline_semaphore:
+                points = await self.kline_loader(
+                    stock_code,
+                    market,
+                    "day",
+                    60,
+                    stock_name=stock_name,
+                )
+        except Exception as exc:
+            return _KlineBuildResult(missing, None, f"kline load failed: {exc}")
+
+        local_as_of = self._china_datetime(as_of)
+        accepted = []
+        accepted_times = []
+        try:
+            for point in points:
+                if not isinstance(point, Mapping):
+                    return _KlineBuildResult(
+                        missing,
+                        None,
+                        "invalid kline point",
+                    )
+                bar_date = self._kline_trade_date(point)
+                if bar_date is None:
+                    return _KlineBuildResult(
+                        missing,
+                        None,
+                        "kline point missing usable bar date",
+                    )
+                available_at = self._kline_available_at(point)
+                if available_at is None:
+                    return _KlineBuildResult(
+                        missing,
+                        None,
+                        "kline point missing usable provenance",
+                    )
+                if (
+                    bar_date > source_trade_date
+                    or available_at > local_as_of
+                ):
+                    continue
+                accepted.append(point)
+                accepted_times.append(available_at)
+        except Exception as exc:
+            return _KlineBuildResult(
+                missing,
+                None,
+                f"invalid kline provenance: {exc}",
+            )
+
+        features = self._calculate_kline_features(accepted)
+        available_at = max(accepted_times) if accepted_times else None
+        reason = None
+        if features["kline_quality"] != "ready":
+            reason = "insufficient point-in-time kline observations"
+        return _KlineBuildResult(
+            features,
+            self._evidence_datetime(available_at, as_of),
+            reason,
+        )
+
     async def build_market_snapshot(
         self,
         db: Any,
@@ -426,6 +537,8 @@ class TradingPlaybookMarketDataProvider:
         as_of: datetime,
         force_degraded: bool = False,
     ) -> MarketSnapshot:
+        local_as_of = self._china_datetime(as_of)
+        database_as_of = local_as_of.replace(tzinfo=None)
         stock_result = await db.execute(select(Stock).order_by(Stock.stock_code))
         eligible_stocks = [
             stock
@@ -439,7 +552,7 @@ class TradingPlaybookMarketDataProvider:
         universe_codes = sorted(stock_by_code)
         quote_snapshot, quote_field_quality = await self._quote_snapshot_with_quality(
             universe_codes,
-            min(target_trade_date, as_of.date()),
+            min(target_trade_date, local_as_of.date()),
             as_of,
         )
 
@@ -447,8 +560,18 @@ class TradingPlaybookMarketDataProvider:
             (
                 quote
                 for quote in quote_snapshot.quotes.values()
-                if quote_field_quality.get(quote.stock_code, {}).get("change_pct")
-                in {"ready", "computed"}
+                if (
+                    quote_field_quality.get(quote.stock_code, {}).get(
+                        "change_pct"
+                    )
+                    in {"ready", "computed"}
+                    and self._rank_timestamp_quality(
+                        quote,
+                        as_of,
+                        quote_field_quality.get(quote.stock_code, {}),
+                    )
+                    == "ready"
+                )
             ),
             key=lambda quote: (-quote.change_pct, quote.stock_code),
         )
@@ -456,8 +579,18 @@ class TradingPlaybookMarketDataProvider:
             (
                 quote
                 for quote in quote_snapshot.quotes.values()
-                if quote_field_quality.get(quote.stock_code, {}).get("speed_pct")
-                == "ready"
+                if (
+                    quote_field_quality.get(quote.stock_code, {}).get(
+                        "speed_pct"
+                    )
+                    == "ready"
+                    and self._rank_timestamp_quality(
+                        quote,
+                        as_of,
+                        quote_field_quality.get(quote.stock_code, {}),
+                    )
+                    == "ready"
+                )
             ),
             key=lambda quote: (-quote.speed_pct, quote.stock_code),
         )
@@ -477,12 +610,13 @@ class TradingPlaybookMarketDataProvider:
         warnings = list(quote_snapshot.quality.warnings)
 
         realtime_rows: List[Dict[str, Any]] = []
-        pool_trade_date = min(target_trade_date, as_of.date())
+        pool_trade_date = min(target_trade_date, local_as_of.date())
         try:
             realtime_rows = await self._load_realtime_limit_up(pool_trade_date)
         except Exception as exc:
             warnings.append(f"realtime limit-up pool failed: {exc}")
         realtime_by_code: Dict[str, Dict[str, Any]] = {}
+        realtime_provenance_by_code: Dict[str, datetime] = {}
         for row in realtime_rows or []:
             if not isinstance(row, dict):
                 warnings.append("invalid realtime limit-up row")
@@ -490,16 +624,29 @@ class TradingPlaybookMarketDataProvider:
             code = self._normalize_code(
                 self._pick(row, "stock_code", "code", "symbol")
             )
+            available_at = self._realtime_available_at(row, pool_trade_date)
+            if available_at is None:
+                warnings.append(
+                    f"realtime row missing usable provenance for {code or 'unknown'}"
+                )
+                continue
+            if available_at > local_as_of:
+                warnings.append(f"future realtime row for {code or 'unknown'}")
+                continue
             if code in stock_by_code:
                 realtime_by_code[code] = row
+                realtime_provenance_by_code[code] = self._evidence_datetime(
+                    available_at,
+                    as_of,
+                )
                 candidate_codes.add(code)
 
         review_dates_result = await db.execute(
             select(MarketReviewStockDaily.trade_date)
             .where(
                 MarketReviewStockDaily.trade_date <= source_trade_date,
-                MarketReviewStockDaily.created_at <= as_of,
-                MarketReviewStockDaily.updated_at <= as_of,
+                MarketReviewStockDaily.created_at <= database_as_of,
+                MarketReviewStockDaily.updated_at <= database_as_of,
             )
             .distinct()
             .order_by(desc(MarketReviewStockDaily.trade_date))
@@ -512,8 +659,8 @@ class TradingPlaybookMarketDataProvider:
                 select(MarketReviewStockDaily)
                 .where(
                     MarketReviewStockDaily.trade_date.in_(review_dates),
-                    MarketReviewStockDaily.created_at <= as_of,
-                    MarketReviewStockDaily.updated_at <= as_of,
+                    MarketReviewStockDaily.created_at <= database_as_of,
+                    MarketReviewStockDaily.updated_at <= database_as_of,
                 )
                 .order_by(
                     desc(MarketReviewStockDaily.trade_date),
@@ -528,28 +675,72 @@ class TradingPlaybookMarketDataProvider:
                 review_history_by_code.setdefault(code, []).append(row)
                 candidate_codes.add(code)
 
-        plan_result = await db.execute(
-            select(TradingPlanCandidate, TradingPlanVersion)
-            .join(
-                TradingPlanVersion,
-                TradingPlanCandidate.plan_version_id == TradingPlanVersion.id,
-            )
+        relevant_plan_dates = {source_trade_date, target_trade_date}
+        plan_version_result = await db.execute(
+            select(TradingPlanVersion)
             .where(
                 TradingPlanVersion.source_trade_date <= source_trade_date,
-                TradingPlanVersion.target_trade_date <= target_trade_date,
-                TradingPlanVersion.generated_at <= as_of,
-                TradingPlanCandidate.action_trade_date >= source_trade_date,
-                TradingPlanCandidate.action_trade_date <= target_trade_date,
+                TradingPlanVersion.target_trade_date.in_(relevant_plan_dates),
+                TradingPlanVersion.generated_at <= database_as_of,
+                TradingPlanVersion.status.in_(("active", "confirmed", "draft")),
             )
             .order_by(
-                desc(TradingPlanCandidate.action_trade_date),
+                desc(TradingPlanVersion.target_trade_date),
+                desc(TradingPlanVersion.version_no),
                 desc(TradingPlanVersion.generated_at),
-                TradingPlanCandidate.rank,
-                TradingPlanCandidate.stock_code,
             )
         )
+        eligible_plan_versions = list(plan_version_result.scalars().all())
+        versions_by_target: Dict[date, Dict[int, TradingPlanVersion]] = {}
+        for plan_version in eligible_plan_versions:
+            versions_by_target.setdefault(
+                plan_version.target_trade_date,
+                {},
+            )[plan_version.id] = plan_version
+        status_precedence = {"draft": 1, "confirmed": 2, "active": 3}
+        selected_version_ids = {
+            max(
+                versions.values(),
+                key=lambda version: (
+                    status_precedence.get(version.status, 0),
+                    version.version_no,
+                    version.generated_at,
+                    version.id,
+                ),
+            ).id
+            for versions in versions_by_target.values()
+        }
+        selected_versions = {
+            version.id: version
+            for version in eligible_plan_versions
+            if version.id in selected_version_ids
+        }
+        plan_rows: List[Tuple[TradingPlanCandidate, TradingPlanVersion]] = []
+        if selected_version_ids:
+            plan_candidate_result = await db.execute(
+                select(TradingPlanCandidate)
+                .where(
+                    TradingPlanCandidate.plan_version_id.in_(
+                        selected_version_ids
+                    ),
+                    TradingPlanCandidate.action_trade_date.in_(
+                        relevant_plan_dates
+                    ),
+                    TradingPlanCandidate.action_trade_date
+                    <= target_trade_date,
+                )
+                .order_by(
+                    desc(TradingPlanCandidate.action_trade_date),
+                    TradingPlanCandidate.rank,
+                    TradingPlanCandidate.stock_code,
+                )
+            )
+            plan_rows = [
+                (candidate, selected_versions[candidate.plan_version_id])
+                for candidate in plan_candidate_result.scalars().all()
+            ]
         plan_by_code: Dict[str, Tuple[TradingPlanCandidate, TradingPlanVersion]] = {}
-        for candidate, plan_version in plan_result.all():
+        for candidate, plan_version in plan_rows:
             code = self._normalize_code(candidate.stock_code)
             if code in stock_by_code:
                 plan_by_code.setdefault(code, (candidate, plan_version))
@@ -557,16 +748,15 @@ class TradingPlaybookMarketDataProvider:
 
         candidate_codes.intersection_update(stock_by_code)
         ordered_candidate_codes = sorted(candidate_codes)
-        kline_semaphore = asyncio.Semaphore(self.max_concurrency)
-
-        async def load_kline(code: str) -> Tuple[str, Dict[str, Any]]:
+        async def load_kline(code: str) -> Tuple[str, _KlineBuildResult]:
             stock = stock_by_code[code]
-            async with kline_semaphore:
-                return code, await self.kline_features(
-                    code,
-                    self._infer_market(code, stock.market),
-                    stock.stock_name,
-                )
+            return code, await self._kline_features_as_of(
+                code,
+                self._infer_market(code, stock.market),
+                stock.stock_name,
+                source_trade_date,
+                as_of,
+            )
 
         kline_pairs = await asyncio.gather(
             *(load_kline(code) for code in ordered_candidate_codes)
@@ -609,8 +799,12 @@ class TradingPlaybookMarketDataProvider:
             if code in change_ranks or code in speed_ranks:
                 rank_evidence = {
                     "source": "full_market_quote_rank",
-                    "as_of": as_of,
-                    "quality": quote_snapshot.quality.status,
+                    "as_of": quote.captured_at,
+                    "quality": self._rank_timestamp_quality(
+                        quote,
+                        as_of,
+                        quote_field_quality.get(code, {}),
+                    ),
                 }
                 if code in change_ranks:
                     rank_evidence["change_rank"] = change_ranks[code]
@@ -623,27 +817,35 @@ class TradingPlaybookMarketDataProvider:
                     ).get("speed_pct", "missing")
                 evidence.append(rank_evidence)
 
-            kline = kline_by_code[code]
-            features.update(kline)
+            kline_result = kline_by_code[code]
+            kline = kline_result.features
             kline_quality = kline["kline_quality"]
+            if kline_quality == "ready":
+                features.update(kline)
+            else:
+                features["kline_quality"] = kline_quality
             kline_evidence = {
                 "source": "kline",
-                "as_of": as_of,
+                "as_of": kline_result.available_at,
                 "quality": kline_quality,
             }
             if kline_quality != "ready":
                 warning = f"missing kline features for {code}"
                 warnings.append(warning)
                 kline_evidence["warning"] = warning
+                if kline_result.reason:
+                    kline_evidence["reason"] = kline_result.reason
             evidence.append(kline_evidence)
 
             realtime_row = realtime_by_code.get(code)
             if realtime_row is not None:
-                features["realtime_limit_up_fact"] = dict(realtime_row)
+                features["realtime_limit_up_fact"] = self._sanitize_fact(
+                    realtime_row
+                )
                 evidence.append(
                     {
                         "source": "realtime_limit_up_pool",
-                        "as_of": as_of,
+                        "as_of": realtime_provenance_by_code[code],
                         "quality": "ready",
                     }
                 )
@@ -666,8 +868,14 @@ class TradingPlaybookMarketDataProvider:
                     {
                         "source": "market_review_stock_daily",
                         "as_of": max(
-                            latest_row.created_at,
-                            latest_row.updated_at,
+                            self._evidence_datetime(
+                                self._china_datetime(latest_row.created_at),
+                                as_of,
+                            ),
+                            self._evidence_datetime(
+                                self._china_datetime(latest_row.updated_at),
+                                as_of,
+                            ),
                         ),
                         "quality": latest_row.data_quality_flag or "ok",
                     }
@@ -690,7 +898,10 @@ class TradingPlaybookMarketDataProvider:
                 evidence.append(
                     {
                         "source": "trading_plan_candidate",
-                        "as_of": plan_version.generated_at,
+                        "as_of": self._evidence_datetime(
+                            self._china_datetime(plan_version.generated_at),
+                            as_of,
+                        ),
                         "quality": "ready",
                     }
                 )
@@ -698,6 +909,7 @@ class TradingPlaybookMarketDataProvider:
             theme_name = self._theme_name(
                 realtime_row,
                 review_history[0] if review_history else None,
+                plan_context[0] if plan_context is not None else None,
             )
             candidates.append(
                 CandidateSnapshot(
@@ -724,17 +936,33 @@ class TradingPlaybookMarketDataProvider:
             key=lambda item: item.stock_code,
         ):
             item = {"stock_code": quote.stock_code}
+            timestamp_quality = self._rank_timestamp_quality(
+                quote,
+                as_of,
+                quote_field_quality.get(quote.stock_code, {}),
+            )
             if quote.stock_code in change_ranks:
                 item["change_rank"] = change_ranks[quote.stock_code]
             else:
-                item["change_quality"] = "missing"
+                item["change_quality"] = (
+                    timestamp_quality
+                    if timestamp_quality != "ready"
+                    else quote_field_quality.get(quote.stock_code, {}).get(
+                        "change_pct",
+                        "missing",
+                    )
+                )
             if quote.stock_code in speed_ranks:
                 item["speed_rank"] = speed_ranks[quote.stock_code]
             else:
-                item["speed_quality"] = quote_field_quality.get(
-                    quote.stock_code,
-                    {},
-                ).get("speed_pct", "missing")
+                item["speed_quality"] = (
+                    timestamp_quality
+                    if timestamp_quality != "ready"
+                    else quote_field_quality.get(
+                        quote.stock_code,
+                        {},
+                    ).get("speed_pct", "missing")
+                )
             rank_evidence.append(item)
         market_features = {
             "quote_requested_count": len(universe_codes),
@@ -799,6 +1027,18 @@ class TradingPlaybookMarketDataProvider:
             return "degraded"
         return "ready"
 
+    def _rank_timestamp_quality(
+        self,
+        quote: QuotePoint,
+        as_of: datetime,
+        field_quality: Dict[str, str],
+    ) -> str:
+        if field_quality.get("timestamp") != "ready":
+            return "degraded"
+        if self._age_seconds(as_of, quote.captured_at) > self.STALE_AFTER_SECONDS:
+            return "stale"
+        return "ready"
+
     @staticmethod
     def _quote_features(
         quote: QuotePoint,
@@ -809,7 +1049,7 @@ class TradingPlaybookMarketDataProvider:
             "speed_quality": field_quality.get("speed_pct", "missing"),
             "captured_at": quote.captured_at,
         }
-        if field_quality.get("speed_pct") in {"ready", "baseline"}:
+        if field_quality.get("speed_pct") == "ready":
             features["speed_pct"] = quote.speed_pct
         optional_fields = (
             "pre_close",
@@ -935,6 +1175,173 @@ class TradingPlaybookMarketDataProvider:
             and time(9, 15) <= local.time().replace(tzinfo=None) < time(9, 27)
         )
 
+    @classmethod
+    def _kline_available_at(
+        cls,
+        point: Mapping[str, Any],
+    ) -> Optional[datetime]:
+        for key in (
+            "available_at",
+            "captured_at",
+            "updated_at",
+            "collected_at",
+            "datetime",
+            "timestamp",
+            "date",
+            "trade_date",
+        ):
+            if key not in point or point[key] in (None, ""):
+                continue
+            parsed = cls._parse_temporal_value(
+                point[key],
+                date_only_at=time(15, 0),
+            )
+            if parsed is not None:
+                return parsed
+        return None
+
+    @classmethod
+    def _kline_trade_date(
+        cls,
+        point: Mapping[str, Any],
+    ) -> Optional[date]:
+        for key in ("date", "trade_date"):
+            parsed_date = cls._parse_date_value(point.get(key))
+            if parsed_date is not None:
+                return parsed_date
+        for key in ("datetime", "timestamp"):
+            if key not in point or point[key] in (None, ""):
+                continue
+            parsed = cls._parse_temporal_value(
+                point[key],
+                date_only_at=time(15, 0),
+            )
+            if parsed is not None:
+                return parsed.date()
+        return None
+
+    @classmethod
+    def _realtime_available_at(
+        cls,
+        row: Mapping[str, Any],
+        requested_date: date,
+    ) -> Optional[datetime]:
+        row_date = requested_date
+        for date_key in ("trade_date", "date"):
+            parsed_date = cls._parse_date_value(row.get(date_key))
+            if parsed_date is not None:
+                row_date = parsed_date
+                break
+
+        candidates = []
+        for key in (
+            "available_at",
+            "captured_at",
+            "updated_at",
+            "_collected_at",
+            "collected_at",
+            "collection_time",
+            "generated_at",
+            "datetime",
+            "timestamp",
+            "quote_time",
+            "time",
+            "final_seal_time",
+            "first_limit_up_time",
+        ):
+            if key not in row or row[key] in (None, ""):
+                continue
+            parsed = cls._parse_temporal_value(
+                row[key],
+                default_date=row_date,
+            )
+            if parsed is not None:
+                candidates.append(parsed)
+        return max(candidates) if candidates else None
+
+    @classmethod
+    def _parse_temporal_value(
+        cls,
+        value: Any,
+        *,
+        default_date: Optional[date] = None,
+        date_only_at: Optional[time] = None,
+    ) -> Optional[datetime]:
+        if isinstance(value, datetime):
+            return cls._china_datetime(value)
+        if isinstance(value, date):
+            if date_only_at is None:
+                return None
+            return cls._china_datetime(datetime.combine(value, date_only_at))
+        if value in (None, ""):
+            return None
+
+        raw = str(value).strip()
+        for pattern in (
+            "%Y%m%d%H%M%S",
+            "%Y-%m-%d %H:%M:%S",
+            "%Y/%m/%d %H:%M:%S",
+        ):
+            try:
+                return cls._china_datetime(datetime.strptime(raw, pattern))
+            except ValueError:
+                pass
+        parsed_date = cls._parse_date_value(raw)
+        if parsed_date is not None:
+            if date_only_at is None:
+                return None
+            return cls._china_datetime(datetime.combine(parsed_date, date_only_at))
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            return cls._china_datetime(parsed)
+        except ValueError:
+            pass
+        if default_date is not None:
+            for pattern in ("%H:%M:%S", "%H%M%S", "%H:%M"):
+                try:
+                    parsed_time = datetime.strptime(raw, pattern).time()
+                    return cls._china_datetime(
+                        datetime.combine(default_date, parsed_time)
+                    )
+                except ValueError:
+                    pass
+        if raw.isdigit() and len(raw) in {10, 13}:
+            try:
+                seconds = int(raw) / (1000 if len(raw) == 13 else 1)
+                return datetime.fromtimestamp(
+                    seconds,
+                    tz=timezone.utc,
+                ).astimezone(ZoneInfo("Asia/Shanghai"))
+            except (OverflowError, OSError, ValueError):
+                return None
+        return None
+
+    @classmethod
+    def _parse_date_value(cls, value: Any) -> Optional[date]:
+        if isinstance(value, datetime):
+            return cls._china_datetime(value).date()
+        if isinstance(value, date):
+            return value
+        if value in (None, ""):
+            return None
+        raw = str(value).strip()
+        for pattern in ("%Y-%m-%d", "%Y%m%d", "%Y/%m/%d"):
+            try:
+                return datetime.strptime(raw, pattern).date()
+            except ValueError:
+                pass
+        return None
+
+    @staticmethod
+    def _evidence_datetime(
+        value: Optional[datetime],
+        as_of: datetime,
+    ) -> Optional[datetime]:
+        if value is None:
+            return None
+        local = TradingPlaybookMarketDataProvider._china_datetime(value)
+        return local if as_of.tzinfo is not None else local.replace(tzinfo=None)
+
     @staticmethod
     def _review_fact(row: MarketReviewStockDaily) -> Dict[str, Any]:
         return {
@@ -958,6 +1365,7 @@ class TradingPlaybookMarketDataProvider:
     def _theme_name(
         realtime_row: Optional[Dict[str, Any]],
         review_row: Optional[MarketReviewStockDaily],
+        plan_candidate: Optional[TradingPlanCandidate] = None,
     ) -> str:
         if realtime_row:
             for key in ("theme_name", "reason_category", "limit_up_reason"):
@@ -965,6 +1373,8 @@ class TradingPlaybookMarketDataProvider:
                     return str(realtime_row[key])
         if review_row is not None and review_row.limit_up_reason:
             return str(review_row.limit_up_reason)
+        if plan_candidate is not None and plan_candidate.theme_name:
+            return str(plan_candidate.theme_name)
         return ""
 
     @staticmethod
@@ -1028,13 +1438,46 @@ class TradingPlaybookMarketDataProvider:
                 return payload[name]
         return None
 
+    @classmethod
+    def _quote_source_value(
+        cls,
+        payload: Dict[str, Any],
+        canonical_name: str,
+        *aliases: str,
+    ) -> Any:
+        missing = payload.get("_missing_fields")
+        if isinstance(missing, (list, tuple, set, frozenset)):
+            missing_names = {str(name) for name in missing}
+            if canonical_name in missing_names:
+                return None
+        return cls._pick(payload, canonical_name, *aliases)
+
     @staticmethod
     def _optional_float(value: Any) -> Optional[float]:
         try:
             number = float(value)
             return number if math.isfinite(number) else None
-        except (TypeError, ValueError):
+        except (OverflowError, TypeError, ValueError):
             return None
+
+    @classmethod
+    def _sanitize_fact(cls, value: Any) -> Any:
+        if isinstance(value, float) and not math.isfinite(value):
+            return _NONFINITE
+        if isinstance(value, Mapping):
+            cleaned = {}
+            for key, item in value.items():
+                sanitized = cls._sanitize_fact(item)
+                if sanitized is not _NONFINITE:
+                    cleaned[key] = sanitized
+            return cleaned
+        if isinstance(value, list):
+            cleaned = [cls._sanitize_fact(item) for item in value]
+            return [item for item in cleaned if item is not _NONFINITE]
+        if isinstance(value, tuple):
+            cleaned = (cls._sanitize_fact(item) for item in value)
+            return tuple(item for item in cleaned if item is not _NONFINITE)
+        return value
 
     @staticmethod
     def _parse_quote_datetime(value: Any) -> Tuple[Optional[datetime], bool]:
@@ -1067,3 +1510,81 @@ class TradingPlaybookMarketDataProvider:
         if right.tzinfo is None:
             right = right.replace(tzinfo=china_tz)
         return (left - right).total_seconds()
+
+    async def _speed_and_cache(
+        self,
+        code: str,
+        price: float,
+        captured_at: datetime,
+        *,
+        timestamp_ready: bool,
+    ) -> Tuple[float, str]:
+        async with self._quote_state_lock:
+            first_observation = code not in self._previous_prices
+            previous = self._previous_prices.get(code)
+            if first_observation:
+                speed_pct = 0.0
+                quality = "baseline"
+            elif (
+                not isinstance(previous, _QuoteCacheRecord)
+                or not math.isfinite(previous.price)
+                or previous.price <= 0
+                or not self._can_compare_speed(
+                    previous.captured_at,
+                    captured_at,
+                )
+            ):
+                speed_pct = math.nan
+                quality = "missing"
+            else:
+                computed_speed = (price / previous.price - 1) * 100
+                if math.isfinite(computed_speed):
+                    speed_pct = round(computed_speed, 4)
+                    quality = "ready"
+                else:
+                    speed_pct = math.nan
+                    quality = "missing"
+
+            if timestamp_ready and (
+                not isinstance(previous, _QuoteCacheRecord)
+                or self._age_seconds(captured_at, previous.captured_at) > 0
+            ):
+                self._previous_prices[code] = _QuoteCacheRecord(
+                    price=price,
+                    captured_at=captured_at,
+                )
+            return speed_pct, quality
+
+    @classmethod
+    def _can_compare_speed(
+        cls,
+        previous_at: datetime,
+        current_at: datetime,
+    ) -> bool:
+        previous = cls._china_datetime(previous_at)
+        current = cls._china_datetime(current_at)
+        interval = (current - previous).total_seconds()
+        return (
+            previous.date() == current.date()
+            and cls._trading_session(previous) is not None
+            and cls._trading_session(previous) == cls._trading_session(current)
+            and 0 < interval <= cls.SPEED_MAX_INTERVAL_SECONDS
+        )
+
+    @staticmethod
+    def _china_datetime(value: datetime) -> datetime:
+        china_tz = ZoneInfo("Asia/Shanghai")
+        if value.tzinfo is None:
+            return value.replace(tzinfo=china_tz)
+        return value.astimezone(china_tz)
+
+    @staticmethod
+    def _trading_session(value: datetime) -> Optional[str]:
+        local_time = value.time().replace(tzinfo=None)
+        if time(9, 15) <= local_time < time(9, 27):
+            return "auction"
+        if time(9, 30) <= local_time <= time(11, 30):
+            return "morning"
+        if time(13, 0) <= local_time <= time(15, 0):
+            return "afternoon"
+        return None
