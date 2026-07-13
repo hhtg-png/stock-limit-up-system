@@ -1217,6 +1217,21 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
                 "scope": "full_market",
                 "as_of": as_of - timedelta(days=1),
             },
+            "missing_trade_date": {
+                "scope": "full_market",
+                "as_of": as_of,
+                "_omit_trade_date": True,
+            },
+            "invalid_trade_date": {
+                "scope": "full_market",
+                "as_of": as_of,
+                "trade_date": "not-a-date",
+            },
+            "mismatched_trade_date": {
+                "scope": "full_market",
+                "as_of": as_of,
+                "trade_date": source_date - timedelta(days=1),
+            },
         }
         catalog = json.loads(
             Path("app/data/trading_playbook_rules_v1.json").read_text(
@@ -1291,12 +1306,21 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
             await db.commit()
             for name, header in variants.items():
                 async def loader(trade_date, stage, captured_at, header=header):
-                    return {
+                    result = {
                         "trade_date": trade_date,
                         **values,
                         "field_quality": {key: "ready" for key in values},
-                        **header,
                     }
+                    result.update(
+                        {
+                            key: value
+                            for key, value in header.items()
+                            if not key.startswith("_")
+                        }
+                    )
+                    if header.get("_omit_trade_date"):
+                        result.pop("trade_date")
+                    return result
 
                 snapshot = await TradingPlaybookMarketDataProvider(
                     quote_api=_FakeQuoteAPI({"300001": payload}),

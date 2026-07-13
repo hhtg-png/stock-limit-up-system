@@ -1099,9 +1099,13 @@ class TradingPlaybookMarketDataProvider:
             return {}, [], "invalid full-market context payload"
         if payload.get("scope") != "full_market":
             return {}, [], "invalid full-market context scope"
+        if "trade_date" not in payload:
+            return {}, [], "full-market context missing trade date"
         payload_trade_date = self._parse_date_value(payload.get("trade_date"))
-        if payload_trade_date is not None and payload_trade_date != trade_date:
-            return {}, [], "stale full-market context trade date"
+        if payload_trade_date is None:
+            return {}, [], "invalid full-market context trade date"
+        if payload_trade_date != trade_date:
+            return {}, [], "mismatched full-market context trade date"
         captured_at = self._parse_temporal_value(payload.get("as_of"))
         if captured_at is None:
             captured_at = self._parse_temporal_value(payload.get("captured_at"))
