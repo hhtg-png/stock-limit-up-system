@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from sqlalchemy import func, select
+from sqlalchemy import event, func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
@@ -253,7 +253,77 @@ class TradingPlaybookRuleCatalogSeedTests(unittest.IsolatedAsyncioTestCase):
                 )
         self.assertEqual(await self._counts(), (8, 19))
 
-    async def test_missing_transcript_lists_relative_path_and_rolls_back_seed(self):
+    async def test_changed_transcript_appends_source_hash_and_preserves_rules(self):
+        self._write_all_transcripts()
+        changed_source = self.catalog_data["sources"][0]
+        transcript_path = self.source_root / changed_source["source_path"]
+        original_content = transcript_path.read_bytes()
+        original_hash = hashlib.sha256(original_content).hexdigest()
+
+        async with self.session_factory() as session:
+            await self.catalog.seed(session, self.source_root)
+
+        changed_content = original_content + b"changed transcript bytes"
+        transcript_path.write_bytes(changed_content)
+        changed_hash = hashlib.sha256(changed_content).hexdigest()
+        async with self.session_factory() as session:
+            await self.catalog.seed(session, self.source_root)
+
+        async with self.session_factory() as session:
+            source_rows = (
+                await session.scalars(select(TradingRuleSource))
+            ).all()
+            rule_count = await session.scalar(
+                select(func.count()).select_from(TradingModeRule)
+            )
+
+        changed_source_rows = [
+            row
+            for row in source_rows
+            if row.source_key == changed_source["source_key"]
+        ]
+        changed_source_hashes = {
+            row.content_hash for row in changed_source_rows
+        }
+        self.assertEqual(len(source_rows), 9)
+        self.assertEqual(len(changed_source_rows), 2)
+        self.assertEqual(changed_source_hashes, {original_hash, changed_hash})
+        self.assertTrue(all(len(value) == 64 for value in changed_source_hashes))
+        self.assertIn(original_hash, changed_source_hashes)
+        self.assertEqual(rule_count, 19)
+
+    async def test_rule_insert_failure_rolls_back_source_and_rule_rows(self):
+        self._write_all_transcripts()
+        failing_mode_key = self.catalog_data["rules"][0]["mode_key"]
+        failure_observed = []
+        source_counts_at_failure = []
+
+        def fail_selected_rule(_mapper, connection, target):
+            if target.mode_key == failing_mode_key:
+                failure_observed.append(target.mode_key)
+                source_counts_at_failure.append(
+                    connection.scalar(
+                        select(func.count()).select_from(TradingRuleSource)
+                    )
+                )
+                raise RuntimeError("forced rule insert failure after source DML")
+
+        event.listen(TradingModeRule, "before_insert", fail_selected_rule)
+        try:
+            async with self.session_factory() as session:
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "forced rule insert failure after source DML",
+                ):
+                    await self.catalog.seed(session, self.source_root)
+        finally:
+            event.remove(TradingModeRule, "before_insert", fail_selected_rule)
+
+        self.assertEqual(failure_observed, [failing_mode_key])
+        self.assertEqual(source_counts_at_failure, [8])
+        self.assertEqual(await self._counts(), (0, 0))
+
+    async def test_missing_transcript_lists_relative_path_before_seed_writes(self):
         self._write_all_transcripts()
         missing_relative_path = self.catalog_data["sources"][3]["source_path"]
         (self.source_root / missing_relative_path).unlink()
