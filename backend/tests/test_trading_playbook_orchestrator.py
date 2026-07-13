@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import unittest
+from dataclasses import replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -87,8 +88,7 @@ def _rule_rows() -> list[dict]:
     ]
 
 
-def _evaluation(code: str) -> ModeEvaluation:
-    key = "mode_00"
+def _evaluation(code: str, key: str = "mode_00") -> ModeEvaluation:
     return ModeEvaluation(
         mode_key=key,
         stock_code=code,
@@ -148,10 +148,55 @@ class _Matcher:
 
     def evaluate(self, market_features, candidate):
         self.seen.append((copy.deepcopy(market_features), copy.deepcopy(candidate)))
-        return [_evaluation(candidate.stock_code)]
+        return [
+            _evaluation(candidate.stock_code, row["mode_key"])
+            for row in _rule_rows()
+        ]
 
     def rule_snapshot(self):
         return _rule_rows()
+
+
+class _DroppingEvaluationMatcher:
+    def __init__(self, delegate, *, stock_code: str, mode_key: str):
+        self.delegate = delegate
+        self.stock_code = stock_code
+        self.mode_key = mode_key
+
+    def evaluate(self, market_features, candidate):
+        rows = self.delegate.evaluate(market_features, candidate)
+        if candidate.stock_code != self.stock_code:
+            return rows
+        return [row for row in rows if row.mode_key != self.mode_key]
+
+    def rule_snapshot(self):
+        return self.delegate.rule_snapshot()
+
+
+class _TamperingEvaluationMatcher:
+    def __init__(self, delegate, *, stock_code: str, mutation: str):
+        self.delegate = delegate
+        self.stock_code = stock_code
+        self.mutation = mutation
+
+    def evaluate(self, market_features, candidate):
+        rows = self.delegate.evaluate(market_features, candidate)
+        if candidate.stock_code != self.stock_code:
+            return rows
+        if self.mutation == "extra":
+            return rows + [
+                replace(
+                    rows[0],
+                    mode_key="unexpected_mode",
+                    rule_hash=hashlib.sha256(b"unexpected_mode").hexdigest(),
+                )
+            ]
+        if self.mutation == "duplicate":
+            return rows + [rows[0]]
+        raise AssertionError(f"unknown mutation: {self.mutation}")
+
+    def rule_snapshot(self):
+        return self.delegate.rule_snapshot()
 
 
 class _PlanService:
@@ -211,7 +256,10 @@ class TradingPlaybookOrchestratorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(plan_service.calls), 1)
         _, planned, evaluations, names, rules = plan_service.calls[0]
         self.assertEqual([row.stock_code for row in planned.candidates], ["000001", "000002"])
-        self.assertEqual([row.stock_code for row in evaluations], ["000001", "000002"])
+        self.assertEqual(len(evaluations), 38)
+        self.assertEqual(
+            {row.stock_code for row in evaluations}, {"000001", "000002"}
+        )
         self.assertEqual(names, {"000001": "股票000001", "000002": "股票000002"})
         self.assertEqual(len(rules), 19)
         for candidate in planned.candidates:
@@ -472,6 +520,87 @@ class TradingPlaybookOrchestratorTests(unittest.IsolatedAsyncioTestCase):
             await orchestrator.build_stage(object(), SOURCE_DATE, "preclose", AS_OF)
         self.assertEqual(plan.calls, [])
 
+    async def test_each_candidate_must_have_exact_catalog_mode_coverage(self):
+        catalog = RuleCatalog(
+            Path("app/data/trading_playbook_rules_v1.json")
+        ).load()
+        real_matcher = ModeMatcher(
+            catalog["rules"], catalog_version=catalog["catalog_version"]
+        )
+        cases = (
+            (
+                _DroppingEvaluationMatcher(
+                    real_matcher,
+                    stock_code="000001",
+                    mode_key=catalog["rules"][0]["mode_key"],
+                ),
+                "missing",
+            ),
+            (
+                _TamperingEvaluationMatcher(
+                    real_matcher, stock_code="000001", mutation="extra"
+                ),
+                "extra.*unexpected_mode",
+            ),
+            (
+                _TamperingEvaluationMatcher(
+                    real_matcher, stock_code="000001", mutation="duplicate"
+                ),
+                "duplicate",
+            ),
+        )
+        for matcher, expected_error in cases:
+            with self.subTest(expected_error=expected_error):
+                plan = _PlanService()
+                orchestrator = TradingPlaybookOrchestrator(
+                    market_data=_EchoMarketData(
+                        candidates=[_candidate("000001")]
+                    ),
+                    analyzer=_CopyAnalyzer(),
+                    feature_builder=ModeFeatureBuilder(),
+                    matcher=matcher,
+                    plan_service=plan,
+                    next_trade_date=lambda value: TARGET_DATE,
+                )
+                with self.assertRaisesRegex(ValueError, expected_error):
+                    await orchestrator.build_stage(
+                        object(), SOURCE_DATE, "preclose", AS_OF
+                    )
+                self.assertEqual(plan.calls, [])
+
+    async def test_second_candidate_mode_gap_stops_the_whole_plan(self):
+        catalog = RuleCatalog(
+            Path("app/data/trading_playbook_rules_v1.json")
+        ).load()
+        missing_mode = catalog["rules"][0]["mode_key"]
+        matcher = _DroppingEvaluationMatcher(
+            ModeMatcher(
+                catalog["rules"], catalog_version=catalog["catalog_version"]
+            ),
+            stock_code="000002",
+            mode_key=missing_mode,
+        )
+        plan = _PlanService()
+        orchestrator = TradingPlaybookOrchestrator(
+            market_data=_EchoMarketData(
+                candidates=[_candidate("000001"), _candidate("000002")]
+            ),
+            analyzer=_CopyAnalyzer(),
+            feature_builder=ModeFeatureBuilder(),
+            matcher=matcher,
+            plan_service=plan,
+            next_trade_date=lambda value: TARGET_DATE,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError, rf"000002.*missing.*{missing_mode}"
+        ):
+            await orchestrator.build_stage(
+                object(), SOURCE_DATE, "preclose", AS_OF
+            )
+
+        self.assertEqual(plan.calls, [])
+
     def test_composition_root_uses_one_real_catalog_and_explicit_data_dependencies(self):
         quote_api = object()
         kline_loader = object()
@@ -663,6 +792,67 @@ class TradingPlaybookOrchestratorIntegrationTests(
         )
         self.assertGreaterEqual(len(result["candidates"]), 1)
         self.assertLessEqual(len(result["candidates"]), 3)
+
+    async def test_candidate_missing_one_catalog_mode_is_rejected_before_plan_write(self):
+        catalog = RuleCatalog(
+            Path("app/data/trading_playbook_rules_v1.json")
+        ).load()
+        missing_mode = catalog["rules"][0]["mode_key"]
+        matcher = _DroppingEvaluationMatcher(
+            ModeMatcher(
+                catalog["rules"], catalog_version=catalog["catalog_version"]
+            ),
+            stock_code="000001",
+            mode_key=missing_mode,
+        )
+        orchestrator = TradingPlaybookOrchestrator(
+            market_data=_EchoMarketData(candidates=[_candidate("000001")]),
+            analyzer=_CopyAnalyzer(),
+            feature_builder=ModeFeatureBuilder(),
+            matcher=matcher,
+            plan_service=TradingPlanService(),
+            next_trade_date=lambda value: TARGET_DATE,
+        )
+
+        async with self.Session() as db:
+            with self.assertRaisesRegex(
+                ValueError, rf"missing.*{missing_mode}"
+            ):
+                await orchestrator.build_stage(
+                    db, SOURCE_DATE, "preclose", AS_OF
+                )
+            persisted = await db.scalar(
+                select(func.count()).select_from(TradingPlanVersion)
+            )
+
+        self.assertEqual(persisted, 0)
+
+    async def test_empty_candidate_snapshot_persists_zero_radar_with_full_rules(self):
+        catalog = RuleCatalog(
+            Path("app/data/trading_playbook_rules_v1.json")
+        ).load()
+        orchestrator = TradingPlaybookOrchestrator(
+            market_data=_EchoMarketData(),
+            analyzer=_CopyAnalyzer(),
+            feature_builder=ModeFeatureBuilder(),
+            matcher=ModeMatcher(
+                catalog["rules"], catalog_version=catalog["catalog_version"]
+            ),
+            plan_service=TradingPlanService(),
+            next_trade_date=lambda value: TARGET_DATE,
+        )
+
+        async with self.Session() as db:
+            result = await orchestrator.build_stage(
+                db, SOURCE_DATE, "preclose", AS_OF
+            )
+            persisted = await db.scalar(
+                select(func.count()).select_from(TradingPlanVersion)
+            )
+
+        self.assertEqual(persisted, 1)
+        self.assertEqual(result["mode_radar_json"], [])
+        self.assertEqual(len(result["rule_snapshot_json"]), 19)
 
     async def test_first_non_preclose_stage_propagates_missing_lineage(self):
         catalog = RuleCatalog(

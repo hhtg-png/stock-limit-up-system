@@ -113,7 +113,6 @@ class TradingPlaybookOrchestrator:
             candidate.features = merged
 
         evaluations = []
-        seen_evaluations = set()
         stock_names = {}
         for candidate in snapshot.candidates:
             code = self._candidate_code(candidate)
@@ -132,17 +131,16 @@ class TradingPlaybookOrchestrator:
                     raise ValueError(
                         "mode evaluation stock_code must match its candidate"
                     )
-                identity = (evaluation.stock_code, evaluation.mode_key)
-                if identity in seen_evaluations:
-                    raise ValueError(
-                        "duplicate mode evaluation for candidate and mode"
-                    )
-                seen_evaluations.add(identity)
                 evaluations.append(evaluation)
 
         evaluations.sort(key=self._evaluation_order)
         rule_snapshot = self._complete_rule_snapshot(
             self.matcher.rule_snapshot()
+        )
+        self._validate_candidate_mode_coverage(
+            snapshot,
+            evaluations,
+            rule_snapshot,
         )
         return await self.plan_service.generate(
             db,
@@ -235,6 +233,36 @@ class TradingPlaybookOrchestrator:
             evaluation.risk_level,
             evaluation.action_scope,
         )
+
+    @classmethod
+    def _validate_candidate_mode_coverage(
+        cls,
+        snapshot: MarketSnapshot,
+        evaluations: Sequence[ModeEvaluation],
+        rule_snapshot: Sequence[Mapping[str, Any]],
+    ) -> None:
+        expected = {row["mode_key"] for row in rule_snapshot}
+        by_candidate: dict[str, dict[str, int]] = {
+            cls._candidate_code(candidate): {}
+            for candidate in snapshot.candidates
+        }
+        for evaluation in evaluations:
+            counts = by_candidate[evaluation.stock_code]
+            counts[evaluation.mode_key] = counts.get(evaluation.mode_key, 0) + 1
+
+        for stock_code in sorted(by_candidate):
+            counts = by_candidate[stock_code]
+            actual = set(counts)
+            missing = sorted(expected - actual)
+            extra = sorted(actual - expected)
+            duplicate = sorted(
+                mode_key for mode_key, count in counts.items() if count > 1
+            )
+            if missing or extra or duplicate:
+                raise ValueError(
+                    f"candidate {stock_code} mode coverage mismatch: "
+                    f"missing={missing}, extra={extra}, duplicate={duplicate}"
+                )
 
     @classmethod
     def _complete_rule_snapshot(cls, rows: Any) -> list[dict[str, Any]]:
