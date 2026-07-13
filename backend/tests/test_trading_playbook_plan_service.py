@@ -2,8 +2,10 @@ import asyncio
 import copy
 import hashlib
 import math
+import tempfile
 import unittest
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 from zoneinfo import ZoneInfo
 
@@ -12,7 +14,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
-from app.database import Base
+from app.database import Base, ensure_sqlite_schema_compat
 from app.models.trading_playbook import (
     TradingPlanCandidate,
     TradingPlanVersion,
@@ -302,6 +304,50 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([row.version_no for row in versions], [1, 2, 3, 4, 5])
             self.assertEqual(len({row.input_hash for row in versions}), 5)
 
+    async def test_automatic_versions_form_same_stage_and_cross_stage_parent_chain(self):
+        evaluation = _evaluation("leader", "000001")
+        async with self.Session() as db:
+            preclose_v1 = await self._generate(db, [evaluation])
+            changed_preclose = _snapshot()
+            changed_preclose.market_features["revision"] = 2
+            preclose_v2 = await self._generate(
+                db,
+                [evaluation],
+                snapshot=changed_preclose,
+            )
+            after_close = await self._generate(
+                db,
+                [evaluation],
+                snapshot=_snapshot(stage="after_close"),
+            )
+            overnight = await self._generate(
+                db,
+                [evaluation],
+                snapshot=_snapshot(stage="overnight"),
+            )
+            auction = await self._generate(
+                db,
+                [evaluation],
+                snapshot=_snapshot(stage="auction"),
+            )
+            same = await self._generate(db, [evaluation])
+
+        self.assertIsNone(preclose_v1["parent_plan_version_id"])
+        self.assertEqual(
+            preclose_v2["parent_plan_version_id"],
+            preclose_v1["id"],
+        )
+        self.assertEqual(
+            after_close["parent_plan_version_id"],
+            preclose_v2["id"],
+        )
+        self.assertEqual(
+            overnight["parent_plan_version_id"],
+            after_close["id"],
+        )
+        self.assertEqual(auction["parent_plan_version_id"], overnight["id"])
+        self.assertEqual(same["id"], preclose_v1["id"])
+
     async def test_rule_snapshot_order_and_dict_order_have_a_stable_hash(self):
         evaluations = [
             _evaluation("alpha", "000001"),
@@ -414,6 +460,120 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(plan["candidates"]), 1)
         self.assertEqual(plan["candidates"][0]["risk_level"], "confirmed")
 
+    async def test_relevant_stale_future_and_missing_evidence_block_confirmed(self):
+        cases = [
+            [
+                {"source": "provider", "stale": True},
+            ],
+            [
+                {
+                    "source": "mode_requirement",
+                    "feature": "candidate.flag",
+                    "result": "matched",
+                    "captured_at": AS_OF + timedelta(seconds=1),
+                },
+                {"source": "mode_risk", "quality": "ready"},
+            ],
+            [
+                {
+                    "source": "mode_requirement",
+                    "feature": "candidate.flag",
+                    "result": "missing",
+                },
+                {"source": "mode_risk", "quality": "ready"},
+            ],
+            [
+                {
+                    "source": "provider",
+                    "required": True,
+                    "quality": "invalid",
+                }
+            ],
+            [
+                {
+                    "source": "provider",
+                    "relevant": True,
+                    "captured_at": AS_OF,
+                }
+            ],
+        ]
+        async with self.Session() as db:
+            for index, evidence in enumerate(cases):
+                evaluation = _evaluation(
+                    f"confirmed-{index}",
+                    "000001",
+                    risk_level="confirmed",
+                )
+                object.__setattr__(evaluation, "evidence", evidence)
+                snapshot = _snapshot()
+                snapshot.market_features["evidence_case"] = index
+                plan = await self._generate(
+                    db,
+                    [evaluation],
+                    snapshot=snapshot,
+                )
+                self.assertEqual(plan["candidates"], [])
+                self.assertEqual(len(plan["mode_radar"]), 1)
+
+    async def test_structured_relevant_evidence_ignores_unrelated_provider_warning(self):
+        evaluation = _evaluation("leader", "000001", risk_level="confirmed")
+        object.__setattr__(
+            evaluation,
+            "evidence",
+            [
+                {
+                    "source": "provider",
+                    "quality": "degraded",
+                    "warning": "unrelated aggregate coverage",
+                    "relevant": False,
+                },
+                {
+                    "source": "mode_requirement",
+                    "feature": "candidate.flag",
+                    "result": "matched",
+                    "captured_at": AS_OF,
+                },
+                {"source": "mode_risk", "quality": "ready"},
+            ],
+        )
+        async with self.Session() as db:
+            plan = await self._generate(db, [evaluation])
+
+        self.assertEqual(len(plan["candidates"]), 1)
+        self.assertEqual(plan["candidates"][0]["risk_level"], "confirmed")
+
+    async def test_required_candidate_feature_quality_blocks_only_confirmed(self):
+        snapshot = _snapshot()
+        snapshot.candidates[0].features["flag"] = True
+        snapshot.candidates[0].features["_feature_quality"] = {"flag": "stale"}
+        evaluations = []
+        for mode, code, risk, score in (
+            ("confirmed", "000001", "confirmed", 100),
+            ("trial", "000002", "trial", 99),
+        ):
+            row = _evaluation(mode, code, risk_level=risk, score=score)
+            object.__setattr__(
+                row,
+                "evidence",
+                [
+                    {
+                        "source": "mode_requirement",
+                        "feature": "candidate.flag",
+                        "result": "matched",
+                    },
+                    {"source": "mode_risk", "quality": "ready"},
+                ],
+            )
+            evaluations.append(row)
+
+        async with self.Session() as db:
+            plan = await self._generate(db, evaluations, snapshot=snapshot)
+
+        self.assertEqual(
+            [(row["stock_code"], row["risk_level"]) for row in plan["candidates"]],
+            [("000002", "trial")],
+        )
+
     async def test_global_time_unsafety_blocks_confirmed_but_not_trial(self):
         evaluations = [
             _evaluation("confirmed", "000001", risk_level="confirmed"),
@@ -495,6 +655,10 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             revised["manual_overrides_json"]["manual_note"],
             "只按书面条件执行",
+        )
+        self.assertEqual(
+            revised["manual_overrides_json"]["invalidation_json"]["price_lte"],
+            11.4,
         )
         self.assertEqual(
             untouched["entry_trigger_json"],
@@ -611,6 +775,37 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(plan_count, 1)
         self.assertEqual(candidate_count, 1)
 
+    async def test_revise_rejects_manual_hard_stop_override_without_child(self):
+        async with self.Session() as db:
+            generated = await self._generate(
+                db,
+                [_evaluation("leader", "000001")],
+            )
+            candidate_id = generated["candidates"][0]["id"]
+            with self.assertRaisesRegex(ValueError, "hard stop|price_lte"):
+                await self.service.revise(
+                    db,
+                    generated["id"],
+                    {
+                        "change_note": "试图覆盖刚性止损",
+                        "candidate_overrides": [
+                            {
+                                "candidate_id": candidate_id,
+                                "invalidation": {
+                                    "label": "人工止损",
+                                    "price_lte": 1.0,
+                                },
+                            }
+                        ],
+                    },
+                )
+            await db.rollback()
+            plan_count = await db.scalar(
+                select(func.count()).select_from(TradingPlanVersion)
+            )
+
+        self.assertEqual(plan_count, 1)
+
     async def test_confirm_activates_target_and_supersedes_old_target_active(self):
         other_target = TARGET_DATE + timedelta(days=1)
         async with self.Session() as db:
@@ -706,6 +901,21 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(persisted_target.status, "draft")
             self.assertIsNone(persisted_target.confirmed_at)
 
+    async def test_serialize_restores_china_offset_after_sqlite_round_trip(self):
+        async with self.Session() as db:
+            generated = await self._generate(
+                db,
+                [_evaluation("leader", "000001")],
+            )
+            await self.service.confirm(db, generated["id"], "local-user")
+            plan_id = generated["id"]
+
+        async with self.Session() as db:
+            payload = await self.service.serialize(db, plan_id)
+
+        self.assertTrue(payload["generated_at"].endswith("+08:00"))
+        self.assertTrue(payload["confirmed_at"].endswith("+08:00"))
+
     async def test_concurrent_confirmations_leave_only_one_target_active(self):
         async with self.Session() as db:
             first = TradingPlanVersion(
@@ -747,6 +957,113 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
             ).all()
         self.assertEqual(sum(row.status == "active" for row in plans), 1)
         self.assertEqual(sum(row.status == "superseded" for row in plans), 1)
+
+    async def test_database_unique_index_protects_active_target_without_process_lock(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            database_path = Path(directory) / "plans.db"
+            url = f"sqlite+aiosqlite:///{database_path.as_posix()}"
+            first_engine = create_async_engine(url, connect_args={"timeout": 5})
+            second_engine = create_async_engine(url, connect_args={"timeout": 5})
+            FirstSession = async_sessionmaker(first_engine, expire_on_commit=False)
+            SecondSession = async_sessionmaker(second_engine, expire_on_commit=False)
+            try:
+                async with first_engine.begin() as connection:
+                    await connection.run_sync(Base.metadata.create_all)
+                async with FirstSession() as db:
+                    first = TradingPlanVersion(
+                        source_trade_date=SOURCE_DATE,
+                        target_trade_date=TARGET_DATE,
+                        stage="preclose",
+                        version_no=1,
+                        status="draft",
+                        input_hash="first-engine",
+                    )
+                    second = TradingPlanVersion(
+                        source_trade_date=SOURCE_DATE,
+                        target_trade_date=TARGET_DATE,
+                        stage="after_close",
+                        version_no=1,
+                        status="draft",
+                        input_hash="second-engine",
+                    )
+                    db.add_all([first, second])
+                    await db.commit()
+                    first_id, second_id = first.id, second.id
+
+                async def confirm(session_factory, plan_id, user):
+                    async with session_factory() as db:
+                        return await TradingPlanService().confirm(db, plan_id, user)
+
+                results = await asyncio.gather(
+                    confirm(FirstSession, first_id, "worker-one"),
+                    confirm(SecondSession, second_id, "worker-two"),
+                    return_exceptions=True,
+                )
+                async with FirstSession() as db:
+                    plans = (
+                        await db.scalars(
+                            select(TradingPlanVersion).where(
+                                TradingPlanVersion.target_trade_date == TARGET_DATE
+                            )
+                        )
+                    ).all()
+                self.assertEqual(sum(row.status == "active" for row in plans), 1)
+                self.assertTrue(
+                    sum(row.status == "superseded" for row in plans) == 1
+                    or any(isinstance(result, ValueError) for result in results)
+                )
+            finally:
+                await first_engine.dispose()
+                await second_engine.dispose()
+
+    async def test_sqlite_compat_migration_repairs_duplicate_active_before_index(self):
+        async with self.engine.begin() as connection:
+            await connection.exec_driver_sql(
+                "DROP INDEX IF EXISTS uq_trading_plan_one_active_target"
+            )
+            for stage, version in (("preclose", 1), ("after_close", 1)):
+                await connection.exec_driver_sql(
+                    "INSERT INTO trading_plan_versions "
+                    "(source_trade_date,target_trade_date,stage,version_no,status,input_hash,"
+                    "market_state_json,theme_ranking_json,mode_radar_json,rule_snapshot_json,"
+                    "risk_settings_json,data_quality_json,change_summary_json,generated_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        SOURCE_DATE.isoformat(),
+                        TARGET_DATE.isoformat(),
+                        stage,
+                        version,
+                        "active",
+                        f"legacy-{stage}",
+                        "{}",
+                        "[]",
+                        "[]",
+                        "[]",
+                        "{}",
+                        "{}",
+                        "{}",
+                        AS_OF.isoformat(),
+                    ),
+                )
+            await connection.run_sync(ensure_sqlite_schema_compat)
+            indexes = (
+                await connection.exec_driver_sql(
+                    "PRAGMA index_list(trading_plan_versions)"
+                )
+            ).all()
+            statuses = (
+                await connection.exec_driver_sql(
+                    "SELECT status FROM trading_plan_versions "
+                    "WHERE target_trade_date=? ORDER BY id",
+                    (TARGET_DATE.isoformat(),),
+                )
+            ).all()
+
+        self.assertIn(
+            "uq_trading_plan_one_active_target",
+            {row[1] for row in indexes},
+        )
+        self.assertEqual([row[0] for row in statuses], ["superseded", "active"])
 
     async def test_invalid_persisted_settings_are_rejected(self):
         invalid_settings = [

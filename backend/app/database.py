@@ -80,6 +80,29 @@ def ensure_sqlite_schema_compat(sync_connection) -> None:
         "intraday_generated_at",
         "DATETIME",
     )
+    _ensure_trading_plan_active_unique_index(sync_connection)
+
+
+def _ensure_trading_plan_active_unique_index(sync_connection) -> None:
+    table = sync_connection.exec_driver_sql(
+        "SELECT 1 FROM sqlite_master "
+        "WHERE type='table' AND name='trading_plan_versions'"
+    ).first()
+    if table is None:
+        return
+    sync_connection.exec_driver_sql(
+        "UPDATE trading_plan_versions SET status='superseded' "
+        "WHERE status='active' AND id NOT IN ("
+        "SELECT MAX(id) FROM trading_plan_versions "
+        "WHERE status='active' GROUP BY target_trade_date"
+        ")"
+    )
+    sync_connection.exec_driver_sql(
+        "CREATE UNIQUE INDEX IF NOT EXISTS "
+        "uq_trading_plan_one_active_target "
+        "ON trading_plan_versions (target_trade_date) "
+        "WHERE status='active'"
+    )
 
 
 def _add_sqlite_column_if_missing(sync_connection, table_name: str, column_name: str, column_def: str) -> None:

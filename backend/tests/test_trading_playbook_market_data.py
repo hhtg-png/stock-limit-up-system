@@ -6,6 +6,7 @@ from dataclasses import FrozenInstanceError, fields
 from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 import app.models  # noqa: F401
@@ -2684,6 +2685,12 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
         as_of = datetime(2026, 7, 13, 9, 25)
         codes = [f"{index:06d}" for index in range(1, 11)]
         async with self.session_factory() as db:
+            # Exercise the provider's defense against legacy/corrupt duplicate
+            # active rows; current schemas prevent this state with a partial
+            # unique index.
+            await db.execute(
+                text("DROP INDEX IF EXISTS uq_trading_plan_one_active_target")
+            )
             db.add_all(
                 [
                     Stock(

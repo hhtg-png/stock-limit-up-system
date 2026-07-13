@@ -9,11 +9,13 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     JSON,
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 
 from app.database import Base
@@ -84,6 +86,13 @@ class TradingPlanVersion(Base):
             "stage",
             "version_no",
             name="uq_trading_plan_stage_version",
+        ),
+        Index(
+            "uq_trading_plan_one_active_target",
+            "target_trade_date",
+            unique=True,
+            sqlite_where=text("status = 'active'"),
+            postgresql_where=text("status = 'active'"),
         ),
     )
 

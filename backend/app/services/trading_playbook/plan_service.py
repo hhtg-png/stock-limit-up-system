@@ -13,7 +13,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from app.config import settings as app_settings
 from app.models.trading_playbook import (
@@ -31,6 +31,7 @@ _EVALUATION_STATUSES = {"matched", "waiting", "manual_review", "not_matched"}
 _RISK_LEVELS = {"avoid", "watch", "trial", "confirmed"}
 _ACTION_SCOPES = {"target", "tail"}
 _RULE_HASH = re.compile(r"[0-9a-f]{64}")
+_STAGE_SEQUENCE = ("preclose", "after_close", "overnight", "auction")
 
 
 def _finite_number(value: Any) -> Optional[float]:
@@ -82,6 +83,14 @@ def _now_cn() -> datetime:
     return datetime.now(CHINA_TZ)
 
 
+def _china_iso(value: datetime) -> str:
+    if value.tzinfo is None or value.utcoffset() is None:
+        value = value.replace(tzinfo=CHINA_TZ)
+    else:
+        value = value.astimezone(CHINA_TZ)
+    return value.isoformat()
+
+
 class TradingPlanService:
     """Create immutable plan versions and controlled child revisions."""
 
@@ -130,10 +139,16 @@ class TradingPlanService:
                             await db.commit()
                         return await self.serialize(db, existing)
 
+                    parent = await self._latest_parent_plan(
+                        db,
+                        snapshot.target_trade_date,
+                        snapshot.stage,
+                    )
                     selected = self._select_candidates(
                         snapshot,
                         radar,
                         risk_settings,
+                        candidate_sources,
                     )
                     version_no = await self._next_version_no(
                         db,
@@ -145,6 +160,7 @@ class TradingPlanService:
                         target_trade_date=snapshot.target_trade_date,
                         stage=snapshot.stage,
                         version_no=version_no,
+                        parent_plan_version_id=parent.id if parent else None,
                         status="draft",
                         market_state_json=copy.deepcopy(
                             snapshot_payload["market_features"]
@@ -552,6 +568,7 @@ class TradingPlanService:
         snapshot: MarketSnapshot,
         radar: Sequence[Mapping[str, Any]],
         risk_settings: Mapping[str, Any],
+        candidate_sources: Mapping[str, Mapping[str, Any]],
     ) -> List[Tuple[Dict[str, Any], List[str]]]:
         global_unsafe = cls._globally_unsafe(snapshot)
         eligible = []
@@ -563,6 +580,12 @@ class TradingPlanService:
             }:
                 continue
             if global_unsafe and row["risk_level"] == "confirmed":
+                continue
+            if row["risk_level"] == "confirmed" and cls._evidence_unsafe(
+                snapshot,
+                row,
+                candidate_sources.get(row["stock_code"], {}),
+            ):
                 continue
             if cls._reference_price(row["entry_trigger"]) is None:
                 continue
@@ -587,6 +610,161 @@ class TradingPlanService:
             )
         )
         return selected[: int(risk_settings["max_candidates"])]
+
+    @classmethod
+    def _evidence_unsafe(
+        cls,
+        snapshot: MarketSnapshot,
+        row: Mapping[str, Any],
+        candidate_source: Mapping[str, Any],
+    ) -> bool:
+        evidence = row.get("evidence")
+        if not isinstance(evidence, list):
+            return True
+        structured = any(
+            isinstance(item, Mapping)
+            and item.get("source") in {"mode_requirement", "mode_risk"}
+            for item in evidence
+        )
+        risk_rows = []
+        required_candidate_fields = set()
+        for item in evidence:
+            if not isinstance(item, Mapping):
+                return True
+            source = item.get("source")
+            inherently_relevant = source in {"mode_requirement", "mode_risk"}
+            explicitly_relevant = item.get("required") is True or item.get(
+                "relevant"
+            ) is True
+            relevant = inherently_relevant or explicitly_relevant
+            if source == "mode_requirement":
+                if item.get("result") != "matched":
+                    return True
+                feature = item.get("feature")
+                if isinstance(feature, str) and feature.startswith("candidate."):
+                    required_candidate_fields.add(feature.split(".", 1)[1])
+            elif source == "mode_risk":
+                risk_rows.append(item)
+
+            if relevant:
+                if cls._evidence_row_unsafe(item, snapshot.as_of, strict=True):
+                    return True
+            elif not structured and cls._evidence_row_unsafe(
+                item,
+                snapshot.as_of,
+                strict=False,
+            ):
+                return True
+
+        if structured and (
+            not risk_rows
+            or any(
+                str(item.get("quality") or "").lower()
+                not in {"ready", "computed", "ok"}
+                for item in risk_rows
+            )
+        ):
+            return True
+
+        features = candidate_source.get("features", {})
+        if not isinstance(features, Mapping):
+            return bool(required_candidate_fields)
+        if features.get("_snapshot_stale", False) is True:
+            return True
+        if features.get("_point_in_time_valid", True) is not True:
+            return True
+        quality_map = features.get("_feature_quality", {})
+        if isinstance(quality_map, Mapping):
+            for field in required_candidate_fields:
+                quality = quality_map.get(field)
+                if quality is not None and str(quality).lower() not in {
+                    "ready",
+                    "computed",
+                    "ok",
+                }:
+                    return True
+        source_evidence = candidate_source.get("evidence", [])
+        if isinstance(source_evidence, list):
+            for item in source_evidence:
+                if (
+                    isinstance(item, Mapping)
+                    and (
+                        item.get("required") is True
+                        or item.get("relevant") is True
+                    )
+                    and cls._evidence_row_unsafe(
+                        item,
+                        snapshot.as_of,
+                        strict=True,
+                    )
+                ):
+                    return True
+        return False
+
+    @classmethod
+    def _evidence_row_unsafe(
+        cls,
+        evidence: Mapping[str, Any],
+        snapshot_as_of: datetime,
+        *,
+        strict: bool,
+    ) -> bool:
+        if evidence.get("stale") is True or evidence.get("future") is True:
+            return True
+        if evidence.get("valid") is False:
+            return True
+        if evidence.get("point_in_time_valid") is False:
+            return True
+        quality = evidence.get("quality")
+        if quality is not None:
+            normalized_quality = str(quality).strip().lower()
+            if strict and normalized_quality not in {"ready", "computed", "ok"}:
+                return True
+            if not strict and normalized_quality in {
+                "stale",
+                "future",
+                "invalid",
+                "error",
+                "unavailable",
+            }:
+                return True
+        elif (
+            strict
+            and evidence.get("source") != "mode_requirement"
+            and (
+                evidence.get("required") is True
+                or evidence.get("relevant") is True
+            )
+        ):
+            return True
+        for key in (
+            "captured_at",
+            "as_of",
+            "available_at",
+            "observed_at",
+            "timestamp",
+        ):
+            if key in evidence and cls._future_evidence_time(
+                evidence[key],
+                snapshot_as_of,
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _future_evidence_time(value: Any, snapshot_as_of: datetime) -> bool:
+        if isinstance(value, datetime):
+            captured = value
+        elif isinstance(value, str):
+            try:
+                captured = datetime.fromisoformat(value)
+            except ValueError:
+                return True
+        else:
+            return True
+        if (captured.utcoffset() is None) != (snapshot_as_of.utcoffset() is None):
+            return True
+        return captured > snapshot_as_of
 
     @staticmethod
     def _globally_unsafe(snapshot: MarketSnapshot) -> bool:
@@ -718,6 +896,37 @@ class TradingPlanService:
         return int(highest or 0) + 1
 
     @staticmethod
+    async def _latest_parent_plan(
+        db,
+        target_trade_date: date,
+        stage: str,
+    ) -> Optional[TradingPlanVersion]:
+        try:
+            stage_index = _STAGE_SEQUENCE.index(stage)
+        except ValueError as exc:
+            raise ValueError("invalid plan stage") from exc
+        eligible_stages = _STAGE_SEQUENCE[: stage_index + 1]
+        rows = (
+            await db.scalars(
+                select(TradingPlanVersion).where(
+                    TradingPlanVersion.target_trade_date == target_trade_date,
+                    TradingPlanVersion.stage.in_(eligible_stages),
+                )
+            )
+        ).all()
+        if not rows:
+            return None
+        stage_rank = {name: index for index, name in enumerate(_STAGE_SEQUENCE)}
+        return max(
+            rows,
+            key=lambda row: (
+                stage_rank[row.stage],
+                row.version_no,
+                row.id,
+            ),
+        )
+
+    @staticmethod
     async def _change_summary(
         db,
         target_trade_date: date,
@@ -793,8 +1002,8 @@ class TradingPlanService:
             "data_quality_json": copy.deepcopy(plan.data_quality_json or {}),
             "change_summary_json": copy.deepcopy(plan.change_summary_json or {}),
             "input_hash": plan.input_hash,
-            "generated_at": plan.generated_at.isoformat(),
-            "confirmed_at": plan.confirmed_at.isoformat()
+            "generated_at": _china_iso(plan.generated_at),
+            "confirmed_at": _china_iso(plan.confirmed_at)
             if plan.confirmed_at
             else None,
             "confirmed_by": plan.confirmed_by,
@@ -1057,6 +1266,10 @@ class TradingPlanService:
     def _normalize_trigger_override(value: Any, field: str) -> Dict[str, Any]:
         if not isinstance(value, Mapping):
             raise ValueError(f"{field} must be a mapping")
+        if field == "invalidation" and "price_lte" in value:
+            raise ValueError(
+                "invalidation.price_lte is a hard stop and cannot be overridden"
+            )
         allowed = {
             "label",
             "reference_price",
@@ -1181,8 +1394,6 @@ class TradingPlanService:
                     audit[key] = value.isoformat()
                 elif key == "manual_note":
                     audit[key] = value
-                elif key.endswith("_json"):
-                    audit[key] = copy.deepcopy(value)
             values["manual_overrides_json"] = audit
 
         reference_price = cls._reference_price(values["entry_trigger_json"])
@@ -1193,6 +1404,21 @@ class TradingPlanService:
             reference_price * (1 - hard_stop / 100),
             2,
         )
+        if override:
+            audit = values["manual_overrides_json"]
+            for key in (
+                "entry_trigger_json",
+                "exit_trigger_json",
+            ):
+                if key in override:
+                    audit[key] = copy.deepcopy(values[key])
+            if (
+                "entry_trigger_json" in override
+                or "invalidation_json" in override
+            ):
+                audit["invalidation_json"] = copy.deepcopy(
+                    values["invalidation_json"]
+                )
         return TradingPlanCandidate(
             plan_version_id=child_plan_id,
             stock_code=parent.stock_code,
@@ -1254,6 +1480,18 @@ class TradingPlanService:
                 plan.confirmed_by = confirmed_by.strip()
                 await db.commit()
                 return plan
+            except IntegrityError as exc:
+                await db.rollback()
+                raise ValueError(
+                    "another plan is already active for this target trade date"
+                ) from exc
+            except OperationalError as exc:
+                await db.rollback()
+                if "locked" in str(exc).lower():
+                    raise ValueError(
+                        "confirmation conflict; another worker is updating this date"
+                    ) from exc
+                raise
             except Exception:
                 await db.rollback()
                 raise
