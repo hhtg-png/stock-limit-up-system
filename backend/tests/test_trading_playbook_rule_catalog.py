@@ -21,23 +21,134 @@ CATALOG_PATH = (
     / "trading_playbook_rules_v1.json"
 )
 
+EXPECTED_SOURCES = {
+    "00-art-1123": (
+        "00-zgjys-live/01_zgjys-art-trading-1123.txt",
+        "交易的艺术 1123",
+    ),
+    "00-art-1130": (
+        "00-zgjys-live/02_zgjys-art-trading-1130.txt",
+        "交易的艺术 1130",
+    ),
+    "01-specialize": (
+        "01-止于心动-专精一艺/01_2025-8-3直播：止于心动，专精一艺.txt",
+        "止于心动，专精一艺",
+    ),
+    "02-window-recognition": (
+        "02-window-recognition/01_2026-3-7小灶：窗口+辨识度.txt",
+        "窗口与辨识度",
+    ),
+    "03-loss-qa": (
+        "03-loss-qa/01_2026-3-15直播解读：面对亏损该如何正确对待交易？.txt",
+        "面对亏损",
+    ),
+    "04-trading-plan": (
+        "04-trading-plan/01_2026-3-22直播：如何制定交易计划表？.txt",
+        "交易计划表",
+    ),
+    "05-new-theme": (
+        "05-new-theme/01_2025-7-27直播：新题材爆发怎么做.txt",
+        "新题材爆发",
+    ),
+    "06-short-term-terms": (
+        "06-short-term-terms/01_2025-11-16直播：短线交易【名词解释】.txt",
+        "短线交易名词解释",
+    ),
+}
+EXPECTED_RULE_KEYS = {
+    "mode_key",
+    "name",
+    "family",
+    "style",
+    "window",
+    "automation_level",
+    "priority",
+    "role",
+    "requirements",
+    "entry",
+    "invalidation",
+    "exit",
+    "source_refs",
+}
+EXPECTED_CATALOG_CANONICAL_SHA256 = (
+    "975b3dd811b6e27ec1e576349068356569070c17978ab1c25eb14d3bc7643af1"
+)
+
 
 class TradingPlaybookRuleCatalogTests(unittest.TestCase):
-    def test_loads_complete_version_one_catalog_with_valid_source_refs(self):
+    def test_catalog_matches_exact_version_one_contract(self):
         catalog = RuleCatalog(CATALOG_PATH).load()
 
+        self.assertEqual(set(catalog), {"catalog_version", "sources", "rules"})
         self.assertEqual(catalog["catalog_version"], 1)
         self.assertEqual(len(catalog["sources"]), 8)
         self.assertEqual(len(catalog["rules"]), 19)
 
-        source_keys = {source["source_key"] for source in catalog["sources"]}
+        for source in catalog["sources"]:
+            self.assertEqual(
+                set(source),
+                {"source_key", "source_path", "source_title"},
+            )
+        actual_sources = {
+            source["source_key"]: (
+                source["source_path"],
+                source["source_title"],
+            )
+            for source in catalog["sources"]
+        }
+        self.assertEqual(actual_sources, EXPECTED_SOURCES)
+
+        source_keys = set(EXPECTED_SOURCES)
         mode_keys = [rule["mode_key"] for rule in catalog["rules"]]
         self.assertEqual(len(mode_keys), len(set(mode_keys)))
         for rule in catalog["rules"]:
+            self.assertEqual(set(rule), EXPECTED_RULE_KEYS)
+            for key in (
+                "mode_key",
+                "name",
+                "family",
+                "style",
+                "window",
+                "automation_level",
+                "role",
+            ):
+                self.assertIsInstance(rule[key], str)
+                self.assertTrue(rule[key].strip())
+            self.assertIs(type(rule["priority"]), int)
+            self.assertIsInstance(rule["requirements"], list)
+            self.assertTrue(rule["requirements"])
+            for requirement in rule["requirements"]:
+                self.assertEqual(set(requirement), {"feature", "op", "value"})
+                self.assertIsInstance(requirement["feature"], str)
+                self.assertTrue(requirement["feature"].strip())
+                self.assertIsInstance(requirement["op"], str)
+                self.assertTrue(requirement["op"].strip())
+                self.assertIn(type(requirement["value"]), {str, int, float, bool})
+            for trigger_key in ("entry", "invalidation", "exit"):
+                self.assertEqual(set(rule[trigger_key]), {"label"})
+                self.assertIsInstance(rule[trigger_key]["label"], str)
+                self.assertTrue(rule[trigger_key]["label"].strip())
             self.assertTrue(rule["source_refs"])
             for source_ref in rule["source_refs"]:
+                self.assertEqual(set(source_ref), {"source_key", "excerpt"})
+                self.assertIsInstance(source_ref["source_key"], str)
+                self.assertIsInstance(source_ref["excerpt"], str)
                 self.assertIn(source_ref["source_key"], source_keys)
                 self.assertTrue(source_ref["excerpt"].strip())
+
+        canonical_payload = json.dumps(
+            catalog,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        actual_digest = hashlib.sha256(canonical_payload.encode("utf-8")).hexdigest()
+        self.assertEqual(
+            actual_digest,
+            EXPECTED_CATALOG_CANONICAL_SHA256,
+            "Catalog content changed. Bump catalog_version and update the exact "
+            "catalog expectations intentionally.",
+        )
 
     def test_verify_sources_hashes_present_transcript_and_marks_missing_source(self):
         sources = [
