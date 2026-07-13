@@ -1416,6 +1416,51 @@ class TestModeMatcherContract:
         market["_feature_quality"] = {"style": "ready", "window": "ready"}
         assert matcher.evaluate(market, candidate)[0].status == "matched"
 
+    @pytest.mark.parametrize("unknown", [None, "", "unknown", " UNKNOWN "])
+    def test_unknown_implicit_market_state_waits_even_when_candidate_fails(
+        self,
+        unknown,
+    ):
+        matcher = ModeMatcher([_rule(automation_level="automatic")])
+        market = {
+            "style": unknown,
+            "window": unknown,
+            "_feature_quality": {"style": "ready", "window": "ready"},
+        }
+
+        row = matcher.evaluate(market, _matcher_candidate(flag=False))[0]
+
+        assert (row.status, row.risk_level) == ("waiting", "watch")
+
+    def test_unknown_market_state_makes_the_full_catalog_wait(self):
+        market = {
+            "style": "unknown",
+            "window": "unknown",
+            "_feature_quality": {"style": "missing", "window": "missing"},
+        }
+        catalog = _catalog_payload()
+
+        rows = ModeMatcher(
+            catalog["rules"],
+            catalog_version=catalog["catalog_version"],
+        ).evaluate(market, _matcher_candidate(flag=False))
+
+        assert len(rows) == 19
+        assert {row.status for row in rows} == {"waiting"}
+
+    def test_known_implicit_market_mismatch_remains_not_matched(self):
+        row = ModeMatcher([_rule(automation_level="automatic")]).evaluate(
+            {
+                "style": "board_flow",
+                "window": "outbreak",
+                "_feature_quality": {"style": "ready", "window": "ready"},
+            },
+            _matcher_candidate(),
+        )[0]
+
+        assert (row.status, row.risk_level) == ("not_matched", "avoid")
+
+
     def test_required_feature_quality_and_missing_trigger_price_wait(self):
         matcher = ModeMatcher([_rule()])
         market = {"style": "dual_active", "window": "outbreak", "quality": "ready"}

@@ -18,6 +18,37 @@ from app.services.trading_playbook.market_state import (
 
 
 class TestMarketStateClassifier:
+    def test_style_and_window_publish_dependency_quality(self):
+        complete = MarketStateClassifier().classify(
+            {
+                "limit_up_count": 82,
+                "limit_up_count_prev": 42,
+                "max_board_height": 6,
+                "seal_rate": 79,
+                "limit_down_count": 2,
+                "trend_new_high_count": 8,
+                "trend_new_high_count_prev": 7,
+                "negative_feedback": False,
+                "divergence_days": 0,
+                "sell_pressure_falling": False,
+                "breadth_recovered": False,
+                "prior_window": "",
+                "sell_pressure_rising": False,
+            }
+        )
+        incomplete = MarketStateClassifier().classify({})
+
+        assert complete["_feature_quality"] == {
+            "style": "ready",
+            "window": "ready",
+        }
+        assert incomplete["style"] == "unknown"
+        assert incomplete["window"] == "unknown"
+        assert incomplete["_feature_quality"] == {
+            "style": "missing",
+            "window": "missing",
+        }
+
     def test_board_flow_and_outbreak_require_expansion(self):
         result = MarketStateClassifier().classify(
             {
@@ -213,9 +244,13 @@ class TestMarketStateClassifier:
         assert chaos["style"] == "chaos_retreat"
         assert chaos["window"] == "unknown"
         assert chaos["quality"] == "degraded"
+        assert chaos["_feature_quality"]["style"] == "ready"
+        assert chaos["_feature_quality"]["window"] == "missing"
         assert decline["style"] == "unknown"
         assert decline["window"] == "decline"
         assert decline["quality"] == "degraded"
+        assert decline["_feature_quality"]["style"] == "missing"
+        assert decline["_feature_quality"]["window"] == "ready"
 
     def test_missing_non_finite_and_zero_denominator_are_safe_and_deterministic(self):
         features = {

@@ -181,7 +181,9 @@ class ModeMatcher:
                 self._condition(requirement, market, features)
             )
 
-        if any(item["result"] == "failed" for item in conditions):
+        if any(item["result"] == "missing" for item in implicit):
+            status, risk_level = "waiting", "watch"
+        elif any(item["result"] == "failed" for item in conditions):
             status, risk_level = "not_matched", "avoid"
         elif any(item["result"] == "missing" for item in conditions):
             status, risk_level = "waiting", "watch"
@@ -358,7 +360,10 @@ class ModeMatcher:
         op: str,
         expected: Any,
     ) -> str:
-        if actual is None:
+        if actual is None or (
+            isinstance(actual, str)
+            and actual.strip().lower() in {"", "unknown"}
+        ):
             return "missing"
         if op == "eq":
             if isinstance(expected, bool):

@@ -226,6 +226,10 @@ class MarketStateClassifier:
             "trend_growth": trend_growth,
             "quality": "degraded" if missing_fields else "ready",
             "missing_fields": sorted(missing_fields),
+            "_feature_quality": {
+                "style": "ready" if style != "unknown" else "missing",
+                "window": "ready" if window != "unknown" else "missing",
+            },
         }
 
     @staticmethod
@@ -496,6 +500,17 @@ class MarketStateAnalyzer:
         """Return a new snapshot containing classified and ranked evidence."""
         market_features = copy.deepcopy(snapshot.market_features)
         market_state = self.classifier.classify(market_features)
+        source_feature_quality = market_features.get("_feature_quality")
+        source_feature_quality = (
+            dict(source_feature_quality)
+            if isinstance(source_feature_quality, Mapping)
+            else {}
+        )
+        state_feature_quality = market_state.get("_feature_quality", {})
+        market_state["_feature_quality"] = {
+            **source_feature_quality,
+            **dict(state_feature_quality),
+        }
         market_features.update(market_state)
         analysis_degraded = market_state["quality"] != "ready"
         analysis_warnings = []

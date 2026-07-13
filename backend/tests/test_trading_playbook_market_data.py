@@ -3,7 +3,7 @@ import importlib.util
 import math
 import unittest
 from dataclasses import FrozenInstanceError, fields
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -958,7 +958,449 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         await self.engine.dispose()
 
-    async def test_bounded_union_quotes_full_market_and_loads_klines_only_for_candidates(self):
+    async def test_full_market_context_loader_populates_point_in_time_features(self):
+        from app.services.trading_playbook.market_data import (
+            TradingPlaybookMarketDataProvider,
+        )
+
+        source_date = date(2026, 7, 10)
+        target_date = date(2026, 7, 13)
+        as_of = datetime(2026, 7, 10, 14, 40)
+        expected = {
+            "limit_up_count": 20,
+            "limit_up_count_prev": 10,
+            "trend_new_high_count": 8,
+            "trend_new_high_count_prev": 7,
+            "limit_down_count": 1,
+            "max_board_height": 3,
+            "seal_rate": 80,
+            "negative_feedback": False,
+            "divergence_days": 0,
+            "sell_pressure_falling": False,
+            "breadth_recovered": False,
+            "prior_window": "",
+            "sell_pressure_rising": False,
+        }
+        calls = []
+        expected_quality = {key: "ready" for key in expected}
+        expected_quality["divergence_days"] = "computed"
+
+        async def full_market_context_loader(trade_date, stage, captured_at):
+            calls.append((trade_date, stage, captured_at))
+            return {
+                "scope": "full_market",
+                "trade_date": trade_date,
+                "as_of": captured_at - timedelta(minutes=1),
+                **expected,
+                "field_quality": expected_quality,
+            }
+
+        async with self.session_factory() as db:
+            snapshot = await TradingPlaybookMarketDataProvider(
+                quote_api=_FakeQuoteAPI(),
+                realtime_limit_up_loader=lambda trade_date: asyncio.sleep(
+                    0,
+                    result=[],
+                ),
+                full_market_context_loader=full_market_context_loader,
+            ).build_market_snapshot(
+                db=db,
+                source_trade_date=source_date,
+                target_trade_date=target_date,
+                stage="preclose",
+                as_of=as_of,
+            )
+
+        self.assertEqual(calls, [(source_date, "preclose", as_of)])
+        for key, value in expected.items():
+            self.assertEqual(snapshot.market_features[key], value)
+            self.assertEqual(
+                snapshot.market_features["_feature_quality"][key],
+                expected_quality[key],
+            )
+        evidence = snapshot.market_features["_evidence"]
+        self.assertEqual(evidence[0]["source"], "full_market_context")
+        self.assertEqual(evidence[0]["scope"], "full_market")
+
+    async def test_real_provider_chain_matches_new_theme_high_volatility(self):
+        import copy
+        import json
+        from pathlib import Path
+
+        from app.services.trading_playbook.domain import CandidateSnapshot
+        from app.services.trading_playbook.market_data import (
+            TradingPlaybookMarketDataProvider,
+        )
+        from app.services.trading_playbook.market_state import MarketStateAnalyzer
+        from app.services.trading_playbook.mode_features import ModeFeatureBuilder
+        from app.services.trading_playbook.mode_matcher import ModeMatcher
+
+        source_date = date(2026, 7, 10)
+        target_date = date(2026, 7, 13)
+        as_of = datetime(2026, 7, 10, 14, 40)
+        codes = ("300001", "000002")
+        payloads = {
+            code: {
+                **_quote_payload(
+                    code,
+                    10.5 if code == "300001" else 10.2,
+                    "20260710144000",
+                ),
+                "amount": "2000" if code == "300001" else "1000",
+            }
+            for code in codes
+        }
+
+        async def realtime_loader(trade_date):
+            return [
+                {
+                    "stock_code": code,
+                    "theme_name": "AI",
+                    "_collected_at": datetime(2026, 7, 10, 14, 39),
+                    "first_limit_up_time": (
+                        "09:31:00" if code == "300001" else "09:35:00"
+                    ),
+                    "continuous_limit_up_days": 2 if code == "300001" else 1,
+                    "seal_amount": 500 if code == "300001" else 300,
+                    "sealed": True,
+                    "broken": False,
+                    "tradable_market_value": (
+                        2_000_000 if code == "300001" else 1_000_000
+                    ),
+                }
+                for code in codes
+            ]
+
+        async def kline_loader(*args, **kwargs):
+            return [
+                {
+                    "date": source_date - timedelta(days=offset),
+                    "close": close,
+                }
+                for offset, close in zip(
+                    range(6, 0, -1),
+                    (8.0, 8.2, 8.4, 8.6, 8.8, 9.2),
+                )
+            ]
+
+        context = {
+            "limit_up_count": 20,
+            "limit_up_count_prev": 10,
+            "trend_new_high_count": 5,
+            "trend_new_high_count_prev": 5,
+            "limit_down_count": 1,
+            "max_board_height": 3,
+            "seal_rate": 80,
+            "negative_feedback": False,
+            "divergence_days": 0,
+            "sell_pressure_falling": False,
+            "breadth_recovered": False,
+            "prior_window": "",
+            "sell_pressure_rising": False,
+        }
+
+        async def context_loader(trade_date, stage, captured_at):
+            return {
+                "scope": "full_market",
+                "trade_date": trade_date,
+                "captured_at": captured_at - timedelta(minutes=1),
+                **context,
+                "field_quality": {key: "ready" for key in context},
+            }
+
+        async with self.session_factory() as db:
+            db.add_all(
+                [
+                    Stock(
+                        stock_code=code,
+                        stock_name=f"Mode {code}",
+                        market="SZ",
+                        is_st=0,
+                        circulating_shares=100_000,
+                    )
+                    for code in codes
+                ]
+            )
+            await db.commit()
+            raw = await TradingPlaybookMarketDataProvider(
+                quote_api=_FakeQuoteAPI(payloads),
+                kline_loader=kline_loader,
+                realtime_limit_up_loader=realtime_loader,
+                full_market_context_loader=context_loader,
+            ).build_market_snapshot(
+                db=db,
+                source_trade_date=source_date,
+                target_trade_date=target_date,
+                stage="preclose",
+                as_of=as_of,
+            )
+
+        enriched = MarketStateAnalyzer().enrich_snapshot(raw)
+        analyzed = next(
+            item for item in enriched.candidates if item.stock_code == "300001"
+        )
+        built = ModeFeatureBuilder().build(enriched, analyzed)
+        match_candidate = CandidateSnapshot(
+            stock_code=analyzed.stock_code,
+            stock_name=analyzed.stock_name,
+            theme_name=analyzed.theme_name,
+            features=built,
+            evidence=copy.deepcopy(analyzed.evidence),
+        )
+        catalog = json.loads(
+            Path("app/data/trading_playbook_rules_v1.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        matches = {
+            row.mode_key: row
+            for row in ModeMatcher(
+                catalog["rules"],
+                catalog_version=catalog["catalog_version"],
+            ).evaluate(enriched.market_features, match_candidate)
+        }
+
+        self.assertEqual(enriched.market_features["style"], "dual_active")
+        self.assertEqual(enriched.market_features["window"], "outbreak")
+        self.assertEqual(
+            enriched.market_features["_feature_quality"],
+            {**{key: "ready" for key in context}, "style": "ready", "window": "ready"},
+        )
+        self.assertEqual(analyzed.features["recognition_quality"], "ready")
+        self.assertEqual(analyzed.features["theme_quality"], "ready")
+        self.assertEqual(analyzed.features["theme_rank"], 1)
+        self.assertTrue(built["high_volatility"])
+        self.assertEqual(
+            (matches["new_theme_high_volatility"].status,
+             matches["new_theme_high_volatility"].risk_level),
+            ("matched", "trial"),
+        )
+
+    async def test_bad_full_market_context_never_becomes_a_known_state(self):
+        import copy
+        import json
+        from pathlib import Path
+
+        from app.services.trading_playbook.domain import CandidateSnapshot
+        from app.services.trading_playbook.market_data import (
+            TradingPlaybookMarketDataProvider,
+        )
+        from app.services.trading_playbook.market_state import MarketStateAnalyzer
+        from app.services.trading_playbook.mode_features import ModeFeatureBuilder
+        from app.services.trading_playbook.mode_matcher import ModeMatcher
+
+        source_date = date(2026, 7, 10)
+        target_date = date(2026, 7, 13)
+        as_of = datetime(2026, 7, 10, 14, 40)
+        values = {
+            "limit_up_count": 20,
+            "limit_up_count_prev": 10,
+            "trend_new_high_count": 5,
+            "trend_new_high_count_prev": 5,
+            "limit_down_count": 1,
+            "max_board_height": 3,
+            "seal_rate": 80,
+            "negative_feedback": False,
+            "divergence_days": 0,
+            "sell_pressure_falling": False,
+            "breadth_recovered": False,
+            "prior_window": "",
+            "sell_pressure_rising": False,
+        }
+        variants = {
+            "wrong_scope": {"scope": "candidate_subset", "as_of": as_of},
+            "future": {
+                "scope": "full_market",
+                "as_of": as_of + timedelta(seconds=1),
+            },
+            "stale": {
+                "scope": "full_market",
+                "as_of": as_of - timedelta(days=1),
+            },
+        }
+        catalog = json.loads(
+            Path("app/data/trading_playbook_rules_v1.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        target_rule = next(
+            rule
+            for rule in catalog["rules"]
+            if rule["mode_key"] == "new_theme_high_volatility"
+        )
+        payload = _quote_payload("300001", 10.5, "20260710144000")
+
+        async def realtime_loader(trade_date):
+            return [{
+                "stock_code": "300001",
+                "theme_name": "AI",
+                "_collected_at": datetime(2026, 7, 10, 14, 39),
+                "first_limit_up_time": "09:31:00",
+                "continuous_limit_up_days": 2,
+                "seal_amount": 500,
+                "sealed": True,
+                "broken": False,
+                "tradable_market_value": 2_000_000,
+            }]
+
+        async def kline_loader(*args, **kwargs):
+            return [
+                {
+                    "date": source_date - timedelta(days=offset),
+                    "close": close,
+                }
+                for offset, close in zip(
+                    range(6, 0, -1),
+                    (8.0, 8.2, 8.4, 8.6, 8.8, 9.2),
+                )
+            ]
+
+        def assert_waiting(snapshot):
+            enriched = MarketStateAnalyzer().enrich_snapshot(snapshot)
+            self.assertEqual(enriched.market_features["style"], "unknown")
+            self.assertEqual(enriched.market_features["window"], "unknown")
+            self.assertEqual(
+                enriched.market_features["_feature_quality"]["style"],
+                "missing",
+            )
+            analyzed = enriched.candidates[0]
+            built = ModeFeatureBuilder().build(enriched, analyzed)
+            candidate = CandidateSnapshot(
+                stock_code=analyzed.stock_code,
+                stock_name=analyzed.stock_name,
+                theme_name=analyzed.theme_name,
+                features=built,
+                evidence=copy.deepcopy(analyzed.evidence),
+            )
+            match = ModeMatcher(
+                [target_rule],
+                catalog_version=catalog["catalog_version"],
+            ).evaluate(enriched.market_features, candidate)[0]
+            self.assertEqual((match.status, match.risk_level), ("waiting", "watch"))
+
+        async with self.session_factory() as db:
+            db.add(
+                Stock(
+                    stock_code="300001",
+                    stock_name="Bad Context Candidate",
+                    market="SZ",
+                    is_st=0,
+                    circulating_shares=100_000,
+                )
+            )
+            await db.commit()
+            for name, header in variants.items():
+                async def loader(trade_date, stage, captured_at, header=header):
+                    return {
+                        "trade_date": trade_date,
+                        **values,
+                        "field_quality": {key: "ready" for key in values},
+                        **header,
+                    }
+
+                snapshot = await TradingPlaybookMarketDataProvider(
+                    quote_api=_FakeQuoteAPI({"300001": payload}),
+                    kline_loader=kline_loader,
+                    realtime_limit_up_loader=realtime_loader,
+                    full_market_context_loader=loader,
+                ).build_market_snapshot(
+                    db=db,
+                    source_trade_date=source_date,
+                    target_trade_date=target_date,
+                    stage="preclose",
+                    as_of=as_of,
+                )
+                with self.subTest(name=name):
+                    assert_waiting(snapshot)
+            missing = await TradingPlaybookMarketDataProvider(
+                quote_api=_FakeQuoteAPI({"300001": payload}),
+                kline_loader=kline_loader,
+                realtime_limit_up_loader=realtime_loader,
+            ).build_market_snapshot(
+                db=db,
+                source_trade_date=source_date,
+                target_trade_date=target_date,
+                stage="preclose",
+                as_of=as_of,
+            )
+        assert_waiting(missing)
+
+    async def test_candidate_conflicts_and_missing_theme_facts_stay_unknown(self):
+        from app.services.trading_playbook.market_data import (
+            TradingPlaybookMarketDataProvider,
+        )
+
+        source_date = date(2026, 7, 10)
+        as_of = datetime(2026, 7, 10, 14, 40)
+        async with self.session_factory() as db:
+            stock = Stock(
+                stock_code="300001",
+                stock_name="Conflict Candidate",
+                market="SZ",
+                is_st=0,
+                circulating_shares=100_000,
+            )
+            db.add(stock)
+            await db.flush()
+            db.add(
+                MarketReviewStockDaily(
+                    trade_date=source_date,
+                    stock_id=stock.id,
+                    stock_code=stock.stock_code,
+                    stock_name=stock.stock_name,
+                    first_limit_time=time(9, 35),
+                    today_continuous_days=3,
+                    tradable_market_value=3_000_000,
+                    limit_up_reason="AI",
+                    created_at=as_of - timedelta(minutes=2),
+                    updated_at=as_of - timedelta(minutes=2),
+                )
+            )
+            await db.commit()
+
+            async def realtime_loader(trade_date):
+                return [{
+                    "stock_code": "300001",
+                    "theme_name": "AI",
+                    "_collected_at": as_of - timedelta(minutes=1),
+                    "first_limit_up_time": "09:31:00",
+                    "continuous_limit_up_days": 2,
+                    "tradable_market_value": 2_000_000,
+                }]
+
+            snapshot = await TradingPlaybookMarketDataProvider(
+                quote_api=_FakeQuoteAPI(
+                    {"300001": _quote_payload("300001", 10.5, "20260710144000")}
+                ),
+                realtime_limit_up_loader=realtime_loader,
+            ).build_market_snapshot(
+                db=db,
+                source_trade_date=source_date,
+                target_trade_date=source_date,
+                stage="preclose",
+                as_of=as_of,
+            )
+
+        candidate = snapshot.candidates[0]
+        for key in (
+            "first_limit_seconds",
+            "board_height",
+            "tradable_market_value",
+        ):
+            self.assertNotIn(key, candidate.features)
+            self.assertEqual(candidate.features["_feature_quality"][key], "missing")
+        theme = snapshot.theme_rankings[0]
+        self.assertEqual(theme["limit_up_count"], 1)
+        self.assertEqual(theme["field_quality"]["limit_up_count"], "ready")
+        self.assertNotIn("new_high_count", theme)
+        self.assertEqual(theme["field_quality"]["new_high_count"], "missing")
+        self.assertNotIn("sealed_count", theme)
+        self.assertNotIn("broken_count", theme)
+        self.assertEqual(theme["quality"], "degraded")
+
+    async def test_bounded_union_quotes_full_market_and_loads_klines_only_for_candidates(
+        self,
+    ):
         from app.services.trading_playbook.market_data import (
             TradingPlaybookMarketDataProvider,
         )

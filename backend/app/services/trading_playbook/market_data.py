@@ -24,6 +24,21 @@ from app.utils.market_data_sanitizer import normalize_change_pct
 
 QuoteFieldQuality = Dict[str, Dict[str, str]]
 _NONFINITE = object()
+_FULL_MARKET_CONTEXT_FIELDS = (
+    "limit_up_count",
+    "limit_up_count_prev",
+    "trend_new_high_count",
+    "trend_new_high_count_prev",
+    "limit_down_count",
+    "max_board_height",
+    "seal_rate",
+    "negative_feedback",
+    "divergence_days",
+    "sell_pressure_falling",
+    "breadth_recovered",
+    "prior_window",
+    "sell_pressure_rising",
+)
 
 
 @dataclass(frozen=True)
@@ -54,6 +69,7 @@ class TradingPlaybookMarketDataProvider:
         batch_size: int = 80,
         max_concurrency: int = 4,
         realtime_limit_up_loader: Optional[Callable[..., Any]] = None,
+        full_market_context_loader: Optional[Callable[..., Any]] = None,
     ):
         self.quote_api = quote_api
         self.quote_client = quote_api
@@ -64,6 +80,7 @@ class TradingPlaybookMarketDataProvider:
             self.MAX_CONCURRENCY,
         )
         self.realtime_limit_up_loader = realtime_limit_up_loader
+        self.full_market_context_loader = full_market_context_loader
         self._previous_prices: Dict[str, _QuoteCacheRecord] = {}
         self._quote_state_lock = asyncio.Lock()
         self._quote_semaphore = asyncio.Semaphore(self.max_concurrency)
@@ -539,6 +556,13 @@ class TradingPlaybookMarketDataProvider:
     ) -> MarketSnapshot:
         local_as_of = self._china_datetime(as_of)
         database_as_of = local_as_of.replace(tzinfo=None)
+        market_context, market_context_evidence, context_warning = (
+            await self._load_full_market_context(
+                source_trade_date,
+                stage,
+                as_of,
+            )
+        )
         stock_result = await db.execute(select(Stock).order_by(Stock.stock_code))
         eligible_stocks = [
             stock
@@ -608,6 +632,8 @@ class TradingPlaybookMarketDataProvider:
             quote.stock_code for quote in speed_order[:200]
         }
         warnings = list(quote_snapshot.quality.warnings)
+        if context_warning:
+            warnings.append(context_warning)
 
         realtime_rows: List[Dict[str, Any]] = []
         pool_trade_date = min(target_trade_date, local_as_of.date())
@@ -937,6 +963,16 @@ class TradingPlaybookMarketDataProvider:
                 review_history[0] if review_history else None,
                 plan_context[0] if plan_context is not None else None,
             )
+            self._add_candidate_mode_inputs(
+                features,
+                evidence,
+                stock=stock,
+                realtime_row=realtime_row,
+                review_row=review_history[0] if review_history else None,
+                quote=quote,
+                quote_quality=quote_field_quality.get(code, {}),
+                as_of=as_of,
+            )
             candidates.append(
                 CandidateSnapshot(
                     stock_code=code,
@@ -947,6 +983,7 @@ class TradingPlaybookMarketDataProvider:
                 )
             )
 
+        self._add_theme_amount_ranks(candidates, as_of)
         if stage == "auction":
             self._add_auction_features(
                 candidates,
@@ -1003,6 +1040,19 @@ class TradingPlaybookMarketDataProvider:
             "full_market_change_ranks": change_ranks,
             "full_market_speed_ranks": speed_ranks,
             "full_market_rank_evidence": rank_evidence,
+            **market_context,
+            "_feature_quality": {
+                key: (
+                    market_context_evidence[0]["field_quality"].get(
+                        key,
+                        "missing",
+                    )
+                    if market_context_evidence
+                    else "missing"
+                )
+                for key in _FULL_MARKET_CONTEXT_FIELDS
+            },
+            "_evidence": market_context_evidence,
         }
         if force_degraded:
             warnings.append("force_degraded requested")
@@ -1028,6 +1078,109 @@ class TradingPlaybookMarketDataProvider:
                 warnings=warnings,
             ),
         )
+
+    async def _load_full_market_context(
+        self,
+        trade_date: date,
+        stage: str,
+        as_of: datetime,
+    ) -> Tuple[Dict[str, Any], List[Dict[str, Any]], Optional[str]]:
+        if self.full_market_context_loader is None:
+            return {}, [], None
+        try:
+            payload = await self.full_market_context_loader(
+                trade_date,
+                stage,
+                as_of,
+            )
+        except Exception as exc:
+            return {}, [], f"full-market context failed: {exc}"
+        if not isinstance(payload, Mapping):
+            return {}, [], "invalid full-market context payload"
+        if payload.get("scope") != "full_market":
+            return {}, [], "invalid full-market context scope"
+        payload_trade_date = self._parse_date_value(payload.get("trade_date"))
+        if payload_trade_date is not None and payload_trade_date != trade_date:
+            return {}, [], "stale full-market context trade date"
+        captured_at = self._parse_temporal_value(payload.get("as_of"))
+        if captured_at is None:
+            captured_at = self._parse_temporal_value(payload.get("captured_at"))
+        local_as_of = self._china_datetime(as_of)
+        if captured_at is None:
+            return {}, [], "full-market context missing provenance"
+        if captured_at > local_as_of:
+            return {}, [], "future full-market context"
+        if (
+            captured_at.date() < trade_date
+            or payload.get("stale") is True
+            or str(payload.get("quality") or "").strip().lower() == "stale"
+        ):
+            return {}, [], "stale full-market context"
+
+        declared_quality = payload.get("field_quality")
+        if not isinstance(declared_quality, Mapping):
+            declared_quality = {}
+        if any(
+            isinstance(value, str)
+            and value.strip().lower() in {"stale", "invalid"}
+            for value in declared_quality.values()
+        ):
+            return {}, [], "stale or invalid full-market context field"
+        normalized: Dict[str, Any] = {}
+        accepted_quality: Dict[str, str] = {}
+        count_fields = {
+            "limit_up_count",
+            "limit_up_count_prev",
+            "trend_new_high_count",
+            "trend_new_high_count_prev",
+            "limit_down_count",
+            "max_board_height",
+            "divergence_days",
+        }
+        flag_fields = {
+            "negative_feedback",
+            "sell_pressure_falling",
+            "breadth_recovered",
+            "sell_pressure_rising",
+        }
+        for key in _FULL_MARKET_CONTEXT_FIELDS:
+            if declared_quality.get(key) not in {"ready", "computed"}:
+                continue
+            value = payload.get(key)
+            if key in count_fields:
+                value = self._optional_float(value)
+                if value is None or value < 0:
+                    continue
+                value = int(value) if value.is_integer() else value
+            elif key == "seal_rate":
+                value = self._optional_float(value)
+                if value is None or not 0 <= value <= 100:
+                    continue
+            elif key in flag_fields:
+                if not isinstance(value, bool):
+                    continue
+            elif key == "prior_window":
+                if not isinstance(value, str):
+                    continue
+                value = value.strip()
+            normalized[key] = value
+            accepted_quality[key] = str(declared_quality[key])
+        evidence = [{
+            "source": "full_market_context",
+            "scope": "full_market",
+            "trade_date": trade_date,
+            "as_of": self._evidence_datetime(captured_at, as_of),
+            "quality": (
+                "ready"
+                if len(normalized) == len(_FULL_MARKET_CONTEXT_FIELDS)
+                else "degraded"
+            ),
+            "field_quality": {
+                key: accepted_quality.get(key, "missing")
+                for key in _FULL_MARKET_CONTEXT_FIELDS
+            },
+        }]
+        return normalized, evidence, None
 
     async def _load_realtime_limit_up(
         self,
@@ -1393,6 +1546,7 @@ class TradingPlaybookMarketDataProvider:
             "change_pct": row.change_pct,
             "amount": row.amount,
             "turnover_rate": row.turnover_rate,
+            "tradable_market_value": row.tradable_market_value,
             "limit_up_reason": row.limit_up_reason or "",
             "data_quality_flag": row.data_quality_flag,
         }
@@ -1413,26 +1567,342 @@ class TradingPlaybookMarketDataProvider:
             return str(plan_candidate.theme_name)
         return ""
 
-    @staticmethod
+    @classmethod
     def _theme_rankings(
+        cls,
         candidates: List[CandidateSnapshot],
     ) -> List[Dict[str, Any]]:
         grouped: Dict[str, List[CandidateSnapshot]] = {}
         for candidate in candidates:
             if candidate.theme_name:
                 grouped.setdefault(candidate.theme_name, []).append(candidate)
-        rankings = [
-            {
+        rankings = []
+        for theme_name, members in grouped.items():
+            realtime_members = [
+                member
+                for member in members
+                if isinstance(
+                    member.features.get("realtime_limit_up_fact"),
+                    Mapping,
+                )
+            ]
+            field_quality = {
+                key: "missing"
+                for key in (
+                    "limit_up_count",
+                    "new_high_count",
+                    "sealed_count",
+                    "broken_count",
+                    "middle_army_strength",
+                )
+            }
+            row: Dict[str, Any] = {
                 "theme_name": theme_name,
                 "candidate_count": len(members),
                 "stock_codes": sorted(member.stock_code for member in members),
             }
-            for theme_name, members in grouped.items()
-        ]
+            if realtime_members:
+                row["limit_up_count"] = len(realtime_members)
+                field_quality["limit_up_count"] = "ready"
+
+                high_flags = []
+                sealed_flags = []
+                broken_flags = []
+                amounts = []
+                for member in realtime_members:
+                    high_flags.append(
+                        member.features.get("n_day_high")
+                        if member.features.get("kline_quality") == "ready"
+                        and isinstance(member.features.get("n_day_high"), bool)
+                        else None
+                    )
+                    fact = member.features["realtime_limit_up_fact"]
+                    sealed_flags.append(
+                        cls._fact_flag(fact, "sealed", "today_sealed_close")
+                    )
+                    broken_flags.append(
+                        cls._fact_flag(fact, "broken", "today_broken")
+                    )
+                    amount = cls._optional_float(member.features.get("amount"))
+                    amount_ready = any(
+                        evidence.get("source") == "tencent"
+                        and isinstance(evidence.get("field_quality"), Mapping)
+                        and evidence["field_quality"].get("amount")
+                        in {"ready", "computed"}
+                        and evidence.get("quality") != "stale"
+                        and evidence.get("stale") is not True
+                        for evidence in member.evidence
+                    )
+                    amounts.append(
+                        amount if amount_ready and amount is not None else None
+                    )
+
+                for field, values, predicate in (
+                    ("new_high_count", high_flags, bool),
+                    ("sealed_count", sealed_flags, bool),
+                    ("broken_count", broken_flags, bool),
+                ):
+                    if all(isinstance(value, bool) for value in values):
+                        row[field] = sum(predicate(value) for value in values)
+                        field_quality[field] = "ready"
+                if all(value is not None for value in amounts):
+                    row["middle_army_strength"] = sum(
+                        value > 0 for value in amounts
+                    )
+                    field_quality["middle_army_strength"] = "ready"
+
+            row["field_quality"] = field_quality
+            row["quality"] = (
+                "ready"
+                if all(value == "ready" for value in field_quality.values())
+                else "degraded"
+            )
+            source_fields = {
+                "realtime_limit_up_pool": (
+                    "limit_up_count",
+                    "sealed_count",
+                    "broken_count",
+                ),
+                "kline": ("new_high_count",),
+                "tencent": ("middle_army_strength",),
+            }
+            row["evidence"] = []
+            for source, fields in source_fields.items():
+                observed = [
+                    evidence.get("as_of")
+                    for member in realtime_members
+                    for evidence in member.evidence
+                    if evidence.get("source") == source
+                    and isinstance(evidence.get("as_of"), datetime)
+                ]
+                row["evidence"].append(
+                    {
+                        "source": source,
+                        "as_of": max(observed) if observed else None,
+                        "quality": (
+                            "ready"
+                            if all(field_quality[field] == "ready" for field in fields)
+                            else "degraded"
+                        ),
+                        "field_quality": {
+                            field: field_quality[field] for field in fields
+                        },
+                        "stock_codes": sorted(
+                            member.stock_code for member in realtime_members
+                        ),
+                    }
+                )
+            rankings.append(row)
         return sorted(
             rankings,
             key=lambda item: (-item["candidate_count"], item["theme_name"]),
         )
+
+    @staticmethod
+    def _fact_flag(fact: Mapping[str, Any], *keys: str) -> Optional[bool]:
+        for key in keys:
+            if key in fact:
+                return fact[key] if isinstance(fact[key], bool) else None
+        return None
+
+    @classmethod
+    def _add_candidate_mode_inputs(
+        cls,
+        features: Dict[str, Any],
+        evidence: List[Dict[str, Any]],
+        *,
+        stock: Stock,
+        realtime_row: Optional[Mapping[str, Any]],
+        review_row: Optional[MarketReviewStockDaily],
+        quote: Optional[QuotePoint],
+        quote_quality: Mapping[str, str],
+        as_of: datetime,
+    ) -> None:
+        keys = (
+            "first_limit_seconds",
+            "board_height",
+            "seal_strength",
+            "resilience",
+            "influence",
+            "tradable_market_value",
+            "theme_amount_rank",
+        )
+        feature_quality = features.get("_feature_quality")
+        feature_quality = (
+            dict(feature_quality)
+            if isinstance(feature_quality, Mapping)
+            else {}
+        )
+        feature_quality.update({key: "missing" for key in keys})
+        normalized: Dict[str, Any] = {}
+        conflicts = set()
+
+        if realtime_row is not None:
+            first_limit = cls._first_limit_seconds(
+                realtime_row.get("first_limit_up_time")
+                if "first_limit_up_time" in realtime_row
+                else realtime_row.get("first_limit_time")
+            )
+            board_height = cls._optional_float(
+                realtime_row.get("continuous_limit_up_days")
+                if "continuous_limit_up_days" in realtime_row
+                else realtime_row.get("today_continuous_days")
+            )
+            seal_strength = cls._optional_float(realtime_row.get("seal_amount"))
+            market_value = cls._optional_float(
+                realtime_row.get("tradable_market_value")
+            )
+            if first_limit is not None:
+                normalized["first_limit_seconds"] = first_limit
+            if board_height is not None and board_height >= 0:
+                normalized["board_height"] = (
+                    int(board_height) if board_height.is_integer() else board_height
+                )
+            if seal_strength is not None and seal_strength >= 0:
+                normalized["seal_strength"] = seal_strength
+            if market_value is not None and market_value >= 0:
+                normalized["tradable_market_value"] = market_value
+
+        if review_row is not None:
+            review_first = cls._first_limit_seconds(review_row.first_limit_time)
+            review_height = cls._optional_float(review_row.today_continuous_days)
+            review_value = cls._optional_float(review_row.tradable_market_value)
+            for key, value in (
+                ("first_limit_seconds", review_first),
+                ("board_height", review_height),
+                ("tradable_market_value", review_value),
+            ):
+                if value is None or value < 0:
+                    continue
+                if key in normalized and normalized[key] != value:
+                    normalized.pop(key)
+                    conflicts.add(key)
+                    continue
+                if key not in conflicts:
+                    normalized[key] = (
+                        int(value)
+                        if isinstance(value, float) and value.is_integer()
+                        else value
+                    )
+
+        quote_is_fresh = (
+            quote is not None
+            and quote_quality.get("timestamp") == "ready"
+            and cls._age_seconds(as_of, quote.captured_at)
+            <= cls.STALE_AFTER_SECONDS
+        )
+        if quote_is_fresh and quote_quality.get("change_pct") in {
+            "ready",
+            "computed",
+        }:
+            resilience = cls._optional_float(features.get("change_pct"))
+            if resilience is not None:
+                normalized["resilience"] = resilience
+        if quote_is_fresh and quote_quality.get("amount") in {
+            "ready",
+            "computed",
+        }:
+            influence = cls._optional_float(features.get("amount"))
+            if influence is not None and influence >= 0:
+                normalized["influence"] = influence
+        if (
+            "tradable_market_value" not in normalized
+            and "tradable_market_value" not in conflicts
+            and quote_is_fresh
+        ):
+            shares = cls._optional_float(stock.circulating_shares)
+            price = cls._optional_float(features.get("price"))
+            if shares is not None and shares > 0 and price is not None and price > 0:
+                normalized["tradable_market_value"] = shares * price
+
+        for key, value in normalized.items():
+            features[key] = value
+            feature_quality[key] = "ready"
+        features["_feature_quality"] = feature_quality
+        if normalized:
+            evidence.append(
+                {
+                    "source": "computed",
+                    "as_of": as_of,
+                    "quality": "ready",
+                    "fields": sorted(normalized),
+                    "field_quality": {
+                        key: "ready" for key in normalized
+                    },
+                }
+            )
+
+    @classmethod
+    def _add_theme_amount_ranks(
+        cls,
+        candidates: List[CandidateSnapshot],
+        as_of: datetime,
+    ) -> None:
+        grouped: Dict[str, List[CandidateSnapshot]] = {}
+        for candidate in candidates:
+            if candidate.theme_name:
+                grouped.setdefault(candidate.theme_name, []).append(candidate)
+        for members in grouped.values():
+            amounts = []
+            for member in members:
+                quality = member.features.get("_feature_quality", {})
+                amount = cls._optional_float(member.features.get("amount"))
+                if (
+                    not isinstance(quality, Mapping)
+                    or quality.get("influence") != "ready"
+                ):
+                    amounts = []
+                    break
+                if amount is None or amount < 0:
+                    amounts = []
+                    break
+                amounts.append((member, amount))
+            if not amounts:
+                continue
+            previous = None
+            rank = 0
+            for member, amount in sorted(
+                amounts,
+                key=lambda item: (-item[1], item[0].stock_code),
+            ):
+                if amount != previous:
+                    rank += 1
+                    previous = amount
+                member.features["theme_amount_rank"] = rank
+                member.features["_feature_quality"]["theme_amount_rank"] = "ready"
+                member.evidence.append(
+                    {
+                        "source": "computed",
+                        "as_of": as_of,
+                        "quality": "ready",
+                        "fields": ["theme_amount_rank"],
+                        "field_quality": {"theme_amount_rank": "ready"},
+                    }
+                )
+
+    @staticmethod
+    def _first_limit_seconds(value: Any) -> Optional[int]:
+        if isinstance(value, datetime):
+            value = value.time()
+        if isinstance(value, time):
+            seconds = value.hour * 3600 + value.minute * 60 + value.second
+            return seconds if 33900 <= seconds <= 54000 else None
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            number = float(value)
+            if math.isfinite(number) and 33900 <= number <= 54000:
+                return int(number)
+            return None
+        if not isinstance(value, str):
+            return None
+        raw = value.strip()
+        for pattern in ("%H:%M:%S", "%H:%M", "%H%M%S"):
+            try:
+                parsed = datetime.strptime(raw, pattern).time()
+                seconds = parsed.hour * 3600 + parsed.minute * 60 + parsed.second
+                return seconds if 33900 <= seconds <= 54000 else None
+            except ValueError:
+                continue
+        return None
 
     @staticmethod
     def _is_st_stock(stock: Stock) -> bool:
