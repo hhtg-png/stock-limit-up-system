@@ -516,31 +516,86 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(plan["mode_radar"]), 1)
 
     async def test_structured_relevant_evidence_ignores_unrelated_provider_warning(self):
-        evaluation = _evaluation("leader", "000001", risk_level="confirmed")
-        object.__setattr__(
-            evaluation,
-            "evidence",
-            [
-                {
-                    "source": "provider",
-                    "quality": "degraded",
-                    "warning": "unrelated aggregate coverage",
-                    "relevant": False,
-                },
-                {
-                    "source": "mode_requirement",
-                    "feature": "candidate.flag",
-                    "result": "matched",
-                    "captured_at": AS_OF,
-                },
-                {"source": "mode_risk", "quality": "ready"},
-            ],
-        )
         async with self.Session() as db:
-            plan = await self._generate(db, [evaluation])
+            for quality in ("ready", "computed"):
+                evaluation = _evaluation(
+                    f"leader-{quality}",
+                    "000001",
+                    risk_level="confirmed",
+                )
+                object.__setattr__(
+                    evaluation,
+                    "evidence",
+                    [
+                        {
+                            "source": "provider",
+                            "quality": "degraded",
+                            "warning": "unrelated aggregate coverage",
+                            "relevant": False,
+                        },
+                        {
+                            "source": "mode_requirement",
+                            "feature": "candidate.flag",
+                            "result": "matched",
+                            "captured_at": AS_OF,
+                        },
+                        {"source": "mode_risk", "quality": "ready"},
+                    ],
+                )
+                snapshot = _snapshot()
+                snapshot.market_features["candidate_quality_case"] = quality
+                snapshot.candidates[0].features["flag"] = True
+                snapshot.candidates[0].features["_feature_quality"] = {
+                    "flag": quality
+                }
+                plan = await self._generate(db, [evaluation], snapshot=snapshot)
 
-        self.assertEqual(len(plan["candidates"]), 1)
-        self.assertEqual(plan["candidates"][0]["risk_level"], "confirmed")
+                with self.subTest(quality=quality):
+                    self.assertEqual(len(plan["candidates"]), 1)
+                    self.assertEqual(
+                        plan["candidates"][0]["risk_level"], "confirmed"
+                    )
+
+    async def test_required_candidate_field_and_quality_are_mandatory_for_confirmed(self):
+        cases = [
+            ("missing-value", {"_feature_quality": {"flag": "ready"}}),
+            ("missing-quality", {"flag": True}),
+            (
+                "quality-missing",
+                {"flag": True, "_feature_quality": {"flag": "missing"}},
+            ),
+            (
+                "quality-invalid",
+                {"flag": True, "_feature_quality": {"flag": "invalid"}},
+            ),
+        ]
+        async with self.Session() as db:
+            for index, (case, features) in enumerate(cases):
+                evaluation = _evaluation(
+                    f"required-candidate-field-{index}",
+                    "000001",
+                    risk_level="confirmed",
+                )
+                object.__setattr__(
+                    evaluation,
+                    "evidence",
+                    [
+                        {
+                            "source": "mode_requirement",
+                            "feature": "candidate.flag",
+                            "result": "matched",
+                        },
+                        {"source": "mode_risk", "quality": "ready"},
+                    ],
+                )
+                snapshot = _snapshot()
+                snapshot.market_features["candidate_field_case"] = case
+                snapshot.candidates[0].features.update(features)
+                plan = await self._generate(db, [evaluation], snapshot=snapshot)
+
+                with self.subTest(case=case):
+                    self.assertEqual(plan["candidates"], [])
+                    self.assertEqual(len(plan["mode_radar"]), 1)
 
     async def test_required_candidate_feature_quality_blocks_only_confirmed(self):
         snapshot = _snapshot()

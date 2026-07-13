@@ -674,15 +674,15 @@ class TradingPlanService:
         if features.get("_point_in_time_valid", True) is not True:
             return True
         quality_map = features.get("_feature_quality", {})
-        if isinstance(quality_map, Mapping):
-            for field in required_candidate_fields:
-                quality = quality_map.get(field)
-                if quality is not None and str(quality).lower() not in {
-                    "ready",
-                    "computed",
-                    "ok",
-                }:
-                    return True
+        for field in required_candidate_fields:
+            if field not in features or not isinstance(quality_map, Mapping):
+                return True
+            if str(quality_map.get(field) or "").lower() not in {
+                "ready",
+                "computed",
+                "ok",
+            }:
+                return True
         source_evidence = candidate_source.get("evidence", [])
         if isinstance(source_evidence, list):
             for item in source_evidence:
