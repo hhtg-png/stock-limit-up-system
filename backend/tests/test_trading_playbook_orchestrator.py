@@ -121,6 +121,20 @@ class _EchoMarketData:
         )
 
 
+class _DirectMarketData:
+    def __init__(self, candidates):
+        self.candidates = candidates
+
+    async def build_market_snapshot(self, **kwargs):
+        return _snapshot(
+            source=kwargs["source_trade_date"],
+            target=kwargs["target_trade_date"],
+            stage=kwargs["stage"],
+            as_of=kwargs["as_of"],
+            candidates=self.candidates,
+        )
+
+
 class _CopyAnalyzer:
     def __init__(self):
         self.calls = []
@@ -133,6 +147,11 @@ class _CopyAnalyzer:
         return result
 
 
+class _IdentityAnalyzer:
+    def enrich_snapshot(self, snapshot):
+        return snapshot
+
+
 class _FeatureBuilder:
     def __init__(self):
         self.seen = []
@@ -142,12 +161,47 @@ class _FeatureBuilder:
         return {"built_for": candidate.stock_code}
 
 
+class _StableUniverseBuilder:
+    def __init__(self):
+        self.snapshot_ids = []
+        self.peer_feature_keys = []
+
+    def build(self, snapshot, candidate):
+        self.snapshot_ids.append(id(snapshot))
+        self.peer_feature_keys.append(
+            {
+                row.stock_code: tuple(sorted(row.features))
+                for row in snapshot.candidates
+            }
+        )
+        return {"built_for": candidate.stock_code}
+
+
+class _DeepcopyProbe:
+    copies = 0
+
+    def __deepcopy__(self, memo):
+        type(self).copies += 1
+        return self
+
+
 class _Matcher:
     def __init__(self):
         self.seen = []
 
     def evaluate(self, market_features, candidate):
         self.seen.append((copy.deepcopy(market_features), copy.deepcopy(candidate)))
+        return [
+            _evaluation(candidate.stock_code, row["mode_key"])
+            for row in _rule_rows()
+        ]
+
+    def rule_snapshot(self):
+        return _rule_rows()
+
+
+class _NoCopyMatcher:
+    def evaluate(self, market_features, candidate):
         return [
             _evaluation(candidate.stock_code, row["mode_key"])
             for row in _rule_rows()
@@ -211,6 +265,55 @@ class _PlanService:
 
 
 class TradingPlaybookOrchestratorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_feature_build_uses_one_stable_universe_and_linear_copy_work(self):
+        candidate_count = 40
+        _DeepcopyProbe.copies = 0
+        candidates = [
+            CandidateSnapshot(
+                stock_code=f"{index:06d}",
+                stock_name=f"股票{index:06d}",
+                theme_name="AI",
+                features={"marker": index, "probe": _DeepcopyProbe()},
+                evidence=[],
+            )
+            for index in range(candidate_count)
+        ]
+        builder = _StableUniverseBuilder()
+        plan = _PlanService()
+        orchestrator = TradingPlaybookOrchestrator(
+            market_data=_DirectMarketData(candidates),
+            analyzer=_IdentityAnalyzer(),
+            feature_builder=builder,
+            matcher=_NoCopyMatcher(),
+            plan_service=plan,
+            next_trade_date=lambda value: TARGET_DATE,
+        )
+
+        await orchestrator.build_stage(
+            object(), SOURCE_DATE, "preclose", AS_OF
+        )
+
+        self.assertEqual(len(set(builder.snapshot_ids)), 1)
+        self.assertEqual(len(builder.peer_feature_keys), candidate_count)
+        self.assertTrue(
+            all(
+                "built_for" not in keys
+                for seen in builder.peer_feature_keys
+                for keys in seen.values()
+            )
+        )
+        self.assertLessEqual(_DeepcopyProbe.copies, candidate_count * 5)
+        planned_snapshot = plan.calls[0][1]
+        self.assertTrue(
+            all(
+                row.features["built_for"] == row.stock_code
+                for row in planned_snapshot.candidates
+            )
+        )
+        self.assertTrue(
+            all("built_for" not in row.features for row in candidates)
+        )
+
     async def test_preclose_runs_real_interfaces_and_shares_built_features(self):
         raw_candidates = [_candidate("000002"), _candidate("000001")]
         market_data = _EchoMarketData(candidates=raw_candidates)
@@ -319,6 +422,91 @@ class TradingPlaybookOrchestratorTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(call["target_trade_date"], expected_target)
                 self.assertIs(call["as_of"], as_of)
                 self.assertEqual(len(calls), expected_resolver_calls)
+
+    async def test_stage_windows_use_beijing_time_and_preserve_utc_as_of(self):
+        valid_cases = (
+            ("preclose", SOURCE_DATE, datetime(2026, 7, 10, 14, 40, tzinfo=CN_TZ)),
+            ("after_close", SOURCE_DATE, datetime(2026, 7, 10, 15, 30, tzinfo=CN_TZ)),
+            ("overnight", TARGET_DATE, datetime(2026, 7, 13, 0, 0, tzinfo=CN_TZ)),
+            ("auction", TARGET_DATE, datetime(2026, 7, 13, 9, 15, tzinfo=CN_TZ)),
+        )
+        for stage, source, as_of in valid_cases:
+            with self.subTest(stage=stage, as_of=as_of):
+                provider = _EchoMarketData()
+                orchestrator = TradingPlaybookOrchestrator(
+                    market_data=provider,
+                    analyzer=_CopyAnalyzer(),
+                    feature_builder=_FeatureBuilder(),
+                    matcher=_Matcher(),
+                    plan_service=_PlanService(),
+                    next_trade_date=lambda value: TARGET_DATE,
+                )
+                await orchestrator.build_stage(
+                    object(), source, stage, as_of
+                )
+                self.assertIs(provider.calls[0]["as_of"], as_of)
+
+        utc_as_of = datetime.fromisoformat("2026-07-10T06:40:00+00:00")
+        provider = _EchoMarketData()
+        orchestrator = TradingPlaybookOrchestrator(
+            market_data=provider,
+            analyzer=_CopyAnalyzer(),
+            feature_builder=_FeatureBuilder(),
+            matcher=_Matcher(),
+            plan_service=_PlanService(),
+            next_trade_date=lambda value: TARGET_DATE,
+        )
+        await orchestrator.build_stage(
+            object(), SOURCE_DATE, "preclose", utc_as_of
+        )
+        self.assertIs(provider.calls[0]["as_of"], utc_as_of)
+
+    async def test_invalid_beijing_date_and_stage_boundaries_stop_before_dependencies(self):
+        invalid_cases = (
+            (
+                "preclose",
+                SOURCE_DATE,
+                datetime(2026, 7, 13, 14, 40, tzinfo=CN_TZ),
+            ),
+            (
+                "preclose",
+                SOURCE_DATE,
+                datetime(2026, 7, 10, 15, 0, tzinfo=CN_TZ),
+            ),
+            (
+                "after_close",
+                SOURCE_DATE,
+                datetime(2026, 7, 10, 15, 29, 59, tzinfo=CN_TZ),
+            ),
+            (
+                "overnight",
+                TARGET_DATE,
+                datetime(2026, 7, 13, 9, 15, tzinfo=CN_TZ),
+            ),
+            (
+                "auction",
+                TARGET_DATE,
+                datetime(2026, 7, 13, 9, 30, tzinfo=CN_TZ),
+            ),
+        )
+        for stage, source, as_of in invalid_cases:
+            with self.subTest(stage=stage, as_of=as_of):
+                provider = AsyncMock()
+                resolver = MagicMock(return_value=TARGET_DATE)
+                orchestrator = TradingPlaybookOrchestrator(
+                    market_data=provider,
+                    analyzer=_CopyAnalyzer(),
+                    feature_builder=_FeatureBuilder(),
+                    matcher=_Matcher(),
+                    plan_service=_PlanService(),
+                    next_trade_date=resolver,
+                )
+                with self.assertRaisesRegex(ValueError, "date|window"):
+                    await orchestrator.build_stage(
+                        object(), source, stage, as_of
+                    )
+                provider.build_market_snapshot.assert_not_awaited()
+                resolver.assert_not_called()
 
     async def test_invalid_inputs_and_calendar_results_stop_before_provider(self):
         invalid_inputs = (

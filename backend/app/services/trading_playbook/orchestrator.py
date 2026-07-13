@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Callable, Mapping, Sequence
-from datetime import date, datetime
+from datetime import date, datetime, time
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from .domain import MarketSnapshot, ModeEvaluation
 from .market_data import TradingPlaybookMarketDataProvider
@@ -25,6 +26,7 @@ class TradingPlaybookOrchestrator:
     )
     _NEXT_DAY_STAGES = frozenset({"preclose", "after_close"})
     RULE_COUNT = 19
+    _CN_TZ = ZoneInfo("Asia/Shanghai")
 
     def __init__(
         self,
@@ -95,16 +97,14 @@ class TradingPlaybookOrchestrator:
         # Every build receives the same pre-build snapshot. A builder cannot leak
         # mutations from one stock into another stock's facts.
         feature_base = copy.deepcopy(snapshot)
+        source_candidates = {
+            self._candidate_code(candidate): candidate
+            for candidate in feature_base.candidates
+        }
         for candidate in snapshot.candidates:
-            isolated_snapshot = copy.deepcopy(feature_base)
-            isolated_candidate = next(
-                row
-                for row in isolated_snapshot.candidates
-                if self._candidate_code(row) == candidate.stock_code
-            )
             built = self.feature_builder.build(
-                isolated_snapshot,
-                isolated_candidate,
+                feature_base,
+                source_candidates[candidate.stock_code],
             )
             if not isinstance(built, Mapping):
                 raise TypeError("mode feature builder must return a mapping")
@@ -168,6 +168,18 @@ class TradingPlaybookOrchestrator:
             raise ValueError("as_of must be timezone-aware")
         if type(degraded) is not bool:
             raise TypeError("degraded must be a boolean")
+        local_as_of = as_of.astimezone(cls._CN_TZ)
+        if local_as_of.date() != source_trade_date:
+            raise ValueError("as_of Beijing date must match source_trade_date")
+        local_time = local_as_of.time()
+        valid_window = {
+            "preclose": time(14, 40) <= local_time < time(15, 0),
+            "after_close": local_time >= time(15, 30),
+            "overnight": time(0, 0) <= local_time < time(9, 15),
+            "auction": time(9, 15) <= local_time < time(9, 30),
+        }[stage]
+        if not valid_window:
+            raise ValueError(f"as_of is outside the {stage} Beijing window")
 
     def _target_trade_date(self, source_trade_date: date, stage: str) -> date:
         if stage not in self._NEXT_DAY_STAGES:
