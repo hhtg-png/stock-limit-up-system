@@ -15,7 +15,12 @@ from app.services.trading_playbook.domain import (
     DataQuality,
     MarketSnapshot,
 )
-from app.services.trading_playbook.mode_features import FEATURE_KEYS, ModeFeatureBuilder
+from app.services.trading_playbook.mode_features import (
+    FEATURE_KEYS,
+    ModeFeatureBuilder,
+    _tri_and,
+    _tri_or,
+)
 from app.services.trading_playbook.mode_matcher import ModeMatcher
 
 
@@ -30,12 +35,20 @@ def _candidate(
     features: dict | None = None,
     evidence: list | None = None,
 ) -> CandidateSnapshot:
+    if evidence is None:
+        evidence = [
+            {
+                "source": "tencent",
+                "as_of": AS_OF,
+                "quality": "ready",
+            }
+        ]
     return CandidateSnapshot(
         stock_code=code,
         stock_name=f"样本{code}",
         theme_name=theme,
         features=copy.deepcopy(features or {}),
-        evidence=copy.deepcopy(evidence or []),
+        evidence=copy.deepcopy(evidence),
     )
 
 
@@ -75,6 +88,24 @@ def _snapshot(
 
 def _ready_quote_evidence(captured_at: datetime = AS_OF) -> list[dict]:
     return [{"source": "tencent", "as_of": captured_at, "quality": "ready"}]
+
+
+def _ready_quote_and_kline_evidence(
+    captured_at: datetime = AS_OF,
+) -> list[dict]:
+    return [
+        *_ready_quote_evidence(captured_at),
+        {"source": "kline", "as_of": captured_at, "quality": "ready"},
+    ]
+
+
+def test_tri_value_helpers_preserve_unknowns_without_masking_true_or_false():
+    assert _tri_or(False, True) is True
+    assert _tri_or(False, None) is None
+    assert _tri_or(False, False) is False
+    assert _tri_and(True, False, None) is False
+    assert _tri_and(True, None) is None
+    assert _tri_and(True, True) is True
 
 
 class TestModeFeatureBuilder:
@@ -127,7 +158,7 @@ class TestModeFeatureBuilder:
                 "five_day_low": 9.1,
                 "prior_n_day_high": 10.5,
             },
-            evidence=_ready_quote_evidence(),
+            evidence=_ready_quote_and_kline_evidence(),
         )
 
         result = ModeFeatureBuilder().build(_snapshot(candidate), candidate)
@@ -277,6 +308,63 @@ class TestModeFeatureBuilder:
         result = builder.build(_snapshot(candidate), candidate)
         assert result["stronger_confirmed"] is True
 
+    def test_turn_and_divergence_alternatives_use_three_value_or(self):
+        candidate = _candidate(
+            features={
+                "price": 10,
+                "captured_at": AS_OF,
+                "prior_mode_state": "survivor",
+                "resealed": False,
+                "reversal_limit_up": True,
+                "right_side_breakout": False,
+                "recognition_rank": 1,
+            },
+        )
+        builder = ModeFeatureBuilder()
+
+        assert builder.build(
+            _snapshot(candidate), candidate
+        )["turn_confirmed"] is True
+
+        candidate.features.update(
+            {
+                "reversal_limit_up": False,
+                "right_side_breakout": True,
+            }
+        )
+        candidate.features.pop("influence_rank", None)
+        assert builder.build(
+            _snapshot(candidate), candidate
+        )["turn_confirmed"] is None
+
+        candidate.features.update(
+            {
+                "confirmed_leader_fact": True,
+                "prior_accelerated": True,
+                "opened": False,
+                "review_today_broken": True,
+            }
+        )
+        assert builder.build(
+            _snapshot(candidate), candidate
+        )["acceleration_to_divergence"] is True
+
+    def test_stronger_confirmation_preserves_unknown_current_strength(self):
+        candidate = _candidate(
+            features={
+                "pre_close": 10,
+                "open_price": 9.9,
+                "captured_at": AS_OF,
+                "prior_mode_state": "turn_confirmed",
+                "recognition_rank": 1,
+                "new_recognition_leader": False,
+            },
+        )
+
+        result = ModeFeatureBuilder().build(_snapshot(candidate), candidate)
+
+        assert result["stronger_confirmed"] is None
+
     def test_nested_realtime_review_and_plan_facts_drive_conservative_states(self):
         candidate = _candidate(
             features={
@@ -343,6 +431,76 @@ class TestModeFeatureBuilder:
 
         assert result["unique_survivor"] is True
 
+    def test_peer_review_ok_quality_is_normalized_as_ready(self):
+        survivor = _candidate(
+            features={
+                "price": 10,
+                "captured_at": AS_OF,
+                "recognition_rank": 1,
+            },
+        )
+        eliminated = _candidate(
+            "000002",
+            features={
+                "former_high_position": True,
+                "review_today_broken": True,
+            },
+            evidence=[
+                {
+                    "source": "market_review_stock_daily",
+                    "as_of": AS_OF,
+                    "quality": "ok",
+                }
+            ],
+        )
+
+        result = ModeFeatureBuilder().build(
+            _snapshot(survivor, eliminated),
+            survivor,
+        )
+
+        assert result["unique_survivor"] is True
+
+    def test_future_or_unsourced_peer_cannot_prove_unique_survivor(self):
+        survivor = _candidate(
+            features={
+                "price": 10,
+                "captured_at": AS_OF,
+                "recognition_rank": 1,
+            },
+        )
+        eliminated = _candidate(
+            "000002",
+            features={
+                "former_high_position": True,
+                "review_today_broken": True,
+            },
+        )
+        future = _candidate(
+            "000003",
+            features={
+                "former_high_position": True,
+                "review_today_broken": True,
+            },
+            evidence=_ready_quote_evidence(AS_OF + timedelta(minutes=1)),
+        )
+        unsourced = _candidate(
+            "000004",
+            features={
+                "former_high_position": True,
+                "review_today_broken": True,
+            },
+            evidence=[],
+        )
+        builder = ModeFeatureBuilder()
+
+        assert builder.build(
+            _snapshot(survivor, eliminated, future), survivor
+        )["unique_survivor"] is None
+        assert builder.build(
+            _snapshot(survivor, eliminated, unsourced), survivor
+        )["unique_survivor"] is None
+
     def test_trend_turn_two_requires_trend_consolidation_breakout_and_linkage(self):
         candidate = _candidate(
             features={
@@ -380,7 +538,7 @@ class TestModeFeatureBuilder:
                 "theme_expanding": True,
                 "theme_rank": 1,
             },
-            evidence=_ready_quote_evidence(),
+            evidence=_ready_quote_and_kline_evidence(),
         )
         snapshot = _snapshot(
             candidate,
@@ -406,6 +564,30 @@ class TestModeFeatureBuilder:
         assert result["acceleration_to_divergence"] is True
         assert result["first_bearish"] is True
         assert result["external_switch"] is True
+
+    def test_fallback_pullback_price_is_not_support_evidence(self):
+        candidate = _candidate(
+            features={
+                "price": 9.6,
+                "captured_at": AS_OF,
+                "prior_n_day_high": 10,
+                "kline_quality": "ready",
+                "trend_established": True,
+            },
+            evidence=_ready_quote_and_kline_evidence(),
+        )
+        builder = ModeFeatureBuilder()
+
+        fallback = builder.build(_snapshot(candidate), candidate)
+        assert fallback["planned_pullback_price"] == 9.12
+        assert fallback["planned_pullback_quality"] == "fallback"
+        assert fallback["pullback"] is None
+
+        candidate.features["five_day_low"] = 9.4
+        supported = builder.build(_snapshot(candidate), candidate)
+        assert supported["planned_pullback_price"] == 9.4
+        assert supported["planned_pullback_quality"] == "ready"
+        assert supported["pullback"] is True
 
     def test_snake_and_right_reversal_wait_without_their_distinct_theme_evidence(self):
         candidate = _candidate(
@@ -454,6 +636,23 @@ class TestModeFeatureBuilder:
         dead = builder.build(_snapshot(core, supplement), core)
         assert dead["theme_alive"] is False
         assert dead["theme_dead"] is True
+
+    def test_theme_dead_excludes_the_candidate_own_right_side_new_high(self):
+        candidate = _candidate(
+            features={
+                "price": 10,
+                "captured_at": AS_OF,
+                "theme_breadth_negative_days": 2,
+                "sealed": True,
+                "n_day_high": True,
+                "right_side_breakout": True,
+            },
+        )
+
+        result = ModeFeatureBuilder().build(_snapshot(candidate), candidate)
+
+        assert result["theme_dead"] is True
+        assert result["right_reversal"] is True
 
     def test_tail_action_requires_preclose_fresh_entry_not_invalidated_and_non_manual(self):
         candidate = _candidate(
@@ -518,6 +717,27 @@ class TestModeFeatureBuilder:
         assert result["_point_in_time_valid"] is False
         assert candidate == before_candidate
         assert snapshot == before_snapshot
+
+    def test_reference_price_requires_ready_non_stale_quote_evidence(self):
+        naked = _candidate(
+            features={"price": 10, "captured_at": AS_OF},
+            evidence=[],
+        )
+        stale = _candidate(
+            features={"price": 10, "captured_at": AS_OF},
+            evidence=[
+                {
+                    "source": "tencent",
+                    "as_of": AS_OF,
+                    "quality": "stale",
+                    "stale": True,
+                }
+            ],
+        )
+        builder = ModeFeatureBuilder()
+
+        assert builder.build(_snapshot(naked), naked)["reference_price"] is None
+        assert builder.build(_snapshot(stale), stale)["reference_price"] is None
 
     def test_aware_utc_future_evidence_is_compared_in_shanghai_time(self):
         captured_at = datetime(2026, 7, 10, 6, 41, tzinfo=timezone.utc)

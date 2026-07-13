@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import math
+from dataclasses import dataclass
 from datetime import date, datetime
 from statistics import median
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple
@@ -47,6 +48,32 @@ FEATURE_KEYS = {
     "planned_breakout_price",
     "exit_change_pct_floor",
 }
+
+
+def _tri_or(*values: Optional[bool]) -> Optional[bool]:
+    """Kleene OR: true wins, unknown survives unless everything is false."""
+    normalized = [value if isinstance(value, bool) else None for value in values]
+    if any(value is True for value in normalized):
+        return True
+    if normalized and all(value is False for value in normalized):
+        return False
+    return None
+
+
+def _tri_and(*values: Optional[bool]) -> Optional[bool]:
+    """Kleene AND: false wins, unknown survives unless everything is true."""
+    normalized = [value if isinstance(value, bool) else None for value in values]
+    if any(value is False for value in normalized):
+        return False
+    if normalized and all(value is True for value in normalized):
+        return True
+    return None
+
+
+@dataclass(frozen=True)
+class _PeerSet:
+    ready: Tuple[CandidateSnapshot, ...]
+    unknown_count: int = 0
 
 
 def _finite_number(
@@ -134,12 +161,10 @@ def _first_number(
 
 
 def _first_flag(source: Mapping[str, Any], names: Sequence[str]) -> Optional[bool]:
-    for name in names:
-        if name in source:
-            value = _strict_flag(source.get(name))
-            if value is not None:
-                return value
-    return None
+    values = [
+        _strict_flag(source.get(name)) for name in names if name in source
+    ]
+    return _tri_or(*values)
 
 
 def _fact_sources(source: Mapping[str, Any]) -> Tuple[Mapping[str, Any], ...]:
@@ -152,11 +177,13 @@ def _fact_sources(source: Mapping[str, Any]) -> Tuple[Mapping[str, Any], ...]:
 
 
 def _fact_flag(source: Mapping[str, Any], names: Sequence[str]) -> Optional[bool]:
-    for facts in _fact_sources(source):
-        value = _first_flag(facts, names)
-        if value is not None:
-            return value
-    return None
+    return _tri_or(
+        *(
+            _first_flag(facts, names)
+            for facts in _fact_sources(source)
+            if any(name in facts for name in names)
+        )
+    )
 
 
 def _seconds_since_midnight(value: Any) -> Optional[int]:
@@ -206,6 +233,7 @@ class ModeFeatureBuilder:
     ) -> Dict[str, Any]:
         raw = copy.deepcopy(candidate.features)
         result: Dict[str, Any] = {key: None for key in FEATURE_KEYS}
+        result["planned_pullback_quality"] = "missing"
         quality: Dict[str, str] = {}
 
         point_in_time_valid = self._point_in_time_valid(snapshot, candidate, raw)
@@ -221,7 +249,14 @@ class ModeFeatureBuilder:
         if point_in_time_valid:
             reference_price = self._reference_price(snapshot, candidate, raw)
             result["reference_price"] = reference_price
-            result.update(self._planned_prices(raw, reference_price))
+            result.update(
+                self._planned_prices(
+                    snapshot,
+                    candidate,
+                    raw,
+                    reference_price,
+                )
+            )
             result["high_volatility"] = self._high_volatility(
                 candidate.stock_code,
                 raw,
@@ -310,6 +345,7 @@ class ModeFeatureBuilder:
                 raw,
                 reference_price,
                 result["planned_pullback_price"],
+                result["planned_pullback_quality"],
                 result["trend_established"],
             )
             result["linkage_confirmed"] = self._linkage_confirmed(
@@ -333,7 +369,11 @@ class ModeFeatureBuilder:
             )
 
             result["theme_alive"] = self._theme_alive(theme_peers)
-            result["theme_dead"] = self._theme_dead(raw, theme_peers)
+            result["theme_dead"] = self._theme_dead(
+                candidate,
+                raw,
+                theme_peers,
+            )
             result["snake_setup"] = self._all_flags(
                 result["theme_alive"],
                 _first_flag(raw, ("snake_pattern", "snake_setup_confirmed")),
@@ -356,6 +396,7 @@ class ModeFeatureBuilder:
 
         for key in FEATURE_KEYS:
             quality[key] = self._feature_quality(key, raw, result.get(key))
+        quality["planned_pullback_price"] = result["planned_pullback_quality"]
         if not point_in_time_valid:
             for key in FEATURE_KEYS:
                 result[key] = None
@@ -363,19 +404,67 @@ class ModeFeatureBuilder:
         result["_feature_quality"] = quality
         return result
 
-    @staticmethod
+    @classmethod
     def _theme_peers(
+        cls,
         snapshot: MarketSnapshot,
         candidate: CandidateSnapshot,
-    ) -> Tuple[CandidateSnapshot, ...]:
+    ) -> _PeerSet:
         theme = str(candidate.theme_name or "").strip()
-        if not theme:
-            return (candidate,)
-        return tuple(
-            peer
-            for peer in snapshot.candidates
-            if str(peer.theme_name or "").strip() == theme
+        peers = (
+            (candidate,)
+            if not theme
+            else tuple(
+                peer
+                for peer in snapshot.candidates
+                if str(peer.theme_name or "").strip() == theme
+            )
         )
+        ready = tuple(
+            peer for peer in peers if cls._candidate_evidence_ready(snapshot, peer)
+        )
+        return _PeerSet(ready=ready, unknown_count=len(peers) - len(ready))
+
+    @classmethod
+    def _candidate_evidence_ready(
+        cls,
+        snapshot: MarketSnapshot,
+        candidate: CandidateSnapshot,
+    ) -> bool:
+        return cls._has_ready_evidence(
+            snapshot,
+            candidate.evidence,
+            ready_qualities={"ready", "computed", "ok"},
+        )
+
+    @staticmethod
+    def _has_ready_evidence(
+        snapshot: MarketSnapshot,
+        evidence_rows: Iterable[Mapping[str, Any]],
+        *,
+        allowed_sources: Optional[set[str]] = None,
+        ready_qualities: Optional[set[str]] = None,
+    ) -> bool:
+        accepted_qualities = ready_qualities or {"ready", "computed"}
+        ready = False
+        for item in evidence_rows:
+            if not isinstance(item, Mapping):
+                continue
+            source = str(item.get("source") or "").strip()
+            if allowed_sources is not None and source not in allowed_sources:
+                continue
+            observed_at = _parse_datetime(item.get("as_of"))
+            if observed_at is None:
+                continue
+            if _comparable_datetime(observed_at, snapshot.as_of) > snapshot.as_of:
+                return False
+            if (
+                _strict_flag(item.get("stale")) is True
+                or item.get("quality") not in accepted_qualities
+            ):
+                continue
+            ready = True
+        return ready
 
     @staticmethod
     def _point_in_time_valid(
@@ -401,8 +490,9 @@ class ModeFeatureBuilder:
             return False
         return True
 
-    @staticmethod
+    @classmethod
     def _reference_price(
+        cls,
         snapshot: MarketSnapshot,
         candidate: CandidateSnapshot,
         raw: Mapping[str, Any],
@@ -413,40 +503,57 @@ class ModeFeatureBuilder:
             return None
         if _comparable_datetime(captured_at, snapshot.as_of) > snapshot.as_of:
             return None
-        quote_evidence = [
-            item
-            for item in candidate.evidence
-            if isinstance(item, Mapping)
-            and item.get("source") in {"tencent", "quote", "market_quote"}
-        ]
-        if quote_evidence and not any(
-            item.get("quality") in {"ready", "computed"}
-            for item in quote_evidence
+        if not cls._has_ready_evidence(
+            snapshot,
+            candidate.evidence,
+            allowed_sources={"tencent", "quote", "market_quote"},
         ):
             return None
         return price
 
     def _planned_prices(
         self,
+        snapshot: MarketSnapshot,
+        candidate: CandidateSnapshot,
         raw: Mapping[str, Any],
         reference_price: Optional[float],
-    ) -> Dict[str, Optional[float]]:
+    ) -> Dict[str, Any]:
         if reference_price is None:
             return {
                 "planned_pullback_price": None,
+                "planned_pullback_quality": "missing",
                 "planned_breakout_price": None,
                 "hard_stop_price": None,
                 "exit_change_pct_floor": None,
             }
-        supports = [
-            _finite_number(raw.get(key), minimum=0.0001, maximum=reference_price)
-            for key in (
-                "validated_support",
-                "support_price",
-                "five_day_low",
-                "five_day_low_price",
-            )
-        ]
+        support_sources = {
+            "kline",
+            "validated_support",
+            "support",
+            "technical_support",
+        }
+        support_evidence_ready = self._has_ready_evidence(
+            snapshot,
+            candidate.evidence,
+            allowed_sources=support_sources,
+        )
+        supports = (
+            [
+                _finite_number(
+                    raw.get(key),
+                    minimum=0.0001,
+                    maximum=reference_price,
+                )
+                for key in (
+                    "validated_support",
+                    "support_price",
+                    "five_day_low",
+                    "five_day_low_price",
+                )
+            ]
+            if support_evidence_ready
+            else []
+        )
         valid_supports = [value for value in supports if value is not None]
         pullback = max(valid_supports) if valid_supports else (
             reference_price * (1 - self.hard_stop_pct / 100)
@@ -464,6 +571,9 @@ class ModeFeatureBuilder:
         )
         return {
             "planned_pullback_price": round(pullback, 2),
+            "planned_pullback_quality": "ready"
+            if valid_supports
+            else "fallback",
             "planned_breakout_price": round(
                 breakout_base + self.market_tick,
                 2,
@@ -544,29 +654,45 @@ class ModeFeatureBuilder:
     def _high_position(
         cls,
         candidate: CandidateSnapshot,
-        peers: Iterable[CandidateSnapshot],
+        peers: _PeerSet,
     ) -> Optional[bool]:
+        if not any(
+            peer.stock_code == candidate.stock_code for peer in peers.ready
+        ):
+            return None
         candidate_height = cls._board_height(candidate.features)
         if candidate_height is not None and candidate_height < 2:
             return False
-        heights = [cls._board_height(peer.features) for peer in peers]
+        heights = [cls._board_height(peer.features) for peer in peers.ready]
         if candidate_height is None or any(value is None for value in heights):
             return None
-        return candidate_height >= 2 and candidate_height == max(heights)
+        if any(value > candidate_height for value in heights):
+            return False
+        if peers.unknown_count:
+            return None
+        return True
 
     @classmethod
     def _same_level_turnover(
         cls,
         candidate: CandidateSnapshot,
-        peers: Iterable[CandidateSnapshot],
+        peers: _PeerSet,
     ) -> Optional[bool]:
-        peer_rows = tuple(peers)
+        if not any(
+            peer.stock_code == candidate.stock_code for peer in peers.ready
+        ):
+            return None
+        peer_rows = peers.ready
         height = cls._board_height(candidate.features)
         heights = [cls._board_height(peer.features) for peer in peer_rows]
         if height is None or any(value is None for value in heights):
             return None
         maximum = max(heights)
-        if height != maximum or sum(value == height for value in heights) < 2:
+        if height != maximum:
+            return False
+        if peers.unknown_count:
+            return None
+        if sum(value == height for value in heights) < 2:
             return False
         sealed = cls._sealed(candidate.features)
         turnover = _finite_number(
@@ -588,9 +714,13 @@ class ModeFeatureBuilder:
     def _middle_army(
         cls,
         candidate: CandidateSnapshot,
-        peers: Iterable[CandidateSnapshot],
+        peers: _PeerSet,
     ) -> Optional[bool]:
-        peer_rows = tuple(peers)
+        if not any(
+            peer.stock_code == candidate.stock_code for peer in peers.ready
+        ):
+            return None
+        peer_rows = peers.ready
         amounts = [cls._amount(peer.features) for peer in peer_rows]
         candidate_amount = cls._amount(candidate.features)
         explicit_rank = cls._rank(candidate.features.get("theme_amount_rank"))
@@ -601,6 +731,8 @@ class ModeFeatureBuilder:
                 return None
             if candidate_amount < max(amounts):
                 return False
+        if peers.unknown_count:
+            return None
         values = [
             _finite_number(
                 peer.features.get("tradable_market_value"),
@@ -667,35 +799,25 @@ class ModeFeatureBuilder:
     def _unique_survivor(
         cls,
         candidate: CandidateSnapshot,
-        peers: Iterable[CandidateSnapshot],
+        peers: _PeerSet,
         recognition_rank: Optional[int],
     ) -> Optional[bool]:
         if recognition_rank is not None and recognition_rank != 1:
             return False
         if recognition_rank is None:
             return None
-        former_peers = [
-            peer
-            for peer in peers
-            if peer.stock_code != candidate.stock_code
-            and (
-                _first_flag(peer.features, ("former_high_position",)) is True
-                or (
-                    _first_number(
-                        peer.features,
-                        ("review_yesterday_continuous_days",),
-                        minimum=2,
-                        maximum=100,
-                        integer=True,
-                    )
-                    is not None
-                )
-                or (cls._board_height(peer.features) or 0) >= 2
-            )
-        ]
-        if not former_peers:
+        former_peers = []
+        states: list[Optional[bool]] = [None] * peers.unknown_count
+        for peer in peers.ready:
+            if peer.stock_code == candidate.stock_code:
+                continue
+            former_state = cls._former_high_position_state(peer.features)
+            if former_state is True:
+                former_peers.append(peer)
+            elif former_state is None:
+                states.append(None)
+        if not former_peers and not states:
             return None
-        states = []
         for peer in former_peers:
             broken = _first_flag(
                 peer.features,
@@ -703,18 +825,32 @@ class ModeFeatureBuilder:
             )
             opened = _first_flag(peer.features, ("opened", "opened_board"))
             trend_broken = _first_flag(peer.features, ("trend_broken",))
-            flags = (broken, opened, trend_broken)
-            if any(value is True for value in flags):
-                states.append(True)
-            elif all(value is False for value in flags):
-                states.append(False)
-            else:
-                states.append(None)
+            states.append(_tri_or(broken, opened, trend_broken))
         if any(value is False for value in states):
             return False
         if any(value is None for value in states):
             return None
         return True
+
+    @classmethod
+    def _former_high_position_state(
+        cls,
+        raw: Mapping[str, Any],
+    ) -> Optional[bool]:
+        explicit = _first_flag(raw, ("former_high_position",))
+        yesterday_height = _first_number(
+            raw,
+            ("review_yesterday_continuous_days",),
+            minimum=0,
+            maximum=100,
+            integer=True,
+        )
+        current_height = cls._board_height(raw)
+        return _tri_or(
+            explicit,
+            yesterday_height >= 2 if yesterday_height is not None else None,
+            current_height >= 2 if current_height is not None else None,
+        )
 
     @staticmethod
     def _prior_state(raw: Mapping[str, Any]) -> Optional[str]:
@@ -730,7 +866,10 @@ class ModeFeatureBuilder:
                 return "survivor"
             if mode == "leader_turn_two":
                 return "turn_confirmed"
-            if role == "confirmed_leader" or mode == "leader_stronger_confirmation":
+            if (
+                role == "confirmed_leader"
+                or mode == "leader_stronger_confirmation"
+            ):
                 return "stronger_confirmed"
         return None
 
@@ -743,23 +882,17 @@ class ModeFeatureBuilder:
             return False
         if prior_state is None:
             return None
-        resealed = _fact_flag(
-            raw,
-            ("resealed", "is_resealed", "reversal_limit_up"),
+        resealed = _tri_or(
+            _fact_flag(raw, ("resealed", "is_resealed")),
+            _fact_flag(raw, ("reversal_limit_up",)),
         )
         breakout = _fact_flag(raw, ("right_side_breakout",))
         influence_rank = ModeFeatureBuilder._rank(raw.get("influence_rank"))
-        influenced_breakout = (
-            breakout and influence_rank is not None and influence_rank <= 3
-            if breakout is not None
-            else None
+        influence_ready = (
+            influence_rank <= 3 if influence_rank is not None else None
         )
-        states = (resealed, influenced_breakout)
-        if any(value is True for value in states):
-            return True
-        if all(value is False for value in states):
-            return False
-        return None
+        influenced_breakout = _tri_and(breakout, influence_ready)
+        return _tri_or(resealed, influenced_breakout)
 
     @staticmethod
     def _stronger_confirmed(
@@ -774,13 +907,17 @@ class ModeFeatureBuilder:
             return None
         pre_close = _finite_number(raw.get("pre_close"), minimum=0.0001)
         open_price = _finite_number(raw.get("open_price"), minimum=0.0001)
-        if pre_close is None or (open_price is None and price is None):
-            strength = None
-        else:
-            strength = any(
-                value is not None and value > pre_close
-                for value in (open_price, price)
-            )
+        open_strength = (
+            open_price > pre_close
+            if open_price is not None and pre_close is not None
+            else None
+        )
+        current_strength = (
+            price > pre_close
+            if price is not None and pre_close is not None
+            else None
+        )
+        strength = _tri_or(open_strength, current_strength)
         new_leader = _first_flag(raw, ("new_recognition_leader",))
         if new_leader is not None:
             no_new_leader = not new_leader
@@ -788,7 +925,7 @@ class ModeFeatureBuilder:
             no_new_leader = recognition_rank == 1
         else:
             no_new_leader = None
-        return ModeFeatureBuilder._all_flags(strength, no_new_leader)
+        return _tri_and(strength, no_new_leader)
 
     @staticmethod
     def _confirmed_leader(
@@ -798,17 +935,16 @@ class ModeFeatureBuilder:
         recognition_rank: Optional[int],
     ) -> Optional[bool]:
         explicit = _first_flag(raw, ("confirmed_leader_fact",))
-        if explicit is not None:
-            return explicit
-        if stronger is True:
-            return True
         if prior_state in {"stronger_confirmed", "confirmed_leader"}:
             if recognition_rank is None:
-                return None
-            return recognition_rank == 1
-        if stronger is False:
-            return False
-        return None
+                prior_confirmation = None
+            else:
+                prior_confirmation = recognition_rank == 1
+        elif prior_state is None:
+            prior_confirmation = None
+        else:
+            prior_confirmation = False
+        return _tri_or(explicit, stronger, prior_confirmation)
 
     @staticmethod
     def _acceleration_to_divergence(
@@ -819,12 +955,16 @@ class ModeFeatureBuilder:
             return False
         if confirmed_leader is None:
             return None
-        accelerated = _first_flag(raw, ("prior_accelerated", "accelerated"))
-        divergence = _first_flag(
-            raw,
-            ("opened", "review_today_broken", "high_turnover_divergence"),
+        accelerated = _tri_or(
+            _first_flag(raw, ("prior_accelerated",)),
+            _first_flag(raw, ("accelerated",)),
         )
-        return ModeFeatureBuilder._all_flags(accelerated, divergence)
+        divergence = _tri_or(
+            _fact_flag(raw, ("opened", "opened_board")),
+            _fact_flag(raw, ("review_today_broken", "today_broken")),
+            _fact_flag(raw, ("high_turnover_divergence",)),
+        )
+        return _tri_and(accelerated, divergence)
 
     @staticmethod
     def _low_position_new_start(
@@ -894,6 +1034,7 @@ class ModeFeatureBuilder:
         raw: Mapping[str, Any],
         reference_price: Optional[float],
         support_price: Optional[float],
+        support_quality: str,
         trend_established: Optional[bool],
     ) -> Optional[bool]:
         if trend_established is False:
@@ -901,8 +1042,10 @@ class ModeFeatureBuilder:
         if trend_established is None:
             return None
         explicit = _first_flag(raw, ("pullback_confirmed",))
-        if explicit is not None:
-            return explicit
+        if explicit is False:
+            return False
+        if support_quality != "ready":
+            return None
         prior_high = _first_number(
             raw,
             ("prior_n_day_high", "n_day_high_price", "prior_high"),
@@ -910,7 +1053,8 @@ class ModeFeatureBuilder:
         )
         if reference_price is None or support_price is None or prior_high is None:
             return None
-        return support_price <= reference_price < prior_high
+        computed = support_price <= reference_price < prior_high
+        return _tri_and(explicit, computed) if explicit is not None else computed
 
     @classmethod
     def _linkage_confirmed(
@@ -937,25 +1081,23 @@ class ModeFeatureBuilder:
     @staticmethod
     def _middle_army_linkage(
         raw: Mapping[str, Any],
-        peers: Iterable[CandidateSnapshot],
+        peers: _PeerSet,
     ) -> Optional[bool]:
         explicit = _first_flag(raw, ("middle_army_linkage",))
         if explicit is not None:
             return explicit
-        states = []
-        for peer in peers:
+        states: list[Optional[bool]] = [None] * peers.unknown_count
+        for peer in peers.ready:
             middle = _first_flag(peer.features, ("middle_army_fact",))
             trend = _first_flag(
                 peer.features,
                 ("positive_trend", "trend_established"),
             )
-            if middle is True and trend is True:
+            state = _tri_and(middle, trend)
+            if state is True:
                 return True
-            if middle is False or trend is False:
-                states.append(False)
-            else:
-                states.append(None)
-        return False if states and all(value is False for value in states) else None
+            states.append(state)
+        return _tri_or(*states)
 
     @staticmethod
     def _consolidation_in_range(raw: Mapping[str, Any]) -> Optional[bool]:
@@ -989,46 +1131,39 @@ class ModeFeatureBuilder:
     def _peer_alive_state(peer: CandidateSnapshot) -> Optional[bool]:
         sealed = ModeFeatureBuilder._sealed(peer.features)
         supplement = _first_flag(peer.features, ("supplement", "is_supplement"))
-        if sealed is True and supplement is True:
-            return True
         middle = _first_flag(peer.features, ("middle_army", "middle_army_fact"))
         positive = _first_flag(
             peer.features,
             ("positive_trend", "trend_established", "n_day_high"),
         )
-        if middle is True and positive is True:
-            return True
-        supplement_branch = False if sealed is False or supplement is False else None
-        middle_branch = False if middle is False or positive is False else None
-        if supplement_branch is False and middle_branch is False:
-            return False
-        return None
+        return _tri_or(
+            _tri_and(sealed, supplement),
+            _tri_and(middle, positive),
+        )
 
     @classmethod
-    def _theme_alive(cls, peers: Iterable[CandidateSnapshot]) -> Optional[bool]:
-        states = [cls._peer_alive_state(peer) for peer in peers]
-        if any(value is True for value in states):
-            return True
-        if states and all(value is False for value in states):
-            return False
-        return None
+    def _theme_alive(cls, peers: _PeerSet) -> Optional[bool]:
+        states = [None] * peers.unknown_count
+        states.extend(cls._peer_alive_state(peer) for peer in peers.ready)
+        return _tri_or(*states)
 
     @classmethod
     def _theme_dead(
         cls,
+        candidate: CandidateSnapshot,
         raw: Mapping[str, Any],
-        peers: Iterable[CandidateSnapshot],
+        peers: _PeerSet,
     ) -> Optional[bool]:
-        peer_states = []
-        for peer in peers:
+        peer_states: list[Optional[bool]] = [None] * peers.unknown_count
+        for peer in peers.ready:
+            if peer.stock_code == candidate.stock_code:
+                continue
             sealed = cls._sealed(peer.features)
             new_high = _first_flag(peer.features, ("n_day_high", "new_high"))
-            if sealed is True or new_high is True:
+            positive_peer = _tri_or(sealed, new_high)
+            if positive_peer is True:
                 return False
-            if sealed is False and new_high is False:
-                peer_states.append(False)
-            else:
-                peer_states.append(None)
+            peer_states.append(positive_peer)
         negative_days = _finite_number(
             raw.get("theme_breadth_negative_days"),
             minimum=0,
@@ -1037,7 +1172,9 @@ class ModeFeatureBuilder:
         )
         if negative_days is not None and negative_days < 2:
             return False
-        if negative_days is None or any(value is None for value in peer_states):
+        if negative_days is None:
+            return None
+        if peer_states and _tri_or(*peer_states) is None:
             return None
         return True
 
@@ -1078,11 +1215,10 @@ class ModeFeatureBuilder:
         if invalidated is True:
             return False
         captured_at = _parse_datetime(raw.get("captured_at"))
-        quote_ready = any(
-            isinstance(item, Mapping)
-            and item.get("source") in {"tencent", "quote", "market_quote"}
-            and item.get("quality") in {"ready", "computed"}
-            for item in candidate.evidence
+        quote_ready = self._has_ready_evidence(
+            snapshot,
+            candidate.evidence,
+            allowed_sources={"tencent", "quote", "market_quote"},
         )
         if captured_at is None or not quote_ready:
             fresh = None
@@ -1100,11 +1236,7 @@ class ModeFeatureBuilder:
 
     @staticmethod
     def _all_flags(*values: Optional[bool]) -> Optional[bool]:
-        if any(value is False for value in values):
-            return False
-        if all(value is True for value in values):
-            return True
-        return None
+        return _tri_and(*values)
 
     @staticmethod
     def _feature_quality(
