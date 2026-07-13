@@ -1672,28 +1672,61 @@ class TradingPlanService:
         plan = await db.get(TradingPlanVersion, plan_id)
         if plan is None:
             raise PlaybookNotFoundError("plan not found")
-        lock_key = (db.bind, plan.target_trade_date)
+        expected_status = plan.status
+        if expected_status not in {"draft", "confirmed"}:
+            raise InvalidTransitionError("plan cannot be confirmed")
+        target_trade_date = plan.target_trade_date
+        lock_key = (db.bind, target_trade_date)
         async with self._lock_manager.hold(lock_key):
             try:
-                await db.refresh(plan)
-                if plan.status not in {"draft", "confirmed"}:
-                    raise InvalidTransitionError("plan cannot be confirmed")
-                active_plans = (
-                    await db.scalars(
-                        select(TradingPlanVersion).where(
-                            TradingPlanVersion.target_trade_date
-                            == plan.target_trade_date,
-                            TradingPlanVersion.status == "active",
-                            TradingPlanVersion.id != plan.id,
-                        )
+                # Claim the exact status observed by this caller before
+                # touching the currently active plan.  A stale competing
+                # transition therefore cannot overwrite the winner.
+                claim = await db.execute(
+                    update(TradingPlanVersion)
+                    .where(
+                        TradingPlanVersion.id == plan_id,
+                        TradingPlanVersion.status == expected_status,
                     )
-                ).all()
-                for active in active_plans:
-                    active.status = "superseded"
-                plan.status = "active"
-                plan.confirmed_at = _now_cn()
-                plan.confirmed_by = confirmed_by.strip()
+                    .values(status="confirmed")
+                    .execution_options(synchronize_session=False)
+                )
+                if claim.rowcount != 1:
+                    raise InvalidTransitionError("plan cannot be confirmed")
+                await db.execute(
+                    update(TradingPlanVersion)
+                    .where(
+                        TradingPlanVersion.target_trade_date
+                        == target_trade_date,
+                        TradingPlanVersion.status == "active",
+                        TradingPlanVersion.id != plan_id,
+                    )
+                    .values(status="superseded")
+                    .execution_options(synchronize_session="fetch")
+                )
+                transition = await db.execute(
+                    update(TradingPlanVersion)
+                    .where(
+                        TradingPlanVersion.id == plan_id,
+                    )
+                    .values(
+                        status="active",
+                        confirmed_at=_now_cn(),
+                        confirmed_by=confirmed_by.strip(),
+                    )
+                    .execution_options(synchronize_session=False)
+                )
+                if transition.rowcount != 1:
+                    raise InvalidTransitionError("plan cannot be confirmed")
                 await db.commit()
+                await db.refresh(plan)
+                if plan.confirmed_at is not None and (
+                    plan.confirmed_at.tzinfo is None
+                    or plan.confirmed_at.utcoffset() is None
+                ):
+                    plan.confirmed_at = plan.confirmed_at.replace(
+                        tzinfo=CHINA_TZ
+                    )
                 return plan
             except IntegrityError as exc:
                 await db.rollback()
@@ -1705,6 +1738,42 @@ class TradingPlanService:
                 if "locked" in str(exc).lower():
                     raise InvalidTransitionError(
                         "confirmation conflict; another worker is updating this date"
+                    ) from exc
+                raise
+            except Exception:
+                await db.rollback()
+                raise
+
+    async def cancel(self, db, plan_id: int) -> TradingPlanVersion:
+        plan = await db.get(TradingPlanVersion, plan_id)
+        if plan is None:
+            raise PlaybookNotFoundError("plan not found")
+        expected_status = plan.status
+        if expected_status not in {"draft", "active"}:
+            raise InvalidTransitionError("plan cannot be cancelled")
+        target_trade_date = plan.target_trade_date
+        lock_key = (db.bind, target_trade_date)
+        async with self._lock_manager.hold(lock_key):
+            try:
+                transition = await db.execute(
+                    update(TradingPlanVersion)
+                    .where(
+                        TradingPlanVersion.id == plan_id,
+                        TradingPlanVersion.status == expected_status,
+                    )
+                    .values(status="expired")
+                    .execution_options(synchronize_session=False)
+                )
+                if transition.rowcount != 1:
+                    raise InvalidTransitionError("plan cannot be cancelled")
+                await db.commit()
+                await db.refresh(plan)
+                return plan
+            except OperationalError as exc:
+                await db.rollback()
+                if "locked" in str(exc).lower():
+                    raise InvalidTransitionError(
+                        "cancellation conflict; another worker is updating this date"
                     ) from exc
                 raise
             except Exception:

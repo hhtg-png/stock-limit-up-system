@@ -27,7 +27,10 @@ from app.services.trading_playbook.domain import (
     ModeEvaluation,
 )
 from app.services.trading_playbook.plan_service import TradingPlanService
-from app.services.trading_playbook.errors import InvalidRequestError
+from app.services.trading_playbook.errors import (
+    InvalidRequestError,
+    InvalidTransitionError,
+)
 
 
 SOURCE_DATE = date(2026, 7, 10)
@@ -1303,6 +1306,103 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
             ).all()
         self.assertEqual(sum(row.status == "active" for row in plans), 1)
         self.assertEqual(sum(row.status == "superseded" for row in plans), 1)
+
+    async def test_file_sqlite_confirm_cancel_cas_has_one_winner_in_both_orders(self):
+        async def run_order(cancel_first: bool):
+            with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+                database_path = Path(directory) / "confirm-cancel.db"
+                url = f"sqlite+aiosqlite:///{database_path.as_posix()}"
+                first_engine = create_async_engine(url, connect_args={"timeout": 5})
+                second_engine = create_async_engine(url, connect_args={"timeout": 5})
+                FirstSession = async_sessionmaker(
+                    first_engine,
+                    expire_on_commit=False,
+                )
+                SecondSession = async_sessionmaker(
+                    second_engine,
+                    expire_on_commit=False,
+                )
+                try:
+                    async with first_engine.begin() as connection:
+                        await connection.run_sync(Base.metadata.create_all)
+                    async with FirstSession() as setup:
+                        existing = TradingPlanVersion(
+                            source_trade_date=SOURCE_DATE,
+                            target_trade_date=TARGET_DATE,
+                            stage="preclose",
+                            version_no=1,
+                            status="active",
+                            input_hash="existing-active",
+                        )
+                        selected = TradingPlanVersion(
+                            source_trade_date=SOURCE_DATE,
+                            target_trade_date=TARGET_DATE,
+                            stage="after_close",
+                            version_no=1,
+                            status="draft",
+                            input_hash="selected-draft",
+                        )
+                        setup.add_all([existing, selected])
+                        await setup.commit()
+                        existing_id, selected_id = existing.id, selected.id
+
+                    async with FirstSession() as first, SecondSession() as second:
+                        stale_first = await first.get(
+                            TradingPlanVersion,
+                            selected_id,
+                        )
+                        stale_second = await second.get(
+                            TradingPlanVersion,
+                            selected_id,
+                        )
+                        self.assertEqual(stale_first.status, "draft")
+                        self.assertEqual(stale_second.status, "draft")
+                        if cancel_first:
+                            winner = await TradingPlanService().cancel(
+                                first,
+                                selected_id,
+                            )
+                            with self.assertRaises(InvalidTransitionError):
+                                await TradingPlanService().confirm(
+                                    second,
+                                    selected_id,
+                                    "stale-confirm",
+                                )
+                            self.assertEqual(winner.status, "expired")
+                        else:
+                            winner = await TradingPlanService().confirm(
+                                first,
+                                selected_id,
+                                "winning-confirm",
+                            )
+                            with self.assertRaises(InvalidTransitionError):
+                                await TradingPlanService().cancel(
+                                    second,
+                                    selected_id,
+                                )
+                            self.assertEqual(winner.status, "active")
+
+                    async with FirstSession() as verify:
+                        existing = await verify.get(
+                            TradingPlanVersion,
+                            existing_id,
+                        )
+                        selected = await verify.get(
+                            TradingPlanVersion,
+                            selected_id,
+                        )
+                        if cancel_first:
+                            self.assertEqual(existing.status, "active")
+                            self.assertEqual(selected.status, "expired")
+                        else:
+                            self.assertEqual(existing.status, "superseded")
+                            self.assertEqual(selected.status, "active")
+                finally:
+                    await first_engine.dispose()
+                    await second_engine.dispose()
+
+        await run_order(cancel_first=True)
+        await run_order(cancel_first=False)
 
     async def test_database_unique_index_protects_active_target_without_process_lock(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:

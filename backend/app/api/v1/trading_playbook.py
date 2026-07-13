@@ -390,15 +390,16 @@ async def confirm_plan(
 
 @router.post("/plans/{plan_id}/cancel", summary="取消预案")
 async def cancel_plan(plan_id: int, db: AsyncSession = Depends(get_db)):
-    plan = await db.get(TradingPlanVersion, plan_id)
-    if plan is None:
-        raise HTTPException(status_code=404, detail="Trading plan not found")
-    if plan.status not in {"draft", "active"}:
-        raise HTTPException(status_code=409, detail="Trading plan cannot be cancelled")
-    plan.status = "expired"
     try:
-        await db.commit()
+        plan = await _plan_service.cancel(db, plan_id)
         return await _plan_service.serialize(db, plan)
+    except PlaybookNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=NOT_FOUND_DETAIL) from exc
+    except InvalidTransitionError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=STATE_CONFLICT_DETAIL,
+        ) from exc
     except IntegrityError as exc:
         await db.rollback()
         raise HTTPException(status_code=409, detail="Plan cancellation conflict") from exc
