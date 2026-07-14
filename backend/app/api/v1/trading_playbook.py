@@ -37,6 +37,10 @@ from app.services.trading_playbook.errors import (
 )
 from app.services.trading_playbook.plan_service import TradingPlanService
 from app.services.trading_playbook.runtime import trading_playbook_runtime
+from app.services.trading_playbook.serialization import (
+    json_value as _json_value,
+    normalize_plan_payload as _normalize_plan_payload,
+)
 
 
 router = APIRouter()
@@ -95,77 +99,6 @@ def _china_iso(value: datetime | None) -> str | None:
     else:
         value = value.astimezone(CN_TZ)
     return value.isoformat()
-
-
-def _json_value(value: Any) -> Any:
-    """Detach JSON columns and keep malformed-but-readable audit values visible."""
-    if value is None or isinstance(value, (str, bool, int)):
-        return value
-    if isinstance(value, float):
-        if math.isnan(value):
-            return "NaN"
-        if value == math.inf:
-            return "Infinity"
-        if value == -math.inf:
-            return "-Infinity"
-        return value
-    if isinstance(value, datetime):
-        return _china_iso(value)
-    if isinstance(value, date):
-        return value.isoformat()
-    if isinstance(value, Mapping):
-        return {str(key): _json_value(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_value(item) for item in value]
-    return str(value)
-
-
-def _reject_nonfinite_numbers(value: Any) -> None:
-    if isinstance(value, bool) or value is None:
-        return
-    if isinstance(value, float):
-        if not math.isfinite(value):
-            raise UnsafePlanDataError("plan contains an unsafe numeric value")
-        return
-    if isinstance(value, Mapping):
-        for item in value.values():
-            _reject_nonfinite_numbers(item)
-        return
-    if isinstance(value, (list, tuple)):
-        for item in value:
-            _reject_nonfinite_numbers(item)
-
-
-def _normalize_plan_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
-    detached = copy.deepcopy(dict(payload))
-    for risk_key in ("risk_settings_json", "risk_settings"):
-        if risk_key in detached:
-            _reject_nonfinite_numbers(detached[risk_key])
-    candidates = detached.get("candidates", [])
-    if not isinstance(candidates, list):
-        raise UnsafePlanDataError("plan candidates are malformed")
-    for candidate in candidates:
-        if not isinstance(candidate, Mapping):
-            raise UnsafePlanDataError("plan candidate is malformed")
-        position = candidate.get("position_reference")
-        if (
-            isinstance(position, bool)
-            or not isinstance(position, (int, float))
-        ):
-            raise UnsafePlanDataError("candidate position is malformed")
-        try:
-            position_is_finite = math.isfinite(float(position))
-        except (OverflowError, TypeError, ValueError):
-            position_is_finite = False
-        if not position_is_finite:
-            raise UnsafePlanDataError("candidate position is unsafe")
-        for trigger_key in (
-            "entry_trigger_json",
-            "invalidation_json",
-            "exit_trigger_json",
-        ):
-            _reject_nonfinite_numbers(candidate.get(trigger_key))
-    return _json_value(detached)
 
 
 async def _serialize_plan_response(
@@ -407,7 +340,7 @@ async def revise_plan(
     try:
         await _serialize_plan_response(db, plan_id)
         child = await _plan_service.revise(db, plan_id, changes)
-        return await _serialize_plan_response(db, child)
+        return child
     except HTTPException:
         raise
     except PlaybookNotFoundError as exc:
@@ -442,7 +375,7 @@ async def confirm_plan(
     try:
         await _serialize_plan_response(db, plan_id)
         plan = await _plan_service.confirm(db, plan_id, request.confirmed_by)
-        return await _serialize_plan_response(db, plan)
+        return plan
     except HTTPException:
         raise
     except PlaybookNotFoundError as exc:
@@ -473,7 +406,7 @@ async def cancel_plan(plan_id: int, db: AsyncSession = Depends(get_db)):
     try:
         await _serialize_plan_response(db, plan_id)
         plan = await _plan_service.cancel(db, plan_id)
-        return await _serialize_plan_response(db, plan)
+        return plan
     except HTTPException:
         raise
     except PlaybookNotFoundError as exc:

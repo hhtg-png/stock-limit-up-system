@@ -315,6 +315,94 @@ class TradingPlaybookApiTests(unittest.TestCase):
         self.assertEqual(confirmed.json()["confirmed_by"], "local-user")
         self.assertTrue(confirmed.json()["confirmed_at"].endswith("+08:00"))
 
+    def test_confirm_response_does_not_serialize_after_commit(self):
+        original = trading_playbook_api._plan_service.serialize
+        calls = 0
+
+        async def fail_after_preflight(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                raise RuntimeError("post-commit confirm serialization secret")
+            return await original(*args, **kwargs)
+
+        with patch.object(
+            trading_playbook_api._plan_service,
+            "serialize",
+            new=fail_after_preflight,
+        ):
+            response = self.client.post(
+                "/trading-playbook/plans/1/confirm",
+                json={"confirmed_by": "local-user"},
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["status"], "active")
+        self.assertEqual(calls, 1)
+
+    def test_cancel_response_does_not_serialize_after_commit(self):
+        original = trading_playbook_api._plan_service.serialize
+        calls = 0
+
+        async def fail_after_preflight(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                raise RuntimeError("post-commit cancel serialization secret")
+            return await original(*args, **kwargs)
+
+        with patch.object(
+            trading_playbook_api._plan_service,
+            "serialize",
+            new=fail_after_preflight,
+        ):
+            response = self.client.post("/trading-playbook/plans/1/cancel")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["status"], "expired")
+        self.assertEqual(calls, 1)
+
+    def test_revision_response_does_not_serialize_after_commit(self):
+        original = trading_playbook_api._plan_service.serialize
+        calls = 0
+
+        async def fail_after_preflight(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                raise RuntimeError("post-commit revision serialization secret")
+            return await original(*args, **kwargs)
+
+        with patch.object(
+            trading_playbook_api._plan_service,
+            "serialize",
+            new=fail_after_preflight,
+        ):
+            response = self.client.put(
+                "/trading-playbook/plans/1",
+                json={"change_note": "idempotent revision"},
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["parent_plan_version_id"], 1)
+        self.assertEqual(calls, 1)
+
+    def test_same_revision_request_reuses_existing_child(self):
+        request = {"change_note": "same normalized revision"}
+        first = self.client.put("/trading-playbook/plans/1", json=request)
+        second = self.client.put("/trading-playbook/plans/1", json=request)
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(second.status_code, 200, second.text)
+        self.assertEqual(first.json()["id"], second.json()["id"])
+
+        async def count_children():
+            async with self.Session() as db:
+                return await db.scalar(
+                    text(
+                        "SELECT count(*) FROM trading_plan_versions "
+                        "WHERE parent_plan_version_id=1"
+                    )
+                )
+
+        self.assertEqual(asyncio.run(count_children()), 1)
+
     def test_missing_plan_and_invalid_transitions_have_distinct_statuses(self):
         self.assertEqual(
             self.client.get("/trading-playbook/plans/99999").status_code, 404

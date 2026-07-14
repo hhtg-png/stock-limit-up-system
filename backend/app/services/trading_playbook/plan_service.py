@@ -30,6 +30,7 @@ from .errors import (
     PlaybookNotFoundError,
     UpstreamUnavailableError,
 )
+from .serialization import normalize_plan_payload
 
 
 CHINA_TZ = ZoneInfo("Asia/Shanghai")
@@ -1150,6 +1151,14 @@ class TradingPlanService:
                 )
             )
         ).all()
+        return self._serialize_loaded(plan, candidates)
+
+    @classmethod
+    def _serialize_loaded(
+        cls,
+        plan: TradingPlanVersion,
+        candidates: Sequence[TradingPlanCandidate],
+    ) -> Dict[str, Any]:
         payload = {
             "id": plan.id,
             "source_trade_date": plan.source_trade_date.isoformat(),
@@ -1171,7 +1180,7 @@ class TradingPlanService:
             if plan.confirmed_at
             else None,
             "confirmed_by": plan.confirmed_by,
-            "candidates": [self._serialize_candidate(row) for row in candidates],
+            "candidates": [cls._serialize_candidate(row) for row in candidates],
         }
         payload.update(
             {
@@ -1220,13 +1229,16 @@ class TradingPlanService:
         db,
         plan_id: int,
         changes: Mapping[str, Any],
-    ) -> TradingPlanVersion:
+    ) -> Dict[str, Any]:
         parent = await db.get(TradingPlanVersion, plan_id)
         if parent is None:
             raise PlaybookNotFoundError("plan not found")
         if parent.status not in {"draft", "confirmed", "active"}:
             raise InvalidTransitionError("plan cannot be revised")
         parent_candidates = await self._load_candidates(db, parent.id)
+        normalize_plan_payload(
+            self._serialize_loaded(parent, parent_candidates)
+        )
         try:
             normalized_changes = self._normalize_revision_changes(
                 parent,
@@ -1235,10 +1247,27 @@ class TradingPlanService:
             )
         except ValueError as exc:
             raise InvalidRequestError(str(exc)) from exc
+        revision_hash = self._revision_input_hash(parent, normalized_changes)
         lock_key = (db.bind, parent.target_trade_date)
         async with self._lock_manager.hold(lock_key):
             for attempt in range(3):
                 try:
+                    existing = await self._find_revision_by_hash(
+                        db,
+                        plan_id,
+                        revision_hash,
+                    )
+                    if existing is not None:
+                        existing_candidates = await self._load_candidates(
+                            db,
+                            existing.id,
+                        )
+                        return normalize_plan_payload(
+                            self._serialize_loaded(
+                                existing,
+                                existing_candidates,
+                            )
+                        )
                     current_parent = await db.get(TradingPlanVersion, plan_id)
                     if current_parent is None or current_parent.status not in {
                         "draft",
@@ -1261,23 +1290,45 @@ class TradingPlanService:
                         current_parent,
                         normalized_changes,
                         version_no,
+                        revision_hash,
                     )
                     db.add(child)
                     await db.flush()
                     overrides = normalized_changes["overrides_by_candidate_id"]
+                    child_candidates = []
                     for candidate in current_candidates:
-                        db.add(
-                            self._clone_candidate_for_revision(
-                                candidate,
-                                child.id,
-                                overrides.get(candidate.id),
-                                child.risk_settings_json,
-                            )
+                        cloned = self._clone_candidate_for_revision(
+                            candidate,
+                            child.id,
+                            overrides.get(candidate.id),
+                            child.risk_settings_json,
                         )
+                        child_candidates.append(cloned)
+                        db.add(cloned)
+                    await db.flush()
+                    payload = normalize_plan_payload(
+                        self._serialize_loaded(child, child_candidates)
+                    )
                     await db.commit()
-                    return child
+                    return payload
                 except IntegrityError:
                     await db.rollback()
+                    existing = await self._find_revision_by_hash(
+                        db,
+                        plan_id,
+                        revision_hash,
+                    )
+                    if existing is not None:
+                        existing_candidates = await self._load_candidates(
+                            db,
+                            existing.id,
+                        )
+                        return normalize_plan_payload(
+                            self._serialize_loaded(
+                                existing,
+                                existing_candidates,
+                            )
+                        )
                     if attempt == 2:
                         raise InvalidTransitionError(
                             "could not allocate a unique revision version"
@@ -1286,6 +1337,22 @@ class TradingPlanService:
                     await db.rollback()
                     raise
         raise RuntimeError("could not revise plan")
+
+    @staticmethod
+    async def _find_revision_by_hash(
+        db,
+        parent_plan_id: int,
+        input_hash: str,
+    ) -> Optional[TradingPlanVersion]:
+        return await db.scalar(
+            select(TradingPlanVersion)
+            .where(
+                TradingPlanVersion.parent_plan_version_id == parent_plan_id,
+                TradingPlanVersion.input_hash == input_hash,
+            )
+            .order_by(TradingPlanVersion.id)
+            .limit(1)
+        )
 
     @staticmethod
     async def _load_candidates(db, plan_id: int) -> List[TradingPlanCandidate]:
@@ -1503,12 +1570,12 @@ class TradingPlanService:
                     f"contradictory {field}: {lower_key} exceeds {upper_key}"
                 )
 
-    @staticmethod
-    def _clone_plan_for_revision(
+    @classmethod
+    def _revision_input_hash(
+        cls,
         parent: TradingPlanVersion,
         normalized_changes: Mapping[str, Any],
-        version_no: int,
-    ) -> TradingPlanVersion:
+    ) -> str:
         hash_payload = {
             "parent_plan_version_id": parent.id,
             "parent_input_hash": parent.input_hash,
@@ -1530,9 +1597,20 @@ class TradingPlanService:
                 )
             ],
         }
-        input_hash = hashlib.sha256(
+        return hashlib.sha256(
             _canonical_json(hash_payload).encode("utf-8")
         ).hexdigest()
+
+    @classmethod
+    def _clone_plan_for_revision(
+        cls,
+        parent: TradingPlanVersion,
+        normalized_changes: Mapping[str, Any],
+        version_no: int,
+        input_hash: Optional[str] = None,
+    ) -> TradingPlanVersion:
+        if input_hash is None:
+            input_hash = cls._revision_input_hash(parent, normalized_changes)
         return TradingPlanVersion(
             source_trade_date=parent.source_trade_date,
             target_trade_date=parent.target_trade_date,
@@ -1665,7 +1743,7 @@ class TradingPlanService:
         db,
         plan_id: int,
         confirmed_by: str,
-    ) -> TradingPlanVersion:
+    ) -> Dict[str, Any]:
         if (
             not isinstance(confirmed_by, str)
             or not 1 <= len(confirmed_by.strip()) <= 80
@@ -1678,6 +1756,18 @@ class TradingPlanService:
         if expected_status not in {"draft", "confirmed"}:
             raise InvalidTransitionError("plan cannot be confirmed")
         target_trade_date = plan.target_trade_date
+        candidates = await self._load_candidates(db, plan.id)
+        confirmed_at = _now_cn()
+        confirmed_by = confirmed_by.strip()
+        payload = self._serialize_loaded(plan, candidates)
+        payload.update(
+            {
+                "status": "active",
+                "confirmed_at": _china_iso(confirmed_at),
+                "confirmed_by": confirmed_by,
+            }
+        )
+        payload = normalize_plan_payload(payload)
         observed_active_id = await db.scalar(
             select(TradingPlanVersion.id)
             .where(
@@ -1729,23 +1819,15 @@ class TradingPlanService:
                     )
                     .values(
                         status="active",
-                        confirmed_at=_now_cn(),
-                        confirmed_by=confirmed_by.strip(),
+                        confirmed_at=confirmed_at,
+                        confirmed_by=confirmed_by,
                     )
                     .execution_options(synchronize_session=False)
                 )
                 if transition.rowcount != 1:
                     raise InvalidTransitionError("plan cannot be confirmed")
                 await db.commit()
-                await db.refresh(plan)
-                if plan.confirmed_at is not None and (
-                    plan.confirmed_at.tzinfo is None
-                    or plan.confirmed_at.utcoffset() is None
-                ):
-                    plan.confirmed_at = plan.confirmed_at.replace(
-                        tzinfo=CHINA_TZ
-                    )
-                return plan
+                return payload
             except IntegrityError as exc:
                 await db.rollback()
                 raise InvalidTransitionError(
@@ -1762,7 +1844,7 @@ class TradingPlanService:
                 await db.rollback()
                 raise
 
-    async def cancel(self, db, plan_id: int) -> TradingPlanVersion:
+    async def cancel(self, db, plan_id: int) -> Dict[str, Any]:
         plan = await db.get(TradingPlanVersion, plan_id)
         if plan is None:
             raise PlaybookNotFoundError("plan not found")
@@ -1770,6 +1852,10 @@ class TradingPlanService:
         if expected_status not in {"draft", "active"}:
             raise InvalidTransitionError("plan cannot be cancelled")
         target_trade_date = plan.target_trade_date
+        candidates = await self._load_candidates(db, plan.id)
+        payload = self._serialize_loaded(plan, candidates)
+        payload["status"] = "expired"
+        payload = normalize_plan_payload(payload)
         lock_key = (db.bind, target_trade_date)
         async with self._lock_manager.hold(lock_key):
             try:
@@ -1785,8 +1871,7 @@ class TradingPlanService:
                 if transition.rowcount != 1:
                     raise InvalidTransitionError("plan cannot be cancelled")
                 await db.commit()
-                await db.refresh(plan)
-                return plan
+                return payload
             except OperationalError as exc:
                 await db.rollback()
                 if "locked" in str(exc).lower():

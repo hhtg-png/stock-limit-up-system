@@ -853,16 +853,16 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
             original_changes = copy.deepcopy(changes)
 
             child = await self.service.revise(db, parent_id, changes)
-            child_payload = await self.service.serialize(db, child.id)
+            child_payload = await self.service.serialize(db, child["id"])
             parent_after = await self.service.serialize(db, parent_id)
 
         self.assertEqual(changes, original_changes)
         self.assertEqual(parent_before, parent_after)
-        self.assertEqual(child.parent_plan_version_id, parent_id)
-        self.assertEqual(child.version_no, 2)
-        self.assertEqual(child.status, "draft")
-        self.assertIsNone(child.confirmed_at)
-        self.assertIsNone(child.confirmed_by)
+        self.assertEqual(child["parent_plan_version_id"], parent_id)
+        self.assertEqual(child["version_no"], 2)
+        self.assertEqual(child["status"], "draft")
+        self.assertIsNone(child["confirmed_at"])
+        self.assertIsNone(child["confirmed_by"])
         self.assertEqual(len(child_payload["candidates"]), 2)
         revised = child_payload["candidates"][0]
         untouched = child_payload["candidates"][1]
@@ -909,7 +909,7 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
                     ],
                 },
             )
-            payload = await self.service.serialize(db, child.id)
+            payload = await self.service.serialize(db, child["id"])
 
         self.assertEqual(
             payload["candidates"][0]["manual_overrides_json"]["manual_note"],
@@ -1140,7 +1140,7 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
                         "candidate_overrides": [override],
                     },
                 )
-                payload = await self.service.serialize(db, child.id)
+                payload = await self.service.serialize(db, child["id"])
                 revised = payload["candidates"][0]
 
                 with self.subTest(case=case):
@@ -1190,11 +1190,11 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
 
             activated = await self.service.confirm(db, target_id, "local-user")
 
-            self.assertEqual(activated.status, "active")
-            self.assertEqual(activated.confirmed_by, "local-user")
-            self.assertIsNotNone(activated.confirmed_at)
+            self.assertEqual(activated["status"], "active")
+            self.assertEqual(activated["confirmed_by"], "local-user")
+            self.assertIsNotNone(activated["confirmed_at"])
             self.assertEqual(
-                activated.confirmed_at.utcoffset(),
+                datetime.fromisoformat(activated["confirmed_at"]).utcoffset(),
                 timedelta(hours=8),
             )
             self.assertEqual(old_active.status, "superseded")
@@ -1249,6 +1249,41 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(persisted_old.status, "active")
             self.assertEqual(persisted_target.status, "draft")
             self.assertIsNone(persisted_target.confirmed_at)
+
+    async def test_confirm_does_not_refresh_after_successful_commit(self):
+        async with self.Session() as db:
+            generated = await self._generate(
+                db,
+                [_evaluation("leader", "000001")],
+            )
+            with patch.object(
+                db,
+                "refresh",
+                AsyncMock(side_effect=RuntimeError("post-commit refresh secret")),
+            ):
+                result = await self.service.confirm(
+                    db,
+                    generated["id"],
+                    "local-user",
+                )
+
+        self.assertEqual(result["status"], "active")
+        self.assertEqual(result["confirmed_by"], "local-user")
+
+    async def test_cancel_does_not_refresh_after_successful_commit(self):
+        async with self.Session() as db:
+            generated = await self._generate(
+                db,
+                [_evaluation("leader", "000001")],
+            )
+            with patch.object(
+                db,
+                "refresh",
+                AsyncMock(side_effect=RuntimeError("post-commit refresh secret")),
+            ):
+                result = await self.service.cancel(db, generated["id"])
+
+        self.assertEqual(result["status"], "expired")
 
     async def test_serialize_restores_china_offset_after_sqlite_round_trip(self):
         async with self.Session() as db:
@@ -1373,7 +1408,7 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(
                     sum(
-                        isinstance(result, TradingPlanVersion)
+                        isinstance(result, dict)
                         for result in results
                     ),
                     1,
@@ -1388,9 +1423,9 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
 
                 async with FirstSession() as verify:
                     winner_id = next(
-                        result.id
+                        result["id"]
                         for result in results
-                        if isinstance(result, TradingPlanVersion)
+                        if isinstance(result, dict)
                     )
                     loser_id = second_id if winner_id == first_id else first_id
                     self.assertEqual(
@@ -1470,7 +1505,7 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
                                     selected_id,
                                     "stale-confirm",
                                 )
-                            self.assertEqual(winner.status, "expired")
+                            self.assertEqual(winner["status"], "expired")
                         else:
                             winner = await TradingPlanService().confirm(
                                 first,
@@ -1482,7 +1517,7 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
                                     second,
                                     selected_id,
                                 )
-                            self.assertEqual(winner.status, "active")
+                            self.assertEqual(winner["status"], "active")
 
                     async with FirstSession() as verify:
                         existing = await verify.get(
@@ -1559,7 +1594,7 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(sum(row.status == "draft" for row in plans), 1)
                 self.assertEqual(
                     sum(
-                        isinstance(result, TradingPlanVersion)
+                        isinstance(result, dict)
                         for result in results
                     ),
                     1,
@@ -1571,6 +1606,86 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
                     ),
                     1,
                 )
+            finally:
+                await first_engine.dispose()
+                await second_engine.dispose()
+
+    async def test_same_revision_is_idempotent_across_independent_engines(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            database_path = Path(directory) / "revision-idempotency.db"
+            url = f"sqlite+aiosqlite:///{database_path.as_posix()}"
+            first_engine = create_async_engine(url, connect_args={"timeout": 5})
+            second_engine = create_async_engine(url, connect_args={"timeout": 5})
+            FirstSession = async_sessionmaker(first_engine, expire_on_commit=False)
+            SecondSession = async_sessionmaker(second_engine, expire_on_commit=False)
+            ready_count = 0
+            ready_lock = asyncio.Lock()
+            both_ready = asyncio.Event()
+
+            class RacingService(TradingPlanService):
+                def __init__(self):
+                    super().__init__()
+                    self.waited = False
+
+                async def _next_version_no(self, db, target_trade_date, stage):
+                    nonlocal ready_count
+                    version_no = await super()._next_version_no(
+                        db,
+                        target_trade_date,
+                        stage,
+                    )
+                    if not self.waited:
+                        self.waited = True
+                        async with ready_lock:
+                            ready_count += 1
+                            if ready_count == 2:
+                                both_ready.set()
+                        await asyncio.wait_for(both_ready.wait(), timeout=5)
+                    return version_no
+
+            try:
+                async with first_engine.begin() as connection:
+                    await connection.run_sync(Base.metadata.create_all)
+                async with FirstSession() as setup:
+                    parent = await TradingPlanService().generate(
+                        setup,
+                        _snapshot(),
+                        [_evaluation("leader", "000001")],
+                        stock_names={"000001": "股票1"},
+                        rule_snapshot=_rule_snapshot("leader"),
+                    )
+                parent_id = parent["id"]
+                changes = {
+                    "change_note": "同一跨进程修订",
+                    "candidate_overrides": [
+                        {
+                            "candidate_id": parent["candidates"][0]["id"],
+                            "manual_note": "只创建一次",
+                        }
+                    ],
+                }
+
+                async def revise(service, session_factory):
+                    async with session_factory() as session:
+                        return await service.revise(session, parent_id, changes)
+
+                first, second = await asyncio.gather(
+                    revise(RacingService(), FirstSession),
+                    revise(RacingService(), SecondSession),
+                )
+
+                self.assertEqual(first["id"], second["id"])
+                async with FirstSession() as verify:
+                    children = (
+                        await verify.scalars(
+                            select(TradingPlanVersion).where(
+                                TradingPlanVersion.parent_plan_version_id
+                                == parent_id
+                            )
+                        )
+                    ).all()
+                self.assertEqual(len(children), 1)
+                self.assertEqual(children[0].input_hash, first["input_hash"])
             finally:
                 await first_engine.dispose()
                 await second_engine.dispose()
