@@ -4,6 +4,7 @@
     {
       "scenario_id": "new-theme-high-volatility-golden",
       "mode_key": "new_theme_high_volatility",
+      "rule_hash": "e543acbf5798dfa9231d60b23d47540859ed6a6cd35c23994f4712fdd911dab6",
       "as_of": "2026-07-10T14:40:00+08:00",
       "expected": "matched",
       "source_refs": [
@@ -15,11 +16,12 @@
         "stock_code": "600001", "stock_name": "场景一", "theme_name": "新题材",
         "features": {"high_volatility": true, "theme_rank": 1, "reference_price": 10.5, "planned_pullback_price": 10.0, "planned_pullback_quality": "ready", "planned_breakout_price": 10.8, "hard_stop_price": 9.5, "exit_change_pct_floor": -3.0}
       },
-      "facts": [{"captured_at": "2026-07-10T14:39:30+08:00", "source_keys": ["05-new-theme", "01-specialize"], "market_features": {"style": "dual_active", "window": "outbreak"}, "candidate_features": {"high_volatility": true, "theme_rank": 1, "planned_pullback_price": 10.0, "planned_breakout_price": 10.8, "hard_stop_price": 9.5}}]
+      "facts": [{"captured_at": "2026-07-10T14:39:30+08:00", "source_keys": ["05-new-theme", "01-specialize"], "market_features": {"style": "dual_active", "window": "outbreak", "quality": "ready"}, "candidate_features": {"high_volatility": true, "theme_rank": 1, "reference_price": 10.5, "planned_pullback_price": 10.0, "planned_pullback_quality": "ready", "planned_breakout_price": 10.8, "hard_stop_price": 9.5, "exit_change_pct_floor": -3.0}}]
     },
     {
       "scenario_id": "new-theme-high-position-golden",
       "mode_key": "new_theme_high_position",
+      "rule_hash": "d51e4142f023581130766c4c044263f1911b7df0dbfd6e7e9d63202d94e7411a",
       "as_of": "2026-07-10T14:40:00+08:00",
       "expected": "matched",
       "source_refs": [{"source_key": "05-new-theme", "excerpt": "高波动优先于高身位，高身位优先于同身位换手"}],
@@ -28,11 +30,12 @@
         "stock_code": "600002", "stock_name": "场景二", "theme_name": "新题材",
         "features": {"high_position": true, "reference_price": 10.5, "planned_pullback_price": 10.0, "planned_pullback_quality": "ready", "planned_breakout_price": 10.8, "hard_stop_price": 9.5, "exit_change_pct_floor": -3.0}
       },
-      "facts": [{"captured_at": "2026-07-10T14:39:30+08:00", "source_keys": ["05-new-theme"], "market_features": {"style": "board_flow", "window": "outbreak"}, "candidate_features": {"high_position": true, "planned_pullback_price": 10.0, "planned_breakout_price": 10.8, "hard_stop_price": 9.5}}]
+      "facts": [{"captured_at": "2026-07-10T14:39:30+08:00", "source_keys": ["05-new-theme"], "market_features": {"style": "board_flow", "window": "outbreak", "quality": "ready"}, "candidate_features": {"high_position": true, "reference_price": 10.5, "planned_pullback_price": 10.0, "planned_pullback_quality": "ready", "planned_breakout_price": 10.8, "hard_stop_price": 9.5, "exit_change_pct_floor": -3.0}}]
     },
     {
       "scenario_id": "new-theme-same-level-turnover-golden",
       "mode_key": "new_theme_same_level_turnover",
+      "rule_hash": "0077fbbd690e357485938070f04ddcab8b938e19fc38dacb680bf0adc1a22459",
       "as_of": "2026-07-10T14:40:00+08:00",
       "expected": "matched",
       "source_refs": [{"source_key": "05-new-theme", "excerpt": "同身位换手不是不好，而是选择更难"}],
@@ -41,11 +44,12 @@
         "stock_code": "600003", "stock_name": "场景三", "theme_name": "新题材",
         "features": {"same_level_turnover": true, "reference_price": 10.5, "planned_pullback_price": 10.0, "planned_pullback_quality": "ready", "planned_breakout_price": 10.8, "hard_stop_price": 9.5, "exit_change_pct_floor": -3.0}
       },
-      "facts": [{"captured_at": "2026-07-10T14:39:30+08:00", "source_keys": ["05-new-theme"], "market_features": {"style": "board_flow", "window": "outbreak"}, "candidate_features": {"same_level_turnover": true, "planned_pullback_price": 10.0, "planned_breakout_price": 10.8, "hard_stop_price": 9.5}}]
+      "facts": [{"captured_at": "2026-07-10T14:39:30+08:00", "source_keys": ["05-new-theme"], "market_features": {"style": "board_flow", "window": "outbreak", "quality": "ready"}, "candidate_features": {"same_level_turnover": true, "reference_price": 10.5, "planned_pullback_price": 10.0, "planned_pullback_quality": "ready", "planned_breakout_price": 10.8, "hard_stop_price": 9.5, "exit_change_pct_floor": -3.0}}]
     },
     {
       "scenario_id": "big-middle-army-transition-golden",
       "mode_key": "big_middle_army_transition",
+      "rule_hash": "a996996eca053eb438aabd6691efa908e9163eeb4a85bd1c3842b803d438f138",
       "as_of": "2026-07-10T14:40:00+08:00",
       "expected": "matched",
       "source_refs": [
@@ -57,11 +61,12 @@
         "stock_code": "600004", "stock_name": "场景四", "theme_name": "主线题材",
         "features": {"middle_army": true, "theme_rank": 1, "reference_price": 10.5, "planned_pullback_price": 10.0, "planned_pullback_quality": "ready", "planned_breakout_price": 10.8, "hard_stop_price": 9.5, "exit_change_pct_floor": -3.0}
       },
-      "facts": [{"captured_at": "2026-07-10T14:39:30+08:00", "source_keys": ["05-new-theme", "01-specialize"], "market_features": {"style": "trend_main_wave", "window": "first_divergence"}, "candidate_features": {"middle_army": true, "theme_rank": 1, "planned_pullback_price": 10.0, "planned_breakout_price": 10.8, "hard_stop_price": 9.5}}]
+      "facts": [{"captured_at": "2026-07-10T14:39:30+08:00", "source_keys": ["05-new-theme", "01-specialize"], "market_features": {"style": "trend_main_wave", "window": "first_divergence", "quality": "ready"}, "candidate_features": {"middle_army": true, "theme_rank": 1, "reference_price": 10.5, "planned_pullback_price": 10.0, "planned_pullback_quality": "ready", "planned_breakout_price": 10.8, "hard_stop_price": 9.5, "exit_change_pct_floor": -3.0}}]
     },
     {
       "scenario_id": "first-mover-leader-golden",
       "mode_key": "first_mover_leader",
+      "rule_hash": "34278d5b32f77abbc665aa35527b549a09941459ce546142c9047a10054ffd13",
       "as_of": "2026-07-10T14:40:00+08:00",
       "expected": "matched",
       "source_refs": [
@@ -73,11 +78,12 @@
         "stock_code": "600005", "stock_name": "场景五", "theme_name": "主线题材",
         "features": {"started_before_theme": true, "recognition_rank": 1, "reference_price": 10.5, "planned_pullback_price": 10.0, "planned_pullback_quality": "ready", "planned_breakout_price": 10.8, "hard_stop_price": 9.5, "exit_change_pct_floor": -3.0}
       },
-      "facts": [{"captured_at": "2026-07-10T14:39:30+08:00", "source_keys": ["02-window-recognition", "06-short-term-terms"], "market_features": {"style": "board_flow", "window": "first_divergence"}, "candidate_features": {"started_before_theme": true, "recognition_rank": 1, "planned_pullback_price": 10.0, "planned_breakout_price": 10.8, "hard_stop_price": 9.5}}]
+      "facts": [{"captured_at": "2026-07-10T14:39:30+08:00", "source_keys": ["02-window-recognition", "06-short-term-terms"], "market_features": {"style": "board_flow", "window": "first_divergence", "quality": "ready"}, "candidate_features": {"started_before_theme": true, "recognition_rank": 1, "reference_price": 10.5, "planned_pullback_price": 10.0, "planned_pullback_quality": "ready", "planned_breakout_price": 10.8, "hard_stop_price": 9.5, "exit_change_pct_floor": -3.0}}]
     },
     {
       "scenario_id": "unique-survivor-trial-golden",
       "mode_key": "unique_survivor_trial",
+      "rule_hash": "e0074486eba6af809573aa333287fc2193787aeb71d069e2067624c648024cfd",
       "as_of": "2026-07-10T14:40:00+08:00",
       "expected": "matched",
       "source_refs": [
@@ -89,11 +95,12 @@
         "stock_code": "600006", "stock_name": "场景六", "theme_name": "主线题材",
         "features": {"unique_survivor": true, "reference_price": 10.5, "planned_pullback_price": 10.0, "planned_pullback_quality": "ready", "planned_breakout_price": 10.8, "hard_stop_price": 9.5, "exit_change_pct_floor": -3.0}
       },
-      "facts": [{"captured_at": "2026-07-10T14:39:30+08:00", "source_keys": ["05-new-theme", "06-short-term-terms"], "market_features": {"style": "dual_active", "window": "divergence_exhaustion"}, "candidate_features": {"unique_survivor": true, "planned_pullback_price": 10.0, "planned_breakout_price": 10.8, "hard_stop_price": 9.5}}]
+      "facts": [{"captured_at": "2026-07-10T14:39:30+08:00", "source_keys": ["05-new-theme", "06-short-term-terms"], "market_features": {"style": "dual_active", "window": "divergence_exhaustion", "quality": "ready"}, "candidate_features": {"unique_survivor": true, "reference_price": 10.5, "planned_pullback_price": 10.0, "planned_pullback_quality": "ready", "planned_breakout_price": 10.8, "hard_stop_price": 9.5, "exit_change_pct_floor": -3.0}}]
     },
     {
       "scenario_id": "leader-turn-two-golden",
       "mode_key": "leader_turn_two",
+      "rule_hash": "59f7a3132e09cbc8fb321c0c72d3de009ad56aebad4a82e17d5dc4cedfa4c01e",
       "as_of": "2026-07-10T14:40:00+08:00",
       "expected": "matched",
       "source_refs": [
@@ -105,11 +112,12 @@
         "stock_code": "600007", "stock_name": "场景七", "theme_name": "主线题材",
         "features": {"turn_confirmed": true, "recognition_rank": 1, "reference_price": 10.5, "planned_pullback_price": 10.0, "planned_pullback_quality": "ready", "planned_breakout_price": 10.8, "hard_stop_price": 9.5, "exit_change_pct_floor": -3.0}
       },
-      "facts": [{"captured_at": "2026-07-10T14:39:30+08:00", "source_keys": ["00-art-1123", "06-short-term-terms"], "market_features": {"style": "board_flow", "window": "divergence_to_consensus"}, "candidate_features": {"turn_confirmed": true, "recognition_rank": 1, "planned_pullback_price": 10.0, "planned_breakout_price": 10.8, "hard_stop_price": 9.5}}]
+      "facts": [{"captured_at": "2026-07-10T14:39:30+08:00", "source_keys": ["00-art-1123", "06-short-term-terms"], "market_features": {"style": "board_flow", "window": "divergence_to_consensus", "quality": "ready"}, "candidate_features": {"turn_confirmed": true, "recognition_rank": 1, "reference_price": 10.5, "planned_pullback_price": 10.0, "planned_pullback_quality": "ready", "planned_breakout_price": 10.8, "hard_stop_price": 9.5, "exit_change_pct_floor": -3.0}}]
     },
     {
       "scenario_id": "leader-stronger-confirmation-golden",
       "mode_key": "leader_stronger_confirmation",
+      "rule_hash": "1f244dffcb1af4e49ab7adb0f0d7e29df3de19254b7c4317b08c6c494ac6cc36",
       "as_of": "2026-07-10T14:40:00+08:00",
       "expected": "matched",
       "source_refs": [{"source_key": "06-short-term-terms", "excerpt": "转二之后隔日强更强，才能确认龙头"}],
@@ -118,11 +126,12 @@
         "stock_code": "600008", "stock_name": "场景八", "theme_name": "主线题材",
         "features": {"stronger_confirmed": true, "reference_price": 10.5, "planned_pullback_price": 10.0, "planned_pullback_quality": "ready", "planned_breakout_price": 10.8, "hard_stop_price": 9.5, "exit_change_pct_floor": -3.0}
       },
-      "facts": [{"captured_at": "2026-07-10T14:39:30+08:00", "source_keys": ["06-short-term-terms"], "market_features": {"style": "board_flow", "window": "stronger_confirmation"}, "candidate_features": {"stronger_confirmed": true, "planned_pullback_price": 10.0, "planned_breakout_price": 10.8, "hard_stop_price": 9.5}}]
+      "facts": [{"captured_at": "2026-07-10T14:39:30+08:00", "source_keys": ["06-short-term-terms"], "market_features": {"style": "board_flow", "window": "stronger_confirmation", "quality": "ready"}, "candidate_features": {"stronger_confirmed": true, "reference_price": 10.5, "planned_pullback_price": 10.0, "planned_pullback_quality": "ready", "planned_breakout_price": 10.8, "hard_stop_price": 9.5, "exit_change_pct_floor": -3.0}}]
     },
     {
       "scenario_id": "leader-acceleration-to-divergence-golden",
       "mode_key": "leader_acceleration_to_divergence",
+      "rule_hash": "50d95d74b99d60efe8c4a984a07f5cbe6beb1fbc6cbc5cba8daa53907e66ab16",
       "as_of": "2026-07-10T14:40:00+08:00",
       "expected": "matched",
       "source_refs": [{"source_key": "06-short-term-terms", "excerpt": "龙头三个买点包括加速转分歧"}],
@@ -131,11 +140,12 @@
         "stock_code": "600009", "stock_name": "场景九", "theme_name": "主线题材",
         "features": {"confirmed_leader": true, "acceleration_to_divergence": true, "reference_price": 10.5, "planned_pullback_price": 10.0, "planned_pullback_quality": "ready", "planned_breakout_price": 10.8, "hard_stop_price": 9.5, "exit_change_pct_floor": -3.0}
       },
-      "facts": [{"captured_at": "2026-07-10T14:39:30+08:00", "source_keys": ["06-short-term-terms"], "market_features": {"style": "board_flow", "window": "second_divergence"}, "candidate_features": {"confirmed_leader": true, "acceleration_to_divergence": true, "planned_pullback_price": 10.0, "planned_breakout_price": 10.8, "hard_stop_price": 9.5}}]
+      "facts": [{"captured_at": "2026-07-10T14:39:30+08:00", "source_keys": ["06-short-term-terms"], "market_features": {"style": "board_flow", "window": "second_divergence", "quality": "ready"}, "candidate_features": {"confirmed_leader": true, "acceleration_to_divergence": true, "reference_price": 10.5, "planned_pullback_price": 10.0, "planned_pullback_quality": "ready", "planned_breakout_price": 10.8, "hard_stop_price": 9.5, "exit_change_pct_floor": -3.0}}]
     },
     {
       "scenario_id": "stage-three-high-low-switch-golden",
       "mode_key": "stage_three_high_low_switch",
+      "rule_hash": "6200f22fef95f88c6a45e98cbcff5c71051c86d170c4b3a584ed1935bbccb851",
       "as_of": "2026-07-10T14:40:00+08:00",
       "expected": "matched",
       "source_refs": [
@@ -147,11 +157,12 @@
         "stock_code": "600010", "stock_name": "场景十", "theme_name": "轮动题材",
         "features": {"low_position_new_start": true, "reference_price": 10.5, "planned_pullback_price": 10.0, "planned_pullback_quality": "ready", "planned_breakout_price": 10.8, "hard_stop_price": 9.5, "exit_change_pct_floor": -3.0}
       },
-      "facts": [{"captured_at": "2026-07-10T14:39:30+08:00", "source_keys": ["01-specialize", "06-short-term-terms"], "market_features": {"style": "board_flow", "window": "stage_three"}, "candidate_features": {"low_position_new_start": true, "planned_pullback_price": 10.0, "planned_breakout_price": 10.8, "hard_stop_price": 9.5}}]
+      "facts": [{"captured_at": "2026-07-10T14:39:30+08:00", "source_keys": ["01-specialize", "06-short-term-terms"], "market_features": {"style": "board_flow", "window": "stage_three", "quality": "ready"}, "candidate_features": {"low_position_new_start": true, "reference_price": 10.5, "planned_pullback_price": 10.0, "planned_pullback_quality": "ready", "planned_breakout_price": 10.8, "hard_stop_price": 9.5, "exit_change_pct_floor": -3.0}}]
     },
     {
       "scenario_id": "stage-transition-supplement-golden",
       "mode_key": "stage_transition_supplement",
+      "rule_hash": "7fc1894fbe128c9bbe2de81ac3ff6fce7fe5cc64b7e30e6dc3a4a1bf6561e55b",
       "as_of": "2026-07-10T14:40:00+08:00",
       "expected": "matched",
       "source_refs": [{"source_key": "06-short-term-terms", "excerpt": "转点补涨卡在关键窗口"}],
@@ -160,11 +171,12 @@
         "stock_code": "600011", "stock_name": "场景十一", "theme_name": "轮动题材",
         "features": {"supplement": true, "reference_price": 10.5, "planned_pullback_price": 10.0, "planned_pullback_quality": "ready", "planned_breakout_price": 10.8, "hard_stop_price": 9.5, "exit_change_pct_floor": -3.0}
       },
-      "facts": [{"captured_at": "2026-07-10T14:39:30+08:00", "source_keys": ["06-short-term-terms"], "market_features": {"style": "board_flow", "window": "stage_three"}, "candidate_features": {"supplement": true, "planned_pullback_price": 10.0, "planned_breakout_price": 10.8, "hard_stop_price": 9.5}}]
+      "facts": [{"captured_at": "2026-07-10T14:39:30+08:00", "source_keys": ["06-short-term-terms"], "market_features": {"style": "board_flow", "window": "stage_three", "quality": "ready"}, "candidate_features": {"supplement": true, "reference_price": 10.5, "planned_pullback_price": 10.0, "planned_pullback_quality": "ready", "planned_breakout_price": 10.8, "hard_stop_price": 9.5, "exit_change_pct_floor": -3.0}}]
     },
     {
       "scenario_id": "leader-first-bearish-rebound-golden",
       "mode_key": "leader_first_bearish_rebound",
+      "rule_hash": "f11b55e1f256c2f989f8249efb3249ee2e3bec3e775ff2e2178381f9a6722161",
       "as_of": "2026-07-10T14:40:00+08:00",
       "expected": "manual_review",
       "source_refs": [{"source_key": "06-short-term-terms", "excerpt": "龙头首阴低吸只适用于已确认龙头"}],
@@ -173,11 +185,12 @@
         "stock_code": "600012", "stock_name": "场景十二", "theme_name": "主线题材",
         "features": {"confirmed_leader": true, "first_bearish": true, "reference_price": 10.5, "planned_pullback_price": 10.0, "planned_pullback_quality": "ready", "planned_breakout_price": 10.8, "hard_stop_price": 9.5, "exit_change_pct_floor": -3.0}
       },
-      "facts": [{"captured_at": "2026-07-10T14:39:30+08:00", "source_keys": ["06-short-term-terms"], "market_features": {"style": "board_flow", "window": "stage_three"}, "candidate_features": {"confirmed_leader": true, "first_bearish": true, "planned_pullback_price": 10.0, "planned_breakout_price": 10.8, "hard_stop_price": 9.5}}]
+      "facts": [{"captured_at": "2026-07-10T14:39:30+08:00", "source_keys": ["06-short-term-terms"], "market_features": {"style": "board_flow", "window": "stage_three", "quality": "ready"}, "candidate_features": {"confirmed_leader": true, "first_bearish": true, "reference_price": 10.5, "planned_pullback_price": 10.0, "planned_pullback_quality": "ready", "planned_breakout_price": 10.8, "hard_stop_price": 9.5, "exit_change_pct_floor": -3.0}}]
     },
     {
       "scenario_id": "trend-core-pullback-golden",
       "mode_key": "trend_core_pullback",
+      "rule_hash": "a347f3da87c51bfa2238f74c6c2c4aa244a20f9e05681296ab80f9366c7d0ca3",
       "as_of": "2026-07-10T14:40:00+08:00",
       "expected": "matched",
       "source_refs": [
@@ -189,11 +202,12 @@
         "stock_code": "600013", "stock_name": "场景十三", "theme_name": "趋势题材",
         "features": {"trend_established": true, "resilience_rank": 1, "pullback": true, "reference_price": 10.5, "planned_pullback_price": 10.0, "planned_pullback_quality": "ready", "planned_breakout_price": 10.8, "hard_stop_price": 9.5, "exit_change_pct_floor": -3.0}
       },
-      "facts": [{"captured_at": "2026-07-10T14:39:30+08:00", "source_keys": ["00-art-1130", "02-window-recognition"], "market_features": {"style": "trend_main_wave", "window": "first_divergence"}, "candidate_features": {"trend_established": true, "resilience_rank": 1, "pullback": true, "planned_pullback_price": 10.0, "planned_breakout_price": 10.8, "hard_stop_price": 9.5}}]
+      "facts": [{"captured_at": "2026-07-10T14:39:30+08:00", "source_keys": ["00-art-1130", "02-window-recognition"], "market_features": {"style": "trend_main_wave", "window": "first_divergence", "quality": "ready"}, "candidate_features": {"trend_established": true, "resilience_rank": 1, "pullback": true, "reference_price": 10.5, "planned_pullback_price": 10.0, "planned_pullback_quality": "ready", "planned_breakout_price": 10.8, "hard_stop_price": 9.5, "exit_change_pct_floor": -3.0}}]
     },
     {
       "scenario_id": "trend-consolidation-rebreak-golden",
       "mode_key": "trend_consolidation_rebreak",
+      "rule_hash": "971b5b73a6984488603840c3bffe23f4fb91e60a382421ce3c61cfe6a7b9fa4e",
       "as_of": "2026-07-10T14:40:00+08:00",
       "expected": "matched",
       "source_refs": [
@@ -205,11 +219,12 @@
         "stock_code": "600014", "stock_name": "场景十四", "theme_name": "趋势题材",
         "features": {"consolidation_rebreak": true, "linkage_confirmed": true, "reference_price": 10.5, "planned_pullback_price": 10.0, "planned_pullback_quality": "ready", "planned_breakout_price": 10.8, "hard_stop_price": 9.5, "exit_change_pct_floor": -3.0}
       },
-      "facts": [{"captured_at": "2026-07-10T14:39:30+08:00", "source_keys": ["00-art-1123", "00-art-1130"], "market_features": {"style": "trend_main_wave", "window": "divergence_to_consensus"}, "candidate_features": {"consolidation_rebreak": true, "linkage_confirmed": true, "planned_pullback_price": 10.0, "planned_breakout_price": 10.8, "hard_stop_price": 9.5}}]
+      "facts": [{"captured_at": "2026-07-10T14:39:30+08:00", "source_keys": ["00-art-1123", "00-art-1130"], "market_features": {"style": "trend_main_wave", "window": "divergence_to_consensus", "quality": "ready"}, "candidate_features": {"consolidation_rebreak": true, "linkage_confirmed": true, "reference_price": 10.5, "planned_pullback_price": 10.0, "planned_pullback_quality": "ready", "planned_breakout_price": 10.8, "hard_stop_price": 9.5, "exit_change_pct_floor": -3.0}}]
     },
     {
       "scenario_id": "trend-turn-two-golden",
       "mode_key": "trend_turn_two",
+      "rule_hash": "c84a84fbdf47618e987459261849d69b6ea7da03aac70ad656a6a6b2cb1ba763",
       "as_of": "2026-07-10T14:40:00+08:00",
       "expected": "matched",
       "source_refs": [
@@ -221,11 +236,12 @@
         "stock_code": "600015", "stock_name": "场景十五", "theme_name": "趋势题材",
         "features": {"trend_turn_two": true, "middle_army_linkage": true, "reference_price": 10.5, "planned_pullback_price": 10.0, "planned_pullback_quality": "ready", "planned_breakout_price": 10.8, "hard_stop_price": 9.5, "exit_change_pct_floor": -3.0}
       },
-      "facts": [{"captured_at": "2026-07-10T14:39:30+08:00", "source_keys": ["00-art-1123", "00-art-1130"], "market_features": {"style": "trend_main_wave", "window": "divergence_to_consensus"}, "candidate_features": {"trend_turn_two": true, "middle_army_linkage": true, "planned_pullback_price": 10.0, "planned_breakout_price": 10.8, "hard_stop_price": 9.5}}]
+      "facts": [{"captured_at": "2026-07-10T14:39:30+08:00", "source_keys": ["00-art-1123", "00-art-1130"], "market_features": {"style": "trend_main_wave", "window": "divergence_to_consensus", "quality": "ready"}, "candidate_features": {"trend_turn_two": true, "middle_army_linkage": true, "reference_price": 10.5, "planned_pullback_price": 10.0, "planned_pullback_quality": "ready", "planned_breakout_price": 10.8, "hard_stop_price": 9.5, "exit_change_pct_floor": -3.0}}]
     },
     {
       "scenario_id": "resilient-core-exhaustion-golden",
       "mode_key": "resilient_core_exhaustion",
+      "rule_hash": "be9673836003465236e01d376fb08f5335fe3d679fd40253b7bd9b3b5472cb89",
       "as_of": "2026-07-10T14:40:00+08:00",
       "expected": "matched",
       "source_refs": [{"source_key": "04-trading-plan", "excerpt": "低吸是弱中选强，不是买分时最弱"}],
@@ -234,11 +250,12 @@
         "stock_code": "600016", "stock_name": "场景十六", "theme_name": "趋势题材",
         "features": {"divergence_days": 3, "resilience_rank": 1, "reference_price": 10.5, "planned_pullback_price": 10.0, "planned_pullback_quality": "ready", "planned_breakout_price": 10.8, "hard_stop_price": 9.5, "exit_change_pct_floor": -3.0}
       },
-      "facts": [{"captured_at": "2026-07-10T14:39:30+08:00", "source_keys": ["04-trading-plan"], "market_features": {"style": "dual_active", "window": "divergence_exhaustion"}, "candidate_features": {"divergence_days": 3, "resilience_rank": 1, "planned_pullback_price": 10.0, "planned_breakout_price": 10.8, "hard_stop_price": 9.5}}]
+      "facts": [{"captured_at": "2026-07-10T14:39:30+08:00", "source_keys": ["04-trading-plan"], "market_features": {"style": "dual_active", "window": "divergence_exhaustion", "quality": "ready"}, "candidate_features": {"divergence_days": 3, "resilience_rank": 1, "reference_price": 10.5, "planned_pullback_price": 10.0, "planned_pullback_quality": "ready", "planned_breakout_price": 10.8, "hard_stop_price": 9.5, "exit_change_pct_floor": -3.0}}]
     },
     {
       "scenario_id": "alive-theme-snake-arbitrage-golden",
       "mode_key": "alive_theme_snake_arbitrage",
+      "rule_hash": "1f08760d54ca608f351a6eaa6936db33a824e271c4157875609418c25d09d3e1",
       "as_of": "2026-07-10T14:40:00+08:00",
       "expected": "manual_review",
       "source_refs": [{"source_key": "04-trading-plan", "excerpt": "板块没走完，行为本质是套利"}],
@@ -247,11 +264,12 @@
         "stock_code": "600017", "stock_name": "场景十七", "theme_name": "趋势题材",
         "features": {"theme_alive": true, "snake_setup": true, "reference_price": 10.5, "planned_pullback_price": 10.0, "planned_pullback_quality": "ready", "planned_breakout_price": 10.8, "hard_stop_price": 9.5, "exit_change_pct_floor": -3.0}
       },
-      "facts": [{"captured_at": "2026-07-10T14:39:30+08:00", "source_keys": ["04-trading-plan"], "market_features": {"style": "dual_active", "window": "divergence_exhaustion"}, "candidate_features": {"theme_alive": true, "snake_setup": true, "planned_pullback_price": 10.0, "planned_breakout_price": 10.8, "hard_stop_price": 9.5}}]
+      "facts": [{"captured_at": "2026-07-10T14:39:30+08:00", "source_keys": ["04-trading-plan"], "market_features": {"style": "dual_active", "window": "divergence_exhaustion", "quality": "ready"}, "candidate_features": {"theme_alive": true, "snake_setup": true, "reference_price": 10.5, "planned_pullback_price": 10.0, "planned_pullback_quality": "ready", "planned_breakout_price": 10.8, "hard_stop_price": 9.5, "exit_change_pct_floor": -3.0}}]
     },
     {
       "scenario_id": "dead-pile-right-confirmation-golden",
       "mode_key": "dead_pile_right_confirmation",
+      "rule_hash": "f3a339db191e7bfd84be530edd1b949e94ea5599ffa95ec87d50a98f25d25eb8",
       "as_of": "2026-07-10T14:40:00+08:00",
       "expected": "manual_review",
       "source_refs": [{"source_key": "04-trading-plan", "excerpt": "死人堆爬出来的只能右侧确认"}],
@@ -260,11 +278,12 @@
         "stock_code": "600018", "stock_name": "场景十八", "theme_name": "趋势题材",
         "features": {"theme_dead": true, "right_reversal": true, "reference_price": 10.5, "planned_pullback_price": 10.0, "planned_pullback_quality": "ready", "planned_breakout_price": 10.8, "hard_stop_price": 9.5, "exit_change_pct_floor": -3.0}
       },
-      "facts": [{"captured_at": "2026-07-10T14:39:30+08:00", "source_keys": ["04-trading-plan"], "market_features": {"style": "dual_active", "window": "divergence_to_consensus"}, "candidate_features": {"theme_dead": true, "right_reversal": true, "planned_pullback_price": 10.0, "planned_breakout_price": 10.8, "hard_stop_price": 9.5}}]
+      "facts": [{"captured_at": "2026-07-10T14:39:30+08:00", "source_keys": ["04-trading-plan"], "market_features": {"style": "dual_active", "window": "divergence_to_consensus", "quality": "ready"}, "candidate_features": {"theme_dead": true, "right_reversal": true, "reference_price": 10.5, "planned_pullback_price": 10.0, "planned_pullback_quality": "ready", "planned_breakout_price": 10.8, "hard_stop_price": 9.5, "exit_change_pct_floor": -3.0}}]
     },
     {
       "scenario_id": "external-high-low-switch-golden",
       "mode_key": "external_high_low_switch",
+      "rule_hash": "bbb65fd0212a0b6578d29e606ce10116b7263c745e045d0804bc9c93a3dd67b8",
       "as_of": "2026-07-10T14:40:00+08:00",
       "expected": "manual_review",
       "source_refs": [
@@ -276,7 +295,7 @@
         "stock_code": "600019", "stock_name": "场景十九", "theme_name": "轮动题材",
         "features": {"external_switch": true, "reference_price": 10.5, "planned_pullback_price": 10.0, "planned_pullback_quality": "ready", "planned_breakout_price": 10.8, "hard_stop_price": 9.5, "exit_change_pct_floor": -3.0}
       },
-      "facts": [{"captured_at": "2026-07-10T14:39:30+08:00", "source_keys": ["01-specialize", "06-short-term-terms"], "market_features": {"style": "dual_active", "window": "stage_three"}, "candidate_features": {"external_switch": true, "planned_pullback_price": 10.0, "planned_breakout_price": 10.8, "hard_stop_price": 9.5}}]
+      "facts": [{"captured_at": "2026-07-10T14:39:30+08:00", "source_keys": ["01-specialize", "06-short-term-terms"], "market_features": {"style": "dual_active", "window": "stage_three", "quality": "ready"}, "candidate_features": {"external_switch": true, "reference_price": 10.5, "planned_pullback_price": 10.0, "planned_pullback_quality": "ready", "planned_breakout_price": 10.8, "hard_stop_price": 9.5, "exit_change_pct_floor": -3.0}}]
     }
   ]
 }

@@ -2,6 +2,7 @@ import copy
 import importlib
 import io
 import json
+import math
 import subprocess
 import sys
 import tempfile
@@ -9,6 +10,10 @@ import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
 from unittest.mock import patch
+
+from app.services.trading_playbook.rule_catalog import (
+    canonical_rule_content_hash,
+)
 
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
@@ -139,6 +144,10 @@ class GoldenScenarioFixtureTest(unittest.TestCase):
             rule = rules[scenario["mode_key"]]
             self.assertEqual(scenario["source_refs"], rule["source_refs"])
             self.assertEqual(scenario["market_features"]["style"], rule["style"])
+            self.assertEqual(
+                scenario.get("rule_hash"),
+                canonical_rule_content_hash(rule),
+            )
             self.assertTrue(scenario["facts"])
             features = scenario["candidate"]["features"]
             for field in (
@@ -211,14 +220,14 @@ class ReplayValidationTest(unittest.TestCase):
         scenario = copy.deepcopy(self.scenario)
         scenario["facts"][0]["candidate_features"]["high_volatility"] = False
 
-        with self.assertRaisesRegex(ValueError, "fact mismatch"):
+        with self.assertRaisesRegex(ValueError, "feature map mismatch"):
             self.replay_scenario(scenario, catalog_path=CATALOG_PATH)
 
     def test_rejects_scenario_when_required_feature_has_no_fact(self):
         scenario = copy.deepcopy(self.scenario)
         del scenario["facts"][0]["candidate_features"]["high_volatility"]
 
-        with self.assertRaisesRegex(ValueError, "unaudited feature"):
+        with self.assertRaisesRegex(ValueError, "feature map mismatch"):
             self.replay_scenario(scenario, catalog_path=CATALOG_PATH)
 
     def test_rejects_fact_not_tied_to_catalog_sources(self):
@@ -226,6 +235,59 @@ class ReplayValidationTest(unittest.TestCase):
         scenario["facts"][0]["source_keys"] = ["invented-source"]
 
         with self.assertRaisesRegex(ValueError, "fact source_keys"):
+            self.replay_scenario(scenario, catalog_path=CATALOG_PATH)
+
+    def test_unfacted_matcher_inputs_cannot_change_actual_status(self):
+        mutations = (
+            ("reference_price", 0.0),
+            ("_snapshot_stale", True),
+            ("exit_change_pct_floor", -101.0),
+        )
+        for key, value in mutations:
+            with self.subTest(key=key):
+                scenario = copy.deepcopy(self.scenario)
+                scenario["candidate"]["features"][key] = value
+                with self.assertRaisesRegex(ValueError, "feature map mismatch"):
+                    self.replay_scenario(
+                        scenario,
+                        catalog_path=CATALOG_PATH,
+                    )
+
+    def test_declared_and_fact_feature_maps_must_match_exactly(self):
+        variants = []
+        declared_more = copy.deepcopy(self.scenario)
+        declared_more["market_features"]["unfacted"] = True
+        variants.append(declared_more)
+        declared_less = copy.deepcopy(self.scenario)
+        del declared_less["market_features"]["quality"]
+        variants.append(declared_less)
+        fact_extra = copy.deepcopy(self.scenario)
+        fact_extra["facts"][0]["market_features"]["invented"] = True
+        variants.append(fact_extra)
+
+        for index, scenario in enumerate(variants):
+            with self.subTest(index=index):
+                with self.assertRaisesRegex(ValueError, "feature map mismatch"):
+                    self.replay_scenario(
+                        scenario,
+                        catalog_path=CATALOG_PATH,
+                    )
+
+    def test_boolean_and_numeric_feature_values_are_not_interchangeable(self):
+        scenario = copy.deepcopy(self.scenario)
+        scenario["facts"][0]["candidate_features"]["high_volatility"] = 1
+
+        with self.assertRaisesRegex(ValueError, "feature map mismatch"):
+            self.replay_scenario(scenario, catalog_path=CATALOG_PATH)
+
+    def test_conflicting_facts_fail_closed(self):
+        scenario = copy.deepcopy(self.scenario)
+        conflicting = copy.deepcopy(scenario["facts"][0])
+        conflicting["captured_at"] = "2026-07-10T14:39:31+08:00"
+        conflicting["candidate_features"]["high_volatility"] = False
+        scenario["facts"].append(conflicting)
+
+        with self.assertRaisesRegex(ValueError, "conflicting facts"):
             self.replay_scenario(scenario, catalog_path=CATALOG_PATH)
 
     def test_rejects_invalid_or_timezone_naive_timestamps(self):
@@ -251,6 +313,51 @@ class ReplayValidationTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "unknown mode"):
             self.replay_scenario(scenario, catalog_path=CATALOG_PATH)
+
+    def test_replay_rejects_same_version_catalog_content_drift(self):
+        catalog = json.loads(CATALOG_PATH.read_text(encoding="utf-8"))
+        scenario = copy.deepcopy(self.scenario)
+        original_rule = next(
+            rule
+            for rule in catalog["rules"]
+            if rule["mode_key"] == scenario["mode_key"]
+        )
+        scenario["rule_hash"] = canonical_rule_content_hash(original_rule)
+        catalog["rules"][0]["entry"]["label"] = "漂移但不改变匹配状态"
+
+        with tempfile.TemporaryDirectory() as directory:
+            catalog_path = Path(directory) / "drifted-catalog.json"
+            catalog_path.write_text(
+                json.dumps(catalog, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "rule_hash"):
+                self.replay_scenario(
+                    scenario,
+                    catalog_path=catalog_path,
+                )
+
+    def test_all_planned_prices_must_be_positive_finite_real_numbers(self):
+        fields = (
+            "planned_pullback_price",
+            "planned_breakout_price",
+            "hard_stop_price",
+        )
+        invalid_values = (0, -1, math.nan, math.inf, True, "10.0")
+        for field in fields:
+            for value in invalid_values:
+                with self.subTest(field=field, value=value):
+                    scenario = copy.deepcopy(self.scenario)
+                    scenario["candidate"]["features"][field] = value
+                    scenario["facts"][0]["candidate_features"][field] = value
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "positive finite price",
+                    ):
+                        self.replay_scenario(
+                            scenario,
+                            catalog_path=CATALOG_PATH,
+                        )
 
 
 class ScenarioLoaderTest(unittest.TestCase):
@@ -323,6 +430,36 @@ class ScenarioLoaderTest(unittest.TestCase):
                         catalog_path=CATALOG_PATH,
                     )
 
+    def test_loader_rejects_same_version_catalog_content_drift(self):
+        replay_module = importlib.import_module(
+            "app.scripts.replay_trading_playbook"
+        )
+        catalog = json.loads(CATALOG_PATH.read_text(encoding="utf-8"))
+        payload = json.loads(SCENARIO_FIXTURE.read_text(encoding="utf-8"))
+        rules = {rule["mode_key"]: rule for rule in catalog["rules"]}
+        for scenario in payload["scenarios"]:
+            scenario["rule_hash"] = canonical_rule_content_hash(
+                rules[scenario["mode_key"]]
+            )
+        catalog["rules"][0]["requirements"][0]["value"] = "changed-window"
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture_path = Path(directory) / "scenarios.json"
+            catalog_path = Path(directory) / "drifted-catalog.json"
+            fixture_path.write_text(
+                json.dumps(payload, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            catalog_path.write_text(
+                json.dumps(catalog, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "rule_hash"):
+                replay_module.load_scenarios(
+                    fixture_path=fixture_path,
+                    catalog_path=catalog_path,
+                )
+
 
 class ReplayCliTest(unittest.TestCase):
     def run_cli(self, *arguments):
@@ -359,6 +496,28 @@ class ReplayCliTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("19 evaluated", result.stdout)
         self.assertIn("no future facts", result.stdout)
+
+    def test_requested_context_is_distinct_from_golden_fixture_facts(self):
+        result = self.run_cli(
+            "--date",
+            "2099-12-31",
+            "--stage",
+            "auction",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("golden_fixture_context", result.stdout)
+        self.assertIn("requested_date=2099-12-31", result.stdout)
+        self.assertIn("requested_stage=auction", result.stdout)
+        self.assertIn(
+            "fixture_as_of=2026-07-10T14:40:00+08:00",
+            result.stdout,
+        )
+        self.assertIn("facts_rewritten=false", result.stdout)
+        self.assertNotRegex(result.stdout, r"(?:^|[;\s])date=")
+        self.assertNotRegex(result.stdout, r"(?:^|[;\s])stage=")
+        self.assertNotIn("fixture_as_of=2099", result.stdout)
+        self.assertNotIn("fixture_stage=auction", result.stdout)
 
     def test_mismatch_returns_nonzero_with_mode_details(self):
         replay_module = importlib.import_module(

@@ -8,16 +8,21 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import sys
 from datetime import date, datetime
+from numbers import Real
 from pathlib import Path
 from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
 from app.services.trading_playbook.domain import CandidateSnapshot
 from app.services.trading_playbook.mode_matcher import ModeMatcher
-from app.services.trading_playbook.rule_catalog import RuleCatalog
+from app.services.trading_playbook.rule_catalog import (
+    RuleCatalog,
+    canonical_rule_content_hash,
+)
 
 
 DEFAULT_CATALOG_PATH = (
@@ -43,6 +48,30 @@ def _aware_timestamp(value: Any, *, field: str) -> datetime:
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise ValueError(f"timezone-aware timestamp required: {field}")
     return parsed
+
+
+def _same_fact_value(left: Any, right: Any) -> bool:
+    """Compare JSON-like facts without treating booleans as numbers."""
+    if isinstance(left, bool) or isinstance(right, bool):
+        return isinstance(left, bool) and isinstance(right, bool) and left is right
+    if isinstance(left, Mapping) or isinstance(right, Mapping):
+        if not isinstance(left, Mapping) or not isinstance(right, Mapping):
+            return False
+        if set(left) != set(right):
+            return False
+        return all(_same_fact_value(left[key], right[key]) for key in left)
+    if isinstance(left, list) or isinstance(right, list):
+        if not isinstance(left, list) or not isinstance(right, list):
+            return False
+        return len(left) == len(right) and all(
+            _same_fact_value(left_item, right_item)
+            for left_item, right_item in zip(left, right)
+        )
+    if isinstance(left, Real) and isinstance(right, Real):
+        if math.isnan(left) or math.isnan(right):
+            return math.isnan(left) and math.isnan(right)
+        return left == right
+    return type(left) is type(right) and left == right
 
 
 def replay_scenario(
@@ -71,6 +100,8 @@ def replay_scenario(
     )
     if rule is None:
         raise ValueError(f"unknown mode: {mode_key}")
+    if scenario.get("rule_hash") != canonical_rule_content_hash(rule):
+        raise ValueError(f"rule_hash mismatch: {mode_key}")
     if scenario.get("source_refs") != rule["source_refs"]:
         raise ValueError("source_refs must match the exact catalog rule")
 
@@ -82,7 +113,9 @@ def replay_scenario(
     expected_source_keys = {
         source_ref["source_key"] for source_ref in rule["source_refs"]
     }
-    audited_features = set()
+    reconstructed_groups: dict[str, dict[str, Any]] = {
+        group_name: {} for group_name in declared_groups
+    }
     for fact in facts:
         source_keys = fact.get("source_keys")
         if (
@@ -96,34 +129,52 @@ def replay_scenario(
             if not isinstance(fact_values, Mapping):
                 raise ValueError(f"fact {group_name} must be a mapping")
             for key, value in fact_values.items():
-                if key not in declared or declared[key] != value:
-                    raise ValueError(f"fact mismatch: {group_name}.{key}")
-                owner = "market" if group_name == "market_features" else "candidate"
-                audited_features.add(f"{owner}.{key}")
+                reconstructed = reconstructed_groups[group_name]
+                if key in reconstructed and not _same_fact_value(
+                    reconstructed[key],
+                    value,
+                ):
+                    raise ValueError(
+                        f"conflicting facts: {group_name}.{key}"
+                    )
+                reconstructed[key] = value
 
-    required_audit = {
-        "market.style",
-        "market.window",
-        "candidate.planned_pullback_price",
-        "candidate.planned_breakout_price",
-        "candidate.hard_stop_price",
-        *(requirement["feature"] for requirement in rule["requirements"]),
-    }
-    unaudited = sorted(required_audit - audited_features)
-    if unaudited:
-        raise ValueError(f"unaudited feature: {unaudited[0]}")
+    for group_name, declared in declared_groups.items():
+        if (
+            not isinstance(declared, Mapping)
+            or not _same_fact_value(
+                reconstructed_groups[group_name],
+                declared,
+            )
+        ):
+            raise ValueError(f"feature map mismatch: {group_name}")
+
+    candidate_features = reconstructed_groups["candidate_features"]
+    for field in (
+        "planned_pullback_price",
+        "planned_breakout_price",
+        "hard_stop_price",
+    ):
+        value = candidate_features.get(field)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, Real)
+            or not math.isfinite(value)
+            or value <= 0
+        ):
+            raise ValueError(f"positive finite price required: {field}")
 
     candidate = CandidateSnapshot(
         stock_code=str(raw_candidate["stock_code"]),
         stock_name=str(raw_candidate["stock_name"]),
         theme_name=str(raw_candidate["theme_name"]),
-        features=dict(raw_candidate["features"]),
+        features=candidate_features,
         evidence=list(scenario.get("facts") or []),
     )
     evaluation = ModeMatcher(
         [rule],
         catalog_version=catalog["catalog_version"],
-    ).evaluate(dict(scenario["market_features"]), candidate)[0]
+    ).evaluate(reconstructed_groups["market_features"], candidate)[0]
     return evaluation.status
 
 
@@ -164,6 +215,12 @@ def load_scenarios(
             "scenario coverage mismatch: "
             f"missing={missing}, extra={extra}"
         )
+    rules_by_mode = {rule["mode_key"]: rule for rule in catalog["rules"]}
+    for scenario in scenarios:
+        mode_key = scenario["mode_key"]
+        expected_hash = canonical_rule_content_hash(rules_by_mode[mode_key])
+        if scenario.get("rule_hash") != expected_hash:
+            raise ValueError(f"rule_hash mismatch: {mode_key}")
     return [dict(scenario) for scenario in scenarios]
 
 
@@ -217,9 +274,19 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         print(f"replay failed: {exc}", file=sys.stderr)
         return 1
+    fixture_as_of_values = sorted({scenario["as_of"] for scenario in scenarios})
+    if len(fixture_as_of_values) == 1:
+        fixture_context = f"fixture_as_of={fixture_as_of_values[0]}"
+    else:
+        fixture_context = "fixture_as_of_set=" + "|".join(
+            fixture_as_of_values
+        )
     print(
         f"{len(scenarios)} evaluated; no future facts; "
-        f"date={args.date.isoformat()} stage={args.stage}; notifications disabled"
+        "golden_fixture_context; "
+        f"requested_date={args.date.isoformat()} "
+        f"requested_stage={args.stage}; {fixture_context}; "
+        "facts_rewritten=false; notifications disabled"
     )
     return 0
 
