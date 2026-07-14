@@ -165,7 +165,7 @@ class TradingPlaybookReviewService:
                 planned_executed += 1
 
             is_invalidated = status == "invalidated"
-            is_triggered = status in {"triggered", "exit"} or any(
+            is_triggered = status == "triggered" or any(
                 event_type in _TRIGGER_EVENT_TYPES
                 for event_type in candidate_events
             )
@@ -271,7 +271,7 @@ class TradingPlaybookReviewService:
                 if row is None:
                     raise PlaybookNotFoundError("review not found")
                 old_manual = copy.deepcopy(row.manual_execution_json or {})
-                candidates, events = await self._review_inputs(
+                candidates, events, _ = await self._review_inputs(
                     db,
                     plan_id,
                     trade_date,
@@ -350,6 +350,20 @@ class TradingPlaybookReviewService:
             TradingExecutionReview.id == review_id
         )
         return statement.with_for_update() if for_update else statement
+
+    @staticmethod
+    def event_select_statement(plan_id: int, candidate_ids: Sequence[int]):
+        return (
+            select(TradingAlertEvent)
+            .where(
+                TradingAlertEvent.plan_version_id == plan_id,
+                TradingAlertEvent.candidate_id.in_(list(candidate_ids)),
+            )
+            .order_by(
+                TradingAlertEvent.triggered_at,
+                TradingAlertEvent.id,
+            )
+        )
 
     @staticmethod
     async def load_outcomes(
@@ -457,14 +471,23 @@ class TradingPlaybookReviewService:
                 row = await self._fresh_review(
                     db,
                     review_id,
-                    for_update=uses_row_lock,
                 )
                 if row is None:
                     raise PlaybookNotFoundError("review not found")
-                if not finalized and row.finalized_at is not None:
+                if row.finalized_at is not None:
                     return row
+                if uses_row_lock:
+                    row = await self._fresh_review(
+                        db,
+                        review_id,
+                        for_update=True,
+                    )
+                    if row is None:
+                        raise PlaybookNotFoundError("review not found")
+                    if row.finalized_at is not None:
+                        return row
                 old_manual = copy.deepcopy(row.manual_execution_json or {})
-                candidates, events = await self._review_inputs(
+                candidates, events, event_warnings = await self._review_inputs(
                     db,
                     plan_id,
                     trade_date,
@@ -479,6 +502,11 @@ class TradingPlaybookReviewService:
                     loaded or [],
                     finalized=finalized,
                 )
+                data_quality["event_warnings"] = copy.deepcopy(
+                    event_warnings
+                )
+                if event_warnings and data_quality["status"] == "ready":
+                    data_quality["status"] = "degraded"
                 summary = self.summarize(
                     candidates,
                     events,
@@ -493,10 +521,9 @@ class TradingPlaybookReviewService:
                         TradingExecutionReview.manual_execution_json
                         == old_manual
                     )
-                if not finalized:
-                    predicates.append(
-                        TradingExecutionReview.finalized_at.is_(None)
-                    )
+                predicates.append(
+                    TradingExecutionReview.finalized_at.is_(None)
+                )
                 values: dict[str, Any] = {
                     "signal_review_json": copy.deepcopy(summary),
                     "plan_compliance_json": copy.deepcopy(
@@ -535,7 +562,11 @@ class TradingPlaybookReviewService:
         db,
         plan_id: int,
         trade_date: date,
-    ) -> tuple[list[TradingPlanCandidate], list[TradingAlertEvent]]:
+    ) -> tuple[
+        list[TradingPlanCandidate],
+        list[TradingAlertEvent],
+        list[dict[str, Any]],
+    ]:
         candidates = list(
             (
                 await db.scalars(
@@ -553,23 +584,50 @@ class TradingPlaybookReviewService:
         )
         candidate_ids = [candidate.id for candidate in candidates]
         if not candidate_ids:
-            return candidates, []
-        events = list(
+            return candidates, [], []
+        persisted_events = list(
             (
                 await db.scalars(
-                    select(TradingAlertEvent)
-                    .where(
-                        TradingAlertEvent.plan_version_id == plan_id,
-                        TradingAlertEvent.candidate_id.in_(candidate_ids),
-                    )
-                    .order_by(
-                        TradingAlertEvent.triggered_at,
-                        TradingAlertEvent.id,
-                    )
+                    self.event_select_statement(plan_id, candidate_ids)
                 )
             ).all()
         )
-        return candidates, events
+        events: list[TradingAlertEvent] = []
+        warnings: list[dict[str, Any]] = []
+        expected = trade_date.isoformat()
+        for event in persisted_events:
+            snapshot = event.market_snapshot_json
+            raw_trade_date = (
+                snapshot.get("trade_date")
+                if isinstance(snapshot, Mapping)
+                else None
+            )
+            if raw_trade_date is None:
+                reason = "missing_trade_date"
+            elif not isinstance(raw_trade_date, str):
+                reason = "invalid_trade_date"
+            else:
+                try:
+                    parsed = date.fromisoformat(raw_trade_date)
+                except ValueError:
+                    reason = "invalid_trade_date"
+                else:
+                    if raw_trade_date != parsed.isoformat():
+                        reason = "invalid_trade_date"
+                    elif raw_trade_date != expected:
+                        reason = "trade_date_mismatch"
+                    else:
+                        events.append(event)
+                        continue
+            warnings.append(
+                {
+                    "event_id": event.id,
+                    "event_type": event.event_type,
+                    "reason": reason,
+                    "observed_trade_date": _json_value(raw_trade_date),
+                }
+            )
+        return candidates, events, warnings
 
     @classmethod
     def _outcome_payload(
@@ -583,6 +641,8 @@ class TradingPlaybookReviewService:
         wanted = sorted({str(code) for code in stock_codes if str(code)})
         outcome: dict[str, dict[str, Any]] = {}
         degraded: list[str] = []
+        stale: list[str] = []
+        freshness_unknown: list[str] = []
         for row in rows:
             row_date = _value(row, "trade_date")
             stock_code = str(_value(row, "stock_code", "") or "")
@@ -602,11 +662,18 @@ class TradingPlaybookReviewService:
                 )
                 else None
             )
+            updated_at = _value(row, "updated_at")
+            freshness = cls._outcome_freshness(updated_at, trade_date)
+            if freshness == "stale":
+                stale.append(stock_code)
+            elif freshness == "unknown":
+                freshness_unknown.append(stock_code)
             if (
                 quality != "ok"
                 or close_price is None
                 or change_pct is None
                 or open_count is None
+                or freshness != "fresh"
             ):
                 degraded.append(stock_code)
             outcome[stock_code] = {
@@ -626,7 +693,8 @@ class TradingPlaybookReviewService:
                 "today_broken": bool(_value(row, "today_broken", False)),
                 "open_count": open_count,
                 "data_quality_flag": quality or "missing",
-                "updated_at": _json_value(_value(row, "updated_at")),
+                "updated_at": _json_value(updated_at),
+                "freshness": freshness,
             }
         missing = sorted(set(wanted) - set(outcome))
         status = "ready"
@@ -641,8 +709,23 @@ class TradingPlaybookReviewService:
             "finalized": finalized,
             "missing_stock_codes": missing,
             "degraded_stock_codes": sorted(set(degraded)),
+            "stale_stock_codes": sorted(set(stale)),
+            "freshness_unknown_stock_codes": sorted(
+                set(freshness_unknown)
+            ),
         }
         return outcome, quality
+
+    @staticmethod
+    def _outcome_freshness(value: Any, trade_date: date) -> str:
+        if not isinstance(value, datetime):
+            return "unknown"
+        observed_date = (
+            value.date()
+            if value.tzinfo is None or value.utcoffset() is None
+            else value.astimezone(CN_TZ).date()
+        )
+        return "fresh" if observed_date == trade_date else "stale"
 
     async def _select_manual_review(
         self,
@@ -676,13 +759,22 @@ class TradingPlaybookReviewService:
                     select(
                         TradingPlanCandidate.id,
                         TradingPlanCandidate.plan_version_id,
+                        TradingPlanCandidate.action_trade_date,
                     ).where(
                         TradingPlanCandidate.id.in_(numeric_ids),
-                        TradingPlanCandidate.action_trade_date == trade_date,
                     )
                 )
             ).all()
         )
+        wrong_date_ids = sorted(
+            row.id
+            for row in candidate_rows
+            if row.action_trade_date != trade_date
+        )
+        if wrong_date_ids:
+            raise InvalidTransitionError(
+                "known candidate action date does not match review date"
+            )
         touched_plans = {row.plan_version_id for row in candidate_rows}
         if not touched_plans:
             if len(reviews) == 1:
