@@ -15,9 +15,18 @@
           type="date"
           value-format="YYYY-MM-DD"
           :clearable="false"
+          :disabled="revisionSaving"
           @change="loadPlanDomain"
         />
-        <el-button type="primary" plain :loading="refreshing" @click="loadAll">刷新全部</el-button>
+        <el-button
+          type="primary"
+          plain
+          :loading="refreshing"
+          :disabled="reviewSaving || revisionSaving"
+          @click="loadAll"
+        >
+          刷新全部
+        </el-button>
       </div>
     </header>
 
@@ -99,6 +108,7 @@
               class="timeline-version"
               :class="{ selected: plan.id === selectedPlan?.id }"
               type="button"
+              :disabled="revisionSaving"
               @click="selectedPlanId = plan.id"
             >
               <strong>{{ stageLabel(plan.stage) }} · v{{ plan.version_no }}</strong>
@@ -268,9 +278,10 @@
             type="date"
             value-format="YYYY-MM-DD"
             :clearable="false"
+            :disabled="reviewSaving"
             @change="loadReviewDomain"
           />
-          <el-button size="small" @click="loadReviewDomain">刷新复盘</el-button>
+          <el-button size="small" :disabled="reviewSaving" @click="loadReviewDomain">刷新复盘</el-button>
         </div>
       </div>
       <el-alert
@@ -308,6 +319,7 @@
           </div>
           <el-switch
             v-model="restrictReviewToPlan"
+            :disabled="reviewSaving"
             active-text="随请求提交 plan_id"
             inactive-text="按候选自动定位"
           />
@@ -319,10 +331,15 @@
               <strong>{{ candidate.stock_name }}（{{ candidate.stock_code }}）</strong>
               <span>{{ candidate.primary_mode_key }}</span>
             </div>
-            <el-switch v-model="plannedDrafts[String(candidate.id)].executed" active-text="已执行" inactive-text="未执行" />
+            <el-switch
+              v-model="plannedDrafts[String(candidate.id)].executed"
+              :disabled="reviewSaving"
+              active-text="已执行"
+              inactive-text="未执行"
+            />
             <el-input-number
               v-model="plannedDrafts[String(candidate.id)].execution_price"
-              :disabled="!plannedDrafts[String(candidate.id)].executed"
+              :disabled="reviewSaving || !plannedDrafts[String(candidate.id)].executed"
               :min="0.01"
               :precision="2"
               controls-position="right"
@@ -330,7 +347,7 @@
             />
             <el-input-number
               v-model="plannedDrafts[String(candidate.id)].quantity"
-              :disabled="!plannedDrafts[String(candidate.id)].executed"
+              :disabled="reviewSaving || !plannedDrafts[String(candidate.id)].executed"
               :min="1"
               :step="100"
               controls-position="right"
@@ -338,12 +355,16 @@
             />
             <el-time-picker
               v-model="plannedDrafts[String(candidate.id)].executed_time"
-              :disabled="!plannedDrafts[String(candidate.id)].executed"
+              :disabled="reviewSaving || !plannedDrafts[String(candidate.id)].executed"
               value-format="HH:mm:ss"
               format="HH:mm:ss"
               placeholder="北京时间"
             />
-            <el-input v-model="plannedDrafts[String(candidate.id)].manual_note" placeholder="执行备注（可选）" />
+            <el-input
+              v-model="plannedDrafts[String(candidate.id)].manual_note"
+              :disabled="reviewSaving"
+              placeholder="执行备注（可选）"
+            />
           </div>
         </div>
         <el-empty v-else description="该复盘版本没有可编辑的计划内候选" :image-size="64" />
@@ -353,20 +374,20 @@
             <h5>计划外执行</h5>
             <span>计划外记录必须结构化填写，不会被包装成计划信号</span>
           </div>
-          <el-button size="small" plain @click="addUnplannedExecution">新增计划外记录</el-button>
+          <el-button size="small" plain :disabled="reviewSaving" @click="addUnplannedExecution">新增计划外记录</el-button>
         </div>
         <div v-for="(item, index) in unplannedDrafts" :key="item.key" class="unplanned-row">
-          <el-input v-model="item.stock_code" maxlength="6" placeholder="六位股票代码" />
-          <el-input v-model="item.stock_name" placeholder="股票名称" />
-          <el-input-number v-model="item.execution_price" :min="0.01" :precision="2" placeholder="成交价" />
-          <el-input-number v-model="item.quantity" :min="1" :step="100" placeholder="数量" />
-          <el-time-picker v-model="item.executed_time" value-format="HH:mm:ss" format="HH:mm:ss" placeholder="北京时间" />
-          <el-input v-model="item.manual_note" placeholder="计划外原因/备注" />
-          <el-button link type="danger" @click="removeUnplannedExecution(index)">删除</el-button>
+          <el-input v-model="item.stock_code" :disabled="reviewSaving" maxlength="6" placeholder="六位股票代码" />
+          <el-input v-model="item.stock_name" :disabled="reviewSaving" placeholder="股票名称" />
+          <el-input-number v-model="item.execution_price" :disabled="reviewSaving" :min="0.01" :precision="2" placeholder="成交价" />
+          <el-input-number v-model="item.quantity" :disabled="reviewSaving" :min="1" :step="100" placeholder="数量" />
+          <el-time-picker v-model="item.executed_time" :disabled="reviewSaving" value-format="HH:mm:ss" format="HH:mm:ss" placeholder="北京时间" />
+          <el-input v-model="item.manual_note" :disabled="reviewSaving" placeholder="计划外原因/备注" />
+          <el-button link type="danger" :disabled="reviewSaving" @click="removeUnplannedExecution(index)">删除</el-button>
         </div>
         <div class="editor-footer">
           <span v-if="!restrictReviewToPlan">仅在候选可唯一定位复盘时可省略 plan_id。</span>
-          <el-button type="primary" :loading="reviewSaving" @click="saveExecutionReview">保存执行记录</el-button>
+          <el-button type="primary" :loading="reviewSaving" :disabled="reviewSaving" @click="saveExecutionReview">保存执行记录</el-button>
         </div>
       </div>
     </section>
@@ -479,7 +500,7 @@
         :closable="false"
         show-icon
       />
-      <el-form label-position="top" class="revision-form">
+      <el-form label-position="top" class="revision-form" :disabled="revisionSaving">
         <el-form-item label="修订说明（必填）">
           <el-input
             v-model="revisionChangeNote"
@@ -543,7 +564,7 @@
       </el-form>
       <template #footer>
         <el-button :disabled="revisionSaving" @click="revisionDialogVisible = false">取消</el-button>
-        <el-button type="primary" :loading="revisionSaving" @click="submitRevision">创建修订版本</el-button>
+        <el-button type="primary" :loading="revisionSaving" :disabled="revisionSaving" @click="submitRevision">创建修订版本</el-button>
       </template>
     </el-dialog>
   </div>
@@ -564,6 +585,7 @@ import {
 import { useTradingPlaybookStore } from '@/stores/trading-playbook'
 import type {
   TradingExecutionReview,
+  TradingExecutionReviewUpdate,
   TradingModeRule,
   TradingPlanCandidate,
   TradingPlanStage,
@@ -589,9 +611,9 @@ import {
   createPlanRevisionController,
   createConcurrentIdGuard,
   createPlanMutationController,
+  createReviewSaveController,
   createReviewDomainController,
   runAndClearErrorOnSuccess,
-  saveReviewIfEditable,
   type CandidateRevisionDraft
 } from '@/views/trading-playbook/interactions'
 
@@ -603,9 +625,12 @@ interface CandidateRevisionRow extends CandidateRevisionDraft {
   stock_code: string
   stock_name: string
   primary_mode_key: string
-  current_entry: Record<string, unknown>
-  current_invalidation: Record<string, unknown>
-  current_exit: Record<string, unknown>
+}
+
+interface ReviewSaveSnapshot {
+  tradeDate: string
+  planId?: number
+  payload: TradingExecutionReviewUpdate
 }
 
 const store = useTradingPlaybookStore()
@@ -711,6 +736,28 @@ const reviewController = createReviewDomainController<TradingExecutionReview, Tr
   },
   onPlanLoaded(plan, review) {
     hydrateExecutionDrafts(plan, review)
+  }
+})
+
+const reviewSaveController = createReviewSaveController<ReviewSaveSnapshot>({
+  save(snapshot) {
+    return updateTradingExecutionReview(
+      snapshot.tradeDate,
+      snapshot.payload,
+      snapshot.planId
+    )
+  },
+  reload(snapshot) {
+    return reviewController.load(snapshot.tradeDate)
+  },
+  success() {
+    ElMessage.success('人工执行记录已保存')
+  },
+  failure(error) {
+    ElMessage.error(`执行记录保存失败：${errorMessage(error)}`)
+  },
+  updatePending(pending) {
+    reviewSaving.value = pending
   }
 })
 
@@ -868,6 +915,7 @@ async function loadRules() {
 }
 
 async function loadReviewDomain() {
+  if (reviewSaving.value) return
   await reviewController.load(reviewDate.value)
 }
 
@@ -907,15 +955,18 @@ function hydrateExecutionDrafts(plan: TradingPlanVersion, review: TradingExecuti
 }
 
 function selectReviewRow(row: TradingExecutionReview) {
+  if (reviewSaving.value) return
   if (selectedReviewPlanId.value === row.plan_version_id) return
   void reviewController.select(row.plan_version_id)
 }
 
 function addUnplannedExecution() {
+  if (reviewSaving.value) return
   unplannedDrafts.value.push({ key: ++unplannedKey, stock_code: '', stock_name: '' })
 }
 
 function removeUnplannedExecution(index: number) {
+  if (reviewSaving.value) return
   unplannedDrafts.value.splice(index, 1)
 }
 
@@ -963,7 +1014,10 @@ async function submitRevision() {
   revisionError.value = null
   let revision
   try {
-    revision = buildPlanRevision(revisionChangeNote.value, revisionDrafts.value)
+    revision = buildPlanRevision(revisionChangeNote.value, revisionDrafts.value, {
+      source_trade_date: plan.source_trade_date,
+      target_trade_date: plan.target_trade_date
+    })
   } catch (error) {
     revisionError.value = errorMessage(error)
     return
@@ -982,26 +1036,23 @@ async function acknowledge(alertId: number) {
 }
 
 async function saveExecutionReview() {
-  if (!reviewEditorReady.value) return
-  reviewSaving.value = true
-  try {
-    await saveReviewIfEditable(
-      selectedReview.value,
-      reviewPlan.value,
-      reviewPlanLoading.value,
-      async () => {
-        const payload = buildManualExecutionUpdate(reviewDate.value, plannedDrafts.value, unplannedDrafts.value)
-        const planId = restrictReviewToPlan.value ? selectedReview.value?.plan_version_id : undefined
-        await updateTradingExecutionReview(reviewDate.value, payload, planId)
-        await loadReviewDomain()
-        ElMessage.success('人工执行记录已保存')
-      }
-    )
-  } catch (error) {
-    ElMessage.error(`执行记录保存失败：${errorMessage(error)}`)
-  } finally {
-    reviewSaving.value = false
-  }
+  if (reviewSaving.value || !reviewEditorReady.value) return
+  const review = selectedReview.value
+  const plan = reviewPlan.value
+  if (!review || !plan || !canEditReview(review, plan, reviewPlanLoading.value)) return
+  const reviewPlanId = review.plan_version_id
+  await reviewSaveController.run(() => {
+    const tradeDate = reviewDate.value
+    return {
+      tradeDate,
+      planId: restrictReviewToPlan.value ? reviewPlanId : undefined,
+      payload: buildManualExecutionUpdate(
+        tradeDate,
+        plannedDrafts.value,
+        unplannedDrafts.value
+      )
+    }
+  })
 }
 
 function syncSettingsDraft() {

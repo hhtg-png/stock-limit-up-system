@@ -54,6 +54,39 @@ export async function saveReviewIfEditable(
   return true
 }
 
+interface ReviewSaveDependencies<T> {
+  save: (snapshot: T) => Promise<unknown>
+  reload: (snapshot: T) => Promise<unknown>
+  success: (snapshot: T) => void
+  failure: (error: unknown) => void
+  updatePending: (pending: boolean) => void
+}
+
+export function createReviewSaveController<T>(dependencies: ReviewSaveDependencies<T>) {
+  let pending = false
+
+  async function run(capture: () => T) {
+    if (pending) return false
+    pending = true
+    dependencies.updatePending(true)
+    try {
+      const snapshot = capture()
+      await dependencies.save(snapshot)
+      await dependencies.reload(snapshot)
+      dependencies.success(snapshot)
+      return true
+    } catch (error) {
+      dependencies.failure(error)
+      return false
+    } finally {
+      pending = false
+      dependencies.updatePending(false)
+    }
+  }
+
+  return { run }
+}
+
 export function createReviewDomainController<
   R extends ReviewSummaryLike,
   P extends ReviewPlanLike
@@ -227,11 +260,19 @@ export async function runAndClearErrorOnSuccess<T>(
 
 export interface CandidateRevisionDraft {
   candidate_id: number
+  current_entry: Record<string, unknown>
+  current_invalidation: Record<string, unknown>
+  current_exit: Record<string, unknown>
   action_trade_date?: string
   manual_note?: string
   entry_trigger_text?: string
   invalidation_text?: string
   exit_trigger_text?: string
+}
+
+export interface PlanRevisionContext {
+  source_trade_date: string
+  target_trade_date: string
 }
 
 const triggerFields = new Set([
@@ -286,7 +327,40 @@ function parseTrigger(
       throw new Error(`${label}.${key}数值无效`)
     }
   }
+  if (
+    field === 'entry_trigger' &&
+    typeof trigger.change_pct_gte === 'number' &&
+    (trigger.change_pct_gte < 0 || trigger.change_pct_gte > 100)
+  ) {
+    throw new Error('触发条件.change_pct_gte 必须在 0 到 100')
+  }
+  if (
+    field === 'exit_trigger' &&
+    typeof trigger.change_pct_lte === 'number' &&
+    (trigger.change_pct_lte < -100 || trigger.change_pct_lte > 0)
+  ) {
+    throw new Error('退出条件.change_pct_lte 必须在 -100 到 0')
+  }
   return Object.keys(trigger).length ? trigger : undefined
+}
+
+function validateMergedTriggerBounds(
+  current: Record<string, unknown>,
+  override: Record<string, unknown>,
+  label: string
+) {
+  const merged = { ...current, ...override }
+  for (const [prefix, name] of [['price', '价格'], ['change_pct', '涨跌幅']] as const) {
+    const lower = merged[`${prefix}_gte`]
+    const upper = merged[`${prefix}_lte`]
+    if (
+      typeof lower === 'number' && Number.isFinite(lower) &&
+      typeof upper === 'number' && Number.isFinite(upper) &&
+      lower > upper
+    ) {
+      throw new Error(`${label}合并后的${name}下限不能大于上限`)
+    }
+  }
 }
 
 function canonicalDate(value: string) {
@@ -297,7 +371,8 @@ function canonicalDate(value: string) {
 
 export function buildPlanRevision(
   changeNote: string,
-  drafts: CandidateRevisionDraft[]
+  drafts: CandidateRevisionDraft[],
+  context: PlanRevisionContext
 ): TradingPlanRevision {
   const note = changeNote.trim()
   if (!note || note.length > 500) throw new Error('修订说明必填且不能超过 500 字')
@@ -314,6 +389,9 @@ export function buildPlanRevision(
     const actionDate = draft.action_trade_date?.trim()
     if (actionDate) {
       if (!canonicalDate(actionDate)) throw new Error('行动交易日必须使用 YYYY-MM-DD')
+      if (![context.source_trade_date, context.target_trade_date].includes(actionDate)) {
+        throw new Error('行动交易日只能是预案来源日或目标日')
+      }
       override.action_trade_date = actionDate
     }
     const manualNote = draft.manual_note?.trim()
@@ -324,9 +402,18 @@ export function buildPlanRevision(
     const entry = parseTrigger(draft.entry_trigger_text, '触发条件', 'entry_trigger')
     const invalidation = parseTrigger(draft.invalidation_text, '失效条件', 'invalidation')
     const exit = parseTrigger(draft.exit_trigger_text, '退出条件', 'exit_trigger')
-    if (entry) override.entry_trigger = entry
-    if (invalidation) override.invalidation = invalidation
-    if (exit) override.exit_trigger = exit
+    if (entry) {
+      validateMergedTriggerBounds(draft.current_entry, entry, '触发条件')
+      override.entry_trigger = entry
+    }
+    if (invalidation) {
+      validateMergedTriggerBounds(draft.current_invalidation, invalidation, '失效条件')
+      override.invalidation = invalidation
+    }
+    if (exit) {
+      validateMergedTriggerBounds(draft.current_exit, exit, '退出条件')
+      override.exit_trigger = exit
+    }
     if (Object.keys(override).length > 1) overrides.push(override)
   }
   if (!overrides.length) throw new Error('至少修改一项候选条件')
@@ -335,6 +422,8 @@ export function buildPlanRevision(
 
 interface RevisionChild {
   id: number
+  parent_plan_version_id?: number | null
+  status?: string
 }
 
 interface PlanRevisionDependencies {
@@ -355,8 +444,11 @@ export function createPlanRevisionController(dependencies: PlanRevisionDependenc
     dependencies.updatePending(true)
     try {
       const child = await dependencies.revise(planId, revision)
-      if (!Number.isInteger(child.id) || child.id <= 0) {
-        throw new Error('修订接口未返回有效子版本')
+      if (
+        !Number.isInteger(child.id) || child.id <= 0 || child.id === planId ||
+        child.parent_plan_version_id !== planId || child.status !== 'draft'
+      ) {
+        throw new Error('修订接口未返回有效草稿子版本')
       }
       await dependencies.reload()
       dependencies.select(child.id)

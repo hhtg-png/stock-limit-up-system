@@ -56,6 +56,7 @@ _ACTION_CONDITION_SPECS = (
 )
 _TERMINAL_ACTION_EVENT_TYPES = ("exit_triggered",)
 _ACTION_OUTBOX_DRAIN_BATCH_SIZE = 100
+_MONITOR_SCAN_BATCH_SIZE = 100
 _ISO_DATE_PATTERN = (
     r"^(?!0000)(?:"
     r"[0-9]{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12][0-9]|3[01])|"
@@ -470,6 +471,85 @@ class TradingPlaybookAlertService:
         quality = cls._plan_value(plan, "data_quality_json")
         return action_quality_ready(quality)
 
+    @classmethod
+    def _monitor_candidate_statement(
+        cls,
+        trade_date: date,
+        *,
+        after: tuple[int, int, int] | None = None,
+        limit: int,
+    ):
+        statement = (
+            select(TradingPlanVersion, TradingPlanCandidate)
+            .join(
+                TradingPlanCandidate,
+                TradingPlanCandidate.plan_version_id == TradingPlanVersion.id,
+            )
+            .where(
+                TradingPlanVersion.status == _MONITOR_PLAN_STATUS,
+                TradingPlanVersion.data_quality_json["status"].as_string()
+                == "ready",
+                TradingPlanCandidate.action_trade_date == trade_date,
+            )
+        )
+        if after is not None:
+            plan_id, rank, candidate_id = after
+            statement = statement.where(
+                or_(
+                    TradingPlanVersion.id < plan_id,
+                    and_(
+                        TradingPlanVersion.id == plan_id,
+                        TradingPlanCandidate.rank > rank,
+                    ),
+                    and_(
+                        TradingPlanVersion.id == plan_id,
+                        TradingPlanCandidate.rank == rank,
+                        TradingPlanCandidate.id > candidate_id,
+                    ),
+                )
+            )
+        return statement.order_by(
+            TradingPlanVersion.id.desc(),
+            TradingPlanCandidate.rank,
+            TradingPlanCandidate.id,
+        ).limit(max(int(limit), 1))
+
+    async def _load_monitor_candidates(self, db, trade_date: date):
+        rows: list[tuple[TradingPlanVersion, TradingPlanCandidate]] = []
+        after: tuple[int, int, int] | None = None
+        batch_limit = min(
+            _MONITOR_SCAN_BATCH_SIZE,
+            self.max_monitor_candidates + 1,
+        )
+        while len(rows) <= self.max_monitor_candidates:
+            batch = list(
+                (
+                    await db.execute(
+                        self._monitor_candidate_statement(
+                            trade_date,
+                            after=after,
+                            limit=batch_limit,
+                        )
+                    )
+                ).all()
+            )
+            if not batch:
+                break
+            for plan, candidate in batch:
+                if self._plan_action_quality_ready(plan):
+                    rows.append((plan, candidate))
+                    if len(rows) > self.max_monitor_candidates:
+                        break
+            if len(rows) > self.max_monitor_candidates or len(batch) < batch_limit:
+                break
+            last_plan, last_candidate = batch[-1]
+            after = (
+                last_plan.id,
+                last_candidate.rank,
+                last_candidate.id,
+            )
+        return rows
+
     async def monitor(self, db, now: datetime):
         """Evaluate today's confirmed candidate conditions from one batch quote."""
         if not isinstance(now, datetime):
@@ -511,36 +591,7 @@ class TradingPlaybookAlertService:
         if not self._is_continuous_trading_time(current):
             return drained_action_events
 
-        rows = list(
-            (
-                await db.execute(
-                    select(TradingPlanVersion, TradingPlanCandidate)
-                    .join(
-                        TradingPlanCandidate,
-                        TradingPlanCandidate.plan_version_id
-                        == TradingPlanVersion.id,
-                    )
-                    .where(
-                        TradingPlanVersion.status == _MONITOR_PLAN_STATUS,
-                        TradingPlanVersion.data_quality_json[
-                            "status"
-                        ].as_string()
-                        == "ready",
-                        TradingPlanCandidate.action_trade_date == trade_date,
-                    )
-                    .order_by(
-                        TradingPlanVersion.id.desc(),
-                        TradingPlanCandidate.rank,
-                        TradingPlanCandidate.id,
-                    )
-                )
-            ).all()
-        )
-        rows = [
-            (plan, candidate)
-            for plan, candidate in rows
-            if self._plan_action_quality_ready(plan)
-        ]
+        rows = await self._load_monitor_candidates(db, trade_date)
         if len(rows) > self.max_monitor_candidates:
             logger.warning(
                 "Trading playbook monitor candidate limit reached: {}",

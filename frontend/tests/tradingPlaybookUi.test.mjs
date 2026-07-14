@@ -94,6 +94,19 @@ test('page exposes loading, error, and empty states and keeps WeChat unavailable
   assert.match(view, /disabled[\s\S]*微信|微信[\s\S]*disabled/, 'WeChat control should be disabled')
 })
 
+test('review and revision editors freeze every captured input while saving', () => {
+  const view = read('src/views/TradingPlaybook.vue')
+  const reviewSection = view.slice(view.indexOf('<section class="panel review-panel"'), view.indexOf('<section class="panel settings-panel"'))
+  const disabledReviewBindings = reviewSection.match(/:disabled="[^"]*reviewSaving[^"]*"/g) || []
+
+  assert.match(view, /async function saveExecutionReview\(\)\s*{\s*if \(reviewSaving\.value \|\| !reviewEditorReady\.value\) return/)
+  assert.match(view, /function selectReviewRow[\s\S]{0,180}if \(reviewSaving\.value\) return/)
+  assert.ok(disabledReviewBindings.length >= 13, 'all review date, switches, fields, and mutation buttons must freeze')
+  assert.match(view, /<el-form[^>]*:disabled="revisionSaving"[^>]*class="revision-form"|<el-form[^>]*class="revision-form"[^>]*:disabled="revisionSaving"/)
+  assert.match(view, /v-model="targetPlanDate"[\s\S]{0,180}:disabled="revisionSaving"/)
+  assert.match(view, /class="timeline-version"[\s\S]{0,180}:disabled="revisionSaving"/)
+})
+
 test('Vue page compiles as a runtime module', async () => {
   await withFrontendModules(async server => {
     const module = await server.ssrLoadModule('/src/views/TradingPlaybook.vue')

@@ -2705,15 +2705,62 @@ class TradingPlaybookActionMonitorTests(unittest.IsolatedAsyncioTestCase):
         quote_api = _BatchQuoteAPI(
             {"000001": _fresh_quote("000001", 10.5)}
         )
+        candidate_queries = []
 
-        async with self.Session() as db:
-            await self._monitor_service(
-                _RecordingInAppChannel(),
-                quote_api=quote_api,
-                max_monitor_candidates=1,
-            ).monitor(db, self.now)
+        def capture_candidate_query(
+            _connection,
+            _cursor,
+            statement,
+            _parameters,
+            _context,
+            _executemany,
+        ):
+            if "JOIN trading_plan_candidates" in statement:
+                candidate_queries.append(statement)
+
+        event.listen(
+            self.engine.sync_engine,
+            "before_cursor_execute",
+            capture_candidate_query,
+        )
+        try:
+            async with self.Session() as db:
+                await self._monitor_service(
+                    _RecordingInAppChannel(),
+                    quote_api=quote_api,
+                    max_monitor_candidates=1,
+                ).monitor(db, self.now)
+        finally:
+            event.remove(
+                self.engine.sync_engine,
+                "before_cursor_execute",
+                capture_candidate_query,
+            )
 
         self.assertEqual(quote_api.calls, [["000001"]])
+        self.assertEqual(len(candidate_queries), 2)
+        self.assertTrue(
+            all(" LIMIT " in statement.upper() for statement in candidate_queries)
+        )
+
+    def test_monitor_candidate_keyset_statement_is_bounded_across_dialects(self):
+        service = self._monitor_service(
+            _RecordingInAppChannel(),
+            max_monitor_candidates=1,
+        )
+        statement = service._monitor_candidate_statement(
+            self.today,
+            after=(9, 2, 20),
+            limit=2,
+        )
+
+        for dialect in (sqlite.dialect(), postgresql.dialect()):
+            compiled = str(statement.compile(dialect=dialect))
+            with self.subTest(dialect=dialect.name):
+                self.assertIn("LIMIT", compiled.upper())
+                self.assertIn("trading_plan_versions.id <", compiled)
+                self.assertIn("trading_plan_candidates.rank >", compiled)
+                self.assertIn("trading_plan_candidates.id >", compiled)
 
     async def test_calendar_missing_failure_and_closed_days_stop_after_outbox_drain(self):
         from app.services.trading_playbook.alert_service import (
