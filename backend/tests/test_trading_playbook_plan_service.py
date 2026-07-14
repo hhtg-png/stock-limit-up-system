@@ -20,6 +20,7 @@ from app.models.trading_playbook import (
     TradingPlanVersion,
     TradingPlaybookSettings,
 )
+from app.models.stock import Stock
 from app.services.trading_playbook.domain import (
     CandidateSnapshot,
     DataQuality,
@@ -27,6 +28,10 @@ from app.services.trading_playbook.domain import (
     ModeEvaluation,
 )
 from app.services.trading_playbook.plan_service import TradingPlanService
+from app.services.trading_playbook.market_data import (
+    TradingPlaybookMarketDataProvider,
+)
+from app.services.trading_playbook.market_state import MarketStateAnalyzer
 from app.services.trading_playbook import serialization as serialization_module
 from app.services.trading_playbook.errors import (
     InvalidRequestError,
@@ -206,6 +211,85 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
             "after_close_barrier_timeout",
         )
         self.assertEqual(quality["warnings"], warnings)
+
+    async def test_forced_marker_survives_actual_market_data_analyzer_and_persistence(self):
+        class OneQuoteAPI:
+            async def get_quotes_batch(self, codes):
+                if "000001" not in codes:
+                    return {}
+                return {
+                    "000001": {
+                        "code": "000001",
+                        "name": "Pipeline Candidate",
+                        "price": 10,
+                        "pre_close": 9.5,
+                        "open": 9.8,
+                        "amount": 1000,
+                        "turnover_rate": 2,
+                        "bid1_price": 10,
+                        "bid1_volume": 100,
+                        "limit_up": 10.45,
+                        "datetime": "20260710144000",
+                    }
+                }
+
+        async def kline_loader(*_args, **_kwargs):
+            return [
+                {
+                    "date": SOURCE_DATE - timedelta(days=6 - index),
+                    "available_at": AS_OF - timedelta(days=6 - index),
+                    "close": close,
+                }
+                for index, close in enumerate(
+                    (8.0, 8.2, 8.4, 8.6, 8.8, 9.2)
+                )
+            ]
+
+        async with self.Session() as db:
+            db.add_all(
+                [
+                    Stock(
+                        stock_code=f"{index:06d}",
+                        stock_name=f"Pipeline {index}",
+                        market="SZ",
+                        is_st=0,
+                    )
+                    for index in range(1, 53)
+                ]
+            )
+            await db.commit()
+            raw_snapshot = await TradingPlaybookMarketDataProvider(
+                quote_api=OneQuoteAPI(),
+                kline_loader=kline_loader,
+                realtime_limit_up_loader=lambda _date: asyncio.sleep(
+                    0, result=[]
+                ),
+            ).build_market_snapshot(
+                db=db,
+                source_trade_date=SOURCE_DATE,
+                target_trade_date=SOURCE_DATE,
+                stage="preclose",
+                as_of=AS_OF,
+                force_degraded=True,
+                force_degraded_reason="after_close_barrier_timeout",
+            )
+            self.assertGreater(len(raw_snapshot.quality.warnings), 51)
+
+            analyzed_snapshot = MarketStateAnalyzer().enrich_snapshot(
+                raw_snapshot
+            )
+            payload = await self._generate(
+                db,
+                [_evaluation("leader", "000001")],
+                snapshot=analyzed_snapshot,
+            )
+
+        self.assertLessEqual(len(analyzed_snapshot.quality.warnings), 50)
+        self.assertTrue(payload["data_quality_json"]["forced_degraded"])
+        self.assertEqual(
+            payload["data_quality_json"]["degradation_reason"],
+            "after_close_barrier_timeout",
+        )
 
     async def test_generate_limits_unique_action_candidates_and_preserves_radar(self):
         evaluations = [

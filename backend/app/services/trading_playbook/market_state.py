@@ -707,6 +707,8 @@ class MarketStateAnalyzer:
             source=original.source,
             stale=original.stale,
             warnings=warnings,
+            forced_degraded=original.forced_degraded,
+            degradation_reason=original.degradation_reason,
         )
 
 
