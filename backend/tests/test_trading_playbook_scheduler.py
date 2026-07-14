@@ -342,6 +342,23 @@ class TradingPlaybookSchedulerStageTests(unittest.IsolatedAsyncioTestCase):
         )
         alert.monitor.assert_awaited_once_with(self.db, self.now)
 
+    async def test_existing_finalized_row_does_not_hide_incomplete_multi_plan_retry(self):
+        review = SimpleNamespace(build=AsyncMock())
+        self.scheduler.install_trading_playbook_review_service(review)
+        self.scheduler._playbook_review_exists.return_value = True
+
+        with patch(
+            "app.data_collectors.scheduler._get_cn_trading_dates",
+            return_value=[self.now.date(), self.now.date() + timedelta(days=1)],
+        ):
+            await self.scheduler._finalize_trading_playbook_review()
+
+        review.build.assert_awaited_once_with(
+            self.db,
+            self.now.date(),
+            finalized=True,
+        )
+
 
 class TradingPlaybookDataReadyBarrierTests(unittest.IsolatedAsyncioTestCase):
     def _scheduler(self, values, sleeps):
@@ -1306,6 +1323,13 @@ class TradingPlaybookCatchupTests(unittest.IsolatedAsyncioTestCase):
     async def test_1510_catches_up_review_when_missing(self):
         self.scheduler._playbook_review_exists.return_value = False
         await self._run(datetime.min.replace(hour=15, minute=10).time(), set())
+        self.scheduler._review_trading_playbook.assert_awaited_once_with()
+
+    async def test_1510_existing_row_still_allows_claim_based_partial_retry(self):
+        self.scheduler._playbook_review_exists.return_value = True
+
+        await self._run(datetime.min.replace(hour=15, minute=10).time(), set())
+
         self.scheduler._review_trading_playbook.assert_awaited_once_with()
 
     async def test_1530_catches_up_after_close_without_notifications(self):

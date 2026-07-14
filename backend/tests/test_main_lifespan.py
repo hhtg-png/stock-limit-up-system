@@ -120,6 +120,7 @@ class LifecycleScheduler:
     def __init__(self, *, start_error=None, calendar_error=None):
         self.orchestrator = None
         self.alert_service = None
+        self.review_service = None
         self.start_calls = 0
         self.stop_calls = 0
         self.reset_calls = 0
@@ -135,10 +136,14 @@ class LifecycleScheduler:
     def install_trading_playbook_alert_service(self, alert_service):
         self.alert_service = alert_service
 
+    def install_trading_playbook_review_service(self, review_service):
+        self.review_service = review_service
+
     def reset_trading_playbook_services(self):
         self.reset_calls += 1
         self.orchestrator = None
         self.alert_service = None
+        self.review_service = None
 
     def get_trading_calendar_service(self):
         return self.calendar
@@ -157,11 +162,15 @@ class MainLifespanTests(unittest.IsolatedAsyncioTestCase):
         trading_playbook_runtime.reset()
         if hasattr(app_main.app.state, "trading_playbook_orchestrator"):
             delattr(app_main.app.state, "trading_playbook_orchestrator")
+        if hasattr(app_main.app.state, "trading_playbook_review_service"):
+            delattr(app_main.app.state, "trading_playbook_review_service")
 
     def tearDown(self):
         trading_playbook_runtime.reset()
         if hasattr(app_main.app.state, "trading_playbook_orchestrator"):
             delattr(app_main.app.state, "trading_playbook_orchestrator")
+        if hasattr(app_main.app.state, "trading_playbook_review_service"):
+            delattr(app_main.app.state, "trading_playbook_review_service")
 
     @staticmethod
     def _lifecycle_patches(scheduler):
@@ -327,6 +336,70 @@ class MainLifespanTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
+    async def test_real_mounted_review_endpoint_uses_one_shared_startup_service_and_cleans_up(self):
+        scheduler = LifecycleScheduler()
+        orchestrator = types.SimpleNamespace(build_stage=AsyncMock())
+        review_payload = {
+            "id": 91,
+            "trade_date": "2026-07-14",
+            "plan_version_id": 7,
+            "signal_review_json": {},
+            "manual_execution_json": {"11": {"executed": False}},
+            "plan_compliance_json": {},
+            "outcome_snapshot_json": {},
+            "data_quality_json": {},
+            "generated_at": "2026-07-14T15:10:00+08:00",
+            "finalized_at": None,
+        }
+        review_service = types.SimpleNamespace(
+            build=AsyncMock(),
+            update_manual_execution=AsyncMock(return_value=review_payload),
+        )
+        patches = self._lifecycle_patches(scheduler)
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7], patch.object(
+            app_main.settings,
+            "TRADING_PLAYBOOK_ENABLED",
+            True,
+        ), patch.object(
+            app_main,
+            "build_production_trading_playbook_orchestrator",
+            return_value=orchestrator,
+        ), patch.object(
+            app_main,
+            "TradingPlaybookReviewService",
+            return_value=review_service,
+        ) as review_factory:
+            async with app_main.lifespan(app_main.app):
+                self.assertIs(scheduler.review_service, review_service)
+                self.assertIs(
+                    trading_playbook_runtime.get_review_service(),
+                    review_service,
+                )
+                self.assertIs(
+                    app_main.app.state.trading_playbook_review_service,
+                    review_service,
+                )
+                transport = httpx.ASGITransport(app=app_main.app)
+                async with httpx.AsyncClient(
+                    transport=transport,
+                    base_url="http://test",
+                ) as client:
+                    response = await client.put(
+                        "/api/v1/trading-playbook/reviews/2026-07-14",
+                        json={"executions": {"11": {"executed": False}}},
+                    )
+
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json(), review_payload)
+                review_service.update_manual_execution.assert_awaited_once()
+
+        review_factory.assert_called_once_with()
+        self.assertIsNone(scheduler.review_service)
+        self.assertIsNone(trading_playbook_runtime.get_review_service())
+        self.assertFalse(
+            hasattr(app_main.app.state, "trading_playbook_review_service")
+        )
+
     async def test_disabled_startup_keeps_generate_endpoint_controlled_503(self):
         scheduler = LifecycleScheduler()
         patches = self._lifecycle_patches(scheduler)
@@ -351,11 +424,18 @@ class MainLifespanTests(unittest.IsolatedAsyncioTestCase):
                             "stage": "after_close",
                         },
                     )
+                    review_response = await client.put(
+                        "/api/v1/trading-playbook/reviews/2026-07-14",
+                        json={"executions": {}},
+                    )
 
         self.assertEqual(response.status_code, 503)
+        self.assertEqual(review_response.status_code, 503)
         factory.assert_not_called()
         self.assertIsNone(scheduler.orchestrator)
         self.assertIsNone(trading_playbook_runtime.get_orchestrator())
+        self.assertIsNone(scheduler.review_service)
+        self.assertIsNone(trading_playbook_runtime.get_review_service())
 
     async def test_calendar_warm_failure_is_logged_and_startup_continues(self):
         scheduler = LifecycleScheduler(

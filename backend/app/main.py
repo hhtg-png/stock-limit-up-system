@@ -26,6 +26,9 @@ from app.services.trading_playbook.channels import (
     InAppTradingPlanAlertChannel,
 )
 from app.services.trading_playbook.runtime import trading_playbook_runtime
+from app.services.trading_playbook.review_service import (
+    TradingPlaybookReviewService,
+)
 from app.utils.time_utils import today_cn
 
 
@@ -38,6 +41,8 @@ def _clear_trading_playbook_runtime(app: FastAPI) -> None:
         delattr(app.state, "trading_playbook_calendar")
     if hasattr(app.state, "trading_playbook_alert_service"):
         delattr(app.state, "trading_playbook_alert_service")
+    if hasattr(app.state, "trading_playbook_review_service"):
+        delattr(app.state, "trading_playbook_review_service")
 
 
 @asynccontextmanager
@@ -71,9 +76,15 @@ async def lifespan(app: FastAPI):
                 trading_calendar=calendar,
             )
             data_scheduler.install_trading_playbook_alert_service(alert_service)
+            review_service = TradingPlaybookReviewService()
+            data_scheduler.install_trading_playbook_review_service(
+                review_service
+            )
             trading_playbook_runtime.install_orchestrator(orchestrator)
+            trading_playbook_runtime.install_review_service(review_service)
             app.state.trading_playbook_orchestrator = orchestrator
             app.state.trading_playbook_alert_service = alert_service
+            app.state.trading_playbook_review_service = review_service
             app.state.trading_playbook_calendar = calendar
 
         # 启动定时任务：盘中采集、盘后统计、市场复盘、每日分析

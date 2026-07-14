@@ -842,11 +842,6 @@ class DataScheduler:
         if not callable(getattr(service, "build", None)):
             logger.info("Trading playbook review service is not installed")
             return None
-        if await self._playbook_review_exists(
-            review_date,
-            finalized=True,
-        ):
-            return None
         return await self._run_trading_playbook_review_phase(
             review_date,
             finalized=True,
@@ -1379,7 +1374,14 @@ class DataScheduler:
                 )
 
         if current_time >= time(15, 10):
-            if not await self._playbook_review_exists(today):
+            # The phase claim is the completeness gate.  One persisted row is
+            # not proof that every applicable plan review was written while
+            # the preliminary-review window is still open.  From 15:30 the
+            # final reconciliation below covers every applicable plan.
+            if (
+                current_time < time(15, 30)
+                or not await self._playbook_review_exists(today)
+            ):
                 await self._review_trading_playbook()
         if current_time >= time(15, 30):
             if not await self._playbook_stage_exists(
