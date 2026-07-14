@@ -38,6 +38,28 @@ class FakeScheduler:
         self.shutdown_called = True
 
 
+class LifecycleFakeScheduler(FakeScheduler):
+    def __init__(self, *, fail_start=False):
+        super().__init__()
+        self.fail_start = fail_start
+        self.running = False
+        self.remove_all_jobs_calls = 0
+
+    def start(self):
+        self.started = True
+        self.running = True
+        if self.fail_start:
+            raise RuntimeError("scheduler start failed")
+
+    def shutdown(self):
+        self.shutdown_called = True
+        self.running = False
+
+    def remove_all_jobs(self):
+        self.remove_all_jobs_calls += 1
+        self.jobs.clear()
+
+
 class AsyncSessionContext:
     def __init__(self, session):
         self.session = session
@@ -150,6 +172,68 @@ class TradingPlaybookSchedulerRegistrationTests(unittest.TestCase):
             )
         )
 
+    def test_failed_start_cleans_jobs_recreates_scheduler_and_can_retry(self):
+        created = []
+
+        def factory():
+            scheduler = LifecycleFakeScheduler(fail_start=not created)
+            created.append(scheduler)
+            return scheduler
+
+        scheduler = DataScheduler(scheduler_factory=factory)
+        first = scheduler.scheduler
+
+        with self.assertRaisesRegex(RuntimeError, "scheduler start failed"):
+            scheduler.start()
+
+        self.assertFalse(scheduler._is_running)
+        self.assertTrue(first.shutdown_called)
+        self.assertEqual(first.jobs, [])
+        self.assertIs(scheduler.scheduler, created[1])
+
+        scheduler.start()
+        ids = [job["id"] for job in scheduler.scheduler.jobs]
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertTrue(scheduler._is_running)
+
+    def test_real_scheduler_start_exception_clears_pending_jobs(self):
+        scheduler = DataScheduler()
+        first = scheduler.scheduler
+
+        with patch.object(
+            first,
+            "start",
+            side_effect=RuntimeError("real scheduler start failed"),
+        ), self.assertRaisesRegex(RuntimeError, "real scheduler start failed"):
+            scheduler.start()
+
+        self.assertEqual(first.get_jobs(), [])
+        self.assertFalse(scheduler._is_running)
+        self.assertIsNot(scheduler.scheduler, first)
+
+    def test_stop_recreates_scheduler_and_normal_restart_has_no_duplicate_jobs(self):
+        created = []
+
+        def factory():
+            scheduler = LifecycleFakeScheduler()
+            created.append(scheduler)
+            return scheduler
+
+        scheduler = DataScheduler(scheduler_factory=factory)
+        scheduler.start()
+        first = scheduler.scheduler
+
+        scheduler.stop()
+
+        self.assertTrue(first.shutdown_called)
+        self.assertEqual(first.jobs, [])
+        self.assertFalse(scheduler._is_running)
+        self.assertIs(scheduler.scheduler, created[1])
+
+        scheduler.start()
+        ids = [job["id"] for job in scheduler.scheduler.jobs]
+        self.assertEqual(len(ids), len(set(ids)))
+
 
 class TradingPlaybookSchedulerStageTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -257,13 +341,17 @@ class TradingPlaybookDataReadyBarrierTests(unittest.IsolatedAsyncioTestCase):
             side_effect=[ScalarResult(value) for value in values]
         )
 
+        monotonic = [0.0]
+
         async def record_sleep(seconds):
             sleeps.append(seconds)
+            monotonic[0] += seconds
 
         scheduler = DataScheduler(
             session_factory=lambda: AsyncSessionContext(db),
             now_provider=lambda: now,
             sleep=record_sleep,
+            monotonic=lambda: monotonic[0],
         )
         return scheduler, db
 
@@ -384,12 +472,16 @@ class TradingPlaybookDataReadyBarrierTests(unittest.IsolatedAsyncioTestCase):
 
         sleeps = []
 
+        monotonic = [0.0]
+
         async def record_sleep(seconds):
             sleeps.append(seconds)
+            monotonic[0] += seconds
 
         scheduler = DataScheduler(
             session_factory=lambda: FailingSession(db),
             sleep=record_sleep,
+            monotonic=lambda: monotonic[0],
         )
 
         ready = await scheduler._wait_for_trading_playbook_data(
@@ -399,6 +491,66 @@ class TradingPlaybookDataReadyBarrierTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(ready)
         self.assertEqual(sleeps, [10])
+        self.assertEqual(lifecycle["exited"], 1)
+
+    async def test_barrier_deadline_includes_query_time_before_sleep(self):
+        monotonic = [0.0]
+        sleeps = []
+        scheduler = DataScheduler(
+            monotonic=lambda: monotonic[0],
+            sleep=AsyncMock(),
+        )
+
+        async def slow_not_ready(_trade_date):
+            monotonic[0] += 7
+            return False
+
+        async def advance_sleep(seconds):
+            sleeps.append(seconds)
+            monotonic[0] += seconds
+
+        scheduler._trading_playbook_data_ready_once = slow_not_ready
+        scheduler._playbook_sleep = advance_sleep
+
+        ready = await scheduler._wait_for_trading_playbook_data(
+            date(2026, 7, 13),
+            timeout_seconds=12,
+            poll_seconds=10,
+        )
+
+        self.assertFalse(ready)
+        self.assertEqual(sleeps, [5])
+        self.assertEqual(monotonic[0], 12)
+
+    async def test_barrier_cancels_slow_query_and_closes_session_at_deadline(self):
+        lifecycle = {"exited": 0}
+
+        class SlowDb:
+            async def execute(self, _query):
+                await asyncio.Event().wait()
+
+        class SlowSession(AsyncSessionContext):
+            async def __aexit__(self, exc_type, exc, traceback):
+                lifecycle["exited"] += 1
+                return False
+
+        scheduler = DataScheduler(
+            session_factory=lambda: SlowSession(SlowDb()),
+        )
+        loop = asyncio.get_running_loop()
+        started_at = loop.time()
+
+        ready = await asyncio.wait_for(
+            scheduler._wait_for_trading_playbook_data(
+                date(2026, 7, 13),
+                timeout_seconds=0.05,
+                poll_seconds=0.01,
+            ),
+            timeout=0.25,
+        )
+
+        self.assertFalse(ready)
+        self.assertLess(loop.time() - started_at, 0.2)
         self.assertEqual(lifecycle["exited"], 1)
 
     async def test_after_close_timeout_builds_degraded_then_finalizes_in_order(self):
@@ -749,13 +901,19 @@ class TradingPlaybookForcedUpgradeTests(unittest.IsolatedAsyncioTestCase):
                 monitor=AsyncMock(),
             )
             review_service = SimpleNamespace(build=AsyncMock())
+            barrier_elapsed = [0.0]
+
+            async def advance_barrier(seconds):
+                barrier_elapsed[0] += seconds
+
             scheduler = DataScheduler(
                 trading_playbook_orchestrator=orchestrator,
                 trading_playbook_alert_service=alert_service,
                 trading_playbook_review_service=review_service,
                 session_factory=scheduler_maker,
                 now_provider=lambda: clock[0],
-                sleep=AsyncMock(),
+                sleep=advance_barrier,
+                monotonic=lambda: barrier_elapsed[0],
             )
 
             try:

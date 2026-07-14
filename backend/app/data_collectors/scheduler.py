@@ -100,8 +100,11 @@ class DataScheduler:
         calendar_service: Optional[TradingCalendarService] = None,
         job_claim_service: Optional[TradingPlaybookJobClaimService] = None,
         claim_owner: Optional[str] = None,
+        scheduler_factory: Optional[Callable[[], Any]] = None,
+        monotonic: Optional[Callable[[], float]] = None,
     ):
-        self.scheduler = AsyncIOScheduler()
+        self._scheduler_factory = scheduler_factory or AsyncIOScheduler
+        self.scheduler = self._scheduler_factory()
         self._is_running = False
         self._trading_playbook_orchestrator = trading_playbook_orchestrator
         self._trading_playbook_alert_service = trading_playbook_alert_service
@@ -111,6 +114,7 @@ class DataScheduler:
             lambda: datetime.now(CN_TZ)
         )
         self._playbook_sleep = sleep or asyncio.sleep
+        self._playbook_monotonic = monotonic
         self._playbook_calendar = calendar_service or TradingCalendarService(
             loader=lambda start, end: _get_cn_trading_dates(start, end),
             refresh_timeout_seconds=(
@@ -134,6 +138,17 @@ class DataScheduler:
         self._STOCKS_CACHE_TTL = 10  # 10秒刷新一次监控列表，优先跟随实时涨停池
     
     def start(self):
+        """Register and start all jobs, leaving a clean scheduler on failure."""
+        if self._is_running or self._scheduler_is_running(self.scheduler):
+            self._is_running = True
+            return
+        try:
+            self._start_registered_scheduler()
+        except BaseException:
+            self._replace_scheduler()
+            raise
+
+    def _start_registered_scheduler(self):
         """启动调度器"""
         if self._is_running:
             return
@@ -381,10 +396,37 @@ class DataScheduler:
     
     def stop(self):
         """停止调度器"""
-        if self._is_running:
-            self.scheduler.shutdown()
-            self._is_running = False
+        was_running = self._is_running or self._scheduler_is_running(
+            self.scheduler
+        )
+        self._replace_scheduler()
+        if was_running:
             logger.info("DataScheduler stopped")
+
+    @staticmethod
+    def _scheduler_is_running(scheduler: Any) -> bool:
+        try:
+            return bool(getattr(scheduler, "running", False))
+        except Exception:
+            return False
+
+    def _replace_scheduler(self) -> None:
+        scheduler = self.scheduler
+        remove_all_jobs = getattr(scheduler, "remove_all_jobs", None)
+        if callable(remove_all_jobs):
+            try:
+                remove_all_jobs()
+            except Exception as exc:
+                logger.warning("Unable to clear scheduler jobs: {}", exc)
+        if self._is_running or self._scheduler_is_running(scheduler):
+            shutdown = getattr(scheduler, "shutdown", None)
+            if callable(shutdown):
+                try:
+                    shutdown()
+                except Exception as exc:
+                    logger.warning("Unable to shutdown scheduler: {}", exc)
+        self._is_running = False
+        self.scheduler = self._scheduler_factory()
 
     def install_trading_playbook_orchestrator(self, orchestrator: Any) -> None:
         if not callable(getattr(orchestrator, "build_stage", None)):
@@ -845,25 +887,40 @@ class DataScheduler:
         self,
         trade_date: date,
         *,
-        timeout_seconds: int = 180,
-        poll_seconds: int = 10,
+        timeout_seconds: float = 180,
+        poll_seconds: float = 10,
     ) -> bool:
-        elapsed = 0
-        while elapsed < timeout_seconds:
+        clock = self._playbook_monotonic
+        if clock is None:
+            clock = asyncio.get_running_loop().time
+        deadline = clock() + max(float(timeout_seconds), 0.0)
+        while True:
+            remaining = deadline - clock()
+            if remaining <= 0:
+                break
             try:
-                if await self._trading_playbook_data_ready_once(trade_date):
+                ready = await asyncio.wait_for(
+                    self._trading_playbook_data_ready_once(trade_date),
+                    timeout=min(10.0, remaining),
+                )
+                if ready:
                     return True
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Trading playbook data-ready poll timed out for {}",
+                    trade_date,
+                )
             except Exception as exc:
                 logger.warning(
                     "Trading playbook data-ready poll failed for {}: {}",
                     trade_date,
                     exc,
                 )
-            wait_seconds = min(poll_seconds, timeout_seconds - elapsed, 10)
+            remaining = deadline - clock()
+            wait_seconds = min(float(poll_seconds), remaining, 10.0)
             if wait_seconds <= 0:
                 break
             await self._playbook_sleep(wait_seconds)
-            elapsed += wait_seconds
         return False
 
     async def _trading_playbook_data_ready_once(

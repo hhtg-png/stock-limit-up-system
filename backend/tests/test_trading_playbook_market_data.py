@@ -1894,6 +1894,151 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot.market_features["quote_requested_count"], 207)
         self.assertEqual(snapshot.market_features["quote_returned_count"], 207)
 
+    async def test_kline_stage_deadline_cancels_batch_and_preserves_required_candidates(
+        self,
+    ):
+        from app.services.trading_playbook.market_data import (
+            TradingPlaybookMarketDataProvider,
+        )
+
+        trade_date = date(2026, 7, 13)
+        as_of = datetime(2026, 7, 13, 14, 40)
+        ranked_codes = [f"{index:06d}" for index in range(200)]
+        realtime_code = "000200"
+        prior_plan_code = "000201"
+        review_only_code = "000202"
+        all_codes = ranked_codes + [
+            realtime_code,
+            prior_plan_code,
+            review_only_code,
+        ]
+        active_loads = set()
+
+        async with self.session_factory() as db:
+            stocks = [
+                Stock(
+                    stock_code=code,
+                    stock_name=f"Budget {code}",
+                    market="SZ",
+                    is_st=0,
+                )
+                for code in all_codes
+            ]
+            db.add_all(stocks)
+            prior_plan = TradingPlanVersion(
+                source_trade_date=trade_date,
+                target_trade_date=trade_date,
+                stage="preclose",
+                version_no=1,
+                status="draft",
+                input_hash="prior-budget-plan",
+                generated_at=as_of - timedelta(minutes=1),
+            )
+            db.add(prior_plan)
+            await db.flush()
+            stocks_by_code = {stock.stock_code: stock for stock in stocks}
+            db.add(
+                TradingPlanCandidate(
+                    plan_version_id=prior_plan.id,
+                    stock_code=prior_plan_code,
+                    stock_name="Prior Plan Required",
+                    action_trade_date=trade_date,
+                    primary_mode_key="leader",
+                    role="leader",
+                    rank=1,
+                    risk_level="trial",
+                )
+            )
+            db.add(
+                MarketReviewStockDaily(
+                    trade_date=trade_date,
+                    stock_id=stocks_by_code[review_only_code].id,
+                    stock_code=review_only_code,
+                    stock_name="Review History Required",
+                    today_touched_limit_up=True,
+                    limit_up_reason="review-only theme",
+                    created_at=as_of - timedelta(minutes=1),
+                    updated_at=as_of - timedelta(minutes=1),
+                )
+            )
+            await db.commit()
+
+            payload = {
+                code: {
+                    **_quote_payload(code, 10, "20260713144000"),
+                    "change_pct": 5 if code in ranked_codes else 0,
+                }
+                for code in all_codes
+            }
+
+            async def slow_kline(code, *args, **kwargs):
+                active_loads.add(code)
+                try:
+                    if code in {realtime_code, prior_plan_code}:
+                        return [
+                            {
+                                "date": trade_date - timedelta(days=6 - index),
+                                "close": close,
+                            }
+                            for index, close in enumerate(
+                                [10, 10.1, 10.2, 10.2, 10.3, 10.4]
+                            )
+                        ]
+                    await asyncio.sleep(1)
+                    return []
+                finally:
+                    active_loads.discard(code)
+
+            async def realtime_loader(_trade_date):
+                return [
+                    {
+                        "stock_code": realtime_code,
+                        "stock_name": "Realtime Required",
+                        "reason_category": "robotics",
+                        "updated_at": as_of - timedelta(seconds=1),
+                    }
+                ]
+
+            provider = TradingPlaybookMarketDataProvider(
+                quote_api=_FakeQuoteAPI(payload),
+                kline_loader=slow_kline,
+                max_concurrency=16,
+                realtime_limit_up_loader=realtime_loader,
+                kline_stage_timeout_seconds=0.05,
+            )
+            loop = asyncio.get_running_loop()
+            started_at = loop.time()
+            snapshot = await provider.build_market_snapshot(
+                db=db,
+                source_trade_date=trade_date,
+                target_trade_date=trade_date,
+                stage="preclose",
+                as_of=as_of,
+            )
+            elapsed = loop.time() - started_at
+
+        candidates = {row.stock_code: row for row in snapshot.candidates}
+        self.assertLess(elapsed, 0.3)
+        self.assertIn(realtime_code, candidates)
+        self.assertIn(prior_plan_code, candidates)
+        self.assertIn(review_only_code, candidates)
+        self.assertEqual(
+            candidates[realtime_code].features["kline_quality"],
+            "ready",
+        )
+        self.assertEqual(
+            candidates[prior_plan_code].features["kline_quality"],
+            "ready",
+        )
+        kline_evidence = next(
+            item
+            for item in candidates[review_only_code].evidence
+            if item["source"] == "kline"
+        )
+        self.assertEqual(kline_evidence["quality"], "missing")
+        self.assertEqual(kline_evidence["reason"], "kline stage deadline exceeded")
+        self.assertEqual(active_loads, set())
+
     async def test_auction_window_adds_facts_and_theme_rank_without_fake_zeros(self):
         from app.services.trading_playbook.market_data import (
             TradingPlaybookMarketDataProvider,

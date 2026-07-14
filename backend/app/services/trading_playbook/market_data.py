@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import desc, select
 
+from app.config import settings
 from app.models.market_review import MarketReviewStockDaily
 from app.models.stock import Stock
 from app.models.trading_playbook import TradingPlanCandidate, TradingPlanVersion
@@ -70,6 +71,7 @@ class TradingPlaybookMarketDataProvider:
         max_concurrency: int = 4,
         realtime_limit_up_loader: Optional[Callable[..., Any]] = None,
         full_market_context_loader: Optional[Callable[..., Any]] = None,
+        kline_stage_timeout_seconds: Optional[float] = None,
     ):
         self.quote_api = quote_api
         self.quote_client = quote_api
@@ -81,6 +83,12 @@ class TradingPlaybookMarketDataProvider:
         )
         self.realtime_limit_up_loader = realtime_limit_up_loader
         self.full_market_context_loader = full_market_context_loader
+        timeout = (
+            settings.TRADING_PLAYBOOK_KLINE_STAGE_TIMEOUT_SECONDS
+            if kline_stage_timeout_seconds is None
+            else kline_stage_timeout_seconds
+        )
+        self.kline_stage_timeout_seconds = max(float(timeout), 0.0)
         self._previous_prices: Dict[str, _QuoteCacheRecord] = {}
         self._quote_state_lock = asyncio.Lock()
         self._quote_semaphore = asyncio.Semaphore(self.max_concurrency)
@@ -706,11 +714,14 @@ class TradingPlaybookMarketDataProvider:
             quote.stock_code: rank
             for rank, quote in enumerate(speed_order, start=1)
         }
-        candidate_codes = {
+        quote_candidate_codes = {
             quote.stock_code for quote in change_order[:200]
         } | {
             quote.stock_code for quote in speed_order[:200]
         }
+        candidate_codes = set(quote_candidate_codes)
+        realtime_candidate_codes = set()
+        plan_candidate_codes = set()
         warnings = list(quote_snapshot.quality.warnings)
         if context_warning:
             warnings.append(context_warning)
@@ -769,6 +780,7 @@ class TradingPlaybookMarketDataProvider:
                     as_of,
                 )
                 candidate_codes.add(code)
+                realtime_candidate_codes.add(code)
 
         review_dates_result = await db.execute(
             select(MarketReviewStockDaily.trade_date)
@@ -874,8 +886,19 @@ class TradingPlaybookMarketDataProvider:
             if code in stock_by_code:
                 plan_by_code.setdefault(code, (candidate, plan_version))
                 candidate_codes.add(code)
+                plan_candidate_codes.add(code)
 
         candidate_codes.intersection_update(stock_by_code)
+        required_codes = (
+            realtime_candidate_codes | plan_candidate_codes
+        ) & candidate_codes
+        quote_priority_codes = quote_candidate_codes & candidate_codes
+        review_only_codes = candidate_codes - required_codes - quote_priority_codes
+        kline_load_order = (
+            sorted(required_codes)
+            + sorted(quote_priority_codes - required_codes)
+            + sorted(review_only_codes)
+        )
         ordered_candidate_codes = sorted(candidate_codes)
         async def load_kline(code: str) -> Tuple[str, _KlineBuildResult]:
             stock = stock_by_code[code]
@@ -887,10 +910,50 @@ class TradingPlaybookMarketDataProvider:
                 as_of,
             )
 
-        kline_pairs = await asyncio.gather(
-            *(load_kline(code) for code in ordered_candidate_codes)
-        )
-        kline_by_code = dict(kline_pairs)
+        kline_tasks = {
+            asyncio.create_task(load_kline(code)): code
+            for code in kline_load_order
+        }
+        done: set = set()
+        pending: set = set()
+        try:
+            if kline_tasks:
+                done, pending = await asyncio.wait(
+                    kline_tasks,
+                    timeout=self.kline_stage_timeout_seconds,
+                )
+        except BaseException:
+            for task in kline_tasks:
+                task.cancel()
+            if kline_tasks:
+                await asyncio.gather(*kline_tasks, return_exceptions=True)
+            raise
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+        missing_kline = self._calculate_kline_features([])
+        kline_by_code: Dict[str, _KlineBuildResult] = {
+            kline_tasks[task]: _KlineBuildResult(
+                dict(missing_kline),
+                None,
+                "kline stage deadline exceeded",
+            )
+            for task in pending
+        }
+        for task in done:
+            code = kline_tasks[task]
+            try:
+                result_code, result = task.result()
+            except Exception as exc:
+                kline_by_code[code] = _KlineBuildResult(
+                    dict(missing_kline),
+                    None,
+                    f"kline task failed: {exc}",
+                )
+            else:
+                kline_by_code[result_code] = result
         market_context, market_context_evidence, completion_warning = (
             self._complete_market_context(
                 market_context,
