@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import inspect
+import json
 import math
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime
@@ -350,26 +352,79 @@ class TradingPlaybookReviewService:
         db,
         trade_date: date,
         finalized: bool = False,
+        *,
+        plan_version_id: Optional[int] = None,
     ) -> list[TradingExecutionReview]:
         """Create preliminary rows or reconcile final facts into those rows."""
         if isinstance(trade_date, datetime) or not isinstance(trade_date, date):
             raise InvalidRequestError("trade_date must be a date")
         if not isinstance(finalized, bool):
             raise InvalidRequestError("finalized must be a boolean")
-        plan_ids = await self._relevant_plan_ids(db, trade_date)
+        plan_ids = await self._selected_plan_ids(
+            db,
+            trade_date,
+            plan_version_id=plan_version_id,
+        )
+        review_rows: dict[int, TradingExecutionReview] = {}
+        for plan_id in plan_ids:
+            review_rows[plan_id] = await self._ensure_review(
+                db,
+                trade_date,
+                plan_id,
+            )
+        pending_plan_ids = [
+            plan_id
+            for plan_id, row in review_rows.items()
+            if row.finalized_at is None
+        ]
+        facts_by_plan, loaded_outcomes = await self._batch_review_inputs(
+            db,
+            pending_plan_ids,
+            trade_date,
+        )
+        plan_snapshots = {
+            row.id: {
+                "id": row.id,
+                "source_trade_date": row.source_trade_date,
+                "target_trade_date": row.target_trade_date,
+                "stage": row.stage,
+                "status": row.status,
+            }
+            for row in (
+                (
+                    await db.execute(
+                        select(
+                            TradingPlanVersion.id,
+                            TradingPlanVersion.source_trade_date,
+                            TradingPlanVersion.target_trade_date,
+                            TradingPlanVersion.stage,
+                            TradingPlanVersion.status,
+                        ).where(
+                            TradingPlanVersion.id.in_(plan_ids)
+                        )
+                    )
+                ).all()
+                if plan_ids and self._alert_service is not None
+                else []
+            )
+        }
         rows: list[TradingExecutionReview] = []
         for plan_id in plan_ids:
-            row = await self._ensure_review(db, trade_date, plan_id)
+            row = review_rows[plan_id]
             reconciled = await self._reconcile_review(
                 db,
                 row.id,
                 trade_date,
                 plan_id,
                 finalized=finalized,
+                prefetched=(
+                    *facts_by_plan.get(plan_id, ([], [], [])),
+                    loaded_outcomes,
+                ),
             )
             rows.append(reconciled)
             if self._alert_service is not None:
-                plan = await db.get(TradingPlanVersion, plan_id)
+                plan = plan_snapshots.get(plan_id)
                 if plan is None:
                     raise PlaybookNotFoundError("review plan not found")
                 await self._alert_service.notify_review_ready(
@@ -379,6 +434,32 @@ class TradingPlaybookReviewService:
                     send=True,
                 )
         return rows
+
+    async def generation_key(
+        self,
+        db,
+        trade_date: date,
+        *,
+        plan_version_id: Optional[int] = None,
+    ) -> str:
+        """Return a stable full hash for the exact relevant plan selection."""
+        if isinstance(trade_date, datetime) or not isinstance(trade_date, date):
+            raise InvalidRequestError("trade_date must be a date")
+        plan_ids = await self._selected_plan_ids(
+            db,
+            trade_date,
+            plan_version_id=plan_version_id,
+        )
+        payload = json.dumps(
+            {
+                "scope": "target" if plan_version_id is not None else "all",
+                "trade_date": trade_date.isoformat(),
+                "plan_version_ids": plan_ids,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     async def update_manual_execution(
         self,
@@ -563,6 +644,108 @@ class TradingPlaybookReviewService:
             ).all()
         )
 
+    async def _selected_plan_ids(
+        self,
+        db,
+        trade_date: date,
+        *,
+        plan_version_id: Optional[int],
+    ) -> list[int]:
+        if plan_version_id is not None and (
+            isinstance(plan_version_id, bool)
+            or not isinstance(plan_version_id, int)
+            or plan_version_id <= 0
+        ):
+            raise InvalidRequestError("plan_version_id must be positive")
+        plan_ids = await self._relevant_plan_ids(db, trade_date)
+        if plan_version_id is None:
+            return plan_ids
+        if plan_version_id not in plan_ids:
+            raise PlaybookNotFoundError(
+                "plan is not relevant to the review trade date"
+            )
+        return [plan_version_id]
+
+    async def _batch_review_inputs(
+        self,
+        db,
+        plan_ids: Sequence[int],
+        trade_date: date,
+    ) -> tuple[
+        dict[
+            int,
+            tuple[
+                list[TradingPlanCandidate],
+                list[TradingAlertEvent],
+                list[dict[str, Any]],
+            ],
+        ],
+        list[Any],
+    ]:
+        grouped: dict[
+            int,
+            tuple[
+                list[TradingPlanCandidate],
+                list[TradingAlertEvent],
+                list[dict[str, Any]],
+            ],
+        ] = {plan_id: ([], [], []) for plan_id in plan_ids}
+        if not plan_ids:
+            return grouped, []
+        candidates = list(
+            (
+                await db.scalars(
+                    select(TradingPlanCandidate)
+                    .where(
+                        TradingPlanCandidate.plan_version_id.in_(plan_ids),
+                        TradingPlanCandidate.action_trade_date == trade_date,
+                    )
+                    .order_by(
+                        TradingPlanCandidate.plan_version_id,
+                        TradingPlanCandidate.rank,
+                        TradingPlanCandidate.id,
+                    )
+                )
+            ).all()
+        )
+        candidate_ids: list[int] = []
+        for candidate in candidates:
+            candidate_ids.append(candidate.id)
+            grouped[candidate.plan_version_id][0].append(candidate)
+        if candidate_ids:
+            persisted_events = list(
+                (
+                    await db.scalars(
+                        select(TradingAlertEvent)
+                        .where(
+                            TradingAlertEvent.plan_version_id.in_(plan_ids),
+                            TradingAlertEvent.candidate_id.in_(candidate_ids),
+                        )
+                        .order_by(
+                            TradingAlertEvent.plan_version_id,
+                            TradingAlertEvent.triggered_at,
+                            TradingAlertEvent.id,
+                        )
+                    )
+                ).all()
+            )
+            events_by_plan = {plan_id: [] for plan_id in plan_ids}
+            for event in persisted_events:
+                if event.plan_version_id in events_by_plan:
+                    events_by_plan[event.plan_version_id].append(event)
+            for plan_id, plan_events in events_by_plan.items():
+                valid, warnings = self._filter_events(plan_events, trade_date)
+                grouped[plan_id][1].extend(valid)
+                grouped[plan_id][2].extend(warnings)
+        stock_codes = [candidate.stock_code for candidate in candidates]
+        loaded_outcomes: list[Any] = []
+        if stock_codes:
+            loaded = self._outcome_loader(db, trade_date, stock_codes)
+            if inspect.isawaitable(loaded):
+                loaded = await loaded
+            loaded_outcomes = list(loaded or [])
+        return grouped, loaded_outcomes
+
     async def _ensure_review(
         self,
         db,
@@ -606,7 +789,16 @@ class TradingPlaybookReviewService:
         plan_id: int,
         *,
         finalized: bool,
+        prefetched: Optional[
+            tuple[
+                Sequence[TradingPlanCandidate],
+                Sequence[TradingAlertEvent],
+                Sequence[Mapping[str, Any]],
+                Sequence[Any],
+            ]
+        ] = None,
     ) -> TradingExecutionReview:
+        current_prefetched = prefetched
         for attempt in range(_MAX_WRITE_ATTEMPTS):
             try:
                 uses_row_lock = db.get_bind().dialect.name == "postgresql"
@@ -629,19 +821,46 @@ class TradingPlaybookReviewService:
                     if row.finalized_at is not None:
                         return row
                 old_manual = copy.deepcopy(row.manual_execution_json or {})
-                candidates, events, event_warnings = await self._review_inputs(
-                    db,
-                    plan_id,
-                    trade_date,
-                )
-                stock_codes = [candidate.stock_code for candidate in candidates]
-                loaded = self._outcome_loader(db, trade_date, stock_codes)
-                if inspect.isawaitable(loaded):
-                    loaded = await loaded
+                if current_prefetched is None:
+                    (
+                        candidates,
+                        events,
+                        event_warnings,
+                    ) = await self._review_inputs(
+                        db, plan_id, trade_date
+                    )
+                    stock_codes = [
+                        candidate.stock_code for candidate in candidates
+                    ]
+                    loaded = self._outcome_loader(
+                        db,
+                        trade_date,
+                        stock_codes,
+                    )
+                    if inspect.isawaitable(loaded):
+                        loaded = await loaded
+                    loaded_outcomes = list(loaded or [])
+                else:
+                    (
+                        raw_candidates,
+                        raw_events,
+                        raw_warnings,
+                        raw_outcomes,
+                    ) = current_prefetched
+                    candidates = list(raw_candidates)
+                    events = list(raw_events)
+                    event_warnings = [
+                        copy.deepcopy(dict(warning))
+                        for warning in raw_warnings
+                    ]
+                    loaded_outcomes = list(raw_outcomes)
+                stock_codes = [
+                    candidate.stock_code for candidate in candidates
+                ]
                 outcome_snapshot, data_quality = self._outcome_payload(
                     trade_date,
                     stock_codes,
-                    loaded or [],
+                    loaded_outcomes,
                     finalized=finalized,
                 )
                 data_quality["event_warnings"] = copy.deepcopy(
@@ -692,8 +911,10 @@ class TradingPlaybookReviewService:
                         raise PlaybookNotFoundError("review not found")
                     return refreshed
                 await db.rollback()
+                current_prefetched = None
             except OperationalError:
                 await db.rollback()
+                current_prefetched = None
                 if attempt + 1 >= _MAX_WRITE_ATTEMPTS:
                     raise
                 await asyncio.sleep(0)
@@ -734,6 +955,14 @@ class TradingPlaybookReviewService:
                 )
             ).all()
         )
+        events, warnings = self._filter_events(persisted_events, trade_date)
+        return candidates, events, warnings
+
+    @staticmethod
+    def _filter_events(
+        persisted_events: Sequence[TradingAlertEvent],
+        trade_date: date,
+    ) -> tuple[list[TradingAlertEvent], list[dict[str, Any]]]:
         events: list[TradingAlertEvent] = []
         warnings: list[dict[str, Any]] = []
         expected = trade_date.isoformat()
@@ -769,7 +998,7 @@ class TradingPlaybookReviewService:
                     "observed_trade_date": _json_value(raw_trade_date),
                 }
             )
-        return candidates, events, warnings
+        return events, warnings
 
     @classmethod
     def _outcome_payload(

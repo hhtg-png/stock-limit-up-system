@@ -703,7 +703,10 @@ class TradingPlaybookSchedulerClaimTests(unittest.IsolatedAsyncioTestCase):
                     )
 
             alert = SimpleNamespace(notify_plan_ready=AsyncMock())
-            review = SimpleNamespace(build=AsyncMock())
+            review = SimpleNamespace(
+                build=AsyncMock(),
+                generation_key=AsyncMock(return_value="stable-plan-set"),
+            )
             now = CN_TZ.localize(datetime(2026, 7, 13, 15, 30))
             schedulers = [
                 DataScheduler(
@@ -875,7 +878,7 @@ class TradingPlaybookSchedulerClaimTests(unittest.IsolatedAsyncioTestCase):
             {claim.generation_key for claim in notify_claims},
         )
 
-    async def test_multiple_after_close_plan_ids_finalize_trade_date_once(self):
+    async def test_targeted_finalization_keeps_plan_ids_in_claim_and_build(self):
         scheduler, engine, orchestrator, alert, review = await self._scheduler_fixture()
         try:
             await scheduler._finalize_trading_playbook_review(
@@ -889,12 +892,47 @@ class TradingPlaybookSchedulerClaimTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await engine.dispose()
 
-        self.assertEqual(review.build.await_count, 1)
-        review.build.assert_awaited_once_with(
-            unittest.mock.ANY,
-            date(2026, 7, 13),
-            finalized=True,
+        self.assertEqual(review.build.await_count, 2)
+        self.assertEqual(
+            review.build.await_args_list,
+            [
+                unittest.mock.call(
+                    unittest.mock.ANY,
+                    date(2026, 7, 13),
+                    finalized=True,
+                    plan_version_id=101,
+                ),
+                unittest.mock.call(
+                    unittest.mock.ANY,
+                    date(2026, 7, 13),
+                    finalized=True,
+                    plan_version_id=202,
+                ),
+            ],
         )
+
+    async def test_new_plan_set_after_completed_final_claim_runs_one_compensation(self):
+        scheduler, engine, _orchestrator, _alert, review = (
+            await self._scheduler_fixture()
+        )
+        review.generation_key = AsyncMock(
+            side_effect=["empty-plan-set", "plan-set-101", "plan-set-101"]
+        )
+        try:
+            await scheduler._finalize_trading_playbook_review(
+                date(2026, 7, 13)
+            )
+            await scheduler._finalize_trading_playbook_review(
+                date(2026, 7, 13)
+            )
+            await scheduler._finalize_trading_playbook_review(
+                date(2026, 7, 13)
+            )
+        finally:
+            await engine.dispose()
+
+        self.assertEqual(review.generation_key.await_count, 3)
+        self.assertEqual(review.build.await_count, 2)
 
     async def test_monitor_retries_failed_finalization_without_rebuild_or_renotify(self):
         scheduler, engine, orchestrator, alert, review = await self._scheduler_fixture(
@@ -1199,7 +1237,12 @@ class TradingPlaybookSchedulerClaimTests(unittest.IsolatedAsyncioTestCase):
             monitor=AsyncMock(),
         )
         review = SimpleNamespace(
-            build=AsyncMock(side_effect=review_side_effect)
+            build=AsyncMock(side_effect=review_side_effect),
+            generation_key=AsyncMock(
+                side_effect=lambda _db, _trade_date, *, plan_version_id=None: (
+                    f"fixture-plan-set:{plan_version_id or 'all'}"
+                )
+            ),
         )
         now = CN_TZ.localize(datetime(2026, 7, 13, 15, 35))
         scheduler = DataScheduler(

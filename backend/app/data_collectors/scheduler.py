@@ -845,6 +845,7 @@ class DataScheduler:
         return await self._run_trading_playbook_review_phase(
             review_date,
             finalized=True,
+            plan_version_id=plan_version_id,
         )
 
     async def _run_trading_playbook_review_phase(
@@ -860,8 +861,29 @@ class DataScheduler:
             logger.info("Trading playbook review service is not installed")
             return None
         phase = "finalize" if finalized else "initial_review"
-        generation_key = review_date.isoformat()
         async with self._playbook_sessions() as db:
+            generation = getattr(service, "generation_key", None)
+            if callable(generation):
+                generation_key = await generation(
+                    db,
+                    review_date,
+                    plan_version_id=plan_version_id,
+                )
+                if (
+                    not isinstance(generation_key, str)
+                    or not generation_key
+                    or len(generation_key) > 120
+                ):
+                    raise ValueError(
+                        "review generation key must contain 1 to 120 characters"
+                    )
+            else:
+                selection = (
+                    plan_version_id
+                    if plan_version_id is not None
+                    else "all"
+                )
+                generation_key = f"legacy:{review_date.isoformat()}:{selection}"
             token = await self._playbook_job_claims.claim(
                 db,
                 job_key=f"playbook:{phase}:{review_date}:{generation_key}",
@@ -875,9 +897,12 @@ class DataScheduler:
             if token is None:
                 return None
             try:
+                build_kwargs = {"finalized": finalized}
+                if plan_version_id is not None:
+                    build_kwargs["plan_version_id"] = plan_version_id
                 result = await self._run_with_playbook_claim(
                     token,
-                    lambda: build(db, review_date, finalized=finalized),
+                    lambda: build(db, review_date, **build_kwargs),
                 )
             except asyncio.CancelledError as exc:
                 await self._rollback_playbook_session(db)

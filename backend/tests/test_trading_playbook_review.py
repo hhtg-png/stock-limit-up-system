@@ -581,6 +581,151 @@ class TradingPlaybookReviewPersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row.data_quality_json["status"], "ready")
         self.assertNotIn("account_profit", json.dumps(row.signal_review_json))
 
+    async def test_generation_key_tracks_relevant_plan_set_and_target_validation(self):
+        service = TradingPlaybookReviewService()
+        async with self.sessions[0]() as db:
+            empty_key = await service.generation_key(db, TRADE_DATE)
+
+        plan_id, _ = await self._add_plan()
+        async with self.sessions[0]() as db:
+            first_key = await service.generation_key(db, TRADE_DATE)
+            repeated_key = await service.generation_key(db, TRADE_DATE)
+            targeted_key = await service.generation_key(
+                db,
+                TRADE_DATE,
+                plan_version_id=plan_id,
+            )
+            with self.assertRaises(PlaybookNotFoundError):
+                await service.generation_key(
+                    db,
+                    TRADE_DATE,
+                    plan_version_id=999999,
+                )
+
+        self.assertNotEqual(empty_key, first_key)
+        self.assertEqual(first_key, repeated_key)
+        self.assertNotEqual(empty_key, targeted_key)
+        self.assertEqual(len(first_key), 64)
+
+    async def test_targeted_build_only_reconciles_selected_relevant_plan(self):
+        first_plan_id, _ = await self._add_plan(
+            version_no=1,
+            stock_code="000001",
+        )
+        second_plan_id, _ = await self._add_plan(
+            version_no=2,
+            target_trade_date=TRADE_DATE + timedelta(days=1),
+            stock_code="000002",
+            action_trade_date=TRADE_DATE,
+        )
+        service = TradingPlaybookReviewService(now_provider=lambda: FINALIZED_AT)
+        async with self.sessions[0]() as db:
+            rows = await service.build(
+                db,
+                TRADE_DATE,
+                finalized=True,
+                plan_version_id=second_plan_id,
+            )
+
+        self.assertEqual([row.plan_version_id for row in rows], [second_plan_id])
+        async with self.sessions[0]() as db:
+            persisted = list(
+                (
+                    await db.scalars(
+                        select(TradingExecutionReview).order_by(
+                            TradingExecutionReview.plan_version_id
+                        )
+                    )
+                ).all()
+            )
+        self.assertEqual(
+            [row.plan_version_id for row in persisted],
+            [second_plan_id],
+        )
+        self.assertNotEqual(first_plan_id, second_plan_id)
+
+    async def test_new_plan_compensation_preserves_finalized_existing_review(self):
+        first_plan_id, _ = await self._add_plan(
+            version_no=1,
+            stock_code="000001",
+        )
+        await self._add_outcome(stock_code="000001")
+        service = TradingPlaybookReviewService(now_provider=lambda: FINALIZED_AT)
+        async with self.sessions[0]() as db:
+            first = (await service.build(db, TRADE_DATE, finalized=True))[0]
+            first_finalized_at = first.finalized_at
+            first_snapshot = copy.deepcopy(first.signal_review_json)
+
+        second_plan_id, _ = await self._add_plan(
+            version_no=2,
+            target_trade_date=TRADE_DATE + timedelta(days=1),
+            stock_code="000002",
+            action_trade_date=TRADE_DATE,
+        )
+        await self._add_outcome(stock_code="000002")
+        async with self.sessions[0]() as db:
+            compensated = await service.build(db, TRADE_DATE, finalized=True)
+        async with self.sessions[0]() as db:
+            repeated = await service.build(db, TRADE_DATE, finalized=True)
+
+        self.assertEqual(
+            [row.plan_version_id for row in compensated],
+            [first_plan_id, second_plan_id],
+        )
+        existing = next(
+            row for row in repeated if row.plan_version_id == first_plan_id
+        )
+        self.assertEqual(existing.finalized_at, first_finalized_at)
+        self.assertEqual(existing.signal_review_json, first_snapshot)
+        self.assertEqual(len(repeated), 2)
+
+    async def test_multi_plan_build_prefetches_major_facts_in_constant_queries(self):
+        for index, stock_code in enumerate(("000001", "000002", "000003")):
+            await self._add_plan(
+                version_no=index + 1,
+                target_trade_date=TRADE_DATE + timedelta(days=index),
+                stock_code=stock_code,
+                action_trade_date=TRADE_DATE,
+            )
+            await self._add_outcome(stock_code=stock_code)
+
+        counts = {"candidates": 0, "events": 0, "outcomes": 0}
+
+        def count_fact_queries(_conn, _cursor, statement, *_args):
+            normalized = " ".join(statement.lower().split())
+            if not normalized.startswith("select"):
+                return
+            if "from trading_plan_candidates" in normalized:
+                counts["candidates"] += 1
+            if "from trading_alert_events" in normalized:
+                counts["events"] += 1
+            if "from market_review_stock_daily" in normalized:
+                counts["outcomes"] += 1
+
+        event.listen(
+            self.engines[0].sync_engine,
+            "before_cursor_execute",
+            count_fact_queries,
+        )
+        try:
+            async with self.sessions[0]() as db:
+                rows = await TradingPlaybookReviewService().build(
+                    db,
+                    TRADE_DATE,
+                    finalized=True,
+                )
+        finally:
+            event.remove(
+                self.engines[0].sync_engine,
+                "before_cursor_execute",
+                count_fact_queries,
+            )
+
+        self.assertEqual(len(rows), 3)
+        self.assertLessEqual(counts["candidates"], 2)
+        self.assertEqual(counts["events"], 1)
+        self.assertEqual(counts["outcomes"], 1)
+
     async def test_successful_review_build_emits_review_ready_through_shared_alert_service(self):
         plan_id, _ = await self._add_plan()
         alert_service = type(
@@ -600,7 +745,7 @@ class TradingPlaybookReviewPersistenceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(alert_service.notify_review_ready.await_count, 2)
         for call in alert_service.notify_review_ready.await_args_list:
-            self.assertEqual(call.args[1].id, plan_id)
+            self.assertEqual(call.args[1]["id"], plan_id)
             self.assertEqual(call.args[2], TRADE_DATE)
             self.assertTrue(call.kwargs["send"])
 
