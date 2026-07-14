@@ -30,6 +30,7 @@ from app.services.realtime_limit_up_service import RealtimeLimitUpSnapshot
 from app.utils.time_utils import CN_TZ, now_cn
 
 from .channels import TradingPlanAlertChannel
+from .quality import action_quality_ready
 
 
 _PLAN_EVENT_TYPES = ("plan_ready", "confirmation_required")
@@ -467,11 +468,7 @@ class TradingPlaybookAlertService:
     @classmethod
     def _plan_action_quality_ready(cls, plan: Any) -> bool:
         quality = cls._plan_value(plan, "data_quality_json")
-        return (
-            isinstance(quality, Mapping)
-            and quality.get("status") == "ready"
-            and quality.get("stale") is not True
-        )
+        return action_quality_ready(quality)
 
     async def monitor(self, db, now: datetime):
         """Evaluate today's confirmed candidate conditions from one batch quote."""
@@ -529,10 +526,6 @@ class TradingPlaybookAlertService:
                             "status"
                         ].as_string()
                         == "ready",
-                        TradingPlanVersion.data_quality_json[
-                            "stale"
-                        ].as_boolean()
-                        .is_not(True),
                         TradingPlanCandidate.action_trade_date == trade_date,
                     )
                     .order_by(
@@ -540,7 +533,6 @@ class TradingPlaybookAlertService:
                         TradingPlanCandidate.rank,
                         TradingPlanCandidate.id,
                     )
-                    .limit(self.max_monitor_candidates + 1)
                 )
             ).all()
         )

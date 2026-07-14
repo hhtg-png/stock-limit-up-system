@@ -1348,29 +1348,45 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ValueError):
                 await self.service.confirm(db, other_active_id, "")
 
-    async def test_confirm_rejects_non_ready_or_stale_plan_quality(self):
+    async def test_confirm_enforces_strict_stale_compatibility_matrix(self):
         cases = [
-            ("degraded", _snapshot(quality_status="degraded")),
-            ("stale", _snapshot(stale=True)),
+            ("missing", {"status": "ready"}, True),
+            ("false", {"status": "ready", "stale": False}, True),
+            ("degraded", {"status": "degraded"}, False),
+            ("null", {"status": "ready", "stale": None}, False),
+            ("zero", {"status": "ready", "stale": 0}, False),
+            ("false-string", {"status": "ready", "stale": "false"}, False),
+            ("yes-string", {"status": "ready", "stale": "yes"}, False),
+            ("true", {"status": "ready", "stale": True}, False),
         ]
         async with self.Session() as db:
-            for case, snapshot in cases:
+            for case, quality, allowed in cases:
                 with self.subTest(case=case):
                     generated = await self._generate(
                         db,
                         [_evaluation(f"leader-{case}", "000001")],
-                        snapshot=snapshot,
                     )
-                    with self.assertRaisesRegex(
-                        InvalidTransitionError,
-                        "data quality",
-                    ):
-                        await self.service.confirm(
+                    plan = await db.get(TradingPlanVersion, generated["id"])
+                    plan.data_quality_json = quality
+                    await db.commit()
+                    if allowed:
+                        activated = await self.service.confirm(
                             db,
                             generated["id"],
                             "local-user",
                         )
-                    await db.rollback()
+                        self.assertEqual(activated["status"], "active")
+                    else:
+                        with self.assertRaisesRegex(
+                            InvalidTransitionError,
+                            "data quality",
+                        ):
+                            await self.service.confirm(
+                                db,
+                                generated["id"],
+                                "local-user",
+                            )
+                        await db.rollback()
 
     async def test_confirm_rolls_back_all_status_changes_when_commit_fails(self):
         async with self.Session() as db:

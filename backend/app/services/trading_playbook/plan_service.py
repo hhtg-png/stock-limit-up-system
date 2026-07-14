@@ -30,6 +30,7 @@ from .errors import (
     PlaybookNotFoundError,
     UpstreamUnavailableError,
 )
+from .quality import action_quality_ready
 from .serialization import (
     ValidatedSettingsPayload,
     json_value,
@@ -1806,12 +1807,7 @@ class TradingPlanService:
         expected_status = plan.status
         if expected_status not in {"draft", "confirmed"}:
             raise InvalidTransitionError("plan cannot be confirmed")
-        quality = plan.data_quality_json
-        if (
-            not isinstance(quality, Mapping)
-            or quality.get("status") != "ready"
-            or quality.get("stale") is True
-        ):
+        if not action_quality_ready(plan.data_quality_json):
             raise InvalidTransitionError(
                 "plan data quality does not allow action alerts"
             )

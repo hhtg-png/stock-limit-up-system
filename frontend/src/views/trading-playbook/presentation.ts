@@ -29,18 +29,21 @@ export interface UnplannedExecutionDraft {
 
 type PlanConfirmationState = Pick<TradingPlanVersion, 'status' | 'data_quality_json'>
 
-export function canEnableActionAlerts(plan: PlanConfirmationState | null | undefined) {
+function actionQualityReady(quality: unknown) {
+  if (!quality || typeof quality !== 'object' || Array.isArray(quality)) return false
+  const value = quality as Record<string, unknown>
   return (
-    plan?.status === 'draft' &&
-    plan.data_quality_json?.status === 'ready' &&
-    plan.data_quality_json.stale !== true
+    value.status === 'ready' &&
+    (!Object.prototype.hasOwnProperty.call(value, 'stale') || value.stale === false)
   )
 }
 
+export function canEnableActionAlerts(plan: PlanConfirmationState | null | undefined) {
+  return plan?.status === 'draft' && actionQualityReady(plan.data_quality_json)
+}
+
 export function isObservationOnly(plan: PlanConfirmationState | null | undefined) {
-  if (!plan) return true
-  const quality = plan.data_quality_json || { status: 'missing' }
-  return quality.status === 'missing' || quality.status === 'degraded' || quality.stale === true
+  return !plan || !actionQualityReady(plan.data_quality_json)
 }
 
 export function filterTradingAlerts<T extends Pick<TradingAlertEvent, 'acknowledged_at'>>(

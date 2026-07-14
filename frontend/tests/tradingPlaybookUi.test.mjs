@@ -111,10 +111,17 @@ test('presentation helpers implement confirmation, canonical inbox, and section 
     }
 
     assert.equal(helpers.canEnableActionAlerts(draft), true)
+    assert.equal(helpers.canEnableActionAlerts({ ...draft, data_quality_json: { status: 'ready', stale: false } }), true)
     assert.equal(helpers.canEnableActionAlerts({ ...draft, status: 'active' }), false)
     assert.equal(helpers.canEnableActionAlerts({ ...draft, data_quality_json: { status: 'missing' } }), false)
     assert.equal(helpers.canEnableActionAlerts({ ...draft, data_quality_json: { status: 'degraded' } }), false)
-    assert.equal(helpers.canEnableActionAlerts({ ...draft, data_quality_json: { status: 'ready', stale: true } }), false)
+    for (const stale of [null, 0, 'false', 'yes', true]) {
+      assert.equal(
+        helpers.canEnableActionAlerts({ ...draft, data_quality_json: { status: 'ready', stale } }),
+        false,
+        `explicit dirty stale=${String(stale)} must fail closed`
+      )
+    }
     assert.equal(helpers.canEnableActionAlerts(null), false)
 
     const alerts = [

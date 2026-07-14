@@ -2600,22 +2600,21 @@ class TradingPlaybookActionMonitorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(quote_api.calls, [])
         self.assertEqual(await self._events(), [])
 
-    async def test_monitor_skips_evaluation_and_outbox_for_unsafe_active_plan_quality(self):
+    async def test_monitor_skips_evaluation_and_outbox_for_strictly_unsafe_quality_matrix(self):
         cases = [
-            ("000001", "degraded", {"status": "degraded"}, self.today),
-            (
-                "000002",
-                "stale",
-                {"status": "ready", "stale": True},
-                date(2026, 7, 15),
-            ),
+            ("000001", "degraded", {"status": "degraded"}),
+            ("000002", "null", {"status": "ready", "stale": None}),
+            ("000003", "zero", {"status": "ready", "stale": 0}),
+            ("000004", "false-string", {"status": "ready", "stale": "false"}),
+            ("000005", "yes-string", {"status": "ready", "stale": "yes"}),
+            ("000006", "true", {"status": "ready", "stale": True}),
         ]
-        for stock_code, mode_key, quality, target_date in cases:
+        for offset, (stock_code, mode_key, quality) in enumerate(cases):
             plan_id, candidate_id = await self._create_candidate(
                 stock_code=stock_code,
                 mode_key=mode_key,
                 data_quality=quality,
-                target_trade_date=target_date,
+                target_trade_date=self.today + timedelta(days=offset),
             )
             await self._seed_action_event(
                 plan_id,
@@ -2624,10 +2623,7 @@ class TradingPlaybookActionMonitorTests(unittest.IsolatedAsyncioTestCase):
                 suffix=mode_key,
             )
         quote_api = _BatchQuoteAPI(
-            {
-                "000001": _fresh_quote("000001", 10.5),
-                "000002": _fresh_quote("000002", 10.5),
-            }
+            {stock_code: _fresh_quote(stock_code, 10.5) for stock_code, _, _ in cases}
         )
         channel = _RecordingInAppChannel()
 
@@ -2642,12 +2638,82 @@ class TradingPlaybookActionMonitorTests(unittest.IsolatedAsyncioTestCase):
         events = await self._events()
         self.assertEqual(
             [event.channel_status_json["in_app"]["status"] for event in events],
-            ["skipped", "skipped"],
+            ["skipped"] * len(cases),
         )
         self.assertEqual(
             {event.channel_status_json["in_app"]["reason"] for event in events},
             {"unsafe_plan_quality"},
         )
+
+    async def test_monitor_keeps_missing_or_strict_false_stale_quality_compatible(self):
+        cases = [
+            ("000001", "missing", {"status": "ready"}),
+            ("000002", "false", {"status": "ready", "stale": False}),
+        ]
+        seeded_event_ids = []
+        for offset, (stock_code, mode_key, quality) in enumerate(cases):
+            plan_id, candidate_id = await self._create_candidate(
+                stock_code=stock_code,
+                mode_key=mode_key,
+                data_quality=quality,
+                target_trade_date=self.today + timedelta(days=offset),
+            )
+            seeded_event_ids.append(
+                await self._seed_action_event(
+                    plan_id,
+                    candidate_id,
+                    action_date=self.today,
+                    suffix=mode_key,
+                )
+            )
+        quote_api = _BatchQuoteAPI(
+            {stock_code: _fresh_quote(stock_code, 10.5) for stock_code, _, _ in cases}
+        )
+        channel = _RecordingInAppChannel()
+
+        async with self.Session() as db:
+            await self._monitor_service(
+                channel,
+                quote_api=quote_api,
+            ).monitor(db, self.now)
+
+        self.assertEqual(quote_api.calls, [["000001", "000002"]])
+        events_by_id = {event.id: event for event in await self._events()}
+        self.assertEqual(
+            [
+                events_by_id[event_id].channel_status_json["in_app"]["status"]
+                for event_id in seeded_event_ids
+            ],
+            ["delivered", "delivered"],
+        )
+        self.assertGreaterEqual(len(channel.sends), 2)
+
+    async def test_unsafe_quality_rows_cannot_crowd_safe_rows_out_of_monitor_limit(self):
+        await self._create_candidate(
+            stock_code="000001",
+            mode_key="safe-oldest",
+            data_quality={"status": "ready"},
+            target_trade_date=self.today,
+        )
+        for offset, stale in enumerate((None, "false"), start=1):
+            await self._create_candidate(
+                stock_code=f"00000{offset + 1}",
+                mode_key=f"unsafe-newer-{offset}",
+                data_quality={"status": "ready", "stale": stale},
+                target_trade_date=self.today + timedelta(days=offset),
+            )
+        quote_api = _BatchQuoteAPI(
+            {"000001": _fresh_quote("000001", 10.5)}
+        )
+
+        async with self.Session() as db:
+            await self._monitor_service(
+                _RecordingInAppChannel(),
+                quote_api=quote_api,
+                max_monitor_candidates=1,
+            ).monitor(db, self.now)
+
+        self.assertEqual(quote_api.calls, [["000001"]])
 
     async def test_calendar_missing_failure_and_closed_days_stop_after_outbox_drain(self):
         from app.services.trading_playbook.alert_service import (
