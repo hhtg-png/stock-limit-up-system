@@ -239,6 +239,20 @@ class TradingPlaybookApiTests(unittest.TestCase):
                         dedup_key="old",
                         triggered_at=datetime(2026, 7, 10, 14, 40),
                         message="old",
+                        channel_status_json={
+                            "in_app": {"status": "pending"}
+                        },
+                    ),
+                    TradingAlertEvent(
+                        plan_version_id=plan.id,
+                        event_type="plan_ready",
+                        severity="info",
+                        dedup_key="middle",
+                        triggered_at=datetime(2026, 7, 10, 14, 50),
+                        message="middle",
+                        channel_status_json={
+                            "in_app": {"status": "sending"}
+                        },
                     ),
                     TradingAlertEvent(
                         plan_version_id=plan.id,
@@ -247,6 +261,9 @@ class TradingPlaybookApiTests(unittest.TestCase):
                         dedup_key="new",
                         triggered_at=datetime(2026, 7, 10, 15, 0),
                         message="new",
+                        channel_status_json={
+                            "in_app": {"status": "uncertain"}
+                        },
                     ),
                 ]
             )
@@ -1340,6 +1357,17 @@ class TradingPlaybookApiTests(unittest.TestCase):
         )
 
     def test_alerts_have_stable_pagination_filter_and_idempotent_ack(self):
+        all_items = self.client.get(
+            "/trading-playbook/alerts", params={"limit": 10, "offset": 0}
+        ).json()["items"]
+        statuses = {
+            item["dedup_key"]: item["channel_status_json"]["in_app"]["status"]
+            for item in all_items
+        }
+        self.assertEqual(
+            statuses,
+            {"old": "pending", "middle": "sending", "new": "uncertain"},
+        )
         response = self.client.get(
             "/trading-playbook/alerts", params={"limit": 1, "offset": 0}
         )

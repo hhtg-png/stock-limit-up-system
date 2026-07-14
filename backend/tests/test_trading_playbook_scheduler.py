@@ -254,7 +254,10 @@ class TradingPlaybookSchedulerStageTests(unittest.IsolatedAsyncioTestCase):
         self.scheduler._playbook_review_exists = AsyncMock(return_value=False)
 
     async def test_build_plan_uses_aware_china_now_same_session_and_notifies_when_installed(self):
-        alert_service = SimpleNamespace(notify_plan_ready=AsyncMock())
+        alert_service = SimpleNamespace(
+            durable_delivery=True,
+            notify_plan_ready=AsyncMock(),
+        )
         self.scheduler.install_trading_playbook_alert_service(alert_service)
 
         with patch(
@@ -281,7 +284,10 @@ class TradingPlaybookSchedulerStageTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_build_plan_skips_non_trading_day_and_never_notifies_backfill(self):
-        alert_service = SimpleNamespace(notify_plan_ready=AsyncMock())
+        alert_service = SimpleNamespace(
+            durable_delivery=True,
+            notify_plan_ready=AsyncMock(),
+        )
         self.scheduler.install_trading_playbook_alert_service(alert_service)
 
         with patch(
@@ -315,7 +321,7 @@ class TradingPlaybookSchedulerStageTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_configured_review_and_monitor_services_receive_same_db_and_now(self):
         review = SimpleNamespace(build=AsyncMock())
-        alert = SimpleNamespace(monitor=AsyncMock())
+        alert = SimpleNamespace(durable_delivery=True, monitor=AsyncMock())
         self.scheduler.install_trading_playbook_review_service(review)
         self.scheduler.install_trading_playbook_alert_service(alert)
 

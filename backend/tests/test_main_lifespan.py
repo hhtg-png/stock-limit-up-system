@@ -116,6 +116,7 @@ class LifecycleScheduler:
 
     def __init__(self, *, start_error=None, calendar_error=None):
         self.orchestrator = None
+        self.alert_service = None
         self.start_calls = 0
         self.stop_calls = 0
         self.reset_calls = 0
@@ -128,9 +129,13 @@ class LifecycleScheduler:
     def get_trading_playbook_orchestrator(self):
         return self.orchestrator
 
+    def install_trading_playbook_alert_service(self, alert_service):
+        self.alert_service = alert_service
+
     def reset_trading_playbook_services(self):
         self.reset_calls += 1
         self.orchestrator = None
+        self.alert_service = None
 
     def get_trading_calendar_service(self):
         return self.calendar
@@ -240,6 +245,11 @@ class MainLifespanTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIs(
                     app_main.app.state.trading_playbook_orchestrator,
                     sentinel,
+                )
+                self.assertTrue(scheduler.alert_service.durable_delivery)
+                self.assertIs(
+                    app_main.app.state.trading_playbook_alert_service,
+                    scheduler.alert_service,
                 )
                 transport = httpx.ASGITransport(app=app_main.app)
                 async with httpx.AsyncClient(

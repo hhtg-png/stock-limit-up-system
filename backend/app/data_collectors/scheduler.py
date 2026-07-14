@@ -438,6 +438,10 @@ class DataScheduler:
         self._trading_playbook_orchestrator = orchestrator
 
     def install_trading_playbook_alert_service(self, service: Any) -> None:
+        if getattr(service, "durable_delivery", None) is not True:
+            raise TypeError(
+                "alert service must declare durable_delivery=True"
+            )
         if not (
             callable(getattr(service, "notify_plan_ready", None))
             or callable(getattr(service, "monitor", None))

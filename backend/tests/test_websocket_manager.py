@@ -17,6 +17,7 @@ class WebSocketManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("tdx_stock_move_event", manager.message_types["client-1"])
         self.assertIn("tdx_news_event", manager.message_types["client-1"])
         self.assertIn("tdx_plate_strength_update", manager.message_types["client-1"])
+        self.assertIn("trading_plan_alert", manager.message_types["client-1"])
 
     async def test_broadcast_tdx_plugin_event_uses_plugin_message_type(self):
         manager = ConnectionManager()
@@ -30,6 +31,18 @@ class WebSocketManagerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(manager.broadcast.await_args.args[1], "tdx_limit_up_event")
         self.assertEqual(manager.broadcast.await_args.args[2], "001259")
+
+    async def test_broadcast_trading_plan_alert_uses_durable_inbox_message_type(self):
+        manager = ConnectionManager()
+        manager.broadcast = AsyncMock()
+        payload = {"id": 7, "dedup_key": "plan:1:in_app:plan_ready"}
+
+        await manager.broadcast_trading_plan_alert(payload)
+
+        manager.broadcast.assert_awaited_once_with(
+            payload,
+            "trading_plan_alert",
+        )
 
     async def test_broadcast_limit_up_alert_deduplicates_same_stock(self):
         manager = ConnectionManager()

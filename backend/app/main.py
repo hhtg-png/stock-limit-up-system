@@ -17,6 +17,12 @@ from app.data_collectors.scheduler import data_scheduler
 from app.services.trading_playbook.composition import (
     build_production_trading_playbook_orchestrator,
 )
+from app.services.trading_playbook.alert_service import (
+    TradingPlaybookAlertService,
+)
+from app.services.trading_playbook.channels import (
+    InAppTradingPlanAlertChannel,
+)
 from app.services.trading_playbook.runtime import trading_playbook_runtime
 from app.utils.time_utils import today_cn
 
@@ -28,6 +34,8 @@ def _clear_trading_playbook_runtime(app: FastAPI) -> None:
         delattr(app.state, "trading_playbook_orchestrator")
     if hasattr(app.state, "trading_playbook_calendar"):
         delattr(app.state, "trading_playbook_calendar")
+    if hasattr(app.state, "trading_playbook_alert_service"):
+        delattr(app.state, "trading_playbook_alert_service")
 
 
 @asynccontextmanager
@@ -53,8 +61,13 @@ async def lifespan(app: FastAPI):
                 next_trade_date=calendar.next_trade_date,
             )
             data_scheduler.install_trading_playbook_orchestrator(orchestrator)
+            alert_service = TradingPlaybookAlertService(
+                InAppTradingPlanAlertChannel()
+            )
+            data_scheduler.install_trading_playbook_alert_service(alert_service)
             trading_playbook_runtime.install_orchestrator(orchestrator)
             app.state.trading_playbook_orchestrator = orchestrator
+            app.state.trading_playbook_alert_service = alert_service
             app.state.trading_playbook_calendar = calendar
 
         # 启动定时任务：盘中采集、盘后统计、市场复盘、每日分析

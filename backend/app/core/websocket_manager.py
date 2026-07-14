@@ -45,6 +45,7 @@ class ConnectionManager:
                 "tdx_stock_move_event",
                 "tdx_news_event",
                 "tdx_plate_strength_update",
+                "trading_plan_alert",
             }
         logger.info(f"WebSocket connected: {client_id}, total: {len(self.active_connections)}")
     
@@ -203,6 +204,10 @@ class ConnectionManager:
             message_type,
             stock_code,
         )
+
+    async def broadcast_trading_plan_alert(self, data: dict):
+        """Broadcast a hint for an event already persisted in the alert inbox."""
+        await self.broadcast(data, "trading_plan_alert")
     
     @property
     def connection_count(self) -> int:
