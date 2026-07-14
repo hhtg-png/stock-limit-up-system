@@ -12,7 +12,7 @@ from collections.abc import Mapping
 from datetime import date, datetime, time
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import and_, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
@@ -54,6 +54,7 @@ _ACTION_CONDITION_SPECS = (
     ("entry_trigger_json", "entry_triggered"),
 )
 _TERMINAL_ACTION_EVENT_TYPES = ("exit_triggered",)
+_ACTION_OUTBOX_DRAIN_BATCH_SIZE = 100
 
 
 class TradingAlertDeliveryStateLost(RuntimeError):
@@ -180,6 +181,162 @@ class TradingPlaybookAlertService:
             await self._deliver(db, event)
         return event
 
+    def _recoverable_action_events_statement(self):
+        status_path = TradingAlertEvent.channel_status_json[
+            self.channel_name
+        ]["status"].as_string()
+        channel_started_path = TradingAlertEvent.channel_status_json[
+            self.channel_name
+        ]["channel_started_at"].as_string()
+        return (
+            select(TradingAlertEvent)
+            .where(
+                TradingAlertEvent.event_type.in_(
+                    tuple(_ACTION_EVENT_SEVERITIES)
+                ),
+                or_(
+                    status_path == "pending",
+                    and_(
+                        status_path == "sending",
+                        channel_started_path.is_(None),
+                    ),
+                ),
+            )
+            .order_by(
+                TradingAlertEvent.triggered_at.asc(),
+                TradingAlertEvent.id.asc(),
+            )
+            .limit(_ACTION_OUTBOX_DRAIN_BATCH_SIZE)
+        )
+
+    @staticmethod
+    def _persisted_action_date(event: TradingAlertEvent) -> date | None:
+        parts = str(event.dedup_key or "").split(":", 2)
+        if len(parts) != 3 or parts[0] != "action":
+            return None
+        value = parts[1]
+        try:
+            parsed = date.fromisoformat(value)
+        except ValueError:
+            return None
+        return parsed if parsed.isoformat() == value else None
+
+    async def _update_recoverable_action_event(
+        self,
+        db,
+        event: TradingAlertEvent,
+        channel_status: Mapping[str, Any],
+    ) -> bool:
+        current_status = dict(
+            (event.channel_status_json or {}).get(self.channel_name) or {}
+        )
+        expected = current_status.get("status")
+        if expected not in {"pending", "sending"}:
+            return False
+        status_path = TradingAlertEvent.channel_status_json[
+            self.channel_name
+        ]["status"].as_string()
+        predicates = [
+            TradingAlertEvent.id == event.id,
+            status_path == expected,
+        ]
+        if expected == "sending":
+            owner_path = TradingAlertEvent.channel_status_json[
+                self.channel_name
+            ]["owner"].as_string()
+            channel_started_path = TradingAlertEvent.channel_status_json[
+                self.channel_name
+            ]["channel_started_at"].as_string()
+            owner = current_status.get("owner")
+            predicates.extend(
+                (
+                    owner_path == owner
+                    if owner is not None
+                    else owner_path.is_(None),
+                    channel_started_path.is_(None),
+                )
+            )
+        status = copy.deepcopy(event.channel_status_json or {})
+        status[self.channel_name] = copy.deepcopy(dict(channel_status))
+        result = await db.execute(
+            update(TradingAlertEvent)
+            .where(*predicates)
+            .values(channel_status_json=status)
+        )
+        await db.commit()
+        if result.rowcount != 1:
+            return False
+        event.channel_status_json = status
+        return True
+
+    async def _drain_action_outbox(
+        self,
+        db,
+        trade_date: date,
+    ) -> list[TradingAlertEvent]:
+        events = list(
+            (
+                await db.execute(
+                    self._recoverable_action_events_statement()
+                )
+            )
+            .scalars()
+            .all()
+        )
+        drained: list[TradingAlertEvent] = []
+        for event in events:
+            action_date = self._persisted_action_date(event)
+            channel_status = copy.deepcopy(
+                dict(
+                    (event.channel_status_json or {}).get(self.channel_name)
+                    or {}
+                )
+            )
+            if action_date is None or action_date < trade_date:
+                channel_status.update(
+                    {
+                        "status": "skipped",
+                        "reason": (
+                            "invalid_action_date"
+                            if action_date is None
+                            else "stale"
+                        ),
+                        "skipped_at": now_cn().isoformat(),
+                    }
+                )
+                channel_status.pop("owner", None)
+                channel_status.pop("sending_at", None)
+                channel_status.pop("channel_started_at", None)
+                if await self._update_recoverable_action_event(
+                    db,
+                    event,
+                    channel_status,
+                ):
+                    drained.append(event)
+                continue
+            if action_date > trade_date:
+                continue
+            if channel_status.get("status") == "sending":
+                channel_status.update(
+                    {
+                        "status": "pending",
+                        "recovered_at": now_cn().isoformat(),
+                        "pre_send_error": "recovered after restart",
+                    }
+                )
+                channel_status.pop("owner", None)
+                channel_status.pop("sending_at", None)
+                if not await self._update_recoverable_action_event(
+                    db,
+                    event,
+                    channel_status,
+                ):
+                    continue
+            await self._deliver(db, event)
+            drained.append(event)
+        await db.commit()
+        return drained
+
     async def monitor(self, db, now: datetime):
         """Evaluate today's confirmed candidate conditions from one batch quote."""
         if not isinstance(now, datetime):
@@ -189,6 +346,10 @@ class TradingPlaybookAlertService:
         else:
             current = now.astimezone(CN_TZ)
         trade_date = current.date()
+        drained_action_events = await self._drain_action_outbox(
+            db,
+            trade_date,
+        )
         calendar = self.trading_calendar
         ensure_date = getattr(calendar, "ensure_date", None)
         is_trading_day = getattr(calendar, "is_trading_day", None)
@@ -196,7 +357,7 @@ class TradingPlaybookAlertService:
             logger.error(
                 "Trading playbook monitor skipped: authoritative calendar missing"
             )
-            return []
+            return drained_action_events
         try:
             await ensure_date(trade_date)
             trading_day = bool(is_trading_day(trade_date))
@@ -207,15 +368,15 @@ class TradingPlaybookAlertService:
                 "Trading playbook monitor calendar lookup failed: {}",
                 exc,
             )
-            return []
+            return drained_action_events
         if not trading_day:
             logger.info(
                 "Trading playbook monitor skipped on closed market date {}",
                 trade_date,
             )
-            return []
+            return drained_action_events
         if not self._is_continuous_trading_time(current):
-            return []
+            return drained_action_events
 
         rows = list(
             (
@@ -261,20 +422,10 @@ class TradingPlaybookAlertService:
             .scalars()
             .all()
         )
-        pending_action_events = [
-            event
-            for event in existing_action_events
-            if dict(
-                (event.channel_status_json or {}).get(self.channel_name) or {}
-            ).get("status")
-            == "pending"
-        ]
         await db.commit()
-        for event in pending_action_events:
-            await self._deliver(db, event)
 
         if not rows:
-            return pending_action_events
+            return drained_action_events
         terminal_candidate_ids = {
             event.candidate_id
             for event in existing_action_events
@@ -287,14 +438,14 @@ class TradingPlaybookAlertService:
                 if candidate.id not in terminal_candidate_ids
             ]
         if not rows:
-            return pending_action_events
+            return drained_action_events
         if self.quote_api is None or not callable(
             getattr(self.quote_api, "get_quotes_batch", None)
         ):
             logger.warning(
                 "Trading playbook monitor skipped: batch quote provider missing"
             )
-            return pending_action_events
+            return drained_action_events
 
         # End the read transaction before waiting on the network.  The project
         # session factory keeps loaded rows usable with expire_on_commit=False.
@@ -307,14 +458,14 @@ class TradingPlaybookAlertService:
             needs_open_count=needs_open_count,
         )
         if response is None:
-            return pending_action_events
+            return drained_action_events
         quotes = self._normalize_quotes(
             response,
             requested_codes=set(codes),
             as_of=current,
         )
         if not quotes:
-            return pending_action_events
+            return drained_action_events
         if needs_open_count:
             open_counts = self._normalize_open_counts(
                 open_count_snapshot,
@@ -327,7 +478,7 @@ class TradingPlaybookAlertService:
                     quote["open_count"] = open_count
 
         channel_enabled = await self._channel_enabled(db)
-        persisted: list[TradingAlertEvent] = list(pending_action_events)
+        persisted: list[TradingAlertEvent] = list(drained_action_events)
         newly_persisted: list[TradingAlertEvent] = []
         for plan, candidate in rows:
             quote = quotes.get(candidate.stock_code)

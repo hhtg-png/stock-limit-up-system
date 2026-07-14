@@ -1081,6 +1081,287 @@ class TradingPlaybookActionMonitorTests(unittest.IsolatedAsyncioTestCase):
                 .all()
             )
 
+    async def _seed_action_event(
+        self,
+        plan_id,
+        candidate_id,
+        *,
+        action_date,
+        status="pending",
+        suffix="seed",
+        triggered_at=None,
+        owner="stopped-worker",
+        channel_started_at=None,
+        event_type="entry_triggered",
+    ):
+        snapshot = {"stock_code": "000001"}
+        if isinstance(action_date, date):
+            snapshot["trade_date"] = action_date.isoformat()
+        elif action_date is not None:
+            snapshot["trade_date"] = action_date
+        if isinstance(action_date, date):
+            dedup_key = f"action:{action_date.isoformat()}:{suffix}"
+        elif action_date is not None:
+            dedup_key = f"action:{action_date}:{suffix}"
+        else:
+            dedup_key = f"action:{suffix}"
+        channel_status = {
+            "status": status,
+            "idempotency_key": dedup_key,
+            "attempts": 1 if status == "sending" else 0,
+        }
+        if status == "sending":
+            channel_status.update(
+                {
+                    "owner": owner,
+                    "sending_at": "2026-07-14T09:59:00+08:00",
+                }
+            )
+        if channel_started_at is not None:
+            channel_status["channel_started_at"] = channel_started_at
+        async with self.Session() as db:
+            row = TradingAlertEvent(
+                plan_version_id=plan_id,
+                candidate_id=candidate_id,
+                event_type=event_type,
+                severity=(
+                    "action" if event_type == "entry_triggered" else "info"
+                ),
+                dedup_key=dedup_key,
+                triggered_at=triggered_at
+                or datetime(2026, 7, 14, 10, 0),
+                market_snapshot_json=snapshot,
+                message=f"seed action {suffix}",
+                channel_status_json={"in_app": channel_status},
+            )
+            db.add(row)
+            await db.commit()
+            await db.refresh(row)
+            return row.id
+
+    async def test_after_hours_restart_drains_today_pending_action(self):
+        plan_id, candidate_id = await self._create_candidate()
+        event_id = await self._seed_action_event(
+            plan_id,
+            candidate_id,
+            action_date=self.today,
+            suffix="after-hours",
+        )
+        channel = _RecordingInAppChannel()
+        after_hours = CN_TZ.localize(datetime(2026, 7, 14, 15, 5))
+
+        async with self.Session() as db:
+            events = await self._monitor_service(channel).monitor(
+                db,
+                after_hours,
+            )
+
+        self.assertEqual([event.id for event in events], [event_id])
+        self.assertEqual(len(channel.sends), 1)
+        self.assertEqual(
+            (await self._events())[0].channel_status_json["in_app"]["status"],
+            "delivered",
+        )
+
+    async def test_calendar_failure_still_drains_today_pending_action(self):
+        plan_id, candidate_id = await self._create_candidate()
+        await self._seed_action_event(
+            plan_id,
+            candidate_id,
+            action_date=self.today,
+            suffix="calendar-failure",
+        )
+        self.calendar.ensure_error = RuntimeError("calendar offline")
+        channel = _RecordingInAppChannel()
+
+        async with self.Session() as db:
+            await self._monitor_service(channel).monitor(db, self.now)
+
+        self.assertEqual(len(channel.sends), 1)
+        self.assertEqual(
+            (await self._events())[0].channel_status_json["in_app"]["status"],
+            "delivered",
+        )
+
+    async def test_next_day_restart_terminalizes_stale_and_leaves_future_pending(self):
+        plan_id, candidate_id = await self._create_candidate()
+        stale_id = await self._seed_action_event(
+            plan_id,
+            candidate_id,
+            action_date=date(2026, 7, 13),
+            suffix="stale",
+        )
+        future_id = await self._seed_action_event(
+            plan_id,
+            candidate_id,
+            action_date=date(2026, 7, 15),
+            suffix="future",
+            triggered_at=datetime(2026, 7, 14, 10, 1),
+        )
+        channel = _RecordingInAppChannel()
+
+        async with self.Session() as db:
+            await self._monitor_service(channel).monitor(db, self.now)
+
+        events = {event.id: event for event in await self._events()}
+        self.assertEqual(channel.sends, [])
+        self.assertEqual(
+            events[stale_id].channel_status_json["in_app"]["status"],
+            "skipped",
+        )
+        self.assertEqual(
+            events[stale_id].channel_status_json["in_app"]["reason"],
+            "stale",
+        )
+        self.assertEqual(
+            events[future_id].channel_status_json["in_app"]["status"],
+            "pending",
+        )
+
+    async def test_malformed_action_date_is_terminal_invalid(self):
+        plan_id, candidate_id = await self._create_candidate()
+        malformed_id = await self._seed_action_event(
+            plan_id,
+            candidate_id,
+            action_date="2026-7-14",
+            suffix="not-a-date:key",
+        )
+        missing_id = await self._seed_action_event(
+            plan_id,
+            candidate_id,
+            action_date=None,
+            suffix="missing-date",
+            triggered_at=datetime(2026, 7, 14, 10, 1),
+        )
+
+        async with self.Session() as db:
+            await self._monitor_service(_RecordingInAppChannel()).monitor(
+                db,
+                self.now,
+            )
+
+        events = {event.id: event for event in await self._events()}
+        for event_id in (malformed_id, missing_id):
+            channel_status = events[event_id].channel_status_json["in_app"]
+            self.assertEqual(channel_status["status"], "skipped")
+            self.assertEqual(channel_status["reason"], "invalid_action_date")
+
+    async def test_restart_recovers_pre_send_sending_action_once(self):
+        plan_id, candidate_id = await self._create_candidate()
+        event_id = await self._seed_action_event(
+            plan_id,
+            candidate_id,
+            action_date=self.today,
+            status="sending",
+            suffix="recoverable-sending",
+        )
+        channel = _RecordingInAppChannel()
+
+        async with self.SecondSession() as db:
+            await self._monitor_service(channel).monitor(db, self.now)
+
+        self.assertEqual(len(channel.sends), 1)
+        event = next(row for row in await self._events() if row.id == event_id)
+        self.assertEqual(
+            event.channel_status_json["in_app"]["status"],
+            "delivered",
+        )
+
+    async def test_action_drain_excludes_plan_events_and_post_fence_sending(self):
+        plan_id, candidate_id = await self._create_candidate()
+        plan_event_id = await self._seed_action_event(
+            plan_id,
+            candidate_id,
+            action_date=None,
+            suffix="non-action-plan-ready",
+            event_type="plan_ready",
+        )
+        fenced_id = await self._seed_action_event(
+            plan_id,
+            candidate_id,
+            action_date=self.today,
+            status="sending",
+            suffix="channel-already-started",
+            triggered_at=datetime(2026, 7, 14, 10, 1),
+            channel_started_at="2026-07-14T10:00:00+08:00",
+        )
+        channel = _RecordingInAppChannel()
+        after_hours = CN_TZ.localize(datetime(2026, 7, 14, 15, 5))
+
+        async with self.Session() as db:
+            await self._monitor_service(channel).monitor(db, after_hours)
+
+        events = {event.id: event for event in await self._events()}
+        self.assertEqual(channel.sends, [])
+        self.assertEqual(
+            events[plan_event_id].channel_status_json["in_app"]["status"],
+            "pending",
+        )
+        self.assertEqual(
+            events[fenced_id].channel_status_json["in_app"]["status"],
+            "sending",
+        )
+
+    async def test_two_engines_drain_one_pending_action_once_after_hours(self):
+        plan_id, candidate_id = await self._create_candidate()
+        await self._seed_action_event(
+            plan_id,
+            candidate_id,
+            action_date=self.today,
+            suffix="two-engine-drain",
+        )
+        channel = _RecordingInAppChannel()
+        after_hours = CN_TZ.localize(datetime(2026, 7, 14, 15, 5))
+
+        async def run(service, sessions):
+            async with sessions() as db:
+                return await service.monitor(db, after_hours)
+
+        await asyncio.gather(
+            run(self._monitor_service(channel), self.Session),
+            run(self._monitor_service(channel), self.SecondSession),
+        )
+
+        self.assertEqual(len(channel.sends), 1)
+        self.assertEqual(
+            (await self._events())[0].channel_status_json["in_app"]["status"],
+            "delivered",
+        )
+
+    async def test_action_drain_batch_is_oldest_first_and_limited_to_100(self):
+        plan_id, candidate_id = await self._create_candidate()
+        event_ids = []
+        for index in range(101):
+            event_ids.append(
+                await self._seed_action_event(
+                    plan_id,
+                    candidate_id,
+                    action_date=date(2026, 7, 13),
+                    suffix=f"batch-{index:03d}",
+                    triggered_at=datetime(2026, 7, 13, 9, 0)
+                    + timedelta(seconds=index),
+                )
+            )
+
+        async with self.Session() as db:
+            await self._monitor_service(_RecordingInAppChannel()).monitor(
+                db,
+                self.now,
+            )
+
+        events = {event.id: event for event in await self._events()}
+        self.assertTrue(
+            all(
+                events[event_id].channel_status_json["in_app"]["status"]
+                == "skipped"
+                for event_id in event_ids[:100]
+            )
+        )
+        self.assertEqual(
+            events[event_ids[100]].channel_status_json["in_app"]["status"],
+            "pending",
+        )
+
     async def test_unconfirmed_candidate_is_watch_only(self):
         from app.services.trading_playbook.alert_service import (
             TradingPlaybookAlertService,
@@ -1770,14 +2051,33 @@ class TradingPlaybookActionMonitorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(quote_api.calls, [])
         self.assertEqual(await self._events(), [])
 
-    async def test_calendar_missing_failure_and_closed_days_fail_before_database(self):
+    async def test_calendar_missing_failure_and_closed_days_stop_after_outbox_drain(self):
         from app.services.trading_playbook.alert_service import (
             TradingPlaybookAlertService,
         )
 
-        class ExplodingDB:
+        class EmptyResult:
+            def scalars(self):
+                return self
+
+            def all(self):
+                return []
+
+        class DrainOnlyDB:
+            def __init__(self):
+                self.execute_calls = 0
+                self.commit_calls = 0
+
             async def execute(self, *_args, **_kwargs):
-                raise AssertionError("database must not be touched")
+                self.execute_calls += 1
+                if self.execute_calls > 1:
+                    raise AssertionError(
+                        "candidate database access must stay gated"
+                    )
+                return EmptyResult()
+
+            async def commit(self):
+                self.commit_calls += 1
 
         cases = [
             (
@@ -1813,10 +2113,13 @@ class TradingPlaybookActionMonitorTests(unittest.IsolatedAsyncioTestCase):
                     _RecordingInAppChannel(),
                     **kwargs,
                 )
+                db = DrainOnlyDB()
 
-                result = await service.monitor(ExplodingDB(), current)
+                result = await service.monitor(db, current)
 
                 self.assertEqual(result, [])
+                self.assertEqual(db.execute_calls, 1)
+                self.assertEqual(db.commit_calls, 1)
                 self.assertEqual(quote_api.calls, [])
                 if calendar is not None:
                     self.assertEqual(calendar.ensure_calls, [current.date()])
