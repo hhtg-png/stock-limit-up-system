@@ -1164,6 +1164,18 @@ class TradingPlaybookForcedUpgradeTests(unittest.IsolatedAsyncioTestCase):
             is_trading_day=MagicMock(return_value=True),
             next_trade_date=MagicMock(),
         )
+
+        class EmptyOutboxResult:
+            def scalars(self):
+                return self
+
+            def all(self):
+                return []
+
+        monitor_db = SimpleNamespace(
+            execute=AsyncMock(return_value=EmptyOutboxResult()),
+            commit=AsyncMock(),
+        )
         alert_service = TradingPlaybookAlertService(
             InAppTradingPlanAlertChannel(),
             trading_calendar=shared_calendar,
@@ -1171,7 +1183,7 @@ class TradingPlaybookForcedUpgradeTests(unittest.IsolatedAsyncioTestCase):
         today = date(2026, 7, 13)
         scheduler = DataScheduler(
             trading_playbook_alert_service=alert_service,
-            session_factory=lambda: AsyncSessionContext(MagicMock()),
+            session_factory=lambda: AsyncSessionContext(monitor_db),
             now_provider=lambda: datetime(
                 2026, 7, 13, 15, 35, tzinfo=CN_TZ
             ),
@@ -1195,7 +1207,7 @@ class TradingPlaybookForcedUpgradeTests(unittest.IsolatedAsyncioTestCase):
             next_trade_date=None,
         )
         scheduler._retry_incomplete_playbook_notifications.assert_awaited_once_with(
-            None,
+            today,
             None,
         )
         scheduler._compensate_trading_playbook_phases.assert_awaited_once_with(

@@ -427,6 +427,116 @@ class TradingPlaybookSchedulerClaimTests(unittest.IsolatedAsyncioTestCase):
         )
         alert.notify_plan_ready.assert_not_awaited()
 
+    async def _historical_notification_claim_case(self, *, calendar_failure):
+        from sqlalchemy import select
+
+        from app.models.trading_playbook import (
+            TradingPlanVersion,
+            TradingPlaybookJobClaim,
+        )
+        from app.services.trading_playbook.calendar_service import (
+            TradingCalendarLookupError,
+            TradingCalendarService,
+        )
+        from app.utils.time_utils import CN_TZ
+
+        scheduler, engine, _orchestrator, alert, _review = (
+            await self._scheduler_fixture()
+        )
+        current = [CN_TZ.localize(datetime(2026, 7, 14, 10, 5))]
+        scheduler._playbook_now_provider = lambda: current[0]
+        scheduler._playbook_calendar = TradingCalendarService(
+            loader=lambda _start, _end: [
+                date(2026, 7, 14),
+                date(2026, 7, 15),
+            ],
+            today_provider=lambda: date(2026, 7, 14),
+        )
+        if calendar_failure:
+            scheduler._ensure_playbook_calendar = AsyncMock(
+                side_effect=TradingCalendarLookupError(
+                    "calendar unavailable"
+                )
+            )
+        try:
+            old = datetime(2026, 6, 2, 9, 0)
+            async with scheduler._playbook_session_factory() as db:
+                plan = TradingPlanVersion(
+                    source_trade_date=date(2026, 6, 1),
+                    target_trade_date=date(2026, 6, 2),
+                    stage="overnight",
+                    version_no=1,
+                    status="active",
+                    input_hash=(
+                        "historical-calendar-failure"
+                        if calendar_failure
+                        else "historical-calendar-healthy"
+                    ),
+                    generated_at=old,
+                )
+                db.add(plan)
+                await db.flush()
+                db.add(
+                    TradingPlaybookJobClaim(
+                        job_key=f"playbook:notify:plan:{plan.id}",
+                        job_type="plan",
+                        phase="notify",
+                        generation_key=str(plan.id),
+                        owner="stopped-worker",
+                        status="retry",
+                        attempt_no=1,
+                        lease_expires_at=old,
+                        last_error="notify interrupted",
+                        created_at=old,
+                        updated_at=old,
+                    )
+                )
+                await db.commit()
+                plan_id = plan.id
+
+            await scheduler._monitor_trading_playbook()
+            async with scheduler._playbook_session_factory() as db:
+                first = (
+                    await db.execute(
+                        select(TradingPlaybookJobClaim).where(
+                            TradingPlaybookJobClaim.generation_key
+                            == str(plan_id),
+                            TradingPlaybookJobClaim.phase == "notify",
+                        )
+                    )
+                ).scalar_one()
+                first_updated_at = first.updated_at
+
+            current[0] += timedelta(seconds=3)
+            await scheduler._monitor_trading_playbook()
+            async with scheduler._playbook_session_factory() as db:
+                second = (
+                    await db.execute(
+                        select(TradingPlaybookJobClaim).where(
+                            TradingPlaybookJobClaim.generation_key
+                            == str(plan_id),
+                            TradingPlaybookJobClaim.phase == "notify",
+                        )
+                    )
+                ).scalar_one()
+
+            self.assertEqual(second.status, "completed")
+            self.assertIn("stale target date", second.last_error)
+            self.assertEqual(second.updated_at, first_updated_at)
+            alert.notify_plan_ready.assert_not_awaited()
+        finally:
+            await engine.dispose()
+
+    async def test_healthy_calendar_terminalizes_historical_notification_once(self):
+        await self._historical_notification_claim_case(
+            calendar_failure=False
+        )
+
+    async def test_calendar_failure_terminalizes_historical_notification_once(self):
+        await self._historical_notification_claim_case(
+            calendar_failure=True
+        )
+
     async def test_broken_business_sessions_fail_claims_in_fresh_sessions(self):
         from sqlalchemy import select
         from sqlalchemy.exc import IntegrityError

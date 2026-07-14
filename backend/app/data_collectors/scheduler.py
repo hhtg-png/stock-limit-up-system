@@ -914,7 +914,7 @@ class DataScheduler:
         else:
             logger.debug("Trading playbook alert monitor is not installed")
         next_trade_date = None
-        notification_earliest_date = None
+        notification_earliest_date = now.date()
         notification_latest_date = None
         try:
             if not await self._ensure_playbook_calendar(now.date()):
@@ -970,6 +970,9 @@ class DataScheduler:
         )
 
         now = self._claim_now()
+        effective_earliest_target_date = (
+            earliest_target_date or self._playbook_now().date()
+        )
         async with self._playbook_sessions() as db:
             claims = list(
                 (
@@ -1043,10 +1046,14 @@ class DataScheduler:
                         f"plan status {plan.status!r} is not notifiable"
                     )
                     continue
+                if plan.target_trade_date < effective_earliest_target_date:
+                    retirement_reason_by_claim_id[claim.id] = (
+                        "stale target date "
+                        f"{plan.target_trade_date.isoformat()} before "
+                        f"{effective_earliest_target_date.isoformat()}"
+                    )
+                    continue
                 if (
-                    earliest_target_date is not None
-                    and plan.target_trade_date < earliest_target_date
-                ) or (
                     latest_target_date is not None
                     and plan.target_trade_date > latest_target_date
                 ):
