@@ -667,6 +667,26 @@ class TradingPlaybookDurableAlertTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("channel_status_json", compiled)
         self.assertIn("->>", compiled)
 
+    def test_action_due_statement_filters_future_before_limit_for_postgresql(self):
+        from app.services.trading_playbook.alert_service import (
+            TradingPlaybookAlertService,
+        )
+
+        service = TradingPlaybookAlertService(_RecordingInAppChannel())
+        compiled = str(
+            service._recoverable_action_events_statement(
+                date(2026, 7, 14)
+            ).compile(
+                dialect=postgresql.dialect(),
+                compile_kwargs={"literal_binds": True},
+            )
+        )
+
+        self.assertIn("action:2026-07-14:%", compiled)
+        self.assertIn("action:____-__-__:%", compiled)
+        self.assertIn("NOT LIKE", compiled)
+        self.assertIn("LIMIT 100", compiled)
+
     async def test_disabled_in_app_setting_persists_without_sending(self):
         from app.models.trading_playbook import TradingPlaybookSettings
         from app.services.trading_playbook.alert_service import (
@@ -1360,6 +1380,51 @@ class TradingPlaybookActionMonitorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             events[event_ids[100]].channel_status_json["in_app"]["status"],
             "pending",
+        )
+
+    async def test_future_actions_do_not_starve_today_outside_first_100(self):
+        plan_id, candidate_id = await self._create_candidate()
+        future_ids = []
+        for index in range(100):
+            future_ids.append(
+                await self._seed_action_event(
+                    plan_id,
+                    candidate_id,
+                    action_date=date(2026, 7, 15),
+                    suffix=f"future-starvation-{index:03d}",
+                    triggered_at=datetime(2026, 7, 13, 9, 0)
+                    + timedelta(seconds=index),
+                )
+            )
+        today_id = await self._seed_action_event(
+            plan_id,
+            candidate_id,
+            action_date=self.today,
+            suffix="today-after-future-batch",
+            triggered_at=datetime(2026, 7, 14, 10, 0),
+        )
+        channel = _RecordingInAppChannel()
+        after_hours = CN_TZ.localize(datetime(2026, 7, 14, 15, 5))
+
+        for sessions in (self.Session, self.SecondSession):
+            async with sessions() as db:
+                await self._monitor_service(channel).monitor(db, after_hours)
+
+        events = {event.id: event for event in await self._events()}
+        self.assertEqual(
+            [payload[0]["id"] for payload in channel.sends],
+            [today_id],
+        )
+        self.assertEqual(
+            events[today_id].channel_status_json["in_app"]["status"],
+            "delivered",
+        )
+        self.assertTrue(
+            all(
+                events[event_id].channel_status_json["in_app"]["status"]
+                == "pending"
+                for event_id in future_ids
+            )
         )
 
     async def test_unconfirmed_candidate_is_watch_only(self):

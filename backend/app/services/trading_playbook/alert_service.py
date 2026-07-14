@@ -181,13 +181,14 @@ class TradingPlaybookAlertService:
             await self._deliver(db, event)
         return event
 
-    def _recoverable_action_events_statement(self):
+    def _recoverable_action_events_statement(self, trade_date: date):
         status_path = TradingAlertEvent.channel_status_json[
             self.channel_name
         ]["status"].as_string()
         channel_started_path = TradingAlertEvent.channel_status_json[
             self.channel_name
         ]["channel_started_at"].as_string()
+        today_prefix = f"action:{trade_date.isoformat()}:"
         return (
             select(TradingAlertEvent)
             .where(
@@ -199,6 +200,15 @@ class TradingPlaybookAlertService:
                     and_(
                         status_path == "sending",
                         channel_started_path.is_(None),
+                    ),
+                ),
+                or_(
+                    TradingAlertEvent.dedup_key.like(
+                        f"{today_prefix}%"
+                    ),
+                    TradingAlertEvent.dedup_key < today_prefix,
+                    TradingAlertEvent.dedup_key.not_like(
+                        "action:____-__-__:%"
                     ),
                 ),
             )
@@ -277,7 +287,7 @@ class TradingPlaybookAlertService:
         events = list(
             (
                 await db.execute(
-                    self._recoverable_action_events_statement()
+                    self._recoverable_action_events_statement(trade_date)
                 )
             )
             .scalars()
