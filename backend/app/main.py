@@ -14,6 +14,7 @@ from app.core.event_bus import event_bus
 from app.utils.logger import setup_logging, logger
 from app.services.data_init_service import data_init_service
 from app.data_collectors.scheduler import data_scheduler
+from app.data_collectors.tencent_api import tencent_api
 from app.services.trading_playbook.composition import (
     build_production_trading_playbook_orchestrator,
 )
@@ -64,6 +65,7 @@ async def lifespan(app: FastAPI):
             alert_service = TradingPlaybookAlertService(
                 InAppTradingPlanAlertChannel(),
                 session_factory=async_session_maker,
+                quote_api=tencent_api,
             )
             data_scheduler.install_trading_playbook_alert_service(alert_service)
             trading_playbook_runtime.install_orchestrator(orchestrator)

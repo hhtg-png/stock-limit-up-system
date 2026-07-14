@@ -4,25 +4,45 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import math
 import uuid
 from collections.abc import Mapping
-from datetime import date, datetime
+from datetime import date, datetime, time
 from typing import Any
 
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from loguru import logger
 
+from app.config import settings as app_settings
 from app.models.trading_playbook import (
     TradingAlertEvent,
+    TradingPlanCandidate,
+    TradingPlanVersion,
     TradingPlaybookSettings,
 )
-from app.utils.time_utils import now_cn
+from app.utils.time_utils import CN_TZ, now_cn
 
 from .channels import TradingPlanAlertChannel
 
 
 _PLAN_EVENT_TYPES = ("plan_ready", "confirmation_required")
+_ACTION_EVALUATION_STATUSES = ("active", "confirmed")
+_MONITOR_PLAN_STATUS = "active"
+_CONDITION_METADATA = frozenset({"label", "reference_price"})
+_NUMERIC_CONDITIONS = {
+    "price_gte": ("price", "gte"),
+    "price_lte": ("price", "lte"),
+    "change_pct_gte": ("change_pct", "gte"),
+    "change_pct_lte": ("change_pct", "lte"),
+    "open_count_gte": ("open_count", "gte"),
+}
+_ACTION_EVENT_SEVERITIES = {
+    "invalidated": "warning",
+    "exit_triggered": "warning",
+    "entry_triggered": "action",
+}
+_TERMINAL_ACTION_EVENT_TYPES = ("invalidated", "exit_triggered")
 
 
 class TradingAlertDeliveryStateLost(RuntimeError):
@@ -39,6 +59,10 @@ class TradingPlaybookAlertService:
         channel: TradingPlanAlertChannel,
         *,
         session_factory=None,
+        quote_api=None,
+        quote_timeout_seconds: float = 5.0,
+        quote_max_age_seconds: float | None = None,
+        max_monitor_candidates: int = 240,
     ) -> None:
         if not isinstance(channel, TradingPlanAlertChannel):
             raise TypeError(
@@ -57,6 +81,16 @@ class TradingPlaybookAlertService:
         self.channel_name = name
         self.owner = uuid.uuid4().hex
         self.session_factory = session_factory
+        self.quote_api = quote_api
+        self.quote_timeout_seconds = max(float(quote_timeout_seconds), 0.01)
+        max_age = (
+            app_settings.TRADING_PLAYBOOK_ALERT_QUOTE_MAX_AGE_SECONDS
+            if quote_max_age_seconds is None
+            else quote_max_age_seconds
+        )
+        self.quote_max_age_seconds = max(float(max_age), 0.0)
+        self.max_monitor_candidates = max(int(max_monitor_candidates), 1)
+        self._memory_dedup: set[tuple[Any, str]] = set()
 
     @staticmethod
     def _plan_value(plan: Any, key: str) -> Any:
@@ -113,8 +147,466 @@ class TradingPlaybookAlertService:
         return event
 
     async def monitor(self, db, now: datetime):
-        """Task-10 extension point; plan-ready delivery is the minimal core."""
+        """Evaluate today's confirmed candidate conditions from one batch quote."""
+        if not isinstance(now, datetime):
+            raise TypeError("alert monitor now must be a datetime")
+        if now.tzinfo is None or now.utcoffset() is None:
+            current = CN_TZ.localize(now)
+        else:
+            current = now.astimezone(CN_TZ)
+        trade_date = current.date()
+        if not self._is_continuous_trading_time(current):
+            return []
+
+        rows = list(
+            (
+                await db.execute(
+                    select(TradingPlanVersion, TradingPlanCandidate)
+                    .join(
+                        TradingPlanCandidate,
+                        TradingPlanCandidate.plan_version_id
+                        == TradingPlanVersion.id,
+                    )
+                    .where(
+                        TradingPlanVersion.status == _MONITOR_PLAN_STATUS,
+                        TradingPlanCandidate.action_trade_date == trade_date,
+                    )
+                    .order_by(
+                        TradingPlanVersion.id.desc(),
+                        TradingPlanCandidate.rank,
+                        TradingPlanCandidate.id,
+                    )
+                    .limit(self.max_monitor_candidates + 1)
+                )
+            ).all()
+        )
+        if len(rows) > self.max_monitor_candidates:
+            logger.warning(
+                "Trading playbook monitor candidate limit reached: {}",
+                self.max_monitor_candidates,
+            )
+            rows = rows[: self.max_monitor_candidates]
+        if not rows:
+            return []
+
+        candidate_ids = [candidate.id for _plan, candidate in rows]
+        existing_action_events = list(
+            (
+                await db.execute(
+                    select(TradingAlertEvent).where(
+                        TradingAlertEvent.candidate_id.in_(candidate_ids),
+                        TradingAlertEvent.dedup_key.like(
+                            f"action:{trade_date.isoformat()}:%"
+                        ),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        existing_by_dedup = {
+            event.dedup_key: event for event in existing_action_events
+        }
+        terminal_candidate_ids = {
+            event.candidate_id
+            for event in existing_action_events
+            if event.event_type in _TERMINAL_ACTION_EVENT_TYPES
+        }
+        if terminal_candidate_ids:
+            rows = [
+                (plan, candidate)
+                for plan, candidate in rows
+                if candidate.id not in terminal_candidate_ids
+            ]
+        if not rows:
+            return []
+        if self.quote_api is None or not callable(
+            getattr(self.quote_api, "get_quotes_batch", None)
+        ):
+            logger.warning(
+                "Trading playbook monitor skipped: batch quote provider missing"
+            )
+            return []
+
+        # End the read transaction before waiting on the network.  The project
+        # session factory keeps loaded rows usable with expire_on_commit=False.
+        await db.commit()
+        codes = sorted({candidate.stock_code for _plan, candidate in rows})
+        try:
+            response = await asyncio.wait_for(
+                self.quote_api.get_quotes_batch(codes),
+                timeout=self.quote_timeout_seconds,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("Trading playbook monitor quote batch failed: {}", exc)
+            return []
+        quotes = self._normalize_quotes(
+            response,
+            requested_codes=set(codes),
+            as_of=current,
+        )
+        if not quotes:
+            return []
+
+        persisted: list[TradingAlertEvent] = []
+        for plan, candidate in rows:
+            quote = quotes.get(candidate.stock_code)
+            if quote is None:
+                continue
+            evaluated = self._evaluate_candidate(
+                plan.status,
+                candidate,
+                quote,
+                use_memory_dedup=False,
+            )
+            for payload in evaluated:
+                dedup_key = self._action_dedup_key(
+                    plan,
+                    candidate,
+                    str(payload.get("event_type") or ""),
+                    trade_date,
+                )
+                event = existing_by_dedup.get(dedup_key)
+                if event is None:
+                    event = await self._ensure_action_event(
+                        db,
+                        plan,
+                        candidate,
+                        payload,
+                        quote,
+                        trade_date=trade_date,
+                        triggered_at=current,
+                        lookup_existing=False,
+                    )
+                    existing_by_dedup[event.dedup_key] = event
+                persisted.append(event)
+        if await self._channel_enabled(db):
+            for event in persisted:
+                await self._deliver(db, event)
+        return persisted
+
+    async def evaluate_candidate(
+        self,
+        plan_status: str,
+        candidate: Any,
+        quote: Mapping[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Evaluate one candidate with deterministic fail-closed precedence."""
+        return self._evaluate_candidate(
+            plan_status,
+            candidate,
+            quote,
+            use_memory_dedup=True,
+        )
+
+    def _evaluate_candidate(
+        self,
+        plan_status: str,
+        candidate: Any,
+        quote: Mapping[str, Any],
+        *,
+        use_memory_dedup: bool,
+    ) -> list[dict[str, Any]]:
+        if plan_status not in _ACTION_EVALUATION_STATUSES:
+            return self._memory_event(
+                candidate,
+                "watch",
+                "info",
+                use_memory_dedup=use_memory_dedup,
+            )
+
+        checks = (
+            ("invalidation_json", "invalidated"),
+            ("exit_trigger_json", "exit_triggered"),
+            ("entry_trigger_json", "entry_triggered"),
+        )
+        for condition_name, event_type in checks:
+            condition = self._candidate_value(candidate, condition_name) or {}
+            if self._condition_matches(condition, quote):
+                return self._memory_event(
+                    candidate,
+                    event_type,
+                    _ACTION_EVENT_SEVERITIES[event_type],
+                    use_memory_dedup=use_memory_dedup,
+                )
         return []
+
+    def _memory_event(
+        self,
+        candidate: Any,
+        event_type: str,
+        severity: str,
+        *,
+        use_memory_dedup: bool,
+    ) -> list[dict[str, Any]]:
+        candidate_id = self._candidate_value(candidate, "id")
+        key = (candidate_id, event_type)
+        if use_memory_dedup and key in self._memory_dedup:
+            return []
+        if use_memory_dedup:
+            self._memory_dedup.add(key)
+        return [{"event_type": event_type, "severity": severity}]
+
+    @staticmethod
+    def _finite_number(value: Any) -> float | None:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        number = float(value)
+        return number if math.isfinite(number) else None
+
+    @classmethod
+    def _condition_matches(
+        cls,
+        condition: Any,
+        quote: Mapping[str, Any],
+    ) -> bool:
+        if not isinstance(condition, Mapping) or not isinstance(quote, Mapping):
+            return False
+        actionable = False
+        for key, expected in condition.items():
+            if key in _CONDITION_METADATA:
+                continue
+            actionable = True
+            if key == "sealed":
+                if not isinstance(expected, bool):
+                    return False
+                actual = quote.get("sealed")
+                if not isinstance(actual, bool) or actual is not expected:
+                    return False
+                continue
+            numeric = _NUMERIC_CONDITIONS.get(key)
+            if numeric is None:
+                return False
+            quote_key, operation = numeric
+            actual_number = cls._finite_number(quote.get(quote_key))
+            expected_number = cls._finite_number(expected)
+            if actual_number is None or expected_number is None:
+                return False
+            if operation == "gte" and actual_number < expected_number:
+                return False
+            if operation == "lte" and actual_number > expected_number:
+                return False
+        return actionable
+
+    @staticmethod
+    def _candidate_value(candidate: Any, key: str) -> Any:
+        if isinstance(candidate, Mapping):
+            return candidate.get(key)
+        return getattr(candidate, key, None)
+
+    @staticmethod
+    def _is_continuous_trading_time(current: datetime) -> bool:
+        local_time = current.replace(tzinfo=None).time()
+        return (
+            time(9, 30) <= local_time <= time(11, 30)
+            or time(13, 0) <= local_time <= time(15, 0)
+        )
+
+    @staticmethod
+    def _parse_quote_datetime(value: Any) -> datetime | None:
+        if isinstance(value, datetime):
+            parsed = value
+        elif isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            parsed = None
+            if len(text) == 14 and text.isdigit():
+                try:
+                    parsed = datetime.strptime(text, "%Y%m%d%H%M%S")
+                except ValueError:
+                    return None
+            if parsed is None:
+                try:
+                    parsed = datetime.fromisoformat(
+                        text.replace("Z", "+00:00")
+                    )
+                except ValueError:
+                    return None
+        else:
+            return None
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            return CN_TZ.localize(parsed)
+        return parsed.astimezone(CN_TZ)
+
+    def _normalize_quotes(
+        self,
+        response: Any,
+        *,
+        requested_codes: set[str],
+        as_of: datetime,
+    ) -> dict[str, dict[str, Any]]:
+        if not isinstance(response, Mapping):
+            return {}
+        normalized: dict[str, dict[str, Any]] = {}
+        for response_code, value in response.items():
+            if not isinstance(value, Mapping):
+                continue
+            code = str(
+                value.get("code")
+                or value.get("stock_code")
+                or response_code
+                or ""
+            ).strip()
+            if code not in requested_codes:
+                continue
+            quote = dict(value)
+            captured_at = self._parse_quote_datetime(
+                quote.get("datetime")
+                or quote.get("as_of")
+                or quote.get("captured_at")
+                or quote.get("quote_time")
+            )
+            if captured_at is None or captured_at.date() != as_of.date():
+                continue
+            age_seconds = (as_of - captured_at).total_seconds()
+            if age_seconds < 0 or age_seconds > self.quote_max_age_seconds:
+                continue
+            sealed = quote.get("sealed")
+            if not isinstance(sealed, bool):
+                sealed = quote.get("is_sealed")
+            if not isinstance(sealed, bool):
+                price = self._finite_number(quote.get("price"))
+                limit_up = self._finite_number(
+                    quote.get("limit_up", quote.get("limit_up_price"))
+                )
+                bid_volume = self._finite_number(quote.get("bid1_volume"))
+                if (
+                    price is not None
+                    and limit_up is not None
+                    and bid_volume is not None
+                ):
+                    sealed = price >= limit_up - 0.001 and bid_volume > 0
+            if isinstance(sealed, bool):
+                quote["sealed"] = sealed
+            quote["code"] = code
+            quote["captured_at"] = captured_at
+            normalized[code] = quote
+        return normalized
+
+    def _action_dedup_key(
+        self,
+        plan: Any,
+        candidate: Any,
+        event_type: str,
+        trade_date: date,
+    ) -> str:
+        return ":".join(
+            (
+                "action",
+                trade_date.isoformat(),
+                str(self._plan_value(plan, "id")),
+                str(self._candidate_value(candidate, "id")),
+                str(self._candidate_value(candidate, "primary_mode_key") or ""),
+                event_type,
+            )
+        )
+
+    @classmethod
+    def _snapshot_quote(cls, quote: Mapping[str, Any]) -> dict[str, Any]:
+        snapshot: dict[str, Any] = {}
+        for key in (
+            "code",
+            "name",
+            "price",
+            "change_pct",
+            "sealed",
+            "open_count",
+            "datetime",
+            "captured_at",
+        ):
+            value = quote.get(key)
+            if isinstance(value, (date, datetime)):
+                snapshot[key] = value.isoformat()
+            elif isinstance(value, bool) or isinstance(value, str):
+                snapshot[key] = value
+            elif cls._finite_number(value) is not None:
+                snapshot[key] = value
+        return snapshot
+
+    async def _ensure_action_event(
+        self,
+        db,
+        plan: Any,
+        candidate: Any,
+        payload: Mapping[str, Any],
+        quote: Mapping[str, Any],
+        *,
+        trade_date: date,
+        triggered_at: datetime,
+        lookup_existing: bool = True,
+    ) -> TradingAlertEvent:
+        plan_id = self._plan_value(plan, "id")
+        candidate_id = self._candidate_value(candidate, "id")
+        if not isinstance(plan_id, int) or not isinstance(candidate_id, int):
+            raise ValueError("action alert requires persisted plan and candidate ids")
+        event_type = str(payload.get("event_type") or "")
+        if event_type not in _ACTION_EVENT_SEVERITIES:
+            raise ValueError(f"unsupported action alert event: {event_type}")
+        dedup_key = self._action_dedup_key(
+            plan,
+            candidate,
+            event_type,
+            trade_date,
+        )
+        if lookup_existing:
+            existing = (
+                await db.execute(
+                    select(TradingAlertEvent).where(
+                        TradingAlertEvent.dedup_key == dedup_key
+                    )
+                )
+            ).scalar_one_or_none()
+            if existing is not None:
+                return existing
+
+        stock_code = str(self._candidate_value(candidate, "stock_code") or "")
+        stock_name = str(self._candidate_value(candidate, "stock_name") or "")
+        mode_key = str(
+            self._candidate_value(candidate, "primary_mode_key") or ""
+        )
+        idempotency_key = dedup_key
+        event = TradingAlertEvent(
+            plan_version_id=plan_id,
+            candidate_id=candidate_id,
+            event_type=event_type,
+            severity=_ACTION_EVENT_SEVERITIES[event_type],
+            dedup_key=dedup_key,
+            triggered_at=triggered_at.astimezone(CN_TZ).replace(tzinfo=None),
+            market_snapshot_json={
+                "trade_date": trade_date.isoformat(),
+                "stock_code": stock_code,
+                "mode_key": mode_key,
+                "quote": self._snapshot_quote(quote),
+            },
+            message=f"交易预案提醒：{stock_code} {stock_name} {event_type}",
+            channel_status_json={
+                self.channel_name: {
+                    "status": "pending",
+                    "idempotency_key": idempotency_key,
+                    "attempts": 0,
+                }
+            },
+        )
+        db.add(event)
+        try:
+            await db.commit()
+            await db.refresh(event)
+            return event
+        except IntegrityError:
+            await db.rollback()
+            winner = (
+                await db.execute(
+                    select(TradingAlertEvent).where(
+                        TradingAlertEvent.dedup_key == dedup_key
+                    )
+                )
+            ).scalar_one_or_none()
+            if winner is None:
+                raise
+            return winner
 
     async def _channel_enabled(self, db) -> bool:
         if self.channel_name != "in_app":
