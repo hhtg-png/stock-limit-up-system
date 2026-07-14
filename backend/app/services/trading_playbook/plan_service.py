@@ -634,11 +634,13 @@ class TradingPlanService:
         self._risk_settings(validation_row)
 
         conditions = [TradingPlaybookSettings.id == 1]
-        if "trial_position_pct" in changes:
+        has_trial = "trial_position_pct" in changes
+        has_confirmed = "confirmed_position_pct" in changes
+        if has_trial and not has_confirmed:
             conditions.append(
                 TradingPlaybookSettings.confirmed_position_pct >= trial
             )
-        if "confirmed_position_pct" in changes:
+        if has_confirmed and not has_trial:
             conditions.append(
                 TradingPlaybookSettings.trial_position_pct <= confirmed
             )

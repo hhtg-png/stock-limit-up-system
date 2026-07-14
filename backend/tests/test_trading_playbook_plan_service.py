@@ -1647,6 +1647,52 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
                         await db.commit()
                 await db.rollback()
 
+    async def test_settings_can_raise_both_position_limits_atomically(self):
+        async with self.Session() as db:
+            db.add(
+                TradingPlaybookSettings(
+                    id=1,
+                    trial_position_pct=10,
+                    confirmed_position_pct=30,
+                )
+            )
+            await db.commit()
+
+            row = await self.service.update_settings(
+                db,
+                {
+                    "trial_position_pct": 50.0,
+                    "confirmed_position_pct": 60.0,
+                },
+                AS_OF.replace(tzinfo=ZoneInfo("Asia/Shanghai")),
+            )
+
+        self.assertEqual(row.trial_position_pct, 50.0)
+        self.assertEqual(row.confirmed_position_pct, 60.0)
+
+    async def test_settings_can_lower_both_position_limits_atomically(self):
+        async with self.Session() as db:
+            db.add(
+                TradingPlaybookSettings(
+                    id=1,
+                    trial_position_pct=50,
+                    confirmed_position_pct=60,
+                )
+            )
+            await db.commit()
+
+            row = await self.service.update_settings(
+                db,
+                {
+                    "trial_position_pct": 10.0,
+                    "confirmed_position_pct": 20.0,
+                },
+                AS_OF.replace(tzinfo=ZoneInfo("Asia/Shanghai")),
+            )
+
+        self.assertEqual(row.trial_position_pct, 10.0)
+        self.assertEqual(row.confirmed_position_pct, 20.0)
+
     async def test_file_sqlite_concurrent_settings_updates_preserve_position_order(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
             database_path = Path(directory) / "settings.db"
@@ -1690,6 +1736,56 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
                     self.assertLessEqual(
                         row.trial_position_pct,
                         row.confirmed_position_pct,
+                    )
+            finally:
+                await first_engine.dispose()
+                await second_engine.dispose()
+
+    async def test_file_sqlite_concurrent_two_field_settings_remain_atomic_pairs(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            database_path = Path(directory) / "settings-pairs.db"
+            url = f"sqlite+aiosqlite:///{database_path.as_posix()}"
+            first_engine = create_async_engine(url, connect_args={"timeout": 5})
+            second_engine = create_async_engine(url, connect_args={"timeout": 5})
+            FirstSession = async_sessionmaker(first_engine, expire_on_commit=False)
+            SecondSession = async_sessionmaker(second_engine, expire_on_commit=False)
+            try:
+                async with first_engine.begin() as connection:
+                    await connection.run_sync(Base.metadata.create_all)
+                async with FirstSession() as db:
+                    db.add(
+                        TradingPlaybookSettings(
+                            id=1,
+                            trial_position_pct=10,
+                            confirmed_position_pct=30,
+                        )
+                    )
+                    await db.commit()
+
+                async def update_pair(session_factory, trial, confirmed):
+                    async with session_factory() as db:
+                        return await TradingPlanService().update_settings(
+                            db,
+                            {
+                                "trial_position_pct": trial,
+                                "confirmed_position_pct": confirmed,
+                            },
+                            AS_OF.replace(tzinfo=ZoneInfo("Asia/Shanghai")),
+                        )
+
+                results = await asyncio.gather(
+                    update_pair(FirstSession, 40.0, 60.0),
+                    update_pair(SecondSession, 15.0, 25.0),
+                    return_exceptions=True,
+                )
+                self.assertFalse(
+                    [result for result in results if isinstance(result, Exception)]
+                )
+                async with FirstSession() as db:
+                    row = await db.get(TradingPlaybookSettings, 1)
+                    self.assertIn(
+                        (row.trial_position_pct, row.confirmed_position_pct),
+                        {(40.0, 60.0), (15.0, 25.0)},
                     )
             finally:
                 await first_engine.dispose()
