@@ -1593,6 +1593,42 @@ class TradingPlaybookReviewPersistenceTests(unittest.IsolatedAsyncioTestCase):
             ["invalid_triggered_at", "triggered_at_trade_date_mismatch"],
         )
 
+    def test_event_filter_sanitizes_nonfinite_snapshot_trade_dates_in_warnings(self):
+        rows = []
+        for event_id, raw_trade_date in enumerate(
+            (float("nan"), float("inf"), float("-inf")),
+            start=1,
+        ):
+            rows.append(
+                {
+                    "id": event_id,
+                    "candidate_id": 1,
+                    "event_type": "entry_triggered",
+                    "dedup_key": (
+                        f"action:{TRADE_DATE.isoformat()}:1:1:mode:entry:{event_id}"
+                    ),
+                    "triggered_at": datetime(2026, 7, 14, 10, 0),
+                    "market_snapshot_json": {"trade_date": raw_trade_date},
+                }
+            )
+
+        events, warnings = TradingPlaybookReviewService._filter_events(
+            rows,
+            TRADE_DATE,
+            build_now=FINALIZED_AT,
+        )
+
+        self.assertEqual(events, [])
+        self.assertEqual(
+            [(warning["event_id"], warning["reason"]) for warning in warnings],
+            [(1, "invalid_trade_date"), (2, "invalid_trade_date"), (3, "invalid_trade_date")],
+        )
+        self.assertEqual(
+            [warning["observed_trade_date"] for warning in warnings],
+            [None, None, None],
+        )
+        json.dumps(warnings, allow_nan=False)
+
     async def test_final_build_racing_manual_update_never_overwrites_manual_json(self):
         _, candidate_id = await self._add_plan()
         await self._add_outcome()
@@ -2064,6 +2100,26 @@ class TradingPlaybookReviewPersistenceTests(unittest.IsolatedAsyncioTestCase):
                     message="corrupt numeric payload",
                 )
             )
+            for index, raw_trade_date in enumerate(
+                (float("nan"), float("inf"), float("-inf")),
+                start=1,
+            ):
+                db.add(
+                    TradingAlertEvent(
+                        plan_version_id=corrupt_plan_id,
+                        candidate_id=corrupt_candidate_id,
+                        event_type="entry_triggered",
+                        severity="info",
+                        dedup_key=(
+                            f"action:{TRADE_DATE.isoformat()}:{corrupt_plan_id}:"
+                            f"{corrupt_candidate_id}:mode:entry:test:bad-date-{index}"
+                        ),
+                        triggered_at=datetime(2026, 7, 14, 10, index),
+                        market_snapshot_json={"trade_date": raw_trade_date},
+                        channel_status_json={},
+                        message="corrupt trade date",
+                    )
+                )
             await db.commit()
 
         service = TradingPlaybookReviewService(now_provider=lambda: FINALIZED_AT)
@@ -2089,8 +2145,19 @@ class TradingPlaybookReviewPersistenceTests(unittest.IsolatedAsyncioTestCase):
             {
                 "market_snapshot_json.quote.price",
                 "market_snapshot_json.nested[0]",
+                "market_snapshot_json.trade_date",
                 "channel_status_json.in_app.latency_seconds",
             },
+        )
+        invalid_date_warnings = [
+            warning
+            for warning in corrupt.data_quality_json["event_warnings"]
+            if warning["reason"] == "invalid_trade_date"
+        ]
+        self.assertEqual(len(invalid_date_warnings), 3)
+        self.assertEqual(
+            [warning["observed_trade_date"] for warning in invalid_date_warnings],
+            [None, None, None],
         )
         json.dumps(corrupt.signal_review_json, allow_nan=False)
         json.dumps(corrupt.data_quality_json, allow_nan=False)

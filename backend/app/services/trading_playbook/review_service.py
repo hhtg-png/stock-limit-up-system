@@ -1246,16 +1246,41 @@ class TradingPlaybookReviewService:
                 events.append(safe_event)
                 warnings.extend(event_warnings)
                 continue
-            warnings.append(
-                {
-                    "event_id": _value(event, "id"),
-                    "event_type": _value(event, "event_type"),
-                    "reason": reason,
-                    "observed_trade_date": _json_value(raw_trade_date),
-                    "dedup_trade_date": dedup_trade_date,
-                    "triggered_at": _json_value(raw_triggered_at),
-                }
-            )
+            warning_issues: list[tuple[str, str]] = []
+            warning = {
+                "event_id": _sanitize_event_json(
+                    _value(event, "id"),
+                    path="event_id",
+                    issues=warning_issues,
+                ),
+                "event_type": _sanitize_event_json(
+                    _value(event, "event_type"),
+                    path="event_type",
+                    issues=warning_issues,
+                ),
+                "reason": reason,
+                "observed_trade_date": _sanitize_event_json(
+                    raw_trade_date,
+                    path="market_snapshot_json.trade_date",
+                    issues=warning_issues,
+                ),
+                "dedup_trade_date": _sanitize_event_json(
+                    dedup_trade_date,
+                    path="dedup_trade_date",
+                    issues=warning_issues,
+                ),
+                "triggered_at": _sanitize_event_json(
+                    raw_triggered_at,
+                    path="triggered_at",
+                    issues=warning_issues,
+                ),
+            }
+            if warning_issues:
+                warning["path"] = warning_issues[0][0]
+                warning["sanitized_paths"] = sorted(
+                    {path for path, _ in warning_issues}
+                )
+            warnings.append(warning)
         return events, warnings
 
     @classmethod
