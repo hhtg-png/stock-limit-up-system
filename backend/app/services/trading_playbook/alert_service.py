@@ -1522,44 +1522,178 @@ class TradingPlaybookAlertService:
             detail={"reason": reason},
         )
 
+    async def _delivery_enabled_under_lock(self, db, event_id: int) -> bool:
+        if self.channel_name != "in_app":
+            return True
+        settings = await self._lock_delivery_settings(db)
+        if settings is None:
+            await self._skip_owned_delivery(
+                db,
+                event_id,
+                reason="settings_missing",
+            )
+            return False
+        if not bool(settings.enabled) or not bool(settings.in_app_enabled):
+            await self._skip_owned_delivery(
+                db,
+                event_id,
+                reason="disabled",
+            )
+            return False
+        return True
+
+    async def _mark_channel_started(
+        self,
+        db,
+        event: TradingAlertEvent,
+    ) -> None:
+        status = copy.deepcopy(event.channel_status_json or {})
+        channel_status = dict(status.get(self.channel_name) or {})
+        if (
+            channel_status.get("status") != "sending"
+            or channel_status.get("owner") != self.owner
+        ):
+            raise TradingAlertDeliveryStateLost(
+                f"alert delivery owner lost for event {event.id}"
+            )
+        channel_status["channel_started_at"] = now_cn().isoformat()
+        status[self.channel_name] = channel_status
+        status_path = TradingAlertEvent.channel_status_json[
+            self.channel_name
+        ]["status"].as_string()
+        owner_path = TradingAlertEvent.channel_status_json[
+            self.channel_name
+        ]["owner"].as_string()
+        channel_started_path = TradingAlertEvent.channel_status_json[
+            self.channel_name
+        ]["channel_started_at"].as_string()
+        result = await db.execute(
+            update(TradingAlertEvent)
+            .where(
+                TradingAlertEvent.id == event.id,
+                status_path == "sending",
+                owner_path == self.owner,
+                channel_started_path.is_(None),
+            )
+            .values(channel_status_json=status)
+        )
+        await db.commit()
+        if result.rowcount != 1:
+            raise TradingAlertDeliveryStateLost(
+                f"alert delivery state lost for event {event.id}"
+            )
+        event.channel_status_json = status
+
+    async def _recover_pre_send_delivery(
+        self,
+        db,
+        event_id: int,
+        error: BaseException,
+    ) -> None:
+        try:
+            await db.rollback()
+        except Exception as rollback_error:
+            logger.error(
+                "Unable to rollback failed pre-send session for {}: {}",
+                event_id,
+                rollback_error,
+            )
+        if self.session_factory is None:
+            logger.error(
+                "Unable to compensate pre-send alert delivery for {}: "
+                "session factory missing",
+                event_id,
+            )
+            return
+        try:
+            async with self.session_factory() as fresh_db:
+                event = await fresh_db.get(TradingAlertEvent, event_id)
+                if event is None:
+                    return
+                status = copy.deepcopy(event.channel_status_json or {})
+                channel_status = dict(status.get(self.channel_name) or {})
+                if (
+                    channel_status.get("status") != "sending"
+                    or channel_status.get("owner") != self.owner
+                ):
+                    return
+                channel_status.update(
+                    {
+                        "status": "pending",
+                        "pre_send_error": str(error),
+                        "recovered_at": now_cn().isoformat(),
+                    }
+                )
+                channel_status.pop("owner", None)
+                channel_status.pop("sending_at", None)
+                channel_status.pop("channel_started_at", None)
+                status[self.channel_name] = channel_status
+                status_path = TradingAlertEvent.channel_status_json[
+                    self.channel_name
+                ]["status"].as_string()
+                owner_path = TradingAlertEvent.channel_status_json[
+                    self.channel_name
+                ]["owner"].as_string()
+                result = await fresh_db.execute(
+                    update(TradingAlertEvent)
+                    .where(
+                        TradingAlertEvent.id == event_id,
+                        status_path == "sending",
+                        owner_path == self.owner,
+                    )
+                    .values(channel_status_json=status)
+                )
+                await fresh_db.commit()
+                if result.rowcount != 1:
+                    logger.error(
+                        "Fresh pre-send compensation lost state for event {}",
+                        event_id,
+                    )
+        except Exception as compensation_error:
+            logger.error(
+                "Unable to compensate pre-send alert delivery for {}: {}",
+                event_id,
+                compensation_error,
+            )
+
     async def _deliver(self, db, event: TradingAlertEvent) -> None:
         if not await self._claim_pending(db, event):
             return
-        if self.channel_name == "in_app":
-            settings = await self._lock_delivery_settings(db)
-            if settings is None:
-                await self._skip_owned_delivery(
-                    db,
-                    event.id,
-                    reason="settings_missing",
-                )
+        try:
+            if not await self._delivery_enabled_under_lock(db, event.id):
                 return
-            if not bool(settings.enabled) or not bool(settings.in_app_enabled):
-                await self._skip_owned_delivery(
-                    db,
-                    event.id,
-                    reason="disabled",
-                )
+            channel_status = event.channel_status_json[self.channel_name]
+            idempotency_key = channel_status["idempotency_key"]
+            payload = {
+                "id": event.id,
+                "dedup_key": event.dedup_key,
+                "idempotency_key": idempotency_key,
+                "plan_version_id": event.plan_version_id,
+                "candidate_id": event.candidate_id,
+                "event_type": event.event_type,
+                "severity": event.severity,
+                "triggered_at": event.triggered_at.isoformat(),
+                "message": event.message,
+                "market_snapshot": copy.deepcopy(
+                    event.market_snapshot_json or {}
+                ),
+            }
+            stock_code = str(
+                (event.market_snapshot_json or {}).get("stock_code") or ""
+            ).strip()
+            if stock_code:
+                payload["stock_code"] = stock_code
+            await self._mark_channel_started(db, event)
+            if not await self._delivery_enabled_under_lock(db, event.id):
                 return
-        channel_status = event.channel_status_json[self.channel_name]
-        idempotency_key = channel_status["idempotency_key"]
-        payload = {
-            "id": event.id,
-            "dedup_key": event.dedup_key,
-            "idempotency_key": idempotency_key,
-            "plan_version_id": event.plan_version_id,
-            "candidate_id": event.candidate_id,
-            "event_type": event.event_type,
-            "severity": event.severity,
-            "triggered_at": event.triggered_at.isoformat(),
-            "message": event.message,
-            "market_snapshot": copy.deepcopy(event.market_snapshot_json or {}),
-        }
-        stock_code = str(
-            (event.market_snapshot_json or {}).get("stock_code") or ""
-        ).strip()
-        if stock_code:
-            payload["stock_code"] = stock_code
+        except asyncio.CancelledError as exc:
+            await asyncio.shield(
+                self._recover_pre_send_delivery(db, event.id, exc)
+            )
+            raise
+        except Exception as exc:
+            await self._recover_pre_send_delivery(db, event.id, exc)
+            raise
         try:
             receipt = await self.channel.send(
                 payload,

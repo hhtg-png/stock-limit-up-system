@@ -251,7 +251,7 @@ class TradingPlaybookDurableAlertTests(unittest.IsolatedAsyncioTestCase):
         def fail_delivered_commit(_connection):
             nonlocal commits, injected
             commits += 1
-            if commits == 5 and not injected:
+            if commits == 6 and not injected:
                 injected = True
                 raise RuntimeError("real delivered commit failure")
 
@@ -310,6 +310,230 @@ class TradingPlaybookDurableAlertTests(unittest.IsolatedAsyncioTestCase):
                 == "delivered"
                 for row in events
             )
+        )
+
+    async def test_settings_lock_failure_returns_pre_send_to_pending_and_restart_sends(self):
+        from app.services.trading_playbook.alert_service import (
+            TradingPlaybookAlertService,
+        )
+
+        channel = _RecordingInAppChannel()
+        failing = TradingPlaybookAlertService(
+            channel,
+            session_factory=self.SecondSession,
+        )
+        async with self.Session() as db:
+            row = await failing.emit_plan_event(
+                db,
+                self.plan,
+                event_type="plan_ready",
+                send=False,
+            )
+            event_id = row.id
+
+        failing._lock_delivery_settings = AsyncMock(
+            side_effect=RuntimeError("settings lock failed")
+        )
+        with self.assertRaisesRegex(RuntimeError, "settings lock failed"):
+            async with self.Session() as db:
+                row = await db.get(TradingAlertEvent, event_id)
+                await failing._deliver(db, row)
+
+        persisted = (await self._events())[0]
+        self.assertEqual(
+            persisted.channel_status_json["in_app"]["status"],
+            "pending",
+        )
+        self.assertIn(
+            "settings lock failed",
+            persisted.channel_status_json["in_app"]["pre_send_error"],
+        )
+        self.assertEqual(channel.sends, [])
+
+        restarted = TradingPlaybookAlertService(
+            channel,
+            session_factory=self.Session,
+        )
+        async with self.SecondSession() as db:
+            row = await db.get(TradingAlertEvent, event_id)
+            await restarted._deliver(db, row)
+
+        self.assertEqual(len(channel.sends), 1)
+        self.assertEqual(
+            (await self._events())[0].channel_status_json["in_app"]["status"],
+            "delivered",
+        )
+
+    async def test_channel_started_commit_failure_recovers_before_send(self):
+        from app.services.trading_playbook.alert_service import (
+            TradingPlaybookAlertService,
+        )
+
+        channel = _RecordingInAppChannel()
+        failing = TradingPlaybookAlertService(
+            channel,
+            session_factory=self.SecondSession,
+        )
+        async with self.Session() as db:
+            row = await failing.emit_plan_event(
+                db,
+                self.plan,
+                event_type="plan_ready",
+                send=False,
+            )
+            event_id = row.id
+
+        commits = 0
+
+        def fail_second_commit(_session):
+            nonlocal commits
+            commits += 1
+            if commits == 2:
+                raise RuntimeError("channel-started commit failed")
+
+        async with self.Session() as db:
+            event.listen(db.sync_session, "before_commit", fail_second_commit)
+            try:
+                row = await db.get(TradingAlertEvent, event_id)
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "channel-started commit failed",
+                ):
+                    await failing._deliver(db, row)
+            finally:
+                event.remove(
+                    db.sync_session,
+                    "before_commit",
+                    fail_second_commit,
+                )
+
+        self.assertEqual(commits, 2)
+        self.assertEqual(channel.sends, [])
+        persisted = (await self._events())[0]
+        self.assertEqual(
+            persisted.channel_status_json["in_app"]["status"],
+            "pending",
+        )
+        self.assertIn(
+            "channel-started commit failed",
+            persisted.channel_status_json["in_app"]["pre_send_error"],
+        )
+
+        restarted = TradingPlaybookAlertService(
+            channel,
+            session_factory=self.Session,
+        )
+        async with self.SecondSession() as db:
+            row = await db.get(TradingAlertEvent, event_id)
+            await restarted._deliver(db, row)
+
+        self.assertEqual(len(channel.sends), 1)
+        self.assertEqual(
+            (await self._events())[0].channel_status_json["in_app"]["status"],
+            "delivered",
+        )
+
+    async def test_second_settings_lock_failure_after_fence_recovers_before_send(self):
+        from app.services.trading_playbook.alert_service import (
+            TradingPlaybookAlertService,
+        )
+
+        channel = _RecordingInAppChannel()
+        failing = TradingPlaybookAlertService(
+            channel,
+            session_factory=self.SecondSession,
+        )
+        async with self.Session() as db:
+            row = await failing.emit_plan_event(
+                db,
+                self.plan,
+                event_type="plan_ready",
+                send=False,
+            )
+            event_id = row.id
+
+        lock_settings = failing._lock_delivery_settings
+        lock_calls = 0
+
+        async def fail_second_lock(db):
+            nonlocal lock_calls
+            lock_calls += 1
+            if lock_calls == 2:
+                raise RuntimeError("second settings lock failed")
+            return await lock_settings(db)
+
+        failing._lock_delivery_settings = fail_second_lock
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "second settings lock failed",
+        ):
+            async with self.Session() as db:
+                row = await db.get(TradingAlertEvent, event_id)
+                await failing._deliver(db, row)
+
+        self.assertEqual(lock_calls, 2)
+        self.assertEqual(channel.sends, [])
+        persisted = (await self._events())[0]
+        self.assertEqual(
+            persisted.channel_status_json["in_app"]["status"],
+            "pending",
+        )
+        self.assertIn(
+            "second settings lock failed",
+            persisted.channel_status_json["in_app"]["pre_send_error"],
+        )
+
+        restarted = TradingPlaybookAlertService(
+            channel,
+            session_factory=self.Session,
+        )
+        async with self.SecondSession() as db:
+            row = await db.get(TradingAlertEvent, event_id)
+            await restarted._deliver(db, row)
+        self.assertEqual(len(channel.sends), 1)
+
+    async def test_cancellation_before_channel_fence_recovers_then_reraises(self):
+        from app.services.trading_playbook.alert_service import (
+            TradingPlaybookAlertService,
+        )
+
+        channel = _RecordingInAppChannel()
+        service = TradingPlaybookAlertService(
+            channel,
+            session_factory=self.SecondSession,
+        )
+        async with self.Session() as db:
+            row = await service.emit_plan_event(
+                db,
+                self.plan,
+                event_type="plan_ready",
+                send=False,
+            )
+            event_id = row.id
+
+        lock_started = asyncio.Event()
+
+        async def block_settings_lock(_db):
+            lock_started.set()
+            await asyncio.Event().wait()
+
+        service._lock_delivery_settings = block_settings_lock
+
+        async def deliver():
+            async with self.Session() as db:
+                row = await db.get(TradingAlertEvent, event_id)
+                await service._deliver(db, row)
+
+        task = asyncio.create_task(deliver())
+        await asyncio.wait_for(lock_started.wait(), timeout=1)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        self.assertEqual(channel.sends, [])
+        self.assertEqual(
+            (await self._events())[0].channel_status_json["in_app"]["status"],
+            "pending",
         )
 
     async def test_cancel_swallowed_after_acceptance_then_takeover_does_not_resend(self):
