@@ -12,7 +12,7 @@ from collections.abc import Mapping
 from datetime import date, datetime, time
 from typing import Any
 
-from sqlalchemy import and_, or_, select, update
+from sqlalchemy import and_, literal, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
@@ -55,6 +55,15 @@ _ACTION_CONDITION_SPECS = (
 )
 _TERMINAL_ACTION_EVENT_TYPES = ("exit_triggered",)
 _ACTION_OUTBOX_DRAIN_BATCH_SIZE = 100
+_ISO_DATE_PATTERN = (
+    r"^(?!0000)(?:"
+    r"[0-9]{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12][0-9]|3[01])|"
+    r"(?:0[469]|11)-(?:0[1-9]|[12][0-9]|30)|"
+    r"02-(?:0[1-9]|1[0-9]|2[0-8]))|"
+    r"(?:[0-9]{2}(?:0[48]|[2468][048]|[13579][26])|"
+    r"(?:0[48]|[2468][048]|[13579][26])00)-02-29"
+    r")$"
+)
 
 
 class TradingAlertDeliveryStateLost(RuntimeError):
@@ -188,7 +197,12 @@ class TradingPlaybookAlertService:
         channel_started_path = TradingAlertEvent.channel_status_json[
             self.channel_name
         ]["channel_started_at"].as_string()
-        today_prefix = f"action:{trade_date.isoformat()}:"
+        action_date_path = TradingAlertEvent.market_snapshot_json[
+            "trade_date"
+        ].as_string()
+        expected_dedup_pattern = (
+            literal("action:") + action_date_path + literal(":%")
+        )
         return (
             select(TradingAlertEvent)
             .where(
@@ -203,12 +217,11 @@ class TradingPlaybookAlertService:
                     ),
                 ),
                 or_(
-                    TradingAlertEvent.dedup_key.like(
-                        f"{today_prefix}%"
-                    ),
-                    TradingAlertEvent.dedup_key < today_prefix,
+                    action_date_path.is_(None),
+                    ~action_date_path.regexp_match(_ISO_DATE_PATTERN),
+                    action_date_path <= trade_date.isoformat(),
                     TradingAlertEvent.dedup_key.not_like(
-                        "action:____-__-__:%"
+                        expected_dedup_pattern
                     ),
                 ),
             )
@@ -221,15 +234,30 @@ class TradingPlaybookAlertService:
 
     @staticmethod
     def _persisted_action_date(event: TradingAlertEvent) -> date | None:
+        snapshot = event.market_snapshot_json
+        if not isinstance(snapshot, Mapping):
+            return None
+        snapshot_value = snapshot.get("trade_date")
+        if not isinstance(snapshot_value, str):
+            return None
+        try:
+            snapshot_date = date.fromisoformat(snapshot_value)
+        except ValueError:
+            return None
+        if snapshot_date.isoformat() != snapshot_value:
+            return None
+
         parts = str(event.dedup_key or "").split(":", 2)
         if len(parts) != 3 or parts[0] != "action":
             return None
-        value = parts[1]
+        dedup_value = parts[1]
         try:
-            parsed = date.fromisoformat(value)
+            dedup_date = date.fromisoformat(dedup_value)
         except ValueError:
             return None
-        return parsed if parsed.isoformat() == value else None
+        if dedup_date.isoformat() != dedup_value:
+            return None
+        return snapshot_date if snapshot_date == dedup_date else None
 
     async def _update_recoverable_action_event(
         self,

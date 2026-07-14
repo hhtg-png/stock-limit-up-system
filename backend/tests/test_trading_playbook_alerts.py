@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from sqlalchemy import event, select, update
-from sqlalchemy.dialects import postgresql
+from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.database import Base
@@ -667,25 +667,33 @@ class TradingPlaybookDurableAlertTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("channel_status_json", compiled)
         self.assertIn("->>", compiled)
 
-    def test_action_due_statement_filters_future_before_limit_for_postgresql(self):
+    def test_action_due_statement_filters_future_before_limit_across_dialects(self):
         from app.services.trading_playbook.alert_service import (
             TradingPlaybookAlertService,
         )
 
         service = TradingPlaybookAlertService(_RecordingInAppChannel())
-        compiled = str(
-            service._recoverable_action_events_statement(
-                date(2026, 7, 14)
-            ).compile(
-                dialect=postgresql.dialect(),
-                compile_kwargs={"literal_binds": True},
-            )
+        statement = service._recoverable_action_events_statement(
+            date(2026, 7, 14)
         )
-
-        self.assertIn("action:2026-07-14:%", compiled)
-        self.assertIn("action:____-__-__:%", compiled)
-        self.assertIn("NOT LIKE", compiled)
-        self.assertIn("LIMIT 100", compiled)
+        for dialect, regex_operator in (
+            (postgresql.dialect(), "!~"),
+            (sqlite.dialect(), "NOT REGEXP"),
+        ):
+            with self.subTest(dialect=dialect.name):
+                compiled = str(
+                    statement.compile(
+                        dialect=dialect,
+                        compile_kwargs={"literal_binds": True},
+                    )
+                )
+                self.assertIn("market_snapshot_json", compiled)
+                self.assertIn("trade_date", compiled)
+                self.assertIn("2026-07-14", compiled)
+                self.assertIn("action:", compiled)
+                self.assertIn(regex_operator, compiled)
+                self.assertIn("NOT LIKE", compiled)
+                self.assertIn("LIMIT 100", compiled)
 
     async def test_disabled_in_app_setting_persists_without_sending(self):
         from app.models.trading_playbook import TradingPlaybookSettings
@@ -1113,12 +1121,15 @@ class TradingPlaybookActionMonitorTests(unittest.IsolatedAsyncioTestCase):
         owner="stopped-worker",
         channel_started_at=None,
         event_type="entry_triggered",
+        snapshot_trade_date=...,
     ):
+        if snapshot_trade_date is ...:
+            snapshot_trade_date = action_date
         snapshot = {"stock_code": "000001"}
-        if isinstance(action_date, date):
-            snapshot["trade_date"] = action_date.isoformat()
-        elif action_date is not None:
-            snapshot["trade_date"] = action_date
+        if isinstance(snapshot_trade_date, date):
+            snapshot["trade_date"] = snapshot_trade_date.isoformat()
+        elif snapshot_trade_date is not None:
+            snapshot["trade_date"] = snapshot_trade_date
         if isinstance(action_date, date):
             dedup_key = f"action:{action_date.isoformat()}:{suffix}"
         elif action_date is not None:
@@ -1253,6 +1264,21 @@ class TradingPlaybookActionMonitorTests(unittest.IsolatedAsyncioTestCase):
             suffix="missing-date",
             triggered_at=datetime(2026, 7, 14, 10, 1),
         )
+        mismatch_id = await self._seed_action_event(
+            plan_id,
+            candidate_id,
+            action_date=self.today,
+            snapshot_trade_date=date(2026, 7, 15),
+            suffix="snapshot-dedup-mismatch",
+            triggered_at=datetime(2026, 7, 14, 10, 2),
+        )
+        invalid_future_id = await self._seed_action_event(
+            plan_id,
+            candidate_id,
+            action_date="2027-02-29",
+            suffix="invalid-future-date",
+            triggered_at=datetime(2026, 7, 14, 10, 3),
+        )
 
         async with self.Session() as db:
             await self._monitor_service(_RecordingInAppChannel()).monitor(
@@ -1261,7 +1287,12 @@ class TradingPlaybookActionMonitorTests(unittest.IsolatedAsyncioTestCase):
             )
 
         events = {event.id: event for event in await self._events()}
-        for event_id in (malformed_id, missing_id):
+        for event_id in (
+            malformed_id,
+            missing_id,
+            mismatch_id,
+            invalid_future_id,
+        ):
             channel_status = events[event_id].channel_status_json["in_app"]
             self.assertEqual(channel_status["status"], "skipped")
             self.assertEqual(channel_status["reason"], "invalid_action_date")
