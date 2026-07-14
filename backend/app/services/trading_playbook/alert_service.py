@@ -161,7 +161,7 @@ class TradingPlaybookAlertService:
             )
             for event_type in _PLAN_EVENT_TYPES
         ]
-        if send and channel_enabled:
+        if send:
             for event in events:
                 await self._deliver(db, event)
         return events
@@ -186,7 +186,7 @@ class TradingPlaybookAlertService:
                 enabled=channel_enabled,
             ),
         )
-        if send and channel_enabled:
+        if send:
             await self._deliver(db, event)
         return event
 

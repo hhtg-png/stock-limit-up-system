@@ -967,6 +967,113 @@ class TradingPlaybookDurableAlertTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
+    async def test_disabled_restart_terminalizes_existing_plan_events(self):
+        from app.models.trading_playbook import TradingPlaybookSettings
+        from app.services.trading_playbook.alert_service import (
+            TradingPlaybookAlertService,
+        )
+
+        channel = _RecordingInAppChannel()
+        service = TradingPlaybookAlertService(channel)
+        async with self.Session() as db:
+            events = await service.notify_plan_ready(
+                db,
+                self.plan,
+                send=False,
+            )
+            confirmation = next(
+                event
+                for event in events
+                if event.event_type == "confirmation_required"
+            )
+            status = dict(confirmation.channel_status_json or {})
+            channel_status = dict(status["in_app"])
+            channel_status.update(
+                {
+                    "status": "sending",
+                    "owner": "crashed-worker",
+                    "sending_at": "2026-07-14T10:00:00+08:00",
+                }
+            )
+            status["in_app"] = channel_status
+            confirmation.channel_status_json = status
+            settings = await db.get(TradingPlaybookSettings, 1)
+            settings.in_app_enabled = False
+            await db.commit()
+
+        restarted = TradingPlaybookAlertService(
+            channel,
+            session_factory=self.SecondSession,
+        )
+        async with self.SecondSession() as db:
+            await restarted.notify_plan_ready(
+                db,
+                self.plan,
+                send=True,
+            )
+
+        self.assertEqual(channel.sends, [])
+        events = {
+            event.event_type: event
+            for event in await self._events()
+        }
+        for event_type in ("plan_ready", "confirmation_required"):
+            channel_status = events[event_type].channel_status_json["in_app"]
+            self.assertEqual(channel_status["status"], "skipped")
+            self.assertEqual(channel_status["reason"], "disabled")
+
+    async def test_disabled_restart_does_not_recover_event_after_marker(self):
+        from app.models.trading_playbook import TradingPlaybookSettings
+        from app.services.trading_playbook.alert_service import (
+            TradingPlaybookAlertService,
+        )
+
+        channel = _RecordingInAppChannel()
+        service = TradingPlaybookAlertService(channel)
+        async with self.Session() as db:
+            event_row = await service.emit_plan_event(
+                db,
+                self.plan,
+                event_type="plan_ready",
+                send=False,
+            )
+            status = dict(event_row.channel_status_json or {})
+            channel_status = dict(status["in_app"])
+            channel_status.update(
+                {
+                    "status": "sending",
+                    "owner": "crashed-after-marker",
+                    "sending_at": "2026-07-14T10:00:00+08:00",
+                    "channel_started_at": "2026-07-14T10:00:01+08:00",
+                }
+            )
+            status["in_app"] = channel_status
+            event_row.channel_status_json = status
+            settings = await db.get(TradingPlaybookSettings, 1)
+            settings.in_app_enabled = False
+            await db.commit()
+            event_id = event_row.id
+
+        restarted = TradingPlaybookAlertService(
+            channel,
+            session_factory=self.SecondSession,
+        )
+        async with self.SecondSession() as db:
+            await restarted.emit_plan_event(
+                db,
+                self.plan,
+                event_type="plan_ready",
+                send=True,
+            )
+
+        self.assertEqual(channel.sends, [])
+        event_row = next(
+            event for event in await self._events() if event.id == event_id
+        )
+        channel_status = event_row.channel_status_json["in_app"]
+        self.assertEqual(channel_status["status"], "sending")
+        self.assertIn("channel_started_at", channel_status)
+
     async def test_send_holds_sqlite_settings_lock_until_delivery_commit(self):
         from app.services.trading_playbook.alert_service import (
             TradingPlaybookAlertService,
