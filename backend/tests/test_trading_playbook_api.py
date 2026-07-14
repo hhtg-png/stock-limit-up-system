@@ -2,6 +2,7 @@ import asyncio
 import json
 import unittest
 from datetime import date, datetime
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI
@@ -10,6 +11,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
+from app.api.v1 import trading_playbook as trading_playbook_api
 from app.api.v1.trading_playbook import (
     get_trading_playbook_now,
     get_trading_playbook_orchestrator,
@@ -25,7 +27,12 @@ from app.models.trading_playbook import (
     TradingPlaybookSettings,
 )
 from app.services.trading_playbook.runtime import trading_playbook_runtime
-from app.services.trading_playbook.errors import InvalidRequestError
+from app.services.trading_playbook.errors import (
+    InvalidRequestError,
+    InvalidTransitionError,
+    PlaybookNotFoundError,
+    UpstreamUnavailableError,
+)
 
 
 CN = ZoneInfo("Asia/Shanghai")
@@ -344,6 +351,23 @@ class TradingPlaybookApiTests(unittest.TestCase):
             ).status_code,
             409,
         )
+
+    def test_cancel_upstream_failure_is_fixed_503_without_internal_detail(self):
+        async def fail(*_args, **_kwargs):
+            raise UpstreamUnavailableError("cancel provider secret")
+
+        with patch.object(
+            trading_playbook_api._plan_service,
+            "cancel",
+            new=fail,
+        ), TestClient(self.app, raise_server_exceptions=False) as client:
+            response = client.post("/trading-playbook/plans/1/cancel")
+        self.assertEqual(response.status_code, 503, response.text)
+        self.assertEqual(
+            response.json()["detail"],
+            "Trading playbook service is unavailable",
+        )
+        self.assertNotIn("secret", response.text)
 
     def test_generate_uses_injected_orchestrator_and_aware_clock(self):
         payload = {"source_trade_date": "2026-07-10", "stage": "after_close"}
@@ -770,6 +794,26 @@ class TradingPlaybookApiTests(unittest.TestCase):
         self.assertFalse(response.json()["wechat_enabled"])
         self.assertFalse(asyncio.run(read_flag()))
 
+    def test_settings_upstream_failure_is_fixed_503_without_internal_detail(self):
+        async def fail(*_args, **_kwargs):
+            raise UpstreamUnavailableError("settings provider secret")
+
+        with patch.object(
+            trading_playbook_api._plan_service,
+            "update_settings",
+            new=fail,
+        ), TestClient(self.app, raise_server_exceptions=False) as client:
+            response = client.put(
+                "/trading-playbook/settings",
+                json={"enabled": True},
+            )
+        self.assertEqual(response.status_code, 503, response.text)
+        self.assertEqual(
+            response.json()["detail"],
+            "Trading playbook service is unavailable",
+        )
+        self.assertNotIn("secret", response.text)
+
     def test_review_payload_is_strict_and_forwarded_without_business_logic(self):
         response = self.client.put(
             "/trading-playbook/reviews/2026-07-10",
@@ -803,6 +847,84 @@ class TradingPlaybookApiTests(unittest.TestCase):
             json={"executions": {"1": {"executed": False, "unknown": 1}}},
         )
         self.assertEqual(invalid.status_code, 422)
+
+    def test_review_invalid_request_is_fixed_422_without_internal_detail(self):
+        async def fail(*_args, **_kwargs):
+            raise InvalidRequestError("execution 7 contains secret internals")
+
+        self.review_service.update_manual_execution = fail
+        response = self.client.put(
+            "/trading-playbook/reviews/2026-07-10",
+            json={"executions": {}},
+        )
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertEqual(
+            response.json()["detail"],
+            "Invalid trading playbook request",
+        )
+        self.assertNotIn("secret", response.text)
+
+    def test_review_missing_resource_is_fixed_404_without_internal_detail(self):
+        async def fail(*_args, **_kwargs):
+            raise PlaybookNotFoundError("plan 991 secret lookup")
+
+        self.review_service.update_manual_execution = fail
+        response = self.client.put(
+            "/trading-playbook/reviews/2026-07-10",
+            json={"executions": {}},
+        )
+        self.assertEqual(response.status_code, 404, response.text)
+        self.assertEqual(response.json()["detail"], "Trading plan not found")
+        self.assertNotIn("secret", response.text)
+
+    def test_review_invalid_transition_is_fixed_409_without_internal_detail(self):
+        async def fail(*_args, **_kwargs):
+            raise InvalidTransitionError("active version 42 secret state")
+
+        self.review_service.update_manual_execution = fail
+        response = self.client.put(
+            "/trading-playbook/reviews/2026-07-10",
+            json={"executions": {}},
+        )
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(
+            response.json()["detail"],
+            "Trading plan state conflict",
+        )
+        self.assertNotIn("secret", response.text)
+
+    def test_review_upstream_failure_is_fixed_503_without_internal_detail(self):
+        async def fail(*_args, **_kwargs):
+            raise UpstreamUnavailableError("provider secret endpoint")
+
+        self.review_service.update_manual_execution = fail
+        with TestClient(self.app, raise_server_exceptions=False) as client:
+            response = client.put(
+                "/trading-playbook/reviews/2026-07-10",
+                json={"executions": {}},
+            )
+        self.assertEqual(response.status_code, 503, response.text)
+        self.assertEqual(
+            response.json()["detail"],
+            "Trading playbook service is unavailable",
+        )
+        self.assertNotIn("secret", response.text)
+
+    def test_review_unclassified_value_error_is_safe_503(self):
+        async def fail(*_args, **_kwargs):
+            raise ValueError("unexpected secret implementation invariant")
+
+        self.review_service.update_manual_execution = fail
+        response = self.client.put(
+            "/trading-playbook/reviews/2026-07-10",
+            json={"executions": {}},
+        )
+        self.assertEqual(response.status_code, 503, response.text)
+        self.assertEqual(
+            response.json()["detail"],
+            "Trading playbook service is unavailable",
+        )
+        self.assertNotIn("secret", response.text)
 
     def test_router_is_mounted_once_under_api_v1_prefix(self):
         from app.api.v1 import api_router

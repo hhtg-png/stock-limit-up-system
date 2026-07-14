@@ -483,6 +483,12 @@ async def cancel_plan(plan_id: int, db: AsyncSession = Depends(get_db)):
             status_code=409,
             detail=STATE_CONFLICT_DETAIL,
         ) from exc
+    except UpstreamUnavailableError as exc:
+        await db.rollback()
+        raise HTTPException(
+            status_code=503,
+            detail=SERVICE_UNAVAILABLE_DETAIL,
+        ) from exc
     except IntegrityError as exc:
         await db.rollback()
         raise HTTPException(status_code=409, detail="Plan cancellation conflict") from exc
@@ -562,9 +568,33 @@ async def update_manual_execution(
             executions,
         )
         return _serialize_review(review)
+    except InvalidRequestError as exc:
+        await db.rollback()
+        raise HTTPException(
+            status_code=422,
+            detail=INVALID_REQUEST_DETAIL,
+        ) from exc
+    except PlaybookNotFoundError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=404, detail=NOT_FOUND_DETAIL) from exc
+    except InvalidTransitionError as exc:
+        await db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=STATE_CONFLICT_DETAIL,
+        ) from exc
+    except UpstreamUnavailableError as exc:
+        await db.rollback()
+        raise HTTPException(
+            status_code=503,
+            detail=SERVICE_UNAVAILABLE_DETAIL,
+        ) from exc
     except ValueError as exc:
         await db.rollback()
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=503,
+            detail=SERVICE_UNAVAILABLE_DETAIL,
+        ) from exc
     except IntegrityError as exc:
         await db.rollback()
         raise HTTPException(status_code=409, detail="Review update conflict") from exc
@@ -638,6 +668,12 @@ async def update_settings(
         raise HTTPException(
             status_code=422,
             detail=INVALID_REQUEST_DETAIL,
+        ) from exc
+    except UpstreamUnavailableError as exc:
+        await db.rollback()
+        raise HTTPException(
+            status_code=503,
+            detail=SERVICE_UNAVAILABLE_DETAIL,
         ) from exc
     except IntegrityError as exc:
         await db.rollback()
