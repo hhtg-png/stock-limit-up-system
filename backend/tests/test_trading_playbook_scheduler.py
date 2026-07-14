@@ -576,8 +576,8 @@ class TradingPlaybookDataReadyBarrierTests(unittest.IsolatedAsyncioTestCase):
             )
             return SimpleNamespace(id=7)
 
-        async def finalize(*, plan_version_id=None):
-            calls.append(("finalize", plan_version_id))
+        async def finalize():
+            calls.append(("finalize",))
 
         scheduler._build_trading_playbook_plan = build
         scheduler._finalize_trading_playbook_review = finalize
@@ -600,7 +600,7 @@ class TradingPlaybookDataReadyBarrierTests(unittest.IsolatedAsyncioTestCase):
                     "after_close_barrier_timeout",
                     False,
                 ),
-                ("finalize", 7),
+                ("finalize",),
             ],
         )
 
@@ -960,8 +960,8 @@ class TradingPlaybookForcedUpgradeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(plans[1].data_quality_json["warnings"], [])
         self.assertEqual(alert_service.notify_plan_ready.await_count, 2)
         self.assertEqual(alert_service.monitor.await_count, 3)
-        self.assertEqual(review_service.build.await_count, 2)
-        review_service.build.assert_awaited_with(
+        self.assertEqual(review_service.build.await_count, 1)
+        review_service.build.assert_awaited_once_with(
             unittest.mock.ANY,
             date(2026, 7, 13),
             finalized=True,
@@ -1113,6 +1113,7 @@ class TradingPlaybookCatchupTests(unittest.IsolatedAsyncioTestCase):
         self.scheduler._build_trading_playbook_after_close = AsyncMock()
         self.scheduler._review_trading_playbook = AsyncMock()
         self.scheduler._playbook_review_exists = AsyncMock(return_value=True)
+        self.scheduler._retry_incomplete_playbook_notifications = AsyncMock()
 
     async def _run(self, local_time, existing_stages):
         async def exists(target_date, stage):
@@ -1185,6 +1186,17 @@ class TradingPlaybookCatchupTests(unittest.IsolatedAsyncioTestCase):
             send_notifications=False,
             trade_date=self.today,
             next_trade_date=self.next_day,
+        )
+
+    async def test_startup_retries_only_preexisting_incomplete_notification_claims(self):
+        await self._run(
+            datetime.min.replace(hour=8, minute=50).time(),
+            {(self.today, "overnight")},
+        )
+
+        self.scheduler._retry_incomplete_playbook_notifications.assert_awaited_once_with(
+            self.today,
+            self.next_day,
         )
 
     async def test_non_trading_day_skips_all_catchup_work(self):

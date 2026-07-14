@@ -2039,6 +2039,96 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kline_evidence["reason"], "kline stage deadline exceeded")
         self.assertEqual(active_loads, set())
 
+    async def test_kline_stage_cleanup_is_bounded_when_loader_suppresses_cancel(
+        self,
+    ):
+        from app.services.trading_playbook.market_data import (
+            TradingPlaybookMarketDataProvider,
+        )
+
+        trade_date = date(2026, 7, 13)
+        as_of = datetime(2026, 7, 13, 14, 40)
+        codes = [f"{index:06d}" for index in range(8)]
+        release = asyncio.Event()
+        active = set()
+        max_active = 0
+
+        async with self.session_factory() as db:
+            db.add_all(
+                [
+                    Stock(
+                        stock_code=code,
+                        stock_name=f"Stubborn {code}",
+                        market="SZ",
+                        is_st=0,
+                    )
+                    for code in codes
+                ]
+            )
+            await db.commit()
+
+            async def stubborn_kline(code, *args, **kwargs):
+                nonlocal max_active
+                active.add(code)
+                max_active = max(max_active, len(active))
+                try:
+                    try:
+                        await asyncio.Event().wait()
+                    except asyncio.CancelledError:
+                        await release.wait()
+                    return []
+                finally:
+                    active.discard(code)
+
+            provider = TradingPlaybookMarketDataProvider(
+                quote_api=_FakeQuoteAPI(
+                    {
+                        code: {
+                            **_quote_payload(code, 10, "20260713144000"),
+                            "change_pct": 5,
+                        }
+                        for code in codes
+                    }
+                ),
+                kline_loader=stubborn_kline,
+                max_concurrency=2,
+                realtime_limit_up_loader=lambda _date: asyncio.sleep(
+                    0, result=[]
+                ),
+                kline_stage_timeout_seconds=0.02,
+                kline_cancel_grace_seconds=0.02,
+            )
+            loop = asyncio.get_running_loop()
+            started_at = loop.time()
+            try:
+                snapshot = await asyncio.wait_for(
+                    provider.build_market_snapshot(
+                        db=db,
+                        source_trade_date=trade_date,
+                        target_trade_date=trade_date,
+                        stage="preclose",
+                        as_of=as_of,
+                    ),
+                    timeout=0.3,
+                )
+            finally:
+                release.set()
+            elapsed = loop.time() - started_at
+            await asyncio.sleep(0.05)
+
+        self.assertLess(elapsed, 0.2)
+        self.assertLessEqual(max_active, 2)
+        self.assertEqual(active, set())
+        for candidate in snapshot.candidates:
+            evidence = next(
+                row for row in candidate.evidence if row["source"] == "kline"
+            )
+            self.assertEqual(evidence["quality"], "missing")
+            self.assertEqual(
+                evidence["reason"],
+                "kline stage deadline exceeded",
+            )
+
     async def test_auction_window_adds_facts_and_theme_rank_without_fake_zeros(self):
         from app.services.trading_playbook.market_data import (
             TradingPlaybookMarketDataProvider,

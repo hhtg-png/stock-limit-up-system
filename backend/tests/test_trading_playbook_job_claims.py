@@ -220,6 +220,74 @@ class TradingPlaybookSchedulerClaimTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(alert.notify_plan_ready.await_count, 1)
         self.assertEqual(review.build.await_count, 1)
 
+    async def test_restart_retries_only_existing_failed_notification_claim(self):
+        from app.data_collectors.scheduler import DataScheduler
+        from app.models.trading_playbook import TradingPlanVersion
+        from app.utils.time_utils import CN_TZ
+
+        scheduler, engine, orchestrator, alert, review = await self._scheduler_fixture(
+            notify_side_effect=RuntimeError("notify offline")
+        )
+        try:
+            await scheduler._build_trading_playbook_after_close()
+            async with scheduler._playbook_session_factory() as db:
+                db.add(
+                    TradingPlanVersion(
+                        source_trade_date=date(2026, 7, 13),
+                        target_trade_date=date(2026, 7, 14),
+                        stage="overnight",
+                        version_no=1,
+                        status="draft",
+                        input_hash="historical-no-notify-claim",
+                        generated_at=datetime(2026, 7, 13, 8, 50),
+                    )
+                )
+                await db.commit()
+
+            alert.notify_plan_ready.side_effect = None
+            restarted = DataScheduler(
+                trading_playbook_alert_service=alert,
+                session_factory=scheduler._playbook_session_factory,
+                now_provider=lambda: CN_TZ.localize(
+                    datetime(2026, 7, 14, 8, 50)
+                ),
+                calendar_service=self._calendar(),
+            )
+            await restarted._retry_incomplete_playbook_notifications(
+                date(2026, 7, 14),
+                date(2026, 7, 14),
+            )
+            await restarted._retry_incomplete_playbook_notifications(
+                date(2026, 7, 14),
+                date(2026, 7, 14),
+            )
+        finally:
+            await engine.dispose()
+
+        self.assertEqual(orchestrator.calls, 1)
+        self.assertEqual(alert.notify_plan_ready.await_count, 2)
+
+    async def test_multiple_after_close_plan_ids_finalize_trade_date_once(self):
+        scheduler, engine, orchestrator, alert, review = await self._scheduler_fixture()
+        try:
+            await scheduler._finalize_trading_playbook_review(
+                date(2026, 7, 13),
+                plan_version_id=101,
+            )
+            await scheduler._finalize_trading_playbook_review(
+                date(2026, 7, 13),
+                plan_version_id=202,
+            )
+        finally:
+            await engine.dispose()
+
+        self.assertEqual(review.build.await_count, 1)
+        review.build.assert_awaited_once_with(
+            unittest.mock.ANY,
+            date(2026, 7, 13),
+            finalized=True,
+        )
+
     async def test_monitor_retries_failed_finalization_without_rebuild_or_renotify(self):
         scheduler, engine, orchestrator, alert, review = await self._scheduler_fixture(
             review_side_effect=[RuntimeError("review offline"), None]

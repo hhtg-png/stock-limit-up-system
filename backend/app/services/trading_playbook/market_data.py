@@ -72,6 +72,7 @@ class TradingPlaybookMarketDataProvider:
         realtime_limit_up_loader: Optional[Callable[..., Any]] = None,
         full_market_context_loader: Optional[Callable[..., Any]] = None,
         kline_stage_timeout_seconds: Optional[float] = None,
+        kline_cancel_grace_seconds: Optional[float] = None,
     ):
         self.quote_api = quote_api
         self.quote_client = quote_api
@@ -89,6 +90,12 @@ class TradingPlaybookMarketDataProvider:
             else kline_stage_timeout_seconds
         )
         self.kline_stage_timeout_seconds = max(float(timeout), 0.0)
+        cancel_grace = (
+            settings.TRADING_PLAYBOOK_KLINE_CANCEL_GRACE_SECONDS
+            if kline_cancel_grace_seconds is None
+            else kline_cancel_grace_seconds
+        )
+        self.kline_cancel_grace_seconds = max(float(cancel_grace), 0.0)
         self._previous_prices: Dict[str, _QuoteCacheRecord] = {}
         self._quote_state_lock = asyncio.Lock()
         self._quote_semaphore = asyncio.Semaphore(self.max_concurrency)
@@ -511,6 +518,13 @@ class TradingPlaybookMarketDataProvider:
             return missing
 
     @staticmethod
+    def _consume_task_result(task: asyncio.Task) -> None:
+        try:
+            task.exception()
+        except BaseException:
+            pass
+
+    @staticmethod
     def _calculate_kline_features(points: Any) -> Dict[str, Any]:
         missing = {
             "n_day_high": False,
@@ -910,50 +924,72 @@ class TradingPlaybookMarketDataProvider:
                 as_of,
             )
 
-        kline_tasks = {
-            asyncio.create_task(load_kline(code)): code
-            for code in kline_load_order
-        }
-        done: set = set()
-        pending: set = set()
+        kline_queue: asyncio.Queue[str] = asyncio.Queue()
+        for code in kline_load_order:
+            kline_queue.put_nowait(code)
+        stop_kline_workers = asyncio.Event()
+        completed_klines: Dict[str, _KlineBuildResult] = {}
+
+        async def kline_worker() -> None:
+            while not stop_kline_workers.is_set():
+                try:
+                    code = kline_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+                try:
+                    result_code, result = await load_kline(code)
+                    if not stop_kline_workers.is_set():
+                        completed_klines[result_code] = result
+                finally:
+                    kline_queue.task_done()
+
+        workers = [
+            asyncio.create_task(kline_worker())
+            for _ in range(min(self.max_concurrency, len(kline_load_order)))
+        ]
+
+        async def stop_workers() -> None:
+            stop_kline_workers.set()
+            for worker in workers:
+                if not worker.done():
+                    worker.cancel()
+            if not workers:
+                return
+            _done, stubborn = await asyncio.wait(
+                workers,
+                timeout=self.kline_cancel_grace_seconds,
+            )
+            for worker in stubborn:
+                worker.add_done_callback(self._consume_task_result)
+
         try:
-            if kline_tasks:
-                done, pending = await asyncio.wait(
-                    kline_tasks,
+            if workers:
+                _done, pending = await asyncio.wait(
+                    workers,
                     timeout=self.kline_stage_timeout_seconds,
                 )
+                if pending:
+                    on_time_klines = dict(completed_klines)
+                    await stop_workers()
+                else:
+                    on_time_klines = dict(completed_klines)
+            else:
+                on_time_klines = {}
         except BaseException:
-            for task in kline_tasks:
-                task.cancel()
-            if kline_tasks:
-                await asyncio.gather(*kline_tasks, return_exceptions=True)
+            await stop_workers()
             raise
-        for task in pending:
-            task.cancel()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
 
         missing_kline = self._calculate_kline_features([])
         kline_by_code: Dict[str, _KlineBuildResult] = {
-            kline_tasks[task]: _KlineBuildResult(
+            code: _KlineBuildResult(
                 dict(missing_kline),
                 None,
                 "kline stage deadline exceeded",
             )
-            for task in pending
+            for code in kline_load_order
+            if code not in on_time_klines
         }
-        for task in done:
-            code = kline_tasks[task]
-            try:
-                result_code, result = task.result()
-            except Exception as exc:
-                kline_by_code[code] = _KlineBuildResult(
-                    dict(missing_kline),
-                    None,
-                    f"kline task failed: {exc}",
-                )
-            else:
-                kline_by_code[result_code] = result
+        kline_by_code.update(on_time_klines)
         market_context, market_context_evidence, completion_warning = (
             self._complete_market_context(
                 market_context,

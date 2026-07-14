@@ -679,13 +679,11 @@ class DataScheduler:
         if await self._playbook_review_exists(
             review_date,
             finalized=True,
-            plan_version_id=plan_version_id,
         ):
             return None
         return await self._run_trading_playbook_review_phase(
             review_date,
             finalized=True,
-            plan_version_id=plan_version_id,
         )
 
     async def _run_trading_playbook_review_phase(
@@ -701,11 +699,7 @@ class DataScheduler:
             logger.info("Trading playbook review service is not installed")
             return None
         phase = "finalize" if finalized else "initial_review"
-        generation_key = (
-            str(plan_version_id)
-            if isinstance(plan_version_id, int)
-            else review_date.isoformat()
-        )
+        generation_key = review_date.isoformat()
         async with self._playbook_sessions() as db:
             token = await self._playbook_job_claims.claim(
                 db,
@@ -755,6 +749,16 @@ class DataScheduler:
             logger.error("Trading playbook calendar refresh failed: {}", exc)
             return monitor_result
         try:
+            await self._retry_incomplete_playbook_notifications(
+                now.date(),
+                next_trade_date,
+            )
+        except Exception as exc:
+            logger.error(
+                "Trading playbook notification compensation failed: {}",
+                exc,
+            )
+        try:
             await self._upgrade_forced_trading_playbook_after_close(
                 send_notifications=True,
                 trade_date=now.date(),
@@ -775,6 +779,62 @@ class DataScheduler:
             logger.error("Trading playbook phase compensation failed: {}", exc)
         return monitor_result
 
+    async def _retry_incomplete_playbook_notifications(
+        self,
+        earliest_target_date: date,
+        latest_target_date: date,
+    ) -> None:
+        service = self._trading_playbook_alert_service
+        if not callable(getattr(service, "notify_plan_ready", None)):
+            return
+        from sqlalchemy import select
+        from app.models.trading_playbook import (
+            TradingPlanVersion,
+            TradingPlaybookJobClaim,
+        )
+
+        async with self._playbook_sessions() as db:
+            generation_keys = (
+                await db.execute(
+                    select(TradingPlaybookJobClaim.generation_key).where(
+                        TradingPlaybookJobClaim.job_type == "plan",
+                        TradingPlaybookJobClaim.phase == "notify",
+                        TradingPlaybookJobClaim.status != "completed",
+                        TradingPlaybookJobClaim.generation_key.is_not(None),
+                    )
+                )
+            ).scalars().all()
+            plan_ids = set()
+            for value in generation_keys:
+                try:
+                    plan_ids.add(int(value))
+                except (TypeError, ValueError):
+                    continue
+            if not plan_ids:
+                return
+            plans = (
+                await db.execute(
+                    select(TradingPlanVersion)
+                    .where(
+                        TradingPlanVersion.id.in_(plan_ids),
+                        TradingPlanVersion.target_trade_date
+                        >= earliest_target_date,
+                        TradingPlanVersion.target_trade_date
+                        <= latest_target_date,
+                        TradingPlanVersion.status.in_(
+                            ("draft", "confirmed", "active")
+                        ),
+                    )
+                    .order_by(
+                        TradingPlanVersion.target_trade_date,
+                        TradingPlanVersion.generated_at,
+                        TradingPlanVersion.id,
+                    )
+                )
+            ).scalars().all()
+        for plan in plans:
+            await self._notify_trading_playbook_plan(plan)
+
     async def _compensate_trading_playbook_phases(
         self,
         trade_date: date,
@@ -794,7 +854,6 @@ class DataScheduler:
             await self._notify_trading_playbook_plan(plan)
         await self._finalize_trading_playbook_review(
             trade_date,
-            plan_version_id=self._plan_value(plan, "id"),
         )
 
     async def _latest_relevant_after_close_plan(
@@ -879,7 +938,6 @@ class DataScheduler:
                 return None
             await self._finalize_trading_playbook_review(
                 source_trade_date,
-                plan_version_id=self._plan_value(plan, "id"),
             )
             return plan
 
@@ -967,9 +1025,7 @@ class DataScheduler:
             send_notifications=send_notifications,
         )
         if plan is not None:
-            await self._finalize_trading_playbook_review(
-                plan_version_id=self._plan_value(plan, "id"),
-            )
+            await self._finalize_trading_playbook_review()
         return plan
 
     async def _playbook_stage_exists(
@@ -1009,7 +1065,7 @@ class DataScheduler:
                 query = query.where(
                     TradingExecutionReview.finalized_at.is_not(None)
                 )
-            if isinstance(plan_version_id, int):
+            if isinstance(plan_version_id, int) and not finalized:
                 query = query.where(
                     TradingExecutionReview.plan_version_id == plan_version_id
                 )
@@ -1086,6 +1142,16 @@ class DataScheduler:
         except Exception as exc:
             logger.error(
                 "Trading playbook startup phase compensation failed: {}",
+                exc,
+            )
+        try:
+            await self._retry_incomplete_playbook_notifications(
+                today,
+                next_trade_date,
+            )
+        except Exception as exc:
+            logger.error(
+                "Trading playbook startup notification compensation failed: {}",
                 exc,
             )
     
