@@ -52,6 +52,12 @@ const router = createRouter({
       meta: { title: '交易模式' }
     },
     {
+      path: '/trading-playbook',
+      name: 'TradingPlaybook',
+      component: () => import('@/views/TradingPlaybook.vue'),
+      meta: { title: '交易预案' }
+    },
+    {
       path: '/industry-trends',
       name: 'IndustryTrends',
       component: () => import('@/views/IndustryTrends.vue'),

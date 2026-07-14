@@ -41,6 +41,10 @@
               <el-icon><TrendCharts /></el-icon>
               <span>交易模式</span>
             </el-menu-item>
+            <el-menu-item index="/trading-playbook">
+              <el-icon><Document /></el-icon>
+              <span>交易预案</span>
+            </el-menu-item>
             <el-menu-item index="/industry-trends">
               <el-icon><TrendCharts /></el-icon>
               <span>产业趋势</span>
@@ -167,6 +171,7 @@ const mobileNavItems = [
   { path: '/daily-info', label: '资讯', icon: Document },
   { path: '/limit-up-classification', label: '分类', icon: Grid },
   { path: '/jiege-mode', label: '交易', icon: TrendCharts },
+  { path: '/trading-playbook', label: '预案', icon: Document },
   { path: '/industry-trends', label: '趋势', icon: TrendCharts },
   { path: '/ultra-short-signals', label: '超短', icon: Bell },
   { path: '/continuous', label: '连板', icon: TrendCharts },
