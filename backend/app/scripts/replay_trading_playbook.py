@@ -36,6 +36,54 @@ DEFAULT_FIXTURE_PATH = (
     / "fixtures"
     / "trading_playbook_scenarios.json"
 )
+_PLANNED_PRICE_FIELDS = {
+    "planned_pullback_price",
+    "planned_breakout_price",
+    "hard_stop_price",
+}
+_QUALITY_STATUSES = {
+    "ready",
+    "computed",
+    "missing",
+    "degraded",
+    "invalid",
+    "stale",
+}
+_REPLAY_STAGES = {"preclose", "after_close", "overnight", "auction"}
+
+
+def _load_json_strict(path: Path) -> Any:
+    """Load JSON while rejecting extensions and duplicate object keys."""
+    resolved = Path(path)
+
+    def reject_constant(value: str) -> Any:
+        raise ValueError(f"{resolved}: invalid constant {value}")
+
+    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"{resolved}: duplicate key {key}")
+            result[key] = value
+        return result
+
+    try:
+        with resolved.open("r", encoding="utf-8") as handle:
+            return json.load(
+                handle,
+                parse_constant=reject_constant,
+                object_pairs_hook=reject_duplicate_keys,
+            )
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"{resolved}: invalid JSON at line {exc.lineno}: {exc.msg}"
+        ) from exc
+
+
+def _load_catalog_strict(path: Path) -> dict[str, Any]:
+    resolved = Path(path)
+    _load_json_strict(resolved)
+    return RuleCatalog(resolved).load()
 
 
 def _aware_timestamp(value: Any, *, field: str) -> datetime:
@@ -48,6 +96,116 @@ def _aware_timestamp(value: Any, *, field: str) -> datetime:
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise ValueError(f"timezone-aware timestamp required: {field}")
     return parsed
+
+
+def _validate_json_like(value: Any, *, path: str) -> None:
+    """Validate direct-call values with JSON's exact type constraints."""
+    if value is None or type(value) in {str, bool, int}:
+        return
+    if type(value) is float:
+        if not math.isfinite(value):
+            if path.rsplit(".", 1)[-1] in _PLANNED_PRICE_FIELDS:
+                raise ValueError(f"{path}: positive finite price required")
+            raise ValueError(f"{path}: non-finite number")
+        return
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            if not isinstance(key, str):
+                raise ValueError(f"{path}: non-string key {key!r}")
+            _validate_json_like(child, path=f"{path}.{key}")
+        return
+    if isinstance(value, list):
+        for index, child in enumerate(value):
+            _validate_json_like(child, path=f"{path}[{index}]")
+        return
+    raise ValueError(f"{path}: invalid JSON-like type {type(value).__name__}")
+
+
+def _require_nonempty_string(
+    source: Mapping[str, Any],
+    field: str,
+    *,
+    path: str,
+) -> str:
+    value = source.get(field)
+    if type(value) is not str or not value.strip():
+        raise ValueError(f"{path}.{field}: non-empty string required")
+    return value
+
+
+def _validate_scenario_shape(scenario: Any) -> tuple[str, str]:
+    unknown_path = "scenario[unknown]"
+    if not isinstance(scenario, Mapping):
+        raise ValueError(f"{unknown_path}: object required")
+
+    mode_key = scenario.get("mode_key")
+    if type(mode_key) is not str or not mode_key.strip():
+        raise ValueError(
+            f"{unknown_path}.mode_key: non-empty string required"
+        )
+    scenario_path = f"scenario[{mode_key}]"
+    _require_nonempty_string(scenario, "as_of", path=scenario_path)
+    rule_hash = _require_nonempty_string(
+        scenario,
+        "rule_hash",
+        path=scenario_path,
+    )
+    if re.fullmatch(r"[0-9a-f]{64}", rule_hash) is None:
+        raise ValueError(f"{scenario_path}.rule_hash: sha256 required")
+
+    market_features = scenario.get("market_features")
+    if not isinstance(market_features, Mapping):
+        raise ValueError(f"{scenario_path}.market_features: object required")
+    candidate = scenario.get("candidate")
+    if not isinstance(candidate, Mapping):
+        raise ValueError(f"{scenario_path}.candidate: object required")
+    for field in ("stock_code", "stock_name", "theme_name"):
+        _require_nonempty_string(
+            candidate,
+            field,
+            path=f"{scenario_path}.candidate",
+        )
+    if not isinstance(candidate.get("features"), Mapping):
+        raise ValueError(
+            f"{scenario_path}.candidate.features: object required"
+        )
+
+    source_refs = scenario.get("source_refs")
+    if not isinstance(source_refs, list) or not source_refs:
+        raise ValueError(f"{scenario_path}.source_refs: non-empty list required")
+    for index, source_ref in enumerate(source_refs):
+        ref_path = f"{scenario_path}.source_refs[{index}]"
+        if not isinstance(source_ref, Mapping):
+            raise ValueError(f"{ref_path}: object required")
+        for field in ("source_key", "excerpt"):
+            _require_nonempty_string(source_ref, field, path=ref_path)
+
+    facts = scenario.get("facts")
+    if not isinstance(facts, list) or not facts:
+        raise ValueError(f"{scenario_path}.facts: non-empty list required")
+    for index, fact in enumerate(facts):
+        fact_path = f"{scenario_path}.facts[{index}]"
+        if not isinstance(fact, Mapping):
+            raise ValueError(f"{fact_path}: object required")
+        _require_nonempty_string(fact, "captured_at", path=fact_path)
+        source_keys = fact.get("source_keys")
+        if (
+            not isinstance(source_keys, list)
+            or not source_keys
+            or any(
+                type(source_key) is not str or not source_key.strip()
+                for source_key in source_keys
+            )
+        ):
+            raise ValueError(
+                f"{fact_path}.source_keys: non-empty string list required"
+            )
+        if len(source_keys) != len(set(source_keys)):
+            raise ValueError(f"{fact_path}.source_keys: duplicates forbidden")
+        for field in ("market_features", "candidate_features"):
+            if not isinstance(fact.get(field), Mapping):
+                raise ValueError(f"{fact_path}.{field}: object required")
+    return mode_key, scenario_path
 
 
 def _same_fact_value(left: Any, right: Any) -> bool:
@@ -68,10 +226,47 @@ def _same_fact_value(left: Any, right: Any) -> bool:
             for left_item, right_item in zip(left, right)
         )
     if isinstance(left, Real) and isinstance(right, Real):
-        if math.isnan(left) or math.isnan(right):
-            return math.isnan(left) and math.isnan(right)
-        return left == right
+        return math.isfinite(left) and math.isfinite(right) and left == right
     return type(left) is type(right) and left == right
+
+
+def _validate_matcher_controls(
+    features: Mapping[str, Any],
+    *,
+    path: str,
+) -> None:
+    for field in ("_snapshot_stale", "_point_in_time_valid"):
+        if field in features and type(features[field]) is not bool:
+            raise ValueError(f"{path}.{field}: exact bool required")
+
+    if "_feature_quality" in features:
+        quality_map = features["_feature_quality"]
+        if not isinstance(quality_map, Mapping):
+            raise ValueError(f"{path}._feature_quality: mapping required")
+        for feature_key, status in quality_map.items():
+            status_path = f"{path}._feature_quality.{feature_key}"
+            if not isinstance(feature_key, str) or not feature_key.strip():
+                raise ValueError(
+                    f"{path}._feature_quality: non-empty feature key required"
+                )
+            if type(status) is not str or status not in _QUALITY_STATUSES:
+                raise ValueError(f"{status_path}: invalid quality status")
+
+    for field in ("quality", "planned_pullback_quality"):
+        if field in features:
+            status = features[field]
+            if type(status) is not str or status not in _QUALITY_STATUSES:
+                raise ValueError(f"{path}.{field}: invalid quality status")
+
+    if "_stage" in features:
+        stage = features["_stage"]
+        if type(stage) is not str or stage not in _REPLAY_STAGES:
+            raise ValueError(f"{path}._stage: invalid replay stage")
+    if (
+        "tail_action_eligible" in features
+        and type(features["tail_action_eligible"]) is not bool
+    ):
+        raise ValueError(f"{path}.tail_action_eligible: exact bool required")
 
 
 def replay_scenario(
@@ -80,30 +275,35 @@ def replay_scenario(
     catalog_path: Path = DEFAULT_CATALOG_PATH,
 ) -> str:
     """Evaluate one scenario against its exact versioned catalog rule."""
-    as_of = _aware_timestamp(scenario.get("as_of"), field="as_of")
+    mode_key, scenario_path = _validate_scenario_shape(scenario)
+    _validate_json_like(scenario, path=scenario_path)
+    as_of = _aware_timestamp(
+        scenario.get("as_of"),
+        field=f"{scenario_path}.as_of",
+    )
     facts = scenario.get("facts")
-    if not isinstance(facts, list) or not facts:
-        raise ValueError("facts must be a non-empty list")
     for index, fact in enumerate(facts):
         captured_at = _aware_timestamp(
-            fact.get("captured_at") if isinstance(fact, Mapping) else None,
-            field=f"facts[{index}].captured_at",
+            fact.get("captured_at"),
+            field=f"{scenario_path}.facts[{index}].captured_at",
         )
         if captured_at > as_of:
             raise ValueError("future fact")
 
-    catalog = RuleCatalog(Path(catalog_path)).load()
-    mode_key = str(scenario.get("mode_key") or "")
+    catalog = _load_catalog_strict(Path(catalog_path))
     rule = next(
         (row for row in catalog["rules"] if row["mode_key"] == mode_key),
         None,
     )
     if rule is None:
-        raise ValueError(f"unknown mode: {mode_key}")
+        raise ValueError(f"{scenario_path}.mode_key: unknown mode: {mode_key}")
     if scenario.get("rule_hash") != canonical_rule_content_hash(rule):
-        raise ValueError(f"rule_hash mismatch: {mode_key}")
+        raise ValueError(f"{scenario_path}.rule_hash: rule_hash mismatch")
     if scenario.get("source_refs") != rule["source_refs"]:
-        raise ValueError("source_refs must match the exact catalog rule")
+        raise ValueError(
+            f"{scenario_path}.source_refs: "
+            "source_refs must match the exact catalog rule"
+        )
 
     raw_candidate = scenario["candidate"]
     declared_groups = {
@@ -116,14 +316,21 @@ def replay_scenario(
     reconstructed_groups: dict[str, dict[str, Any]] = {
         group_name: {} for group_name in declared_groups
     }
-    for fact in facts:
+    group_paths = {
+        "market_features": f"{scenario_path}.market_features",
+        "candidate_features": f"{scenario_path}.candidate.features",
+    }
+    for fact_index, fact in enumerate(facts):
         source_keys = fact.get("source_keys")
         if (
             not isinstance(source_keys, list)
             or len(source_keys) != len(set(source_keys))
             or set(source_keys) != expected_source_keys
         ):
-            raise ValueError("fact source_keys must match catalog sources")
+            raise ValueError(
+                f"{scenario_path}.facts[{fact_index}].source_keys: "
+                "fact source_keys must match catalog sources"
+            )
         for group_name, declared in declared_groups.items():
             fact_values = fact.get(group_name)
             if not isinstance(fact_values, Mapping):
@@ -135,7 +342,8 @@ def replay_scenario(
                     value,
                 ):
                     raise ValueError(
-                        f"conflicting facts: {group_name}.{key}"
+                        f"{scenario_path}.facts[{fact_index}].{group_name}.{key}: "
+                        "conflicting facts"
                     )
                 reconstructed[key] = value
 
@@ -147,14 +355,20 @@ def replay_scenario(
                 declared,
             )
         ):
-            raise ValueError(f"feature map mismatch: {group_name}")
+            raise ValueError(
+                f"{group_paths[group_name]}: feature map mismatch"
+            )
 
     candidate_features = reconstructed_groups["candidate_features"]
-    for field in (
-        "planned_pullback_price",
-        "planned_breakout_price",
-        "hard_stop_price",
-    ):
+    _validate_matcher_controls(
+        reconstructed_groups["market_features"],
+        path=f"{scenario_path}.market_features",
+    )
+    _validate_matcher_controls(
+        candidate_features,
+        path=f"{scenario_path}.candidate.features",
+    )
+    for field in _PLANNED_PRICE_FIELDS:
         value = candidate_features.get(field)
         if (
             isinstance(value, bool)
@@ -162,7 +376,10 @@ def replay_scenario(
             or not math.isfinite(value)
             or value <= 0
         ):
-            raise ValueError(f"positive finite price required: {field}")
+            raise ValueError(
+                f"{scenario_path}.candidate.features.{field}: "
+                "positive finite price required"
+            )
 
     candidate = CandidateSnapshot(
         stock_code=str(raw_candidate["stock_code"]),
@@ -184,8 +401,7 @@ def load_scenarios(
     catalog_path: Path = DEFAULT_CATALOG_PATH,
 ) -> list[dict[str, Any]]:
     """Load the complete, duplicate-free golden scenario set."""
-    with Path(fixture_path).open("r", encoding="utf-8") as handle:
-        payload = json.load(handle)
+    payload = _load_json_strict(Path(fixture_path))
     if not isinstance(payload, dict):
         raise ValueError("scenario fixture root must be an object")
     scenarios = payload.get("scenarios")
@@ -203,7 +419,7 @@ def load_scenarios(
     if len(mode_keys) != len(set(mode_keys)):
         raise ValueError("duplicate mode_key in scenarios")
 
-    catalog = RuleCatalog(Path(catalog_path)).load()
+    catalog = _load_catalog_strict(Path(catalog_path))
     if payload.get("catalog_version") != catalog["catalog_version"]:
         raise ValueError("scenario catalog_version mismatch")
     catalog_mode_keys = {rule["mode_key"] for rule in catalog["rules"]}
@@ -260,8 +476,19 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     try:
         scenarios = load_scenarios()
-        for scenario in scenarios:
-            actual = replay_scenario(scenario)
+        for index, scenario in enumerate(scenarios):
+            mode_context = (
+                scenario.get("mode_key")
+                if isinstance(scenario, Mapping)
+                and isinstance(scenario.get("mode_key"), str)
+                else "unknown"
+            )
+            try:
+                actual = replay_scenario(scenario)
+            except Exception as exc:
+                raise ValueError(
+                    f"scenario index={index} mode={mode_context}: {exc}"
+                ) from exc
             expected = scenario.get("expected")
             if actual != expected:
                 print(

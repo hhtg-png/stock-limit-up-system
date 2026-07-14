@@ -3,6 +3,7 @@ import importlib
 import io
 import json
 import math
+import re
 import subprocess
 import sys
 import tempfile
@@ -359,8 +360,310 @@ class ReplayValidationTest(unittest.TestCase):
                             catalog_path=CATALOG_PATH,
                         )
 
+    def test_replay_strictly_preflights_duplicate_catalog_keys(self):
+        raw_catalog = CATALOG_PATH.read_text(encoding="utf-8")
+        raw_catalog = raw_catalog.replace(
+            '"priority": 100,',
+            '"priority": 100, "priority": 100,',
+            1,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            catalog_path = Path(directory) / "duplicate-catalog.json"
+            catalog_path.write_text(raw_catalog, encoding="utf-8")
+            with self.assertRaisesRegex(
+                ValueError,
+                r"duplicate-catalog\.json.*duplicate key.*priority",
+            ):
+                self.replay_scenario(
+                    copy.deepcopy(self.scenario),
+                    catalog_path=catalog_path,
+                )
+
+    def test_direct_mapping_rejects_non_json_values_with_full_path(self):
+        mode_context = r"scenario\[new_theme_high_volatility\]"
+        cases = (
+            (
+                "nested-infinity",
+                "candidate",
+                "nested",
+                {"bad": math.inf},
+                rf"{mode_context}\.candidate\.features\.nested\.bad.*non-finite",
+            ),
+            (
+                "nested-negative-infinity",
+                "market",
+                "nested",
+                {"bad": -math.inf},
+                rf"{mode_context}\.market_features\.nested\.bad.*non-finite",
+            ),
+            (
+                "tuple",
+                "candidate",
+                "tuple_value",
+                (1, 2),
+                rf"{mode_context}\.candidate\.features\.tuple_value.*tuple",
+            ),
+            (
+                "bytes",
+                "candidate",
+                "bytes_value",
+                b"not-json",
+                rf"{mode_context}\.candidate\.features\.bytes_value.*bytes",
+            ),
+            (
+                "object",
+                "candidate",
+                "object_value",
+                object(),
+                rf"{mode_context}\.candidate\.features\.object_value.*object",
+            ),
+        )
+
+        for label, owner, key, value, message in cases:
+            with self.subTest(label=label):
+                scenario = copy.deepcopy(self.scenario)
+                if owner == "candidate":
+                    scenario["candidate"]["features"][key] = value
+                    scenario["facts"][0]["candidate_features"][key] = value
+                else:
+                    scenario["market_features"][key] = value
+                    scenario["facts"][0]["market_features"][key] = value
+                with self.assertRaisesRegex(ValueError, message):
+                    self.replay_scenario(
+                        scenario,
+                        catalog_path=CATALOG_PATH,
+                    )
+
+        scenario = copy.deepcopy(self.scenario)
+        scenario["market_features"][1] = "not-a-string-key"
+        scenario["facts"][0]["market_features"][1] = "not-a-string-key"
+        with self.assertRaisesRegex(
+            ValueError,
+            rf"{mode_context}\.market_features.*non-string key.*1",
+        ):
+            self.replay_scenario(scenario, catalog_path=CATALOG_PATH)
+
+    def test_matcher_control_schema_rejects_unsafe_values(self):
+        cases = (
+            ("candidate", "_snapshot_stale", 1),
+            ("candidate", "_snapshot_stale", math.nan),
+            ("candidate", "_point_in_time_valid", 1),
+            ("candidate", "_point_in_time_valid", math.nan),
+            ("candidate", "_feature_quality", []),
+            ("market", "_feature_quality", []),
+            ("candidate", "_feature_quality", None),
+            ("candidate", "_feature_quality", {"": "ready"}),
+            ("candidate", "_feature_quality", {"flag": []}),
+            ("candidate", "_feature_quality", {"flag": "unknown"}),
+            ("candidate", "quality", []),
+            ("market", "quality", []),
+            ("candidate", "planned_pullback_quality", []),
+            ("candidate", "_stage", "midday"),
+            ("candidate", "_stage", []),
+            ("candidate", "tail_action_eligible", 1),
+        )
+        mode = "new_theme_high_volatility"
+
+        for owner, key, value in cases:
+            with self.subTest(owner=owner, key=key, value=value):
+                scenario = copy.deepcopy(self.scenario)
+                if owner == "candidate":
+                    scenario["candidate"]["features"][key] = value
+                    scenario["facts"][0]["candidate_features"][key] = value
+                    field_path = f"scenario[{mode}].candidate.features.{key}"
+                else:
+                    scenario["market_features"][key] = value
+                    scenario["facts"][0]["market_features"][key] = value
+                    field_path = f"scenario[{mode}].market_features.{key}"
+                with self.assertRaisesRegex(
+                    ValueError,
+                    re.escape(field_path),
+                ):
+                    self.replay_scenario(
+                        scenario,
+                        catalog_path=CATALOG_PATH,
+                    )
+
+    def test_valid_matcher_controls_preserve_real_matcher_behavior(self):
+        stale = copy.deepcopy(self.scenario)
+        stale["candidate"]["features"]["_snapshot_stale"] = True
+        stale["facts"][0]["candidate_features"]["_snapshot_stale"] = True
+        self.assertEqual(
+            self.replay_scenario(stale, catalog_path=CATALOG_PATH),
+            "waiting",
+        )
+
+        point_invalid = copy.deepcopy(self.scenario)
+        point_invalid["candidate"]["features"]["_point_in_time_valid"] = False
+        point_invalid["facts"][0]["candidate_features"][
+            "_point_in_time_valid"
+        ] = False
+        self.assertEqual(
+            self.replay_scenario(point_invalid, catalog_path=CATALOG_PATH),
+            "waiting",
+        )
+
+        ready = copy.deepcopy(self.scenario)
+        ready["candidate"]["features"].update(
+            {
+                "_feature_quality": {"high_volatility": "ready"},
+                "_stage": "auction",
+                "tail_action_eligible": False,
+            }
+        )
+        ready["facts"][0]["candidate_features"].update(
+            {
+                "_feature_quality": {"high_volatility": "ready"},
+                "_stage": "auction",
+                "tail_action_eligible": False,
+            }
+        )
+        self.assertEqual(
+            self.replay_scenario(ready, catalog_path=CATALOG_PATH),
+            "matched",
+        )
+
+    def test_direct_scenario_shape_errors_include_mode_and_field_path(self):
+        mode = "new_theme_high_volatility"
+        cases = []
+        cases.append((None, r"scenario\[unknown\].*object required"))
+        cases.append(([], r"scenario\[unknown\].*object required"))
+        cases.append(({}, r"scenario\[unknown\]\.mode_key"))
+
+        missing_market = copy.deepcopy(self.scenario)
+        del missing_market["market_features"]
+        cases.append(
+            (missing_market, rf"scenario\[{mode}\]\.market_features")
+        )
+        null_market = copy.deepcopy(self.scenario)
+        null_market["market_features"] = None
+        cases.append((null_market, rf"scenario\[{mode}\]\.market_features"))
+
+        missing_candidate = copy.deepcopy(self.scenario)
+        del missing_candidate["candidate"]
+        cases.append((missing_candidate, rf"scenario\[{mode}\]\.candidate"))
+        null_candidate = copy.deepcopy(self.scenario)
+        null_candidate["candidate"] = None
+        cases.append((null_candidate, rf"scenario\[{mode}\]\.candidate"))
+        missing_features = copy.deepcopy(self.scenario)
+        del missing_features["candidate"]["features"]
+        cases.append(
+            (
+                missing_features,
+                rf"scenario\[{mode}\]\.candidate\.features",
+            )
+        )
+        blank_stock = copy.deepcopy(self.scenario)
+        blank_stock["candidate"]["stock_code"] = ""
+        cases.append(
+            (blank_stock, rf"scenario\[{mode}\]\.candidate\.stock_code")
+        )
+        bad_fact = copy.deepcopy(self.scenario)
+        bad_fact["facts"][0] = None
+        cases.append((bad_fact, rf"scenario\[{mode}\]\.facts\[0\]"))
+        bad_source_keys = copy.deepcopy(self.scenario)
+        bad_source_keys["facts"][0]["source_keys"] = None
+        cases.append(
+            (
+                bad_source_keys,
+                rf"scenario\[{mode}\]\.facts\[0\]\.source_keys",
+            )
+        )
+        bad_source_refs = copy.deepcopy(self.scenario)
+        bad_source_refs["source_refs"] = None
+        cases.append(
+            (bad_source_refs, rf"scenario\[{mode}\]\.source_refs")
+        )
+
+        for index, (scenario, message) in enumerate(cases):
+            with self.subTest(index=index):
+                with self.assertRaisesRegex(ValueError, message):
+                    self.replay_scenario(
+                        scenario,
+                        catalog_path=CATALOG_PATH,
+                    )
+
 
 class ScenarioLoaderTest(unittest.TestCase):
+    def test_fixture_rejects_nonfinite_constants_and_nested_duplicate_keys(self):
+        raw_fixture = SCENARIO_FIXTURE.read_text(encoding="utf-8")
+        mutations = (
+            (
+                "NaN",
+                raw_fixture.replace(
+                    '"planned_pullback_price": 10.0',
+                    '"planned_pullback_price": NaN',
+                    1,
+                ),
+                r"fixture-NaN\.json.*constant.*NaN",
+            ),
+            (
+                "Infinity",
+                raw_fixture.replace(
+                    '"planned_pullback_price": 10.0',
+                    '"planned_pullback_price": Infinity',
+                    1,
+                ),
+                r"fixture-Infinity\.json.*constant.*Infinity",
+            ),
+            (
+                "negative-infinity",
+                raw_fixture.replace(
+                    '"planned_pullback_price": 10.0',
+                    '"planned_pullback_price": -Infinity',
+                    1,
+                ),
+                r"fixture-negative-infinity\.json.*constant.*-Infinity",
+            ),
+            (
+                "duplicate",
+                raw_fixture.replace(
+                    '"market_features": {"style": "dual_active",',
+                    '"market_features": {"style": "dual_active", '
+                    '"style": "dual_active",',
+                    1,
+                ),
+                r"fixture-duplicate\.json.*duplicate key.*style",
+            ),
+        )
+
+        for label, content, message in mutations:
+            with (
+                self.subTest(label=label),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                fixture_path = Path(directory) / f"fixture-{label}.json"
+                fixture_path.write_text(content, encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, message):
+                    importlib.import_module(
+                        "app.scripts.replay_trading_playbook"
+                    ).load_scenarios(
+                        fixture_path=fixture_path,
+                        catalog_path=CATALOG_PATH,
+                    )
+
+    def test_loader_strictly_preflights_nonfinite_catalog_constant(self):
+        raw_catalog = CATALOG_PATH.read_text(encoding="utf-8").replace(
+            '"priority": 100,',
+            '"priority": NaN,',
+            1,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            catalog_path = Path(directory) / "constant-catalog.json"
+            catalog_path.write_text(raw_catalog, encoding="utf-8")
+            with self.assertRaisesRegex(
+                ValueError,
+                r"constant-catalog\.json.*constant.*NaN",
+            ):
+                importlib.import_module(
+                    "app.scripts.replay_trading_playbook"
+                ).load_scenarios(
+                    fixture_path=SCENARIO_FIXTURE,
+                    catalog_path=catalog_path,
+                )
+
     def test_rejects_duplicate_mode_scenario(self):
         replay_module = importlib.import_module(
             "app.scripts.replay_trading_playbook"
@@ -568,3 +871,33 @@ class ReplayCliTest(unittest.TestCase):
                 result = self.run_cli(*command)
                 self.assertEqual(result.returncode, 2)
                 self.assertIn("usage:", result.stderr)
+
+    def test_cli_failure_reports_scenario_index_mode_and_field_path(self):
+        replay_module = importlib.import_module(
+            "app.scripts.replay_trading_playbook"
+        )
+        scenario = json.loads(
+            SCENARIO_FIXTURE.read_text(encoding="utf-8")
+        )["scenarios"][0]
+        del scenario["candidate"]
+        stderr = io.StringIO()
+
+        with patch.object(
+            replay_module,
+            "load_scenarios",
+            return_value=[scenario],
+        ), redirect_stderr(stderr):
+            code = replay_module.main(
+                ["--date", "2099-12-31", "--stage", "preclose"]
+            )
+
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "scenario index=0 mode=new_theme_high_volatility",
+            stderr.getvalue(),
+        )
+        self.assertIn(
+            "scenario[new_theme_high_volatility].candidate",
+            stderr.getvalue(),
+        )
+        self.assertNotIn("KeyError", stderr.getvalue())
