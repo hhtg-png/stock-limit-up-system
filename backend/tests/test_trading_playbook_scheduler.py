@@ -83,6 +83,7 @@ class InMemoryClaimService:
     """Deterministic phase claim fake for tests that use mock DB sessions."""
 
     def __init__(self):
+        self.lease_seconds = 300
         self.active = set()
         self.completed = set()
 
@@ -104,6 +105,9 @@ class InMemoryClaimService:
     async def fail(self, _db, token, **_kwargs):
         self.active.discard(token.job_key)
         return True
+
+    async def renew(self, _db, token, **_kwargs):
+        return token.job_key in self.active
 
 
 class TradingPlaybookSchedulerRegistrationTests(unittest.TestCase):
@@ -282,7 +286,7 @@ class TradingPlaybookSchedulerStageTests(unittest.IsolatedAsyncioTestCase):
 
         with patch(
             "app.data_collectors.scheduler._get_cn_trading_dates",
-            return_value=[],
+            return_value=[self.now.date() + timedelta(days=1)],
         ):
             result = await self.scheduler._build_trading_playbook_plan("after_close")
 
@@ -303,7 +307,7 @@ class TradingPlaybookSchedulerStageTests(unittest.IsolatedAsyncioTestCase):
     async def test_unconfigured_future_services_are_controlled_noops(self):
         with patch(
             "app.data_collectors.scheduler._get_cn_trading_dates",
-            return_value=[self.now.date()],
+            return_value=[self.now.date(), self.now.date() + timedelta(days=1)],
         ):
             await self.scheduler._review_trading_playbook()
             await self.scheduler._finalize_trading_playbook_review()
@@ -317,7 +321,7 @@ class TradingPlaybookSchedulerStageTests(unittest.IsolatedAsyncioTestCase):
 
         with patch(
             "app.data_collectors.scheduler._get_cn_trading_dates",
-            return_value=[self.now.date()],
+            return_value=[self.now.date(), self.now.date() + timedelta(days=1)],
         ):
             await self.scheduler._review_trading_playbook()
             await self.scheduler._finalize_trading_playbook_review()
@@ -584,7 +588,7 @@ class TradingPlaybookDataReadyBarrierTests(unittest.IsolatedAsyncioTestCase):
 
         with patch(
             "app.data_collectors.scheduler._get_cn_trading_dates",
-            return_value=[date(2026, 7, 13)],
+            return_value=[date(2026, 7, 13), date(2026, 7, 14)],
         ):
             await scheduler._build_trading_playbook_after_close(
                 send_notifications=False
@@ -614,7 +618,7 @@ class TradingPlaybookDataReadyBarrierTests(unittest.IsolatedAsyncioTestCase):
 
         with patch(
             "app.data_collectors.scheduler._get_cn_trading_dates",
-            return_value=[date(2026, 7, 13)],
+            return_value=[date(2026, 7, 13), date(2026, 7, 14)],
         ):
             await scheduler._build_trading_playbook_after_close()
             await scheduler._build_trading_playbook_after_close()
@@ -1057,7 +1061,10 @@ class TradingPlaybookForcedUpgradeTests(unittest.IsolatedAsyncioTestCase):
     async def test_forced_upgrade_skips_before_1530_and_on_non_trading_day(self):
         for now, trading_dates in (
             (datetime(2026, 7, 13, 15, 29, tzinfo=CN_TZ), [date(2026, 7, 13)]),
-            (datetime(2026, 7, 12, 15, 35, tzinfo=CN_TZ), []),
+            (
+                datetime(2026, 7, 12, 15, 35, tzinfo=CN_TZ),
+                [date(2026, 7, 13)],
+            ),
         ):
             with self.subTest(now=now):
                 scheduler = DataScheduler(now_provider=lambda now=now: now)
@@ -1102,6 +1109,31 @@ class TradingPlaybookForcedUpgradeTests(unittest.IsolatedAsyncioTestCase):
             next_trade_date=date(2026, 7, 14),
         )
         alert_service.monitor.assert_awaited_once()
+
+    async def test_alert_monitor_error_does_not_block_any_compensation_phase(self):
+        alert_service = SimpleNamespace(
+            monitor=AsyncMock(side_effect=RuntimeError("monitor failed"))
+        )
+        scheduler = DataScheduler(
+            trading_playbook_alert_service=alert_service,
+            session_factory=lambda: AsyncSessionContext(MagicMock()),
+            now_provider=lambda: datetime(
+                2026, 7, 13, 15, 35, tzinfo=CN_TZ
+            ),
+        )
+        scheduler._upgrade_forced_trading_playbook_after_close = AsyncMock()
+        scheduler._retry_incomplete_playbook_notifications = AsyncMock()
+        scheduler._compensate_trading_playbook_phases = AsyncMock()
+
+        with patch(
+            "app.data_collectors.scheduler._get_cn_trading_dates",
+            return_value=[date(2026, 7, 13), date(2026, 7, 14)],
+        ):
+            await scheduler._monitor_trading_playbook()
+
+        scheduler._upgrade_forced_trading_playbook_after_close.assert_awaited_once()
+        scheduler._retry_incomplete_playbook_notifications.assert_awaited_once()
+        scheduler._compensate_trading_playbook_phases.assert_awaited_once()
 
 
 class TradingPlaybookCatchupTests(unittest.IsolatedAsyncioTestCase):
@@ -1203,7 +1235,7 @@ class TradingPlaybookCatchupTests(unittest.IsolatedAsyncioTestCase):
         now = datetime(2026, 7, 12, 15, 30, tzinfo=CN_TZ)
         with patch(
             "app.data_collectors.scheduler._get_cn_trading_dates",
-            return_value=[],
+            return_value=[date(2026, 7, 13)],
         ):
             await self.scheduler._run_trading_playbook_catchup(now)
 

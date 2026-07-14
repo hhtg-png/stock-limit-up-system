@@ -9,6 +9,14 @@ from unittest.mock import AsyncMock
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 
+class _NullAsyncSessionContext:
+    async def __aenter__(self):
+        return SimpleNamespace()
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return False
+
+
 class TradingPlaybookJobClaimTests(unittest.IsolatedAsyncioTestCase):
     async def test_dual_engine_claim_is_single_winner_and_completed_is_terminal(self):
         from app.models.trading_playbook import TradingPlaybookJobClaim
@@ -110,6 +118,72 @@ class TradingPlaybookJobClaimTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(first)
             self.assertIsNone(live)
             self.assertIsNotNone(takeover)
+            self.assertEqual(takeover.owner, "worker-b")
+            self.assertEqual(takeover.attempt_no, 2)
+        finally:
+            await engine.dispose()
+
+    async def test_renew_fences_by_owner_and_attempt_then_expiry_allows_takeover(self):
+        from app.models.trading_playbook import TradingPlaybookJobClaim
+        from app.services.trading_playbook.job_claim_service import (
+            TradingPlaybookClaimToken,
+            TradingPlaybookJobClaimService,
+        )
+
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+        async with engine.begin() as connection:
+            await connection.run_sync(TradingPlaybookJobClaim.__table__.create)
+        service = TradingPlaybookJobClaimService(lease_seconds=1)
+        now = datetime(2026, 7, 13, 15, 30)
+        try:
+            async with maker() as db:
+                token = await service.claim(
+                    db,
+                    job_key="slow-build",
+                    job_type="stage",
+                    phase="build",
+                    owner="worker-a",
+                    now=now,
+                )
+            async with maker() as db:
+                self.assertFalse(
+                    await service.renew(
+                        db,
+                        TradingPlaybookClaimToken(
+                            token.job_key, "wrong-owner", token.attempt_no
+                        ),
+                        now=now + timedelta(milliseconds=300),
+                    )
+                )
+            async with maker() as db:
+                self.assertTrue(
+                    await service.renew(
+                        db,
+                        token,
+                        now=now + timedelta(milliseconds=600),
+                    )
+                )
+            async with maker() as db:
+                self.assertIsNone(
+                    await service.claim(
+                        db,
+                        job_key="slow-build",
+                        job_type="stage",
+                        phase="build",
+                        owner="worker-b",
+                        now=now + timedelta(seconds=1.1),
+                    )
+                )
+            async with maker() as db:
+                takeover = await service.claim(
+                    db,
+                    job_key="slow-build",
+                    job_type="stage",
+                    phase="build",
+                    owner="worker-b",
+                    now=now + timedelta(seconds=1.7),
+                )
             self.assertEqual(takeover.owner, "worker-b")
             self.assertEqual(takeover.attempt_no, 2)
         finally:
@@ -301,6 +375,229 @@ class TradingPlaybookSchedulerClaimTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(orchestrator.calls, 1)
         self.assertEqual(alert.notify_plan_ready.await_count, 1)
         self.assertEqual(review.build.await_count, 2)
+
+    async def test_validated_mapping_dates_are_coerced_before_notification_claim(self):
+        from app.data_collectors.scheduler import DataScheduler
+        from app.models.trading_playbook import TradingPlaybookJobClaim
+        from app.utils.time_utils import CN_TZ
+
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+        async with engine.begin() as connection:
+            await connection.run_sync(TradingPlaybookJobClaim.__table__.create)
+        alert = SimpleNamespace(notify_plan_ready=AsyncMock())
+        scheduler = DataScheduler(
+            trading_playbook_alert_service=alert,
+            session_factory=maker,
+            now_provider=lambda: CN_TZ.localize(datetime(2026, 7, 13, 15, 30)),
+        )
+        plan = {
+            "id": 77,
+            "source_trade_date": "2026-07-13",
+            "target_trade_date": "2026-07-14",
+            "stage": "after_close",
+        }
+        try:
+            await scheduler._notify_trading_playbook_plan(plan)
+            await scheduler._notify_trading_playbook_plan(plan)
+            async with maker() as db:
+                claim = (
+                    await db.execute(
+                        __import__("sqlalchemy").select(TradingPlaybookJobClaim)
+                    )
+                ).scalar_one()
+        finally:
+            await engine.dispose()
+
+        self.assertEqual(alert.notify_plan_ready.await_count, 1)
+        self.assertEqual(claim.status, "completed")
+        self.assertEqual(claim.source_trade_date, date(2026, 7, 13))
+
+    async def test_slow_notification_renews_lease_and_runs_once(self):
+        from app.data_collectors.scheduler import DataScheduler
+        from app.models.trading_playbook import TradingPlaybookJobClaim
+        from app.services.trading_playbook.job_claim_service import (
+            TradingPlaybookJobClaimService,
+        )
+        from app.utils.time_utils import CN_TZ
+
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "slow-notify.db"
+            url = f"sqlite+aiosqlite:///{path.as_posix()}"
+            engines = [create_async_engine(url) for _ in range(2)]
+            makers = [
+                async_sessionmaker(engine, expire_on_commit=False)
+                for engine in engines
+            ]
+            async with engines[0].begin() as connection:
+                await connection.run_sync(TradingPlaybookJobClaim.__table__.create)
+            notify_calls = 0
+
+            async def notify(*_args, **_kwargs):
+                nonlocal notify_calls
+                notify_calls += 1
+                await asyncio.sleep(2.0)
+
+            alert = SimpleNamespace(notify_plan_ready=notify)
+            schedulers = [
+                DataScheduler(
+                    trading_playbook_alert_service=alert,
+                    session_factory=makers[index],
+                    now_provider=lambda: datetime.now(CN_TZ),
+                    job_claim_service=TradingPlaybookJobClaimService(
+                        lease_seconds=1
+                    ),
+                )
+                for index in range(2)
+            ]
+            plan = SimpleNamespace(
+                id=88,
+                source_trade_date=date(2026, 7, 13),
+                target_trade_date=date(2026, 7, 14),
+                stage="after_close",
+            )
+            try:
+                first = asyncio.create_task(
+                    schedulers[0]._notify_trading_playbook_plan(plan)
+                )
+                await asyncio.sleep(1.05)
+                second = asyncio.create_task(
+                    schedulers[1]._notify_trading_playbook_plan(plan)
+                )
+                await asyncio.gather(first, second)
+            finally:
+                for engine in engines:
+                    await engine.dispose()
+
+        self.assertEqual(notify_calls, 1)
+
+    async def test_slow_build_renews_lease_and_runs_once(self):
+        from app.data_collectors.scheduler import DataScheduler
+        from app.models.trading_playbook import (
+            TradingPlanVersion,
+            TradingPlaybookJobClaim,
+        )
+        from app.services.trading_playbook.job_claim_service import (
+            TradingPlaybookJobClaimService,
+        )
+        from app.utils.time_utils import CN_TZ
+
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "slow-build.db"
+            url = f"sqlite+aiosqlite:///{path.as_posix()}"
+            engines = [create_async_engine(url) for _ in range(2)]
+            makers = [
+                async_sessionmaker(engine, expire_on_commit=False)
+                for engine in engines
+            ]
+            async with engines[0].begin() as connection:
+                await connection.run_sync(TradingPlanVersion.__table__.create)
+                await connection.run_sync(TradingPlaybookJobClaim.__table__.create)
+            build_calls = 0
+
+            class SlowOrchestrator:
+                async def build_stage(self, *_args, **_kwargs):
+                    nonlocal build_calls
+                    build_calls += 1
+                    await asyncio.sleep(1.3)
+                    return SimpleNamespace(
+                        id=99,
+                        source_trade_date=date(2026, 7, 13),
+                        target_trade_date=date(2026, 7, 14),
+                        stage="after_close",
+                    )
+
+            started = asyncio.get_running_loop().time()
+
+            def now():
+                elapsed = asyncio.get_running_loop().time() - started
+                return CN_TZ.localize(datetime(2026, 7, 13, 15, 30)) + timedelta(
+                    seconds=elapsed
+                )
+
+            schedulers = [
+                DataScheduler(
+                    trading_playbook_orchestrator=SlowOrchestrator(),
+                    session_factory=makers[index],
+                    now_provider=now,
+                    calendar_service=self._calendar(),
+                    job_claim_service=TradingPlaybookJobClaimService(
+                        lease_seconds=1
+                    ),
+                )
+                for index in range(2)
+            ]
+            try:
+                first = asyncio.create_task(
+                    schedulers[0]._build_trading_playbook_plan(
+                        "after_close",
+                        send_notifications=False,
+                    )
+                )
+                await asyncio.sleep(1.05)
+                second = asyncio.create_task(
+                    schedulers[1]._build_trading_playbook_plan(
+                        "after_close",
+                        send_notifications=False,
+                    )
+                )
+                await asyncio.gather(first, second)
+            finally:
+                for engine in engines:
+                    await engine.dispose()
+
+        self.assertEqual(build_calls, 1)
+
+    async def test_lost_heartbeat_cancels_work_and_fences_downstream_notification(self):
+        from app.data_collectors.scheduler import DataScheduler
+        from app.services.trading_playbook.job_claim_service import (
+            TradingPlaybookClaimToken,
+        )
+        from app.utils.time_utils import CN_TZ
+
+        cancelled = asyncio.Event()
+
+        class LostClaimService:
+            lease_seconds = 1
+
+            async def claim(self, _db, **kwargs):
+                return TradingPlaybookClaimToken(
+                    kwargs["job_key"], kwargs["owner"], 1
+                )
+
+            async def renew(self, *_args, **_kwargs):
+                return False
+
+            async def fail(self, *_args, **_kwargs):
+                return False
+
+            async def complete(self, *_args, **_kwargs):
+                raise AssertionError("lost claim must not complete")
+
+        class SlowOrchestrator:
+            async def build_stage(self, *_args, **_kwargs):
+                try:
+                    await asyncio.sleep(5)
+                except asyncio.CancelledError:
+                    cancelled.set()
+                    raise
+
+        scheduler = DataScheduler(
+            trading_playbook_orchestrator=SlowOrchestrator(),
+            trading_playbook_alert_service=SimpleNamespace(
+                notify_plan_ready=AsyncMock()
+            ),
+            session_factory=lambda: _NullAsyncSessionContext(),
+            now_provider=lambda: CN_TZ.localize(datetime(2026, 7, 13, 15, 30)),
+            calendar_service=self._calendar(),
+            job_claim_service=LostClaimService(),
+        )
+
+        result = await scheduler._build_trading_playbook_plan("after_close")
+
+        self.assertIsNone(result)
+        self.assertTrue(cancelled.is_set())
+        scheduler._trading_playbook_alert_service.notify_plan_ready.assert_not_awaited()
 
     async def _scheduler_fixture(
         self,

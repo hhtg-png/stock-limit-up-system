@@ -7,6 +7,8 @@ import time
 from datetime import date, datetime, timedelta
 from typing import Callable, Iterable, Optional
 
+from loguru import logger
+
 from app.utils.time_utils import today_cn
 
 
@@ -38,6 +40,8 @@ class TradingCalendarService:
         self._refresh_day: Optional[date] = None
         self._next_retry_at = 0.0
         self._last_error: Optional[TradingCalendarLookupError] = None
+        self._refresh_task: Optional[asyncio.Task] = None
+        self._refresh_range: Optional[tuple[date, date]] = None
 
     async def ensure_date(self, value: date) -> None:
         end = value + timedelta(days=15)
@@ -58,11 +62,12 @@ class TradingCalendarService:
                 self._raise_without_covered_cache(value, end)
                 return
             try:
-                loaded = await asyncio.wait_for(
-                    asyncio.to_thread(self._loader, value, end),
-                    timeout=self._refresh_timeout_seconds,
-                )
+                loaded = await self._load_singleflight(value, end)
                 normalized = self._normalize_dates(loaded, value, end)
+                if not normalized or not any(day > value for day in normalized):
+                    raise TradingCalendarLookupError(
+                        "China trading calendar returned no usable next trade date"
+                    )
             except Exception as exc:
                 error = (
                     exc
@@ -101,7 +106,49 @@ class TradingCalendarService:
         )
 
     async def close(self) -> None:
-        """Calendar refreshes are awaited inline, so no background task remains."""
+        """Bound shutdown while retaining ownership of any live worker task."""
+        task = self._refresh_task
+        if task is None or task.done():
+            if task is not None:
+                self._consume_refresh_result(task)
+            return
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(task),
+                timeout=self._refresh_timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Trading calendar refresh still running during shutdown")
+        except Exception as exc:
+            logger.warning("Trading calendar refresh failed during shutdown: {}", exc)
+
+    async def _load_singleflight(self, start: date, end: date):
+        task = self._refresh_task
+        if task is None or task.done():
+            if task is not None:
+                self._consume_refresh_result(task)
+            task = asyncio.create_task(asyncio.to_thread(self._loader, start, end))
+            task.add_done_callback(self._consume_refresh_result)
+            self._refresh_task = task
+            self._refresh_range = (start, end)
+        try:
+            return await asyncio.wait_for(
+                asyncio.shield(task),
+                timeout=self._refresh_timeout_seconds,
+            )
+        except asyncio.TimeoutError as exc:
+            raise TradingCalendarLookupError(
+                "Unable to refresh China trading calendar: timed out"
+            ) from exc
+
+    @staticmethod
+    def _consume_refresh_result(task: asyncio.Task) -> None:
+        if not task.done() or task.cancelled():
+            return
+        try:
+            task.exception()
+        except (asyncio.CancelledError, Exception):
+            pass
 
     def _is_current(self, start: date, end: date, refresh_day: date) -> bool:
         return self._refresh_day == refresh_day and self._covers(start, end)
@@ -143,4 +190,3 @@ class TradingCalendarService:
             if start <= value <= end:
                 normalized.add(value)
         return sorted(normalized)
-

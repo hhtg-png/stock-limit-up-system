@@ -102,6 +102,33 @@ class TradingPlaybookMarketDataProvider:
         self._quote_state_lock = asyncio.Lock()
         self._quote_semaphore = asyncio.Semaphore(self.max_concurrency)
         self._kline_semaphore = asyncio.Semaphore(self.max_concurrency)
+        self._orphan_kline_tasks: set[asyncio.Task] = set()
+
+    def _track_orphan_kline_task(self, task: asyncio.Task) -> None:
+        if task in self._orphan_kline_tasks:
+            return
+        self._orphan_kline_tasks.add(task)
+
+        def done(completed: asyncio.Task) -> None:
+            self._orphan_kline_tasks.discard(completed)
+            self._consume_task_result(completed)
+
+        task.add_done_callback(done)
+
+    async def aclose(self) -> None:
+        """Bounded drain for cancellation-suppressing K-line workers."""
+        tasks = list(self._orphan_kline_tasks)
+        if not tasks:
+            return
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        _done, pending = await asyncio.wait(
+            tasks,
+            timeout=self.kline_cancel_grace_seconds,
+        )
+        for task in pending:
+            self._track_orphan_kline_task(task)
 
     async def quote_snapshot(
         self,
@@ -990,7 +1017,7 @@ class TradingPlaybookMarketDataProvider:
                 timeout=self.kline_cancel_grace_seconds,
             )
             for worker in stubborn:
-                worker.add_done_callback(self._consume_task_result)
+                self._track_orphan_kline_task(worker)
 
         try:
             if workers:

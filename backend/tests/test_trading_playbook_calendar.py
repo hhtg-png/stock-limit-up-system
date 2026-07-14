@@ -160,6 +160,68 @@ class TradingPlaybookCalendarServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, 1)
         self.assertFalse(service.is_trading_day(date(2026, 7, 13)))
 
+    async def test_empty_refresh_never_replaces_last_good_calendar(self):
+        from app.services.trading_playbook.calendar_service import (
+            TradingCalendarLookupError,
+            TradingCalendarService,
+        )
+
+        calls = 0
+        current_day = [date(2026, 7, 13)]
+
+        def loader(_start, _end):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return [date(2026, 7, 13), date(2026, 7, 14)]
+            return []
+
+        service = TradingCalendarService(
+            loader=loader,
+            retry_interval_seconds=0,
+            today_provider=lambda: current_day[0],
+        )
+        await service.ensure_date(date(2026, 7, 13))
+        current_day[0] = date(2026, 7, 14)
+        await service.ensure_date(date(2026, 7, 13))
+
+        self.assertEqual(service.next_trade_date(date(2026, 7, 13)), date(2026, 7, 14))
+        fresh = TradingCalendarService(
+            loader=lambda _start, _end: [],
+            today_provider=lambda: date(2026, 7, 13),
+        )
+        with self.assertRaises(TradingCalendarLookupError):
+            await fresh.ensure_date(date(2026, 7, 13))
+
+    async def test_timed_out_loader_is_singleflight_and_close_is_bounded(self):
+        from app.services.trading_playbook.calendar_service import (
+            TradingCalendarLookupError,
+            TradingCalendarService,
+        )
+
+        calls = 0
+
+        def loader(_start, _end):
+            nonlocal calls
+            calls += 1
+            time.sleep(0.2)
+            return [date(2026, 7, 13), date(2026, 7, 14)]
+
+        service = TradingCalendarService(
+            loader=loader,
+            refresh_timeout_seconds=0.03,
+            retry_interval_seconds=0,
+            today_provider=lambda: date(2026, 7, 13),
+        )
+        for _ in range(2):
+            with self.assertRaises(TradingCalendarLookupError):
+                await service.ensure_date(date(2026, 7, 13))
+        started = time.monotonic()
+        await service.close()
+
+        self.assertEqual(calls, 1)
+        self.assertLess(time.monotonic() - started, 0.1)
+
 
 if __name__ == "__main__":
     unittest.main()

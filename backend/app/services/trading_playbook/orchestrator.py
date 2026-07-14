@@ -46,6 +46,11 @@ class TradingPlaybookOrchestrator:
         self.plan_service = plan_service
         self.next_trade_date = next_trade_date
 
+    async def aclose(self) -> None:
+        close = getattr(self.market_data, "aclose", None)
+        if callable(close):
+            await close()
+
     async def build_stage(
         self,
         db: Any,

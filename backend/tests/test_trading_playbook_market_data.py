@@ -2363,13 +2363,16 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
                     timeout=0.3,
                 )
             finally:
+                self.assertLessEqual(len(provider._orphan_kline_tasks), 2)
                 release.set()
             elapsed = loop.time() - started_at
             await asyncio.sleep(0.05)
+            await provider.aclose()
 
         self.assertLess(elapsed, 0.2)
         self.assertLessEqual(max_active, 2)
         self.assertEqual(active, set())
+        self.assertEqual(provider._orphan_kline_tasks, set())
         for candidate in snapshot.candidates:
             evidence = next(
                 row for row in candidate.evidence if row["source"] == "kline"

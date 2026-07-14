@@ -24,6 +24,10 @@ from app.services.trading_playbook.job_claim_service import (
 from app.utils.time_utils import CN_TZ, get_market_status, is_trading_time, today_cn
 
 
+class TradingPlaybookClaimLost(RuntimeError):
+    """Raised when a running phase no longer owns its database lease."""
+
+
 def _normalize_trade_calendar_date(raw_value) -> Optional[date]:
     if isinstance(raw_value, date):
         return raw_value
@@ -548,12 +552,15 @@ class DataScheduler:
                     build_kwargs = {"degraded": degraded}
                     if degradation_reason is not None:
                         build_kwargs["degradation_reason"] = degradation_reason
-                    plan = await orchestrator.build_stage(
-                        db,
-                        source_trade_date,
-                        stage,
-                        now,
-                        **build_kwargs,
+                    plan = await self._run_with_playbook_claim(
+                        token,
+                        lambda: orchestrator.build_stage(
+                            db,
+                            source_trade_date,
+                            stage,
+                            now,
+                            **build_kwargs,
+                        ),
                     )
                 except BaseException as exc:
                     await self._playbook_job_claims.fail(
@@ -562,12 +569,18 @@ class DataScheduler:
                         now=self._claim_now(),
                         error=exc,
                     )
+                    if isinstance(exc, TradingPlaybookClaimLost):
+                        logger.error("{}", exc)
+                        return None
                     raise
-                await self._playbook_job_claims.complete(
+                completed = await self._playbook_job_claims.complete(
                     db,
                     token,
                     now=self._claim_now(),
                 )
+                if not completed:
+                    logger.error("Trading playbook build claim lost before completion")
+                    return None
         if send_notifications and plan is not None:
             await self._notify_trading_playbook_plan(plan)
         return plan
@@ -575,11 +588,83 @@ class DataScheduler:
     def _claim_now(self) -> datetime:
         return self._playbook_now().replace(tzinfo=None)
 
+    async def _run_with_playbook_claim(self, token, operation):
+        """Run work behind a renewable lease and cancel immediately if fenced."""
+        interval = max(
+            min(float(self._playbook_job_claims.lease_seconds) / 3.0, 30.0),
+            0.05,
+        )
+        work_task = asyncio.create_task(operation())
+
+        async def heartbeat():
+            while True:
+                await asyncio.sleep(interval)
+                async with self._playbook_sessions() as heartbeat_db:
+                    renewed = await self._playbook_job_claims.renew(
+                        heartbeat_db,
+                        token,
+                        now=self._claim_now(),
+                    )
+                if not renewed:
+                    raise TradingPlaybookClaimLost(
+                        f"playbook claim lost: {token.job_key}"
+                    )
+
+        heartbeat_task = asyncio.create_task(heartbeat())
+        try:
+            done, _pending = await asyncio.wait(
+                {work_task, heartbeat_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if heartbeat_task in done:
+                error = heartbeat_task.exception()
+                work_task.cancel()
+                await asyncio.gather(work_task, return_exceptions=True)
+                raise error or TradingPlaybookClaimLost(
+                    f"playbook claim heartbeat stopped: {token.job_key}"
+                )
+            result = await work_task
+            heartbeat_task.cancel()
+            await asyncio.gather(heartbeat_task, return_exceptions=True)
+            async with self._playbook_sessions() as fence_db:
+                fenced = await self._playbook_job_claims.renew(
+                    fence_db,
+                    token,
+                    now=self._claim_now(),
+                )
+            if not fenced:
+                raise TradingPlaybookClaimLost(
+                    f"playbook claim lost before completion: {token.job_key}"
+                )
+            return result
+        finally:
+            for task in (work_task, heartbeat_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                work_task,
+                heartbeat_task,
+                return_exceptions=True,
+            )
+
     @staticmethod
     def _plan_value(plan: Any, key: str) -> Any:
         if isinstance(plan, dict):
             return plan.get(key)
         return getattr(plan, key, None)
+
+    @staticmethod
+    def _coerce_date(value: Any, field_name: str) -> date:
+        if isinstance(value, datetime):
+            return value.date()
+        if type(value) is date:
+            return value
+        if isinstance(value, str):
+            try:
+                return date.fromisoformat(value.strip())
+            except ValueError as exc:
+                raise ValueError(f"invalid {field_name}: {value!r}") from exc
+        raise ValueError(f"invalid {field_name}: {value!r}")
 
     @staticmethod
     async def _latest_stage_plan_in_session(db, target_trade_date, stage):
@@ -610,23 +695,79 @@ class DataScheduler:
         if not isinstance(plan_id, int):
             logger.error("Skipping playbook notification without plan id")
             return None
-        async with self._playbook_sessions() as db:
-            token = await self._playbook_job_claims.claim(
-                db,
-                job_key=f"playbook:notify:plan:{plan_id}",
-                job_type="plan",
-                phase="notify",
-                owner=self._playbook_claim_owner,
-                now=self._claim_now(),
-                source_trade_date=self._plan_value(plan, "source_trade_date"),
-                target_trade_date=self._plan_value(plan, "target_trade_date"),
-                stage=self._plan_value(plan, "stage"),
-                generation_key=str(plan_id),
+        raw_source_date = self._plan_value(plan, "source_trade_date")
+        raw_target_date = self._plan_value(plan, "target_trade_date")
+        date_error = None
+        try:
+            source_trade_date = (
+                self._coerce_date(raw_source_date, "source_trade_date")
+                if raw_source_date is not None
+                else None
             )
+            target_trade_date = (
+                self._coerce_date(raw_target_date, "target_trade_date")
+                if raw_target_date is not None
+                else None
+            )
+        except ValueError as exc:
+            source_trade_date = None
+            target_trade_date = None
+            date_error = exc
+        async with self._playbook_sessions() as db:
+            claim_kwargs = {
+                "job_key": f"playbook:notify:plan:{plan_id}",
+                "job_type": "plan",
+                "phase": "notify",
+                "owner": self._playbook_claim_owner,
+                "now": self._claim_now(),
+                "source_trade_date": source_trade_date,
+                "target_trade_date": target_trade_date,
+                "stage": self._plan_value(plan, "stage"),
+                "generation_key": str(plan_id),
+            }
+            try:
+                token = await self._playbook_job_claims.claim(db, **claim_kwargs)
+            except Exception as claim_error:
+                await db.rollback()
+                logger.error(
+                    "Trading playbook notification claim failed: {}",
+                    claim_error,
+                )
+                # A second metadata-free attempt preserves a retry marker when
+                # optional payload fields caused the original claim failure.
+                claim_kwargs["source_trade_date"] = None
+                claim_kwargs["target_trade_date"] = None
+                try:
+                    token = await self._playbook_job_claims.claim(
+                        db,
+                        **claim_kwargs,
+                    )
+                except Exception:
+                    return None
+                if token is not None:
+                    await self._playbook_job_claims.fail(
+                        db,
+                        token,
+                        now=self._claim_now(),
+                        error=claim_error,
+                    )
+                return None
             if token is None:
                 return None
+            if date_error is not None:
+                await self._playbook_job_claims.fail(
+                    db,
+                    token,
+                    now=self._claim_now(),
+                    error=date_error,
+                )
+                logger.error("Trading playbook notification payload invalid: {}", date_error)
+                return None
             try:
-                result = await notify(db, plan, send=True)
+                result = await self._run_with_playbook_claim(
+                    token,
+                    lambda: notify(db, plan, send=True),
+                )
             except BaseException as exc:
                 await self._playbook_job_claims.fail(
                     db,
@@ -636,12 +777,12 @@ class DataScheduler:
                 )
                 logger.error("Trading playbook notification failed: {}", exc)
                 return None
-            await self._playbook_job_claims.complete(
+            completed = await self._playbook_job_claims.complete(
                 db,
                 token,
                 now=self._claim_now(),
             )
-            return result
+            return result if completed else None
 
     async def _build_trading_playbook_preclose(self):
         return await self._build_trading_playbook_plan("preclose")
@@ -714,7 +855,10 @@ class DataScheduler:
             if token is None:
                 return None
             try:
-                result = await build(db, review_date, finalized=finalized)
+                result = await self._run_with_playbook_claim(
+                    token,
+                    lambda: build(db, review_date, finalized=finalized),
+                )
             except BaseException as exc:
                 await self._playbook_job_claims.fail(
                     db,
@@ -724,12 +868,12 @@ class DataScheduler:
                 )
                 logger.error("Trading playbook {} failed: {}", phase, exc)
                 return None
-            await self._playbook_job_claims.complete(
+            completed = await self._playbook_job_claims.complete(
                 db,
                 token,
                 now=self._claim_now(),
             )
-            return result
+            return result if completed else None
 
     async def _monitor_trading_playbook(self):
         now = self._playbook_now()
@@ -737,8 +881,11 @@ class DataScheduler:
         service = self._trading_playbook_alert_service
         monitor = getattr(service, "monitor", None)
         if callable(monitor):
-            async with self._playbook_sessions() as db:
-                monitor_result = await monitor(db, now)
+            try:
+                async with self._playbook_sessions() as db:
+                    monitor_result = await monitor(db, now)
+            except Exception as exc:
+                logger.error("Trading playbook alert monitor failed: {}", exc)
         else:
             logger.debug("Trading playbook alert monitor is not installed")
         try:
@@ -749,16 +896,6 @@ class DataScheduler:
             logger.error("Trading playbook calendar refresh failed: {}", exc)
             return monitor_result
         try:
-            await self._retry_incomplete_playbook_notifications(
-                now.date(),
-                next_trade_date,
-            )
-        except Exception as exc:
-            logger.error(
-                "Trading playbook notification compensation failed: {}",
-                exc,
-            )
-        try:
             await self._upgrade_forced_trading_playbook_after_close(
                 send_notifications=True,
                 trade_date=now.date(),
@@ -767,6 +904,16 @@ class DataScheduler:
         except Exception as exc:
             logger.error(
                 "Trading playbook forced after-close upgrade failed: {}",
+                exc,
+            )
+        try:
+            await self._retry_incomplete_playbook_notifications(
+                now.date(),
+                next_trade_date,
+            )
+        except Exception as exc:
+            logger.error(
+                "Trading playbook notification compensation failed: {}",
                 exc,
             )
         try:

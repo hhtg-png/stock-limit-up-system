@@ -13,6 +13,7 @@ from app.models.market_review import (
     MarketReviewStockDaily,
 )
 from app.models.stock import Stock
+from app.services.realtime_limit_up_service import RealtimeLimitUpSnapshot
 from app.services.trading_playbook.composition import (
     build_production_trading_playbook_orchestrator,
 )
@@ -52,6 +53,11 @@ class TradingPlaybookProductionPipelineTests(unittest.IsolatedAsyncioTestCase):
 
     async def _seed_real_facts(self):
         async with self.Session() as db:
+            stock_codes = (
+                "300001",
+                "000002",
+                *(f"600{index:03d}" for index in range(50)),
+            )
             stocks = [
                 Stock(
                     stock_code=code,
@@ -60,7 +66,7 @@ class TradingPlaybookProductionPipelineTests(unittest.IsolatedAsyncioTestCase):
                     is_st=0,
                     circulating_shares=100_000,
                 )
-                for code in ("300001", "000002")
+                for code in stock_codes
             ]
             db.add_all(stocks)
             await db.flush()
@@ -209,7 +215,11 @@ class TradingPlaybookProductionPipelineTests(unittest.IsolatedAsyncioTestCase):
                 "limit_up": "11",
                 "datetime": quote_time,
             }
-            for code in ("300001", "000002")
+            for code in (
+                "300001",
+                "000002",
+                *(f"600{index:03d}" for index in range(50)),
+            )
         }
 
         async def realtime_loader(_trade_date):
@@ -252,7 +262,12 @@ class TradingPlaybookProductionPipelineTests(unittest.IsolatedAsyncioTestCase):
                 }
                 for index in range(18)
             )
-            return rows
+            return RealtimeLimitUpSnapshot(
+                items=rows,
+                authoritative=True,
+                complete=True,
+                evidence_trade_date=evidence_date,
+            )
 
         async def kline_loader(*_args, **_kwargs):
             return [
@@ -300,6 +315,10 @@ class TradingPlaybookProductionPipelineTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotEqual(
                     plan["market_state_json"]["window"],
                     "unknown",
+                )
+                self.assertEqual(
+                    plan["market_state_json"]["trend_evidence_source"],
+                    "bounded_sample",
                 )
                 self.assertTrue(
                     any(

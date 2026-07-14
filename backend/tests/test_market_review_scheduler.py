@@ -11,6 +11,13 @@ triggers_module = types.ModuleType("apscheduler.triggers")
 cron_module = types.ModuleType("apscheduler.triggers.cron")
 date_module = types.ModuleType("apscheduler.triggers.date")
 interval_module = types.ModuleType("apscheduler.triggers.interval")
+_installed_stub_modules = []
+
+
+def _install_stub(name, module):
+    if name not in sys.modules:
+        sys.modules[name] = module
+        _installed_stub_modules.append(name)
 
 
 class StubAsyncIOScheduler:
@@ -47,13 +54,16 @@ cron_module.CronTrigger = StubCronTrigger
 date_module.DateTrigger = StubDateTrigger
 interval_module.IntervalTrigger = StubIntervalTrigger
 
-sys.modules.setdefault("apscheduler", apscheduler_module)
-sys.modules.setdefault("apscheduler.schedulers", schedulers_module)
-sys.modules.setdefault("apscheduler.schedulers.asyncio", asyncio_module)
-sys.modules.setdefault("apscheduler.triggers", triggers_module)
-sys.modules.setdefault("apscheduler.triggers.cron", cron_module)
-sys.modules.setdefault("apscheduler.triggers.date", date_module)
-sys.modules.setdefault("apscheduler.triggers.interval", interval_module)
+try:
+    import apscheduler  # noqa: F401
+except ImportError:
+    _install_stub("apscheduler", apscheduler_module)
+    _install_stub("apscheduler.schedulers", schedulers_module)
+    _install_stub("apscheduler.schedulers.asyncio", asyncio_module)
+    _install_stub("apscheduler.triggers", triggers_module)
+    _install_stub("apscheduler.triggers.cron", cron_module)
+    _install_stub("apscheduler.triggers.date", date_module)
+    _install_stub("apscheduler.triggers.interval", interval_module)
 
 
 class StubShanghaiTimezone(tzinfo):
@@ -71,11 +81,17 @@ class StubShanghaiTimezone(tzinfo):
 
 pytz_module = types.ModuleType("pytz")
 pytz_module.timezone = lambda _: StubShanghaiTimezone()
-sys.modules.setdefault("pytz", pytz_module)
+try:
+    import pytz  # noqa: F401
+except ImportError:
+    _install_stub("pytz", pytz_module)
 
 from app.data_collectors.scheduler import DataScheduler, _get_cn_trading_dates
 from app.utils.time_utils import CN_TZ
 from scripts.backfill_market_review import backfill_market_review
+
+for _stub_name in reversed(_installed_stub_modules):
+    sys.modules.pop(_stub_name, None)
 
 
 def _cron_value(trigger, name):

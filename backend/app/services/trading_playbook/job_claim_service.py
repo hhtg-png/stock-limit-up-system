@@ -123,6 +123,28 @@ class TradingPlaybookJobClaimService:
         await db.commit()
         return result.rowcount == 1
 
+    async def renew(
+        self,
+        db,
+        token: TradingPlaybookClaimToken,
+        *,
+        now: datetime,
+    ) -> bool:
+        """Extend only a still-live lease owned by this exact attempt."""
+        result = await db.execute(
+            update(TradingPlaybookJobClaim)
+            .where(
+                *self._token_predicates(token),
+                TradingPlaybookJobClaim.lease_expires_at > now,
+            )
+            .values(
+                lease_expires_at=now + timedelta(seconds=self.lease_seconds),
+                updated_at=now,
+            )
+        )
+        await db.commit()
+        return result.rowcount == 1
+
     async def fail(
         self,
         db,

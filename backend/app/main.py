@@ -70,6 +70,17 @@ async def lifespan(app: FastAPI):
         except Exception as exc:
             logger.error(f"DataScheduler shutdown failed: {exc}")
         try:
+            orchestrator = getattr(
+                app.state,
+                "trading_playbook_orchestrator",
+                None,
+            )
+            close = getattr(orchestrator, "aclose", None)
+            if callable(close):
+                await close()
+        except Exception as exc:
+            logger.error(f"Trading playbook provider cleanup failed: {exc}")
+        try:
             _clear_trading_playbook_runtime(app)
         except Exception as exc:
             logger.error(f"Trading playbook runtime cleanup failed: {exc}")
