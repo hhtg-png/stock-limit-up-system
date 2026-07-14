@@ -82,6 +82,9 @@ class TradingPlaybookProductionCompositionTests(unittest.IsolatedAsyncioTestCase
         from app.services.trading_playbook.composition import (
             load_production_full_market_context,
         )
+        from app.services.trading_playbook.market_data import (
+            _FULL_MARKET_CONTEXT_FIELDS as FULL_MARKET_CONTEXT_FIELDS,
+        )
 
         previous = SimpleNamespace(
             trade_date=date(2026, 7, 10),
@@ -118,12 +121,191 @@ class TradingPlaybookProductionCompositionTests(unittest.IsolatedAsyncioTestCase
         self.assertEqual(result["limit_down_count"], 1)
         self.assertEqual(result["max_board_height"], 5)
         self.assertEqual(result["seal_rate"], 75.0)
+        self.assertEqual(result["quality"], "degraded")
+        self.assertEqual(set(result["field_quality"]), set(FULL_MARKET_CONTEXT_FIELDS))
+        self.assertEqual(result["field_quality"]["limit_up_count"], "ready")
         self.assertEqual(
-            result["field_quality"]["limit_up_count"],
-            "ready",
+            result["field_quality"]["trend_new_high_count"],
+            "missing",
         )
         self.assertEqual(result["as_of"].tzinfo, CN_TZ)
         db.execute.assert_awaited_once()
+
+    async def test_partial_metric_never_promotes_default_zeroes_to_ready(self):
+        from app.services.trading_playbook.composition import (
+            load_production_full_market_context,
+        )
+        from app.services.trading_playbook.market_data import (
+            _FULL_MARKET_CONTEXT_FIELDS as FULL_MARKET_CONTEXT_FIELDS,
+        )
+
+        partial = SimpleNamespace(
+            trade_date=date(2026, 7, 13),
+            limit_up_count=0,
+            limit_down_count=0,
+            max_board_height=0,
+            seal_rate=0.0,
+            source_status="partial",
+            updated_at=datetime(2026, 7, 13, 15, 7),
+        )
+        db = SimpleNamespace(execute=AsyncMock(return_value=ScalarRows([partial])))
+
+        result = await load_production_full_market_context(
+            date(2026, 7, 13),
+            "after_close",
+            datetime(2026, 7, 13, 15, 30, tzinfo=CN_TZ),
+            session_factory=lambda: AsyncSessionContext(db),
+        )
+
+        self.assertEqual(result["quality"], "degraded")
+        self.assertEqual(
+            result["field_quality"],
+            {key: "missing" for key in FULL_MARKET_CONTEXT_FIELDS},
+        )
+        for key in FULL_MARKET_CONTEXT_FIELDS:
+            self.assertNotIn(key, result)
+
+    async def test_complete_primary_metric_is_the_only_ready_context(self):
+        from app.services.trading_playbook.composition import (
+            load_production_full_market_context,
+        )
+        from app.services.trading_playbook.market_data import (
+            _FULL_MARKET_CONTEXT_FIELDS as FULL_MARKET_CONTEXT_FIELDS,
+        )
+
+        values = {
+            "limit_up_count": 55,
+            "limit_up_count_prev": 43,
+            "trend_new_high_count": 18,
+            "trend_new_high_count_prev": 15,
+            "limit_down_count": 1,
+            "max_board_height": 5,
+            "seal_rate": 75.0,
+            "negative_feedback": False,
+            "divergence_days": 0,
+            "sell_pressure_falling": True,
+            "breadth_recovered": True,
+            "prior_window": "divergence_to_consensus",
+            "sell_pressure_rising": False,
+        }
+        current_values = {
+            key: value
+            for key, value in values.items()
+            if key != "limit_up_count_prev"
+        }
+        current = SimpleNamespace(
+            trade_date=date(2026, 7, 13),
+            source_status="primary",
+            updated_at=datetime(2026, 7, 13, 15, 7),
+            **current_values,
+        )
+        previous = SimpleNamespace(
+            trade_date=date(2026, 7, 10),
+            source_status="primary",
+            updated_at=datetime(2026, 7, 10, 15, 7),
+            limit_up_count=values["limit_up_count_prev"],
+        )
+        db = SimpleNamespace(
+            execute=AsyncMock(return_value=ScalarRows([current, previous]))
+        )
+
+        result = await load_production_full_market_context(
+            date(2026, 7, 13),
+            "after_close",
+            datetime(2026, 7, 13, 15, 30, tzinfo=CN_TZ),
+            session_factory=lambda: AsyncSessionContext(db),
+        )
+
+        self.assertEqual(result["quality"], "ready")
+        self.assertEqual(
+            result["field_quality"],
+            {key: "ready" for key in FULL_MARKET_CONTEXT_FIELDS},
+        )
+        self.assertEqual(
+            {key: result[key] for key in FULL_MARKET_CONTEXT_FIELDS},
+            values,
+        )
+
+    async def test_partial_previous_metric_cannot_supply_previous_count(self):
+        from app.services.trading_playbook.composition import (
+            load_production_full_market_context,
+        )
+
+        current = SimpleNamespace(
+            trade_date=date(2026, 7, 13),
+            source_status="primary",
+            updated_at=datetime(2026, 7, 13, 15, 7),
+            limit_up_count=55,
+        )
+        previous = SimpleNamespace(
+            trade_date=date(2026, 7, 10),
+            source_status="partial",
+            updated_at=datetime(2026, 7, 10, 15, 7),
+            limit_up_count=0,
+        )
+        db = SimpleNamespace(
+            execute=AsyncMock(return_value=ScalarRows([current, previous]))
+        )
+
+        result = await load_production_full_market_context(
+            date(2026, 7, 13),
+            "after_close",
+            datetime(2026, 7, 13, 15, 30, tzinfo=CN_TZ),
+            session_factory=lambda: AsyncSessionContext(db),
+        )
+
+        self.assertEqual(
+            result["field_quality"]["limit_up_count_prev"],
+            "missing",
+        )
+        self.assertNotIn("limit_up_count_prev", result)
+
+    async def test_provider_explicitly_degrades_incomplete_composed_context(self):
+        from app.services.trading_playbook.composition import (
+            load_production_full_market_context,
+        )
+        from app.services.trading_playbook.market_data import (
+            TradingPlaybookMarketDataProvider,
+        )
+
+        current = SimpleNamespace(
+            trade_date=date(2026, 7, 13),
+            limit_up_count=55,
+            limit_down_count=1,
+            max_board_height=5,
+            seal_rate=75.0,
+            source_status="primary",
+            updated_at=datetime(2026, 7, 13, 15, 7),
+        )
+        previous = SimpleNamespace(
+            trade_date=date(2026, 7, 10),
+            limit_up_count=43,
+            updated_at=datetime(2026, 7, 10, 15, 7),
+        )
+        db = SimpleNamespace(
+            execute=AsyncMock(return_value=ScalarRows([current, previous]))
+        )
+
+        async def loader(trade_date, stage, as_of):
+            return await load_production_full_market_context(
+                trade_date,
+                stage,
+                as_of,
+                session_factory=lambda: AsyncSessionContext(db),
+            )
+
+        normalized, evidence, warning = await TradingPlaybookMarketDataProvider(
+            quote_api=AsyncMock(),
+            full_market_context_loader=loader,
+        )._load_full_market_context(
+            date(2026, 7, 13),
+            "after_close",
+            datetime(2026, 7, 13, 15, 30, tzinfo=CN_TZ),
+        )
+
+        self.assertEqual(normalized["limit_up_count"], 55)
+        self.assertEqual(evidence[0]["quality"], "degraded")
+        self.assertIn("incomplete", warning)
 
     async def test_full_market_adapter_fails_closed_when_source_date_is_missing(self):
         from app.services.trading_playbook.composition import (

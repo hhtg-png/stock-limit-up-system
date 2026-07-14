@@ -1195,6 +1195,9 @@ class TradingPlaybookMarketDataProvider:
                 continue
             normalized[key] = value
             accepted_quality[key] = str(declared_quality[key])
+        payload_quality = str(payload.get("quality") or "").strip().lower()
+        complete = len(normalized) == len(_FULL_MARKET_CONTEXT_FIELDS)
+        explicitly_degraded = bool(payload_quality) and payload_quality != "ready"
         evidence = [{
             "source": "full_market_context",
             "scope": "full_market",
@@ -1202,7 +1205,7 @@ class TradingPlaybookMarketDataProvider:
             "as_of": self._evidence_datetime(captured_at, as_of),
             "quality": (
                 "ready"
-                if len(normalized) == len(_FULL_MARKET_CONTEXT_FIELDS)
+                if complete and not explicitly_degraded
                 else "degraded"
             ),
             "field_quality": {
@@ -1210,12 +1213,15 @@ class TradingPlaybookMarketDataProvider:
                 for key in _FULL_MARKET_CONTEXT_FIELDS
             },
         }]
-        warning = (
-            "invalid full-market context fields: "
-            + ",".join(sorted(invalid_fields))
-            if invalid_fields
-            else None
-        )
+        warnings = []
+        if invalid_fields:
+            warnings.append(
+                "invalid full-market context fields: "
+                + ",".join(sorted(invalid_fields))
+            )
+        if not complete or explicitly_degraded:
+            warnings.append("incomplete full-market context")
+        warning = "; ".join(warnings) if warnings else None
         return normalized, evidence, warning
 
     async def _load_realtime_limit_up(

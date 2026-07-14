@@ -104,6 +104,7 @@ class DataScheduler:
             lambda: datetime.now(CN_TZ)
         )
         self._playbook_sleep = sleep or asyncio.sleep
+        self._playbook_upgrade_lock = asyncio.Lock()
         # 监控股票缓存
         self._monitored_stocks: List[Dict] = []
         self._stocks_cache_time: datetime = datetime.min
@@ -458,9 +459,13 @@ class DataScheduler:
         async with self._playbook_sessions() as db:
             return await build(db, now.date(), finalized=False)
 
-    async def _finalize_trading_playbook_review(self):
+    async def _finalize_trading_playbook_review(
+        self,
+        trade_date: Optional[date] = None,
+    ):
         now = self._playbook_now()
-        if not self._is_cn_trading_day(now.date()):
+        review_date = trade_date or now.date()
+        if not self._is_cn_trading_day(review_date):
             logger.info("Skipping trading playbook final review on non-trading day")
             return None
         service = self._trading_playbook_review_service
@@ -469,12 +474,21 @@ class DataScheduler:
             logger.info("Trading playbook review service is not installed")
             return None
         async with self._playbook_sessions() as db:
-            return await build(db, now.date(), finalized=True)
+            return await build(db, review_date, finalized=True)
 
     async def _monitor_trading_playbook(self):
         now = self._playbook_now()
         if not self._is_cn_trading_day(now.date()):
             return None
+        try:
+            await self._upgrade_forced_trading_playbook_after_close(
+                send_notifications=True
+            )
+        except Exception as exc:
+            logger.error(
+                "Trading playbook forced after-close upgrade failed: {}",
+                exc,
+            )
         service = self._trading_playbook_alert_service
         monitor = getattr(service, "monitor", None)
         if not callable(monitor):
@@ -483,6 +497,96 @@ class DataScheduler:
         async with self._playbook_sessions() as db:
             return await monitor(db, now)
 
+    async def _latest_relevant_after_close_plan(
+        self,
+        trade_date: date,
+    ):
+        from sqlalchemy import select
+        from app.models.trading_playbook import TradingPlanVersion
+
+        async with self._playbook_sessions() as db:
+            result = await db.execute(
+                select(TradingPlanVersion)
+                .where(
+                    TradingPlanVersion.stage == "after_close",
+                    TradingPlanVersion.source_trade_date <= trade_date,
+                    TradingPlanVersion.target_trade_date >= trade_date,
+                )
+                .order_by(
+                    TradingPlanVersion.target_trade_date.desc(),
+                    TradingPlanVersion.version_no.desc(),
+                    TradingPlanVersion.id.desc(),
+                )
+                .limit(1)
+            )
+            return result.scalar_one_or_none()
+
+    @staticmethod
+    def _is_forced_degraded_plan(plan: Any) -> bool:
+        quality = getattr(plan, "data_quality_json", None)
+        if not isinstance(quality, dict):
+            return False
+        warnings = quality.get("warnings")
+        if not isinstance(warnings, (list, tuple)):
+            return False
+        return "force_degraded requested" in warnings
+
+    async def _upgrade_forced_trading_playbook_after_close(
+        self,
+        *,
+        send_notifications: bool,
+    ):
+        now = self._playbook_now()
+        current_time = now.time().replace(tzinfo=None)
+        if current_time < time(15, 30):
+            return None
+        if not self._is_cn_trading_day(now.date()):
+            return None
+        orchestrator = self._trading_playbook_orchestrator
+        if orchestrator is None:
+            return None
+
+        async with self._playbook_upgrade_lock:
+            predecessor = await self._latest_relevant_after_close_plan(
+                now.date()
+            )
+            if not self._is_forced_degraded_plan(predecessor):
+                return None
+            source_trade_date = predecessor.source_trade_date
+            if not await self._trading_playbook_data_ready_once(
+                source_trade_date
+            ):
+                return None
+            as_of = now
+            if source_trade_date != now.date():
+                as_of = datetime.combine(
+                    source_trade_date,
+                    time(23, 59, 59),
+                    tzinfo=CN_TZ,
+                )
+            async with self._playbook_sessions() as db:
+                plan = await orchestrator.build_stage(
+                    db,
+                    source_trade_date,
+                    "after_close",
+                    as_of,
+                    degraded=False,
+                )
+                service = self._trading_playbook_alert_service
+                notify = getattr(service, "notify_plan_ready", None)
+                if send_notifications and callable(notify):
+                    try:
+                        await notify(db, plan, send=True)
+                    except Exception as exc:
+                        logger.error(
+                            "Trading playbook upgrade notification failed: {}",
+                            exc,
+                        )
+            await self._finalize_trading_playbook_review(
+                source_trade_date
+            )
+            return plan
+
     async def _wait_for_trading_playbook_data(
         self,
         trade_date: date,
@@ -490,32 +594,47 @@ class DataScheduler:
         timeout_seconds: int = 180,
         poll_seconds: int = 10,
     ) -> bool:
+        elapsed = 0
+        while elapsed < timeout_seconds:
+            try:
+                if await self._trading_playbook_data_ready_once(trade_date):
+                    return True
+            except Exception as exc:
+                logger.warning(
+                    "Trading playbook data-ready poll failed for {}: {}",
+                    trade_date,
+                    exc,
+                )
+            wait_seconds = min(poll_seconds, timeout_seconds - elapsed, 10)
+            if wait_seconds <= 0:
+                break
+            await self._playbook_sleep(wait_seconds)
+            elapsed += wait_seconds
+        return False
+
+    async def _trading_playbook_data_ready_once(
+        self,
+        trade_date: date,
+    ) -> bool:
         from sqlalchemy import select
         from app.models.market_review import MarketReviewDailyMetric
 
         cutoff = datetime.combine(trade_date, time(15, 0), tzinfo=CN_TZ)
-        elapsed = 0
         async with self._playbook_sessions() as db:
-            while elapsed < timeout_seconds:
-                result = await db.execute(
-                    select(MarketReviewDailyMetric)
-                    .where(MarketReviewDailyMetric.trade_date == trade_date)
-                    .limit(1)
-                )
-                metric = result.scalar_one_or_none()
-                updated_at = getattr(metric, "updated_at", None)
-                if isinstance(updated_at, datetime):
-                    if updated_at.tzinfo is None or updated_at.utcoffset() is None:
-                        updated_at = updated_at.replace(tzinfo=CN_TZ)
-                    else:
-                        updated_at = updated_at.astimezone(CN_TZ)
-                    if updated_at > cutoff:
-                        return True
-                wait_seconds = min(poll_seconds, timeout_seconds - elapsed, 10)
-                if wait_seconds <= 0:
-                    break
-                await self._playbook_sleep(wait_seconds)
-                elapsed += wait_seconds
+            result = await db.execute(
+                select(MarketReviewDailyMetric)
+                .where(MarketReviewDailyMetric.trade_date == trade_date)
+                .limit(1)
+            )
+            metric = result.scalar_one_or_none()
+        updated_at = getattr(metric, "updated_at", None)
+        if isinstance(updated_at, datetime):
+            if updated_at.tzinfo is None or updated_at.utcoffset() is None:
+                updated_at = updated_at.replace(tzinfo=CN_TZ)
+            else:
+                updated_at = updated_at.astimezone(CN_TZ)
+            if updated_at > cutoff:
+                return True
         return False
 
     async def _build_trading_playbook_after_close(
@@ -625,6 +744,15 @@ class DataScheduler:
                 await self._build_trading_playbook_after_close(
                     send_notifications=False,
                 )
+        try:
+            await self._upgrade_forced_trading_playbook_after_close(
+                send_notifications=False
+            )
+        except Exception as exc:
+            logger.error(
+                "Trading playbook startup forced upgrade failed: {}",
+                exc,
+            )
     
     async def _get_monitored_stocks(self, db) -> List[Dict]:
         """获取需要监控的股票列表（优先实时涨停池，其次数据库），带缓存"""

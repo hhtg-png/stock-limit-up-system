@@ -1,12 +1,20 @@
+import asyncio
 import unittest
 from datetime import date, datetime, timedelta
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.data_collectors.scheduler import (
     DataScheduler,
     TradingCalendarLookupError,
 )
+from app.models.market_review import MarketReviewDailyMetric
+from app.models.trading_playbook import TradingPlanVersion
 from app.utils.time_utils import CN_TZ
 
 
@@ -232,6 +240,85 @@ class TradingPlaybookDataReadyBarrierTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sleeps, [10])
         self.assertEqual(db.execute.await_count, 2)
 
+    async def test_barrier_reopens_session_and_observes_writer_commit(self):
+        with TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "playbook-ready.db"
+            url = f"sqlite+aiosqlite:///{database_path.as_posix()}"
+            reader_engine = create_async_engine(url)
+            writer_engine = create_async_engine(url)
+            reader_maker = async_sessionmaker(
+                reader_engine,
+                expire_on_commit=False,
+            )
+            writer_maker = async_sessionmaker(
+                writer_engine,
+                expire_on_commit=False,
+            )
+
+            async with writer_engine.begin() as connection:
+                await connection.run_sync(
+                    MarketReviewDailyMetric.__table__.create
+                )
+            async with writer_maker() as writer:
+                writer.add(
+                    MarketReviewDailyMetric(
+                        trade_date=date(2026, 7, 13),
+                        updated_at=datetime(2026, 7, 13, 14, 59),
+                    )
+                )
+                await writer.commit()
+
+            lifecycle = {"entered": 0, "exited": 0}
+
+            class TrackedSession:
+                def __init__(self, session):
+                    self.session = session
+
+                async def __aenter__(self):
+                    lifecycle["entered"] += 1
+                    return self.session
+
+                async def __aexit__(self, exc_type, exc, traceback):
+                    await self.session.close()
+                    lifecycle["exited"] += 1
+                    return False
+
+            def reader_sessions():
+                return TrackedSession(reader_maker())
+
+            sleeps = []
+
+            async def publish_ready(seconds):
+                sleeps.append(seconds)
+                async with writer_maker() as writer:
+                    row = await writer.get(MarketReviewDailyMetric, 1)
+                    row.updated_at = datetime(2026, 7, 13, 15, 1)
+                    await writer.commit()
+
+            scheduler = DataScheduler(
+                session_factory=reader_sessions,
+                now_provider=lambda: datetime(
+                    2026,
+                    7,
+                    13,
+                    15,
+                    30,
+                    tzinfo=CN_TZ,
+                ),
+                sleep=publish_ready,
+            )
+            try:
+                ready = await scheduler._wait_for_trading_playbook_data(
+                    date(2026, 7, 13)
+                )
+            finally:
+                await reader_engine.dispose()
+                await writer_engine.dispose()
+
+        self.assertTrue(ready)
+        self.assertEqual(sleeps, [10])
+        self.assertEqual(lifecycle, {"entered": 2, "exited": 2})
+
     async def test_barrier_times_out_at_180_seconds_with_each_sleep_at_most_10(self):
         sleeps = []
         stale = SimpleNamespace(updated_at=datetime(2026, 7, 13, 14, 59))
@@ -244,6 +331,36 @@ class TradingPlaybookDataReadyBarrierTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(sleeps)
         self.assertLessEqual(max(sleeps), 10)
         self.assertEqual(db.execute.await_count, 18)
+
+    async def test_barrier_treats_query_failure_as_not_ready_and_closes_session(self):
+        lifecycle = {"exited": 0}
+        db = SimpleNamespace(
+            execute=AsyncMock(side_effect=RuntimeError("database unavailable"))
+        )
+
+        class FailingSession(AsyncSessionContext):
+            async def __aexit__(self, exc_type, exc, traceback):
+                lifecycle["exited"] += 1
+                return False
+
+        sleeps = []
+
+        async def record_sleep(seconds):
+            sleeps.append(seconds)
+
+        scheduler = DataScheduler(
+            session_factory=lambda: FailingSession(db),
+            sleep=record_sleep,
+        )
+
+        ready = await scheduler._wait_for_trading_playbook_data(
+            date(2026, 7, 13),
+            timeout_seconds=10,
+        )
+
+        self.assertFalse(ready)
+        self.assertEqual(sleeps, [10])
+        self.assertEqual(lifecycle["exited"], 1)
 
     async def test_after_close_timeout_builds_degraded_then_finalizes_in_order(self):
         scheduler = DataScheduler(now_provider=lambda: datetime(2026, 7, 13, 15, 30, tzinfo=CN_TZ))
@@ -305,6 +422,337 @@ class TradingPlaybookDataReadyBarrierTests(unittest.IsolatedAsyncioTestCase):
                 ),
             ],
         )
+
+
+class TradingPlaybookForcedUpgradeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_latest_relevant_plan_excludes_expired_and_future_sources(self):
+        with TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "playbook-latest.db"
+            engine = create_async_engine(
+                f"sqlite+aiosqlite:///{database_path.as_posix()}"
+            )
+            maker = async_sessionmaker(engine, expire_on_commit=False)
+            async with engine.begin() as connection:
+                await connection.run_sync(TradingPlanVersion.__table__.create)
+
+            def plan(source_date, target_date, version_no, warning):
+                return TradingPlanVersion(
+                    source_trade_date=source_date,
+                    target_trade_date=target_date,
+                    stage="after_close",
+                    version_no=version_no,
+                    status="draft",
+                    market_state_json={},
+                    theme_ranking_json=[],
+                    mode_radar_json=[],
+                    rule_snapshot_json=[],
+                    risk_settings_json={},
+                    data_quality_json={"warnings": [warning]},
+                    change_summary_json={},
+                    input_hash=f"{source_date}-{target_date}-{version_no}",
+                    generated_at=datetime(2026, 7, 13, 15, 35),
+                )
+
+            try:
+                async with maker() as db:
+                    db.add_all(
+                        [
+                            plan(date(2026, 7, 10), date(2026, 7, 11), 99, "expired"),
+                            plan(date(2026, 7, 14), date(2026, 7, 15), 99, "future"),
+                            plan(date(2026, 7, 13), date(2026, 7, 14), 1, "old"),
+                            plan(date(2026, 7, 13), date(2026, 7, 14), 2, "latest"),
+                        ]
+                    )
+                    await db.commit()
+                scheduler = DataScheduler(session_factory=maker)
+
+                result = await scheduler._latest_relevant_after_close_plan(
+                    date(2026, 7, 13)
+                )
+            finally:
+                await engine.dispose()
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.version_no, 2)
+        self.assertEqual(result.data_quality_json["warnings"], ["latest"])
+
+    async def test_monitor_upgrades_forced_timeout_once_after_writer_is_ready(self):
+        with TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "playbook-upgrade.db"
+            url = f"sqlite+aiosqlite:///{database_path.as_posix()}"
+            scheduler_engine = create_async_engine(url)
+            writer_engine = create_async_engine(url)
+            scheduler_maker = async_sessionmaker(
+                scheduler_engine,
+                expire_on_commit=False,
+            )
+            writer_maker = async_sessionmaker(
+                writer_engine,
+                expire_on_commit=False,
+            )
+            async with writer_engine.begin() as connection:
+                await connection.run_sync(
+                    MarketReviewDailyMetric.__table__.create
+                )
+                await connection.run_sync(TradingPlanVersion.__table__.create)
+            async with writer_maker() as writer:
+                writer.add(
+                    MarketReviewDailyMetric(
+                        trade_date=date(2026, 7, 13),
+                        updated_at=datetime(2026, 7, 13, 14, 59),
+                    )
+                )
+                await writer.commit()
+
+            clock = [datetime(2026, 7, 13, 15, 30, tzinfo=CN_TZ)]
+
+            class PersistingOrchestrator:
+                def __init__(self):
+                    self.calls = []
+
+                async def build_stage(
+                    self,
+                    db,
+                    source_trade_date,
+                    stage,
+                    as_of,
+                    degraded=False,
+                ):
+                    latest = (
+                        await db.execute(
+                            select(TradingPlanVersion)
+                            .order_by(TradingPlanVersion.version_no.desc())
+                            .limit(1)
+                        )
+                    ).scalar_one_or_none()
+                    version_no = 1 if latest is None else latest.version_no + 1
+                    plan = TradingPlanVersion(
+                        source_trade_date=source_trade_date,
+                        target_trade_date=date(2026, 7, 14),
+                        stage=stage,
+                        version_no=version_no,
+                        status="draft",
+                        market_state_json={},
+                        theme_ranking_json=[],
+                        mode_radar_json=[],
+                        rule_snapshot_json=[],
+                        risk_settings_json={},
+                        data_quality_json={
+                            "status": "degraded" if degraded else "ready",
+                            "warnings": (
+                                ["force_degraded requested"]
+                                if degraded
+                                else []
+                            ),
+                        },
+                        change_summary_json={},
+                        input_hash=f"stage-{version_no}-{degraded}",
+                        generated_at=as_of.replace(tzinfo=None),
+                    )
+                    db.add(plan)
+                    await db.commit()
+                    await db.refresh(plan)
+                    self.calls.append(
+                        (source_trade_date, stage, as_of, degraded)
+                    )
+                    return plan
+
+            orchestrator = PersistingOrchestrator()
+            alert_service = SimpleNamespace(
+                notify_plan_ready=AsyncMock(),
+                monitor=AsyncMock(),
+            )
+            review_service = SimpleNamespace(build=AsyncMock())
+            scheduler = DataScheduler(
+                trading_playbook_orchestrator=orchestrator,
+                trading_playbook_alert_service=alert_service,
+                trading_playbook_review_service=review_service,
+                session_factory=scheduler_maker,
+                now_provider=lambda: clock[0],
+                sleep=AsyncMock(),
+            )
+
+            try:
+                with patch(
+                    "app.data_collectors.scheduler._get_cn_trading_dates",
+                    return_value=[date(2026, 7, 13)],
+                ):
+                    await scheduler._build_trading_playbook_after_close()
+
+                async with writer_maker() as writer:
+                    metric = await writer.get(MarketReviewDailyMetric, 1)
+                    metric.updated_at = datetime(2026, 7, 13, 15, 1)
+                    await writer.commit()
+                clock[0] = datetime(2026, 7, 13, 15, 35, tzinfo=CN_TZ)
+
+                with patch(
+                    "app.data_collectors.scheduler._get_cn_trading_dates",
+                    return_value=[date(2026, 7, 13)],
+                ):
+                    await asyncio.gather(
+                        scheduler._monitor_trading_playbook(),
+                        scheduler._monitor_trading_playbook(),
+                    )
+                    await scheduler._monitor_trading_playbook()
+
+                async with scheduler_maker() as db:
+                    plans = (
+                        await db.execute(
+                            select(TradingPlanVersion).order_by(
+                                TradingPlanVersion.version_no
+                            )
+                        )
+                    ).scalars().all()
+            finally:
+                await scheduler_engine.dispose()
+                await writer_engine.dispose()
+
+        self.assertEqual([call[3] for call in orchestrator.calls], [True, False])
+        self.assertEqual(len(plans), 2)
+        self.assertEqual(
+            plans[0].data_quality_json["warnings"],
+            ["force_degraded requested"],
+        )
+        self.assertEqual(plans[1].data_quality_json["warnings"], [])
+        self.assertEqual(alert_service.notify_plan_ready.await_count, 2)
+        self.assertEqual(alert_service.monitor.await_count, 3)
+        self.assertEqual(review_service.build.await_count, 2)
+        review_service.build.assert_awaited_with(
+            unittest.mock.ANY,
+            date(2026, 7, 13),
+            finalized=True,
+        )
+
+    async def test_natural_degraded_plan_never_enters_forced_upgrade(self):
+        scheduler = DataScheduler(
+            trading_playbook_orchestrator=SimpleNamespace(
+                build_stage=AsyncMock()
+            ),
+            now_provider=lambda: datetime(
+                2026,
+                7,
+                13,
+                15,
+                35,
+                tzinfo=CN_TZ,
+            ),
+        )
+        scheduler._latest_relevant_after_close_plan = AsyncMock(
+            return_value=SimpleNamespace(
+                source_trade_date=date(2026, 7, 13),
+                data_quality_json={
+                    "status": "degraded",
+                    "warnings": ["quote source unavailable"],
+                },
+            )
+        )
+        scheduler._trading_playbook_data_ready_once = AsyncMock()
+
+        with patch(
+            "app.data_collectors.scheduler._get_cn_trading_dates",
+            return_value=[date(2026, 7, 13)],
+        ):
+            result = await scheduler._upgrade_forced_trading_playbook_after_close(
+                send_notifications=True
+            )
+
+        self.assertIsNone(result)
+        scheduler._trading_playbook_data_ready_once.assert_not_awaited()
+        scheduler._trading_playbook_orchestrator.build_stage.assert_not_awaited()
+
+    async def test_startup_upgrade_is_silent_and_still_finalizes_review(self):
+        now = datetime(2026, 7, 13, 16, 0, tzinfo=CN_TZ)
+        db = MagicMock()
+        plan = SimpleNamespace(id=2)
+        orchestrator = SimpleNamespace(build_stage=AsyncMock(return_value=plan))
+        alert_service = SimpleNamespace(notify_plan_ready=AsyncMock())
+        review_service = SimpleNamespace(build=AsyncMock())
+        scheduler = DataScheduler(
+            trading_playbook_orchestrator=orchestrator,
+            trading_playbook_alert_service=alert_service,
+            trading_playbook_review_service=review_service,
+            session_factory=lambda: AsyncSessionContext(db),
+            now_provider=lambda: now,
+        )
+        scheduler._is_cn_trading_day = MagicMock(return_value=True)
+        scheduler._playbook_stage_exists = AsyncMock(return_value=True)
+        scheduler._playbook_review_exists = AsyncMock(return_value=True)
+        scheduler._latest_relevant_after_close_plan = AsyncMock(
+            return_value=SimpleNamespace(
+                source_trade_date=now.date(),
+                data_quality_json={
+                    "warnings": ["force_degraded requested"],
+                },
+            )
+        )
+        scheduler._trading_playbook_data_ready_once = AsyncMock(return_value=True)
+
+        with patch(
+            "app.data_collectors.scheduler._get_cn_trading_dates",
+            return_value=[date(2026, 7, 14)],
+        ):
+            await scheduler._run_trading_playbook_catchup(now)
+
+        orchestrator.build_stage.assert_awaited_once_with(
+            db,
+            now.date(),
+            "after_close",
+            now,
+            degraded=False,
+        )
+        alert_service.notify_plan_ready.assert_not_awaited()
+        review_service.build.assert_awaited_once_with(
+            db,
+            now.date(),
+            finalized=True,
+        )
+
+    async def test_forced_upgrade_skips_before_1530_and_on_non_trading_day(self):
+        for now, trading_dates in (
+            (datetime(2026, 7, 13, 15, 29, tzinfo=CN_TZ), [date(2026, 7, 13)]),
+            (datetime(2026, 7, 12, 15, 35, tzinfo=CN_TZ), []),
+        ):
+            with self.subTest(now=now):
+                scheduler = DataScheduler(now_provider=lambda now=now: now)
+                scheduler._latest_relevant_after_close_plan = AsyncMock()
+                with patch(
+                    "app.data_collectors.scheduler._get_cn_trading_dates",
+                    return_value=trading_dates,
+                ):
+                    result = await scheduler._upgrade_forced_trading_playbook_after_close(
+                        send_notifications=True
+                    )
+                self.assertIsNone(result)
+                scheduler._latest_relevant_after_close_plan.assert_not_awaited()
+
+    async def test_upgrade_error_does_not_prevent_future_alert_monitor(self):
+        alert_service = SimpleNamespace(monitor=AsyncMock())
+        scheduler = DataScheduler(
+            trading_playbook_alert_service=alert_service,
+            session_factory=lambda: AsyncSessionContext(MagicMock()),
+            now_provider=lambda: datetime(
+                2026,
+                7,
+                13,
+                15,
+                35,
+                tzinfo=CN_TZ,
+            ),
+        )
+        scheduler._upgrade_forced_trading_playbook_after_close = AsyncMock(
+            side_effect=RuntimeError("upgrade failed")
+        )
+
+        with patch(
+            "app.data_collectors.scheduler._get_cn_trading_dates",
+            return_value=[date(2026, 7, 13)],
+        ):
+            await scheduler._monitor_trading_playbook()
+
+        scheduler._upgrade_forced_trading_playbook_after_close.assert_awaited_once_with(
+            send_notifications=True
+        )
+        alert_service.monitor.assert_awaited_once()
 
 
 class TradingPlaybookCatchupTests(unittest.IsolatedAsyncioTestCase):
@@ -379,6 +827,17 @@ class TradingPlaybookCatchupTests(unittest.IsolatedAsyncioTestCase):
         await self._run(datetime.min.replace(hour=15, minute=30).time(), set())
         self.scheduler._build_trading_playbook_after_close.assert_awaited_once_with(
             send_notifications=False,
+        )
+
+    async def test_startup_catchup_checks_existing_forced_plan_without_notifications(self):
+        self.scheduler._upgrade_forced_trading_playbook_after_close = AsyncMock()
+        await self._run(
+            datetime.min.replace(hour=16).time(),
+            {(self.next_day, "after_close")},
+        )
+        self.scheduler._build_trading_playbook_after_close.assert_not_awaited()
+        self.scheduler._upgrade_forced_trading_playbook_after_close.assert_awaited_once_with(
+            send_notifications=False
         )
 
     async def test_non_trading_day_skips_all_catchup_work(self):

@@ -17,6 +17,7 @@ from .orchestrator import (
     TradingPlaybookOrchestrator,
     build_default_orchestrator,
 )
+from .market_data import _FULL_MARKET_CONTEXT_FIELDS
 
 
 async def load_production_kline(
@@ -95,25 +96,38 @@ async def load_production_full_market_context(
         (row for row in rows if row.trade_date < trade_date),
         None,
     )
-    fields = {
-        "limit_up_count": current.limit_up_count,
-        "limit_down_count": current.limit_down_count,
-        "max_board_height": current.max_board_height,
-        "seal_rate": current.seal_rate,
-    }
-    if previous is not None:
-        fields["limit_up_count_prev"] = previous.limit_up_count
     source_status = str(getattr(current, "source_status", "") or "").lower()
-    accepted = source_status not in {"empty", "failed", "placeholder"}
-    field_quality = {
-        key: "ready" if accepted else "missing" for key in fields
-    }
     captured_at = _china_datetime(current.updated_at)
+    if captured_at > local_as_of:
+        raise LookupError(
+            f"market review facts are newer than as_of for {trade_date.isoformat()}"
+        )
+    accepted = source_status == "primary"
+    fields: dict[str, Any] = {}
+    field_quality = {
+        key: "missing" for key in _FULL_MARKET_CONTEXT_FIELDS
+    }
+    if accepted:
+        for key in _FULL_MARKET_CONTEXT_FIELDS:
+            if key == "limit_up_count_prev":
+                value = (
+                    getattr(previous, "limit_up_count", None)
+                    if previous is not None
+                    and str(getattr(previous, "source_status", "") or "").lower()
+                    == "primary"
+                    else None
+                )
+            else:
+                value = getattr(current, key, None)
+            if value is not None:
+                fields[key] = value
+                field_quality[key] = "ready"
+    complete = all(value == "ready" for value in field_quality.values())
     return {
         "scope": "full_market",
         "trade_date": trade_date,
         "as_of": captured_at,
-        "quality": "ready" if accepted and previous is not None else "degraded",
+        "quality": "ready" if accepted and complete else "degraded",
         "stale": False,
         "field_quality": field_quality,
         **fields,
