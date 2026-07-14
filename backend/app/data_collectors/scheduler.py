@@ -24,6 +24,9 @@ from app.services.trading_playbook.job_claim_service import (
 from app.utils.time_utils import CN_TZ, get_market_status, is_trading_time, today_cn
 
 
+_PLAYBOOK_NOTIFICATION_RETRY_BATCH_SIZE = 100
+
+
 class TradingPlaybookClaimLost(RuntimeError):
     """Raised when a running phase no longer owns its database lease."""
 
@@ -910,13 +913,17 @@ class DataScheduler:
                 logger.error("Trading playbook alert monitor failed: {}", exc)
         else:
             logger.debug("Trading playbook alert monitor is not installed")
+        next_trade_date = None
+        notification_earliest_date = None
+        notification_latest_date = None
         try:
             if not await self._ensure_playbook_calendar(now.date()):
                 return monitor_result
             next_trade_date = self._next_cn_trading_date(now.date())
+            notification_earliest_date = now.date()
+            notification_latest_date = next_trade_date
         except Exception as exc:
             logger.error("Trading playbook calendar refresh failed: {}", exc)
-            return monitor_result
         try:
             await self._upgrade_forced_trading_playbook_after_close(
                 send_notifications=True,
@@ -930,8 +937,8 @@ class DataScheduler:
             )
         try:
             await self._retry_incomplete_playbook_notifications(
-                now.date(),
-                next_trade_date,
+                notification_earliest_date,
+                notification_latest_date,
             )
         except Exception as exc:
             logger.error(
@@ -950,8 +957,8 @@ class DataScheduler:
 
     async def _retry_incomplete_playbook_notifications(
         self,
-        earliest_target_date: date,
-        latest_target_date: date,
+        earliest_target_date: Optional[date],
+        latest_target_date: Optional[date],
     ) -> None:
         service = self._trading_playbook_alert_service
         if not callable(getattr(service, "notify_plan_ready", None)):
@@ -965,12 +972,18 @@ class DataScheduler:
         async with self._playbook_sessions() as db:
             generation_keys = (
                 await db.execute(
-                    select(TradingPlaybookJobClaim.generation_key).where(
+                    select(TradingPlaybookJobClaim.generation_key)
+                    .where(
                         TradingPlaybookJobClaim.job_type == "plan",
                         TradingPlaybookJobClaim.phase == "notify",
                         TradingPlaybookJobClaim.status != "completed",
                         TradingPlaybookJobClaim.generation_key.is_not(None),
                     )
+                    .order_by(
+                        TradingPlaybookJobClaim.updated_at.desc(),
+                        TradingPlaybookJobClaim.id.desc(),
+                    )
+                    .limit(_PLAYBOOK_NOTIFICATION_RETRY_BATCH_SIZE)
                 )
             ).scalars().all()
             plan_ids = set()
@@ -981,24 +994,30 @@ class DataScheduler:
                     continue
             if not plan_ids:
                 return
+            plan_filters = [
+                TradingPlanVersion.id.in_(plan_ids),
+                TradingPlanVersion.status.in_(("draft", "confirmed", "active")),
+            ]
+            if earliest_target_date is not None:
+                plan_filters.append(
+                    TradingPlanVersion.target_trade_date
+                    >= earliest_target_date
+                )
+            if latest_target_date is not None:
+                plan_filters.append(
+                    TradingPlanVersion.target_trade_date
+                    <= latest_target_date
+                )
             plans = (
                 await db.execute(
                     select(TradingPlanVersion)
-                    .where(
-                        TradingPlanVersion.id.in_(plan_ids),
-                        TradingPlanVersion.target_trade_date
-                        >= earliest_target_date,
-                        TradingPlanVersion.target_trade_date
-                        <= latest_target_date,
-                        TradingPlanVersion.status.in_(
-                            ("draft", "confirmed", "active")
-                        ),
-                    )
+                    .where(*plan_filters)
                     .order_by(
                         TradingPlanVersion.target_trade_date,
                         TradingPlanVersion.generated_at,
                         TradingPlanVersion.id,
                     )
+                    .limit(_PLAYBOOK_NOTIFICATION_RETRY_BATCH_SIZE)
                 )
             ).scalars().all()
         for plan in plans:

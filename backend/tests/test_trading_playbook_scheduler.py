@@ -809,10 +809,19 @@ class TradingPlaybookForcedUpgradeTests(unittest.IsolatedAsyncioTestCase):
             await scheduler._monitor_trading_playbook()
 
         alert_service.monitor.assert_awaited_once()
-        log_error.assert_called_once()
-        self.assertIsInstance(
-            log_error.call_args.args[1],
-            TradingCalendarLookupError,
+        self.assertEqual(
+            [call.args[0] for call in log_error.call_args_list],
+            [
+                "Trading playbook calendar refresh failed: {}",
+                "Trading playbook forced after-close upgrade failed: {}",
+                "Trading playbook phase compensation failed: {}",
+            ],
+        )
+        self.assertTrue(
+            all(
+                isinstance(call.args[1], TradingCalendarLookupError)
+                for call in log_error.call_args_list
+            )
         )
 
     async def test_monitor_upgrades_forced_timeout_once_after_writer_is_ready(self):
@@ -1140,6 +1149,86 @@ class TradingPlaybookForcedUpgradeTests(unittest.IsolatedAsyncioTestCase):
         scheduler._upgrade_forced_trading_playbook_after_close.assert_awaited_once()
         scheduler._retry_incomplete_playbook_notifications.assert_awaited_once()
         scheduler._compensate_trading_playbook_phases.assert_awaited_once()
+
+    async def test_calendar_failure_does_not_starve_independent_compensations(self):
+        from app.services.trading_playbook.alert_service import (
+            TradingPlaybookAlertService,
+        )
+        from app.services.trading_playbook.channels import (
+            InAppTradingPlanAlertChannel,
+        )
+
+        calendar_error = TradingCalendarLookupError("calendar unavailable")
+        shared_calendar = SimpleNamespace(
+            ensure_date=AsyncMock(side_effect=calendar_error),
+            is_trading_day=MagicMock(return_value=True),
+            next_trade_date=MagicMock(),
+        )
+        alert_service = TradingPlaybookAlertService(
+            InAppTradingPlanAlertChannel(),
+            trading_calendar=shared_calendar,
+        )
+        today = date(2026, 7, 13)
+        scheduler = DataScheduler(
+            trading_playbook_alert_service=alert_service,
+            session_factory=lambda: AsyncSessionContext(MagicMock()),
+            now_provider=lambda: datetime(
+                2026, 7, 13, 15, 35, tzinfo=CN_TZ
+            ),
+            calendar_service=shared_calendar,
+        )
+        scheduler._upgrade_forced_trading_playbook_after_close = AsyncMock(
+            side_effect=RuntimeError("upgrade failed closed")
+        )
+        scheduler._retry_incomplete_playbook_notifications = AsyncMock()
+        scheduler._compensate_trading_playbook_phases = AsyncMock(
+            side_effect=RuntimeError("phase failed closed")
+        )
+
+        result = await scheduler._monitor_trading_playbook()
+
+        self.assertEqual(result, [])
+        self.assertEqual(shared_calendar.ensure_date.await_count, 2)
+        scheduler._upgrade_forced_trading_playbook_after_close.assert_awaited_once_with(
+            send_notifications=True,
+            trade_date=today,
+            next_trade_date=None,
+        )
+        scheduler._retry_incomplete_playbook_notifications.assert_awaited_once_with(
+            None,
+            None,
+        )
+        scheduler._compensate_trading_playbook_phases.assert_awaited_once_with(
+            today,
+            None,
+            send_notifications=True,
+        )
+
+    async def test_authoritative_holiday_skips_today_compensations(self):
+        shared_calendar = SimpleNamespace(
+            ensure_date=AsyncMock(),
+            is_trading_day=MagicMock(return_value=False),
+            next_trade_date=MagicMock(),
+        )
+        alert_service = SimpleNamespace(monitor=AsyncMock(return_value=[]))
+        scheduler = DataScheduler(
+            trading_playbook_alert_service=alert_service,
+            session_factory=lambda: AsyncSessionContext(MagicMock()),
+            now_provider=lambda: datetime(
+                2026, 7, 12, 15, 35, tzinfo=CN_TZ
+            ),
+            calendar_service=shared_calendar,
+        )
+        scheduler._upgrade_forced_trading_playbook_after_close = AsyncMock()
+        scheduler._retry_incomplete_playbook_notifications = AsyncMock()
+        scheduler._compensate_trading_playbook_phases = AsyncMock()
+
+        result = await scheduler._monitor_trading_playbook()
+
+        self.assertEqual(result, [])
+        scheduler._upgrade_forced_trading_playbook_after_close.assert_not_awaited()
+        scheduler._retry_incomplete_playbook_notifications.assert_not_awaited()
+        scheduler._compensate_trading_playbook_phases.assert_not_awaited()
 
 
 class TradingPlaybookCatchupTests(unittest.IsolatedAsyncioTestCase):

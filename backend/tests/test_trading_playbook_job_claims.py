@@ -417,9 +417,17 @@ class TradingPlaybookSchedulerClaimTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(alert.notify_plan_ready.await_count, 1)
         self.assertEqual(review.build.await_count, 1)
 
-    async def test_restart_retries_only_existing_failed_notification_claim(self):
-        from app.data_collectors.scheduler import DataScheduler
-        from app.models.trading_playbook import TradingPlanVersion
+    async def test_calendar_failure_retries_only_existing_failed_notification_claim(self):
+        from sqlalchemy import select
+
+        from app.data_collectors.scheduler import (
+            DataScheduler,
+            TradingCalendarLookupError,
+        )
+        from app.models.trading_playbook import (
+            TradingPlanVersion,
+            TradingPlaybookJobClaim,
+        )
         from app.utils.time_utils import CN_TZ
 
         scheduler, engine, orchestrator, alert, review = await self._scheduler_fixture(
@@ -439,6 +447,25 @@ class TradingPlaybookSchedulerClaimTests(unittest.IsolatedAsyncioTestCase):
                         generated_at=datetime(2026, 7, 13, 8, 50),
                     )
                 )
+                old_claim_time = datetime(2026, 7, 1, 9, 0)
+                db.add_all(
+                    [
+                        TradingPlaybookJobClaim(
+                            job_key=f"playbook:notify:plan:{10000 + index}",
+                            job_type="plan",
+                            phase="notify",
+                            generation_key=str(10000 + index),
+                            owner="retired-worker",
+                            status="retry",
+                            attempt_no=1,
+                            lease_expires_at=old_claim_time,
+                            last_error="plan superseded",
+                            created_at=old_claim_time,
+                            updated_at=old_claim_time,
+                        )
+                        for index in range(100)
+                    ]
+                )
                 await db.commit()
 
             alert.notify_plan_ready.side_effect = None
@@ -450,19 +477,34 @@ class TradingPlaybookSchedulerClaimTests(unittest.IsolatedAsyncioTestCase):
                 ),
                 calendar_service=self._calendar(),
             )
-            await restarted._retry_incomplete_playbook_notifications(
-                date(2026, 7, 14),
-                date(2026, 7, 14),
+            restarted._ensure_playbook_calendar = AsyncMock(
+                side_effect=TradingCalendarLookupError(
+                    "calendar unavailable"
+                )
             )
-            await restarted._retry_incomplete_playbook_notifications(
-                date(2026, 7, 14),
-                date(2026, 7, 14),
-            )
+            await restarted._monitor_trading_playbook()
+            await restarted._monitor_trading_playbook()
+            async with restarted._playbook_session_factory() as db:
+                notify_claims = list(
+                    (
+                        await db.execute(
+                            select(TradingPlaybookJobClaim).where(
+                                TradingPlaybookJobClaim.phase == "notify"
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
         finally:
             await engine.dispose()
 
         self.assertEqual(orchestrator.calls, 1)
         self.assertEqual(alert.notify_plan_ready.await_count, 2)
+        completed_claims = [
+            claim for claim in notify_claims if claim.status == "completed"
+        ]
+        self.assertEqual(len(completed_claims), 1)
 
     async def test_multiple_after_close_plan_ids_finalize_trade_date_once(self):
         scheduler, engine, orchestrator, alert, review = await self._scheduler_fixture()
