@@ -46,6 +46,7 @@ _QUALITY_STATUSES = {
     "computed",
     "missing",
     "degraded",
+    "fallback",
     "invalid",
     "stale",
 }
@@ -262,11 +263,15 @@ def _validate_matcher_controls(
         stage = features["_stage"]
         if type(stage) is not str or stage not in _REPLAY_STAGES:
             raise ValueError(f"{path}._stage: invalid replay stage")
-    if (
-        "tail_action_eligible" in features
-        and type(features["tail_action_eligible"]) is not bool
-    ):
-        raise ValueError(f"{path}.tail_action_eligible: exact bool required")
+    for field in ("tail_action_eligible", "_current_sealed"):
+        if (
+            field in features
+            and features[field] is not None
+            and type(features[field]) is not bool
+        ):
+            raise ValueError(
+                f"{path}.{field}: None or exact bool required"
+            )
 
 
 def replay_scenario(

@@ -12,6 +12,8 @@ from contextlib import redirect_stderr
 from pathlib import Path
 from unittest.mock import patch
 
+from app.services.trading_playbook.domain import CandidateSnapshot
+from app.services.trading_playbook.mode_matcher import ModeMatcher
 from app.services.trading_playbook.rule_catalog import (
     canonical_rule_content_hash,
 )
@@ -184,6 +186,10 @@ class ReplayValidationTest(unittest.TestCase):
     def setUp(self):
         payload = json.loads(SCENARIO_FIXTURE.read_text(encoding="utf-8"))
         self.scenario = payload["scenarios"][0]
+        self.scenarios_by_mode = {
+            scenario["mode_key"]: scenario
+            for scenario in payload["scenarios"]
+        }
         self.replay_scenario = importlib.import_module(
             "app.scripts.replay_trading_playbook"
         ).replay_scenario
@@ -444,6 +450,32 @@ class ReplayValidationTest(unittest.TestCase):
         ):
             self.replay_scenario(scenario, catalog_path=CATALOG_PATH)
 
+    def test_fallback_quality_is_accepted_and_real_matcher_decides_status(self):
+        cases = (
+            ("new_theme_high_volatility", "matched"),
+            ("unique_survivor_trial", "waiting"),
+        )
+
+        for mode_key, expected in cases:
+            with self.subTest(mode_key=mode_key):
+                scenario = copy.deepcopy(self.scenarios_by_mode[mode_key])
+                controls = {
+                    "planned_pullback_quality": "fallback",
+                    "_feature_quality": {
+                        "planned_pullback_price": "fallback",
+                    },
+                }
+                scenario["candidate"]["features"].update(controls)
+                scenario["facts"][0]["candidate_features"].update(controls)
+
+                self.assertEqual(
+                    self.replay_scenario(
+                        scenario,
+                        catalog_path=CATALOG_PATH,
+                    ),
+                    expected,
+                )
+
     def test_matcher_control_schema_rejects_unsafe_values(self):
         cases = (
             ("candidate", "_snapshot_stale", 1),
@@ -462,6 +494,15 @@ class ReplayValidationTest(unittest.TestCase):
             ("candidate", "_stage", "midday"),
             ("candidate", "_stage", []),
             ("candidate", "tail_action_eligible", 1),
+            ("candidate", "tail_action_eligible", 0),
+            ("candidate", "tail_action_eligible", "true"),
+            ("candidate", "tail_action_eligible", []),
+            ("candidate", "tail_action_eligible", math.nan),
+            ("candidate", "_current_sealed", 1),
+            ("candidate", "_current_sealed", 0),
+            ("candidate", "_current_sealed", "true"),
+            ("candidate", "_current_sealed", []),
+            ("candidate", "_current_sealed", math.nan),
         )
         mode = "new_theme_high_volatility"
 
@@ -484,6 +525,80 @@ class ReplayValidationTest(unittest.TestCase):
                         scenario,
                         catalog_path=CATALOG_PATH,
                     )
+
+    def test_tail_action_eligible_accepts_optional_exact_bool_values(self):
+        for value in (None, False, True):
+            with self.subTest(value=value):
+                scenario = copy.deepcopy(self.scenario)
+                scenario["candidate"]["features"][
+                    "tail_action_eligible"
+                ] = value
+                scenario["facts"][0]["candidate_features"][
+                    "tail_action_eligible"
+                ] = value
+
+                self.assertEqual(
+                    self.replay_scenario(
+                        scenario,
+                        catalog_path=CATALOG_PATH,
+                    ),
+                    "matched",
+                )
+
+    def test_optional_tail_controls_preserve_real_matcher_action_scope(self):
+        catalog = json.loads(CATALOG_PATH.read_text(encoding="utf-8"))
+        mode_key = "leader_turn_two"
+        rule = next(
+            rule
+            for rule in catalog["rules"]
+            if rule["mode_key"] == mode_key
+        )
+        cases = (
+            (None, True, "target"),
+            (False, True, "target"),
+            (True, None, "target"),
+            (True, False, "target"),
+            (True, True, "tail"),
+        )
+
+        for tail_eligible, current_sealed, expected_scope in cases:
+            with self.subTest(
+                tail_eligible=tail_eligible,
+                current_sealed=current_sealed,
+            ):
+                scenario = copy.deepcopy(self.scenarios_by_mode[mode_key])
+                controls = {
+                    "tail_action_eligible": tail_eligible,
+                    "_current_sealed": current_sealed,
+                    "_stage": "preclose",
+                }
+                scenario["candidate"]["features"].update(controls)
+                scenario["facts"][0]["candidate_features"].update(controls)
+
+                self.assertEqual(
+                    self.replay_scenario(
+                        scenario,
+                        catalog_path=CATALOG_PATH,
+                    ),
+                    "matched",
+                )
+                raw_candidate = scenario["candidate"]
+                evaluation = ModeMatcher(
+                    [rule],
+                    catalog_version=catalog["catalog_version"],
+                ).evaluate(
+                    scenario["market_features"],
+                    CandidateSnapshot(
+                        stock_code=raw_candidate["stock_code"],
+                        stock_name=raw_candidate["stock_name"],
+                        theme_name=raw_candidate["theme_name"],
+                        features=raw_candidate["features"],
+                        evidence=scenario["facts"],
+                    ),
+                )[0]
+
+                self.assertEqual(evaluation.status, "matched")
+                self.assertEqual(evaluation.action_scope, expected_scope)
 
     def test_valid_matcher_controls_preserve_real_matcher_behavior(self):
         stale = copy.deepcopy(self.scenario)
