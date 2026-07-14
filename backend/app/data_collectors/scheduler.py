@@ -400,6 +400,18 @@ class DataScheduler:
     def _is_cn_trading_day(value: date) -> bool:
         return bool(_get_cn_trading_dates(value, value))
 
+    @staticmethod
+    def _next_cn_trading_date(value: date) -> date:
+        next_dates = _get_cn_trading_dates(
+            value + timedelta(days=1),
+            value + timedelta(days=15),
+        )
+        if not next_dates:
+            raise TradingCalendarLookupError(
+                f"Unable to resolve next China trading date after {value}"
+            )
+        return next_dates[0]
+
     async def _build_trading_playbook_plan(
         self,
         stage: str,
@@ -478,11 +490,14 @@ class DataScheduler:
 
     async def _monitor_trading_playbook(self):
         now = self._playbook_now()
-        if not self._is_cn_trading_day(now.date()):
-            return None
         try:
+            if not self._is_cn_trading_day(now.date()):
+                return None
+            next_trade_date = self._next_cn_trading_date(now.date())
             await self._upgrade_forced_trading_playbook_after_close(
-                send_notifications=True
+                send_notifications=True,
+                trade_date=now.date(),
+                next_trade_date=next_trade_date,
             )
         except Exception as exc:
             logger.error(
@@ -500,20 +515,23 @@ class DataScheduler:
     async def _latest_relevant_after_close_plan(
         self,
         trade_date: date,
+        next_trade_date: Optional[date] = None,
     ):
         from sqlalchemy import select
         from app.models.trading_playbook import TradingPlanVersion
 
+        target_trade_date = (
+            next_trade_date or self._next_cn_trading_date(trade_date)
+        )
         async with self._playbook_sessions() as db:
             result = await db.execute(
                 select(TradingPlanVersion)
                 .where(
                     TradingPlanVersion.stage == "after_close",
-                    TradingPlanVersion.source_trade_date <= trade_date,
-                    TradingPlanVersion.target_trade_date >= trade_date,
+                    TradingPlanVersion.source_trade_date == trade_date,
+                    TradingPlanVersion.target_trade_date == target_trade_date,
                 )
                 .order_by(
-                    TradingPlanVersion.target_trade_date.desc(),
                     TradingPlanVersion.version_no.desc(),
                     TradingPlanVersion.id.desc(),
                 )
@@ -535,41 +553,40 @@ class DataScheduler:
         self,
         *,
         send_notifications: bool,
+        trade_date: Optional[date] = None,
+        next_trade_date: Optional[date] = None,
     ):
         now = self._playbook_now()
         current_time = now.time().replace(tzinfo=None)
         if current_time < time(15, 30):
             return None
-        if not self._is_cn_trading_day(now.date()):
-            return None
+        source_trade_date = trade_date or now.date()
+        target_trade_date = next_trade_date
+        if target_trade_date is None:
+            if not self._is_cn_trading_day(source_trade_date):
+                return None
+            target_trade_date = self._next_cn_trading_date(source_trade_date)
         orchestrator = self._trading_playbook_orchestrator
         if orchestrator is None:
             return None
 
         async with self._playbook_upgrade_lock:
             predecessor = await self._latest_relevant_after_close_plan(
-                now.date()
+                source_trade_date,
+                target_trade_date,
             )
             if not self._is_forced_degraded_plan(predecessor):
                 return None
-            source_trade_date = predecessor.source_trade_date
             if not await self._trading_playbook_data_ready_once(
                 source_trade_date
             ):
                 return None
-            as_of = now
-            if source_trade_date != now.date():
-                as_of = datetime.combine(
-                    source_trade_date,
-                    time(23, 59, 59),
-                    tzinfo=CN_TZ,
-                )
             async with self._playbook_sessions() as db:
                 plan = await orchestrator.build_stage(
                     db,
                     source_trade_date,
                     "after_close",
-                    as_of,
+                    now,
                     degraded=False,
                 )
                 service = self._trading_playbook_alert_service
@@ -698,15 +715,7 @@ class DataScheduler:
         if not self._is_cn_trading_day(today):
             logger.info("Skipping trading playbook catch-up on non-trading day")
             return
-        next_dates = _get_cn_trading_dates(
-            today + timedelta(days=1),
-            today + timedelta(days=15),
-        )
-        if not next_dates:
-            raise TradingCalendarLookupError(
-                f"Unable to resolve next China trading date after {today}"
-            )
-        next_trade_date = next_dates[0]
+        next_trade_date = self._next_cn_trading_date(today)
         current_time = current.time().replace(tzinfo=None)
 
         if time(8, 50) <= current_time < time(9, 26):
@@ -746,7 +755,9 @@ class DataScheduler:
                 )
         try:
             await self._upgrade_forced_trading_playbook_after_close(
-                send_notifications=False
+                send_notifications=False,
+                trade_date=today,
+                next_trade_date=next_trade_date,
             )
         except Exception as exc:
             logger.error(

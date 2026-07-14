@@ -425,56 +425,151 @@ class TradingPlaybookDataReadyBarrierTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TradingPlaybookForcedUpgradeTests(unittest.IsolatedAsyncioTestCase):
-    async def test_latest_relevant_plan_excludes_expired_and_future_sources(self):
+    @staticmethod
+    def _after_close_plan(source_date, target_date, version_no, warning):
+        return TradingPlanVersion(
+            source_trade_date=source_date,
+            target_trade_date=target_date,
+            stage="after_close",
+            version_no=version_no,
+            status="draft",
+            market_state_json={},
+            theme_ranking_json=[],
+            mode_radar_json=[],
+            rule_snapshot_json=[],
+            risk_settings_json={},
+            data_quality_json={"warnings": [warning]},
+            change_summary_json={},
+            input_hash=f"{source_date}-{target_date}-{version_no}",
+            generated_at=datetime(2026, 7, 13, 15, 35),
+        )
+
+    async def test_old_source_targeting_today_is_not_upgraded(self):
         with TemporaryDirectory() as temp_dir:
-            database_path = Path(temp_dir) / "playbook-latest.db"
+            database_path = Path(temp_dir) / "playbook-old-source.db"
             engine = create_async_engine(
                 f"sqlite+aiosqlite:///{database_path.as_posix()}"
             )
             maker = async_sessionmaker(engine, expire_on_commit=False)
             async with engine.begin() as connection:
                 await connection.run_sync(TradingPlanVersion.__table__.create)
-
-            def plan(source_date, target_date, version_no, warning):
-                return TradingPlanVersion(
-                    source_trade_date=source_date,
-                    target_trade_date=target_date,
-                    stage="after_close",
-                    version_no=version_no,
-                    status="draft",
-                    market_state_json={},
-                    theme_ranking_json=[],
-                    mode_radar_json=[],
-                    rule_snapshot_json=[],
-                    risk_settings_json={},
-                    data_quality_json={"warnings": [warning]},
-                    change_summary_json={},
-                    input_hash=f"{source_date}-{target_date}-{version_no}",
-                    generated_at=datetime(2026, 7, 13, 15, 35),
+            orchestrator = SimpleNamespace(build_stage=AsyncMock())
+            try:
+                async with maker() as db:
+                    db.add(
+                        self._after_close_plan(
+                            date(2026, 7, 10),
+                            date(2026, 7, 13),
+                            9,
+                            "force_degraded requested",
+                        )
+                    )
+                    await db.commit()
+                scheduler = DataScheduler(
+                    trading_playbook_orchestrator=orchestrator,
+                    session_factory=maker,
+                    now_provider=lambda: datetime(
+                        2026, 7, 13, 15, 35, tzinfo=CN_TZ
+                    ),
+                )
+                scheduler._trading_playbook_data_ready_once = AsyncMock(
+                    return_value=True
                 )
 
+                with patch(
+                    "app.data_collectors.scheduler._get_cn_trading_dates",
+                    side_effect=[
+                        [date(2026, 7, 13)],
+                        [date(2026, 7, 14)],
+                    ],
+                ):
+                    result = (
+                        await scheduler._upgrade_forced_trading_playbook_after_close(
+                            send_notifications=True
+                        )
+                    )
+            finally:
+                await engine.dispose()
+
+        self.assertIsNone(result)
+        orchestrator.build_stage.assert_not_awaited()
+        scheduler._trading_playbook_data_ready_once.assert_not_awaited()
+
+    async def test_latest_plan_uses_exact_next_target_not_far_future(self):
+        with TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "playbook-exact-target.db"
+            engine = create_async_engine(
+                f"sqlite+aiosqlite:///{database_path.as_posix()}"
+            )
+            maker = async_sessionmaker(engine, expire_on_commit=False)
+            async with engine.begin() as connection:
+                await connection.run_sync(TradingPlanVersion.__table__.create)
             try:
                 async with maker() as db:
                     db.add_all(
                         [
-                            plan(date(2026, 7, 10), date(2026, 7, 11), 99, "expired"),
-                            plan(date(2026, 7, 14), date(2026, 7, 15), 99, "future"),
-                            plan(date(2026, 7, 13), date(2026, 7, 14), 1, "old"),
-                            plan(date(2026, 7, 13), date(2026, 7, 14), 2, "latest"),
+                            self._after_close_plan(
+                                date(2026, 7, 13),
+                                date(2026, 7, 14),
+                                1,
+                                "old",
+                            ),
+                            self._after_close_plan(
+                                date(2026, 7, 13),
+                                date(2026, 7, 14),
+                                2,
+                                "latest",
+                            ),
+                            self._after_close_plan(
+                                date(2026, 7, 13),
+                                date(2026, 7, 20),
+                                99,
+                                "far-future",
+                            ),
                         ]
                     )
                     await db.commit()
                 scheduler = DataScheduler(session_factory=maker)
 
-                result = await scheduler._latest_relevant_after_close_plan(
-                    date(2026, 7, 13)
-                )
+                with patch(
+                    "app.data_collectors.scheduler._get_cn_trading_dates",
+                    return_value=[date(2026, 7, 14)],
+                ):
+                    result = await scheduler._latest_relevant_after_close_plan(
+                        date(2026, 7, 13)
+                    )
             finally:
                 await engine.dispose()
 
         self.assertIsNotNone(result)
+        self.assertEqual(result.target_trade_date, date(2026, 7, 14))
         self.assertEqual(result.version_no, 2)
-        self.assertEqual(result.data_quality_json["warnings"], ["latest"])
+
+    async def test_monitor_isolates_empty_next_calendar_and_runs_alerts(self):
+        alert_service = SimpleNamespace(monitor=AsyncMock())
+        scheduler = DataScheduler(
+            trading_playbook_orchestrator=SimpleNamespace(
+                build_stage=AsyncMock()
+            ),
+            trading_playbook_alert_service=alert_service,
+            session_factory=lambda: AsyncSessionContext(MagicMock()),
+            now_provider=lambda: datetime(
+                2026, 7, 13, 15, 35, tzinfo=CN_TZ
+            ),
+        )
+
+        with patch(
+            "app.data_collectors.scheduler._get_cn_trading_dates",
+            side_effect=[[date(2026, 7, 13)], []],
+        ), patch("app.data_collectors.scheduler.logger.error") as log_error:
+            await scheduler._monitor_trading_playbook()
+
+        alert_service.monitor.assert_awaited_once()
+        log_error.assert_called_once()
+        self.assertIsInstance(
+            log_error.call_args.args[1],
+            TradingCalendarLookupError,
+        )
 
     async def test_monitor_upgrades_forced_timeout_once_after_writer_is_ready(self):
         with TemporaryDirectory() as temp_dir:
@@ -587,7 +682,11 @@ class TradingPlaybookForcedUpgradeTests(unittest.IsolatedAsyncioTestCase):
 
                 with patch(
                     "app.data_collectors.scheduler._get_cn_trading_dates",
-                    return_value=[date(2026, 7, 13)],
+                    side_effect=lambda start, end: (
+                        [date(2026, 7, 13)]
+                        if start == end
+                        else [date(2026, 7, 14)]
+                    ),
                 ):
                     await asyncio.gather(
                         scheduler._monitor_trading_playbook(),
@@ -745,12 +844,18 @@ class TradingPlaybookForcedUpgradeTests(unittest.IsolatedAsyncioTestCase):
 
         with patch(
             "app.data_collectors.scheduler._get_cn_trading_dates",
-            return_value=[date(2026, 7, 13)],
+            side_effect=lambda start, end: (
+                [date(2026, 7, 13)]
+                if start == end
+                else [date(2026, 7, 14)]
+            ),
         ):
             await scheduler._monitor_trading_playbook()
 
         scheduler._upgrade_forced_trading_playbook_after_close.assert_awaited_once_with(
-            send_notifications=True
+            send_notifications=True,
+            trade_date=date(2026, 7, 13),
+            next_trade_date=date(2026, 7, 14),
         )
         alert_service.monitor.assert_awaited_once()
 
@@ -837,7 +942,9 @@ class TradingPlaybookCatchupTests(unittest.IsolatedAsyncioTestCase):
         )
         self.scheduler._build_trading_playbook_after_close.assert_not_awaited()
         self.scheduler._upgrade_forced_trading_playbook_after_close.assert_awaited_once_with(
-            send_notifications=False
+            send_notifications=False,
+            trade_date=self.today,
+            next_trade_date=self.next_day,
         )
 
     async def test_non_trading_day_skips_all_catchup_work(self):
