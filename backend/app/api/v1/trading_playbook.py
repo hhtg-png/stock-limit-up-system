@@ -539,11 +539,16 @@ async def update_manual_execution(
         key: value.model_dump(mode="python", exclude_unset=True)
         for key, value in request.executions.items()
     }
+    unplanned_executions = [
+        value.model_dump(mode="python", exclude_unset=True)
+        for value in request.unplanned_executions
+    ]
     try:
         review = await review_service.update_manual_execution(
             db,
             trade_date,
             executions,
+            unplanned_executions=unplanned_executions,
         )
         return _serialize_review(review)
     except InvalidRequestError as exc:

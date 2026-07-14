@@ -86,14 +86,26 @@ class _FakeReviewService:
     def __init__(self):
         self.calls = []
 
-    async def update_manual_execution(self, db, trade_date, executions):
-        self.calls.append((db, trade_date, executions))
+    async def update_manual_execution(
+        self,
+        db,
+        trade_date,
+        executions,
+        *,
+        unplanned_executions=None,
+    ):
+        self.calls.append(
+            (db, trade_date, executions, unplanned_executions or [])
+        )
+        manual = dict(executions)
+        if unplanned_executions:
+            manual["_unplanned"] = unplanned_executions
         return {
             "id": 501,
             "trade_date": trade_date.isoformat(),
             "plan_version_id": 1,
             "signal_review_json": {},
-            "manual_execution_json": executions,
+            "manual_execution_json": manual,
             "plan_compliance_json": {},
             "outcome_snapshot_json": {},
             "data_quality_json": {},
@@ -1586,25 +1598,50 @@ class TradingPlaybookApiTests(unittest.TestCase):
             json={
                 "executions": {
                     "1": {
-                        "executed": False,
+                        "executed": True,
                         "executed_at": "2026-07-10T09:31:00+08:00",
-                        "manual_note": "计划内未执行",
+                        "manual_note": "计划内执行",
                     }
-                }
+                },
+                "unplanned_executions": [
+                    {
+                        "executed": True,
+                        "stock_code": "600000",
+                        "stock_name": "浦发银行",
+                        "execution_price": 10.2,
+                        "quantity": 100,
+                        "executed_at": "2026-07-10T10:31:00+08:00",
+                        "manual_note": "临盘计划外成交",
+                    }
+                ],
             },
         )
         self.assertEqual(response.status_code, 200, response.text)
-        _, trade_date, executions = self.review_service.calls[0]
+        _, trade_date, executions, unplanned = self.review_service.calls[0]
         self.assertEqual(trade_date, date(2026, 7, 10))
         self.assertEqual(
             executions,
             {
                 "1": {
-                    "executed": False,
+                    "executed": True,
                     "executed_at": datetime(2026, 7, 10, 9, 31, tzinfo=CN),
-                    "manual_note": "计划内未执行",
+                    "manual_note": "计划内执行",
                 }
             },
+        )
+        self.assertEqual(
+            unplanned,
+            [
+                {
+                    "executed": True,
+                    "stock_code": "600000",
+                    "stock_name": "浦发银行",
+                    "execution_price": 10.2,
+                    "quantity": 100,
+                    "executed_at": datetime(2026, 7, 10, 10, 31, tzinfo=CN),
+                    "manual_note": "临盘计划外成交",
+                }
+            ],
         )
         self.assertTrue(response.json()["generated_at"].endswith("+08:00"))
 
@@ -1613,6 +1650,55 @@ class TradingPlaybookApiTests(unittest.TestCase):
             json={"executions": {"1": {"executed": False, "unknown": 1}}},
         )
         self.assertEqual(invalid.status_code, 422)
+
+    def test_review_execution_contract_rejects_false_facts_and_invalid_unplanned(self):
+        for field, value in (
+            ("execution_price", 10.0),
+            ("quantity", 100),
+            ("executed_at", "2026-07-10T09:31:00+08:00"),
+        ):
+            with self.subTest(field=field):
+                response = self.client.put(
+                    "/trading-playbook/reviews/2026-07-10",
+                    json={
+                        "executions": {
+                            "1": {"executed": False, field: value}
+                        }
+                    },
+                )
+                self.assertEqual(response.status_code, 422, response.text)
+
+        invalid_rows = [
+            {"executed": False, "stock_code": "600000", "stock_name": "浦发"},
+            {"executed": True, "stock_code": "60000", "stock_name": "浦发"},
+            {
+                "executed": True,
+                "stock_code": "600000",
+                "stock_name": "浦发",
+                "unknown": 1,
+            },
+        ]
+        for row in invalid_rows:
+            with self.subTest(row=row):
+                response = self.client.put(
+                    "/trading-playbook/reviews/2026-07-10",
+                    json={"unplanned_executions": [row]},
+                )
+                self.assertEqual(response.status_code, 422, response.text)
+
+        too_many = [
+            {
+                "executed": True,
+                "stock_code": f"{index:06d}",
+                "stock_name": f"股票{index}",
+            }
+            for index in range(1, 102)
+        ]
+        response = self.client.put(
+            "/trading-playbook/reviews/2026-07-10",
+            json={"unplanned_executions": too_many},
+        )
+        self.assertEqual(response.status_code, 422, response.text)
 
     def test_review_invalid_request_is_fixed_422_without_internal_detail(self):
         async def fail(*_args, **_kwargs):

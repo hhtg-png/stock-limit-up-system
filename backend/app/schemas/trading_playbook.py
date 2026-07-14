@@ -197,15 +197,36 @@ class ManualExecutionEntry(StrictRequest):
             or self.executed_at.utcoffset() is None
         ):
             raise ValueError("executed_at must be timezone-aware")
+        if not self.executed and any(
+            value is not None
+            for value in (
+                self.execution_price,
+                self.quantity,
+                self.executed_at,
+            )
+        ):
+            raise ValueError(
+                "unexecuted entries must not contain execution facts"
+            )
         return self
 
 
 CandidateIdKey = Annotated[str, StringConstraints(pattern=r"^[1-9][0-9]*$")]
 
 
+class UnplannedExecutionEntry(ManualExecutionEntry):
+    executed: Literal[True]
+    stock_code: Annotated[str, StringConstraints(pattern=r"^[0-9]{6}$")]
+    stock_name: Annotated[NonEmptyText, StringConstraints(max_length=50)]
+
+
 class ManualExecutionUpdate(StrictRequest):
     executions: dict[CandidateIdKey, ManualExecutionEntry] = Field(
         default_factory=dict,
+        max_length=100,
+    )
+    unplanned_executions: list[UnplannedExecutionEntry] = Field(
+        default_factory=list,
         max_length=100,
     )
 
@@ -248,6 +269,7 @@ __all__ = [
     "CandidateOverride",
     "ManualExecutionEntry",
     "ManualExecutionUpdate",
+    "UnplannedExecutionEntry",
     "PlanConfirmRequest",
     "PlanGenerateRequest",
     "PlanRevisionRequest",

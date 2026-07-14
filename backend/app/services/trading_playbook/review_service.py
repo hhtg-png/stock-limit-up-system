@@ -87,6 +87,30 @@ def _finite_optional(value: Any) -> Optional[float]:
     return number if math.isfinite(number) else None
 
 
+def _cn_datetime(value: Any) -> Optional[datetime]:
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None or value.utcoffset() is None:
+        return CN_TZ.localize(value)
+    return value.astimezone(CN_TZ)
+
+
+def _event_price(event: Any) -> Optional[float]:
+    snapshot = _value(event, "market_snapshot_json", {})
+    if not isinstance(snapshot, Mapping):
+        return None
+    quote = snapshot.get("quote")
+    if not isinstance(quote, Mapping):
+        return None
+    price = _finite_optional(quote.get("price"))
+    return price if price is not None and price > 0 else None
+
+
 class TradingPlaybookReviewService:
     """Build immutable-plan execution reviews without inferring account P&L."""
 
@@ -115,6 +139,7 @@ class TradingPlaybookReviewService:
 
         event_types: dict[int, list[str]] = {}
         event_audit: dict[int, list[dict[str, Any]]] = {}
+        event_rows_by_candidate: dict[int, list[Any]] = {}
         for event in event_rows:
             candidate_id = _value(event, "candidate_id")
             event_type = _value(event, "event_type")
@@ -125,8 +150,10 @@ class TradingPlaybookReviewService:
             types = event_types.setdefault(candidate_id, [])
             if event_type not in types:
                 types.append(event_type)
+            event_rows_by_candidate.setdefault(candidate_id, []).append(event)
             event_audit.setdefault(candidate_id, []).append(
                 {
+                    "event_id": _json_value(_value(event, "id")),
                     "event_type": event_type,
                     "triggered_at": _json_value(
                         _value(event, "triggered_at")
@@ -137,6 +164,10 @@ class TradingPlaybookReviewService:
                     "channel_status": _json_value(
                         _value(event, "channel_status_json", {}) or {}
                     ),
+                    "market_snapshot": _json_value(
+                        _value(event, "market_snapshot_json", {}) or {}
+                    ),
+                    "message": _json_value(_value(event, "message")),
                 }
             )
 
@@ -147,6 +178,7 @@ class TradingPlaybookReviewService:
         signal_outcomes: list[dict[str, Any]] = []
         candidate_ids: set[int] = set()
         planned_executed = 0
+        violation_details: list[dict[str, Any]] = []
 
         for candidate in candidate_rows:
             candidate_id = _value(candidate, "id")
@@ -156,6 +188,7 @@ class TradingPlaybookReviewService:
                 continue
             candidate_ids.add(candidate_id)
             candidate_events = event_types.get(candidate_id, [])
+            candidate_event_rows = event_rows_by_candidate.get(candidate_id, [])
             execution = manual.get(str(candidate_id), {})
             was_executed = (
                 isinstance(execution, Mapping)
@@ -181,30 +214,118 @@ class TradingPlaybookReviewService:
             else:
                 not_triggered.append(stock_code)
 
+            entry_event = next(
+                (
+                    event
+                    for event in candidate_event_rows
+                    if _value(event, "event_type") in _TRIGGER_EVENT_TYPES
+                ),
+                None,
+            )
+            invalidation_event = next(
+                (
+                    event
+                    for event in candidate_event_rows
+                    if _value(event, "event_type") == "invalidated"
+                ),
+                None,
+            )
+            entry_at_raw = (
+                _value(entry_event, "triggered_at")
+                if entry_event is not None
+                else None
+            )
+            invalidation_at_raw = (
+                _value(invalidation_event, "triggered_at")
+                if invalidation_event is not None
+                else None
+            )
+            entry_at = _cn_datetime(entry_at_raw)
+            invalidation_at = _cn_datetime(invalidation_at_raw)
+            executed_at = (
+                _cn_datetime(execution.get("executed_at"))
+                if was_executed and isinstance(execution, Mapping)
+                else None
+            )
+            if not was_executed:
+                execution_timing = "not_executed"
+            elif entry_event is None:
+                execution_timing = "without_signal"
+            elif executed_at is None:
+                execution_timing = "unknown_time"
+            elif invalidation_at is not None and executed_at >= invalidation_at:
+                execution_timing = "after_invalidation"
+            elif entry_at is None:
+                execution_timing = "unknown_time"
+            elif executed_at >= entry_at:
+                execution_timing = "after_signal"
+            else:
+                execution_timing = "before_signal"
+            if execution_timing in {
+                "before_signal",
+                "after_invalidation",
+                "without_signal",
+            }:
+                violation_details.append(
+                    {
+                        "candidate_id": candidate_id,
+                        "stock_code": stock_code,
+                        "reason": execution_timing,
+                    }
+                )
+
+            entry_price = _event_price(entry_event) if entry_event is not None else None
+            close_fact = outcome_by_code.get(stock_code)
+            close_price = (
+                _finite_optional(close_fact.get("close_price"))
+                if isinstance(close_fact, Mapping)
+                else None
+            )
+            if entry_price is None:
+                signal_return_quality = "missing_entry_price"
+                signal_to_close_pct = None
+            elif close_price is None:
+                signal_return_quality = "missing_close"
+                signal_to_close_pct = None
+            else:
+                signal_return_quality = "ready"
+                signal_to_close_pct = round(
+                    (close_price - entry_price) / entry_price * 100,
+                    4,
+                )
+
             signal_outcome = {
                 "candidate_id": candidate_id,
                 "stock_code": stock_code,
                 "status": status,
                 "event_types": list(candidate_events),
                 "events": copy.deepcopy(event_audit.get(candidate_id, [])),
+                "entry_signal_at": _json_value(entry_at_raw),
+                "invalidation_at": _json_value(invalidation_at_raw),
+                "execution_timing": execution_timing,
+                "signal_entry_price": entry_price,
+                "signal_entry_price_source": (
+                    "first_entry_event.market_snapshot_json.quote.price"
+                    if entry_price is not None
+                    else None
+                ),
+                "signal_to_close_pct": signal_to_close_pct,
+                "signal_return_quality": signal_return_quality,
             }
-            close_fact = outcome_by_code.get(stock_code)
             if isinstance(close_fact, Mapping):
                 signal_outcome["close"] = copy.deepcopy(dict(close_fact))
             signal_outcomes.append(signal_outcome)
 
-        unplanned = sum(
-            1
-            for raw_id, execution in manual.items()
-            if (
-                isinstance(execution, Mapping)
+        raw_unplanned = manual.get("_unplanned", [])
+        unplanned_executions = (
+            [
+                copy.deepcopy(dict(execution))
+                for execution in raw_unplanned
+                if isinstance(execution, Mapping)
                 and execution.get("executed") is True
-                and (
-                    not isinstance(raw_id, str)
-                    or not raw_id.isdigit()
-                    or int(raw_id) not in candidate_ids
-                )
-            )
+            ]
+            if isinstance(raw_unplanned, list)
+            else []
         )
         return {
             "not_triggered": not_triggered,
@@ -214,9 +335,12 @@ class TradingPlaybookReviewService:
             "plan_compliance": {
                 "planned": len(candidate_ids),
                 "executed": planned_executed,
-                "unplanned": unplanned,
+                "unplanned": len(unplanned_executions),
+                "violations": len(violation_details),
+                "violation_details": violation_details,
             },
             "signal_outcomes": signal_outcomes,
+            "unplanned_executions": unplanned_executions,
         }
 
     async def build(
@@ -250,15 +374,22 @@ class TradingPlaybookReviewService:
         db,
         trade_date: date,
         executions: Mapping[str, Mapping[str, Any]],
+        *,
+        unplanned_executions: Optional[Sequence[Mapping[str, Any]]] = None,
     ) -> TradingExecutionReview:
         """Replace one unambiguously selected review's manual execution map."""
         if isinstance(trade_date, datetime) or not isinstance(trade_date, date):
             raise InvalidRequestError("trade_date must be a date")
         manual = self._normalize_manual_execution(executions)
+        unplanned = self._normalize_unplanned_executions(
+            unplanned_executions or []
+        )
+        if unplanned:
+            manual["_unplanned"] = unplanned
         review_id, plan_id = await self._select_manual_review(
             db,
             trade_date,
-            set(manual),
+            set(manual) - {"_unplanned"},
         )
         for attempt in range(_MAX_WRITE_ATTEMPTS):
             try:
@@ -766,6 +897,8 @@ class TradingPlaybookReviewService:
                 )
             ).all()
         )
+        if {row.id for row in candidate_rows} != numeric_ids:
+            raise InvalidTransitionError("unknown candidate id")
         wrong_date_ids = sorted(
             row.id
             for row in candidate_rows
@@ -777,8 +910,6 @@ class TradingPlaybookReviewService:
             )
         touched_plans = {row.plan_version_id for row in candidate_rows}
         if not touched_plans:
-            if len(reviews) == 1:
-                return reviews[0].id, reviews[0].plan_version_id
             raise InvalidTransitionError(
                 "manual execution does not identify exactly one review"
             )
@@ -815,9 +946,62 @@ class TradingPlaybookReviewService:
                 raise InvalidRequestError("execution entries must be mappings")
             if not isinstance(execution.get("executed"), bool):
                 raise InvalidRequestError("executed must be a boolean")
+            if execution.get("executed") is False and any(
+                field in execution
+                for field in ("execution_price", "quantity", "executed_at")
+            ):
+                raise InvalidRequestError(
+                    "unexecuted entries must not contain execution facts"
+                )
             normalized[candidate_id] = _json_value(
                 copy.deepcopy(dict(execution)),
                 path=f"executions.{candidate_id}",
+            )
+        return normalized
+
+    @staticmethod
+    def _normalize_unplanned_executions(
+        executions: Sequence[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        if isinstance(executions, (str, bytes)) or not isinstance(
+            executions,
+            Sequence,
+        ):
+            raise InvalidRequestError("unplanned_executions must be a list")
+        if len(executions) > 100:
+            raise InvalidRequestError("too many unplanned executions")
+        normalized: list[dict[str, Any]] = []
+        allowed = {
+            "executed",
+            "stock_code",
+            "stock_name",
+            "execution_price",
+            "quantity",
+            "executed_at",
+            "manual_note",
+        }
+        for index, execution in enumerate(executions):
+            if not isinstance(execution, Mapping):
+                raise InvalidRequestError(
+                    "unplanned execution entries must be mappings"
+                )
+            item = dict(execution)
+            if set(item) - allowed:
+                raise InvalidRequestError("unknown unplanned execution field")
+            if item.get("executed") is not True:
+                raise InvalidRequestError("unplanned execution must be executed")
+            stock_code = item.get("stock_code")
+            if (
+                not isinstance(stock_code, str)
+                or len(stock_code) != 6
+                or not stock_code.isdigit()
+            ):
+                raise InvalidRequestError("stock_code must be six digits")
+            stock_name = item.get("stock_name")
+            if not isinstance(stock_name, str) or not stock_name.strip():
+                raise InvalidRequestError("stock_name is required")
+            normalized.append(
+                _json_value(item, path=f"unplanned_executions[{index}]")
             )
         return normalized
 

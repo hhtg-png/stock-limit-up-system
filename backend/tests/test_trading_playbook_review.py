@@ -48,7 +48,13 @@ class TradingPlaybookReviewSummaryTests(unittest.TestCase):
         self.assertEqual(result["triggered_not_executed"], ["000003"])
         self.assertEqual(
             result["plan_compliance"],
-            {"planned": 3, "executed": 0, "unplanned": 0},
+            {
+                "planned": 3,
+                "executed": 0,
+                "unplanned": 0,
+                "violations": 0,
+                "violation_details": [],
+            },
         )
 
     def test_review_classifies_execution_and_unplanned_without_profit_inference(self):
@@ -64,7 +70,14 @@ class TradingPlaybookReviewSummaryTests(unittest.TestCase):
                     "execution_price": 10.0,
                     "quantity": 100,
                 },
-                "999": {"executed": True, "execution_price": 9.0},
+                "_unplanned": [
+                    {
+                        "executed": True,
+                        "stock_code": "000999",
+                        "stock_name": "计划外股票",
+                        "execution_price": 9.0,
+                    }
+                ],
             },
         )
 
@@ -72,8 +85,15 @@ class TradingPlaybookReviewSummaryTests(unittest.TestCase):
         self.assertEqual(result["not_triggered"], ["000002"])
         self.assertEqual(
             result["plan_compliance"],
-            {"planned": 2, "executed": 1, "unplanned": 1},
+            {
+                "planned": 2,
+                "executed": 1,
+                "unplanned": 1,
+                "violations": 0,
+                "violation_details": [],
+            },
         )
+        self.assertEqual(result["unplanned_executions"][0]["stock_code"], "000999")
         serialized = json.dumps(result, ensure_ascii=False)
         self.assertNotIn("account_profit", serialized)
         self.assertNotIn("profit", serialized)
@@ -93,8 +113,11 @@ class TradingPlaybookReviewSummaryTests(unittest.TestCase):
                     "planned": 0,
                     "executed": 0,
                     "unplanned": 0,
+                    "violations": 0,
+                    "violation_details": [],
                 },
                 "signal_outcomes": [],
+                "unplanned_executions": [],
             },
         )
 
@@ -105,8 +128,14 @@ class TradingPlaybookReviewSummaryTests(unittest.TestCase):
                 {
                     "candidate_id": 1,
                     "event_type": "entry_triggered",
+                    "id": 17,
                     "triggered_at": datetime(2026, 7, 14, 10, 0),
                     "acknowledged_at": datetime(2026, 7, 14, 10, 1),
+                    "market_snapshot_json": {
+                        "trade_date": "2026-07-14",
+                        "quote": {"price": 10.0},
+                    },
+                    "message": "价格触发",
                     "channel_status_json": {"in_app": "sent"},
                 }
             ],
@@ -114,10 +143,112 @@ class TradingPlaybookReviewSummaryTests(unittest.TestCase):
         )
 
         audit = result["signal_outcomes"][0]["events"][0]
+        self.assertEqual(audit["event_id"], 17)
         self.assertEqual(audit["event_type"], "entry_triggered")
         self.assertEqual(audit["triggered_at"], "2026-07-14T10:00:00")
         self.assertEqual(audit["acknowledged_at"], "2026-07-14T10:01:00")
         self.assertEqual(audit["channel_status"], {"in_app": "sent"})
+        self.assertEqual(audit["market_snapshot"]["quote"]["price"], 10.0)
+        self.assertEqual(audit["message"], "价格触发")
+
+    def test_execution_timing_violations_and_signal_return_are_transparent(self):
+        events = [
+            {
+                "id": 101,
+                "candidate_id": 1,
+                "event_type": "entry_triggered",
+                "triggered_at": datetime(2026, 7, 14, 2, 0, tzinfo=timezone.utc),
+                "market_snapshot_json": {
+                    "trade_date": "2026-07-14",
+                    "quote": {"price": 10.0},
+                },
+                "message": "entry",
+            },
+            {
+                "id": 102,
+                "candidate_id": 2,
+                "event_type": "entry_triggered",
+                "triggered_at": datetime(2026, 7, 14, 10, 0),
+                "market_snapshot_json": {
+                    "trade_date": "2026-07-14",
+                    "quote": {"price": 10.0},
+                },
+            },
+            {
+                "id": 103,
+                "candidate_id": 3,
+                "event_type": "entry_triggered",
+                "triggered_at": datetime(2026, 7, 14, 10, 0),
+                "market_snapshot_json": {
+                    "trade_date": "2026-07-14",
+                    "quote": {"price": 10.0},
+                },
+            },
+            {
+                "id": 104,
+                "candidate_id": 3,
+                "event_type": "invalidated",
+                "triggered_at": datetime(2026, 7, 14, 10, 5),
+                "market_snapshot_json": {"trade_date": "2026-07-14"},
+            },
+            {
+                "id": 105,
+                "candidate_id": 5,
+                "event_type": "confirmation_triggered",
+                "triggered_at": datetime(2026, 7, 14, 10, 0),
+                "market_snapshot_json": {"trade_date": "2026-07-14"},
+            },
+        ]
+        result = TradingPlaybookReviewService().summarize(
+            candidates=[
+                {"id": 1, "stock_code": "000001", "status": "triggered"},
+                {"id": 2, "stock_code": "000002", "status": "triggered"},
+                {"id": 3, "stock_code": "000003", "status": "invalidated"},
+                {"id": 4, "stock_code": "000004", "status": "waiting"},
+                {"id": 5, "stock_code": "000005", "status": "triggered"},
+            ],
+            events=events,
+            manual_execution={
+                "1": {
+                    "executed": True,
+                    "executed_at": "2026-07-14T10:01:00+08:00",
+                },
+                "2": {
+                    "executed": True,
+                    "executed_at": "2026-07-14T09:59:00+08:00",
+                },
+                "3": {
+                    "executed": True,
+                    "executed_at": "2026-07-14T10:05:00+08:00",
+                },
+                "4": {"executed": True},
+                "5": {"executed": True},
+            },
+            outcomes={
+                "000001": {"close_price": 11.0},
+                "000002": {"close_price": float("inf")},
+            },
+        )
+
+        by_id = {
+            row["candidate_id"]: row for row in result["signal_outcomes"]
+        }
+        self.assertEqual(by_id[1]["execution_timing"], "after_signal")
+        self.assertEqual(by_id[2]["execution_timing"], "before_signal")
+        self.assertEqual(by_id[3]["execution_timing"], "after_invalidation")
+        self.assertEqual(by_id[4]["execution_timing"], "without_signal")
+        self.assertEqual(by_id[5]["execution_timing"], "unknown_time")
+        self.assertEqual(by_id[1]["entry_signal_at"], "2026-07-14T02:00:00+00:00")
+        self.assertEqual(by_id[3]["invalidation_at"], "2026-07-14T10:05:00")
+        self.assertEqual(by_id[1]["signal_to_close_pct"], 10.0)
+        self.assertEqual(by_id[1]["signal_return_quality"], "ready")
+        self.assertIsNone(by_id[2]["signal_to_close_pct"])
+        self.assertEqual(by_id[2]["signal_return_quality"], "missing_close")
+        self.assertEqual(result["plan_compliance"]["violations"], 3)
+        self.assertEqual(
+            [item["reason"] for item in result["plan_compliance"]["violation_details"]],
+            ["before_signal", "after_invalidation", "without_signal"],
+        )
 
     def test_exit_without_entry_evidence_is_not_classified_as_triggered(self):
         exit_only = TradingPlaybookReviewService().summarize(
@@ -540,23 +671,82 @@ class TradingPlaybookReviewPersistenceTests(unittest.IsolatedAsyncioTestCase):
                     },
                 )
 
-    async def test_truly_unknown_candidate_counts_unplanned_for_one_selected_review(self):
+    async def test_truly_unknown_candidate_id_is_rejected(self):
         _, today_candidate_id = await self._add_plan()
         service = TradingPlaybookReviewService(
             now_provider=lambda: FINALIZED_AT,
         )
         async with self.sessions[0]() as db:
             await service.build(db, TRADE_DATE, finalized=False)
+            with self.assertRaises(InvalidTransitionError):
+                await service.update_manual_execution(
+                    db,
+                    TRADE_DATE,
+                    {
+                        str(today_candidate_id): {"executed": False},
+                        "999999": {"executed": True},
+                    },
+                )
+
+    async def test_explicit_unplanned_execution_is_persisted_without_profit_inference(self):
+        _, today_candidate_id = await self._add_plan()
+        service = TradingPlaybookReviewService(
+            now_provider=lambda: FINALIZED_AT,
+        )
+        unplanned = [
+            {
+                "executed": True,
+                "stock_code": "600000",
+                "stock_name": "浦发银行",
+                "execution_price": 10.2,
+                "quantity": 100,
+                "executed_at": "2026-07-14T10:31:00+08:00",
+                "manual_note": "临盘计划外成交",
+            }
+        ]
+        async with self.sessions[0]() as db:
+            await service.build(db, TRADE_DATE, finalized=False)
             updated = await service.update_manual_execution(
                 db,
                 TRADE_DATE,
-                {
-                    str(today_candidate_id): {"executed": False},
-                    "999999": {"executed": True},
-                },
+                {str(today_candidate_id): {"executed": False}},
+                unplanned_executions=unplanned,
             )
 
+        self.assertEqual(updated.manual_execution_json["_unplanned"], unplanned)
         self.assertEqual(updated.plan_compliance_json["unplanned"], 1)
+        self.assertEqual(
+            updated.signal_review_json["unplanned_executions"],
+            unplanned,
+        )
+        serialized = json.dumps(updated.signal_review_json, ensure_ascii=False)
+        self.assertNotIn("profit", serialized.lower())
+        self.assertNotIn("pnl", serialized.lower())
+
+    async def test_only_unplanned_execution_cannot_select_among_multiple_reviews(self):
+        await self._add_plan(version_no=1, stock_code="000001")
+        await self._add_plan(
+            version_no=2,
+            target_trade_date=TRADE_DATE + timedelta(days=1),
+            stock_code="000002",
+            action_trade_date=TRADE_DATE,
+        )
+        service = TradingPlaybookReviewService(now_provider=lambda: FINALIZED_AT)
+        async with self.sessions[0]() as db:
+            await service.build(db, TRADE_DATE, finalized=False)
+            with self.assertRaises(InvalidTransitionError):
+                await service.update_manual_execution(
+                    db,
+                    TRADE_DATE,
+                    {},
+                    unplanned_executions=[
+                        {
+                            "executed": True,
+                            "stock_code": "600000",
+                            "stock_name": "浦发银行",
+                        }
+                    ],
+                )
 
     async def test_update_without_a_review_is_not_found(self):
         service = TradingPlaybookReviewService()
