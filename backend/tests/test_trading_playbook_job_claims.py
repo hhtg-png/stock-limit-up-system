@@ -209,6 +209,224 @@ class TradingPlaybookSchedulerClaimTests(unittest.IsolatedAsyncioTestCase):
             today_provider=lambda: date(2026, 7, 13),
         )
 
+    async def _notification_retry_fairness_case(self, *, valid_is_oldest):
+        from app.models.trading_playbook import (
+            TradingPlanVersion,
+            TradingPlaybookJobClaim,
+        )
+
+        scheduler, engine, _orchestrator, alert, _review = (
+            await self._scheduler_fixture()
+        )
+        failing_time = datetime(2026, 7, 2, 9, 0)
+        valid_time = datetime(2026, 7, 1, 9, 0)
+        if not valid_is_oldest:
+            failing_time, valid_time = valid_time, failing_time
+        try:
+            async with scheduler._playbook_session_factory() as db:
+                plans = [
+                    TradingPlanVersion(
+                        source_trade_date=date(2026, 7, 13),
+                        target_trade_date=date(2026, 7, 14),
+                        stage="auction",
+                        version_no=index + 1,
+                        status="draft",
+                        input_hash=f"retry-fairness-{index}",
+                        generated_at=datetime(2026, 7, 13, 9, 0)
+                        + timedelta(seconds=index),
+                    )
+                    for index in range(101)
+                ]
+                db.add_all(plans)
+                await db.flush()
+                valid_plan_id = plans[-1].id
+                db.add_all(
+                    [
+                        TradingPlaybookJobClaim(
+                            job_key=f"playbook:notify:plan:{plan.id}",
+                            job_type="plan",
+                            phase="notify",
+                            generation_key=str(plan.id),
+                            owner="retired-worker",
+                            status="retry",
+                            attempt_no=1,
+                            lease_expires_at=(
+                                valid_time
+                                if plan.id == valid_plan_id
+                                else failing_time
+                            ),
+                            last_error="notify offline",
+                            created_at=failing_time,
+                            updated_at=(
+                                valid_time
+                                if plan.id == valid_plan_id
+                                else failing_time
+                            ),
+                        )
+                        for plan in plans
+                    ]
+                )
+                await db.commit()
+
+            attempted = []
+
+            async def notify(_db, plan, *, send):
+                self.assertTrue(send)
+                attempted.append(plan.id)
+                if plan.id != valid_plan_id:
+                    raise RuntimeError("notify offline")
+
+            alert.notify_plan_ready.side_effect = notify
+            await scheduler._retry_incomplete_playbook_notifications(None, None)
+            valid_attempted_first = valid_plan_id in attempted
+            await scheduler._retry_incomplete_playbook_notifications(None, None)
+            valid_attempted_second = valid_plan_id in attempted
+            return valid_attempted_first, valid_attempted_second
+        finally:
+            await engine.dispose()
+
+    async def test_oldest_valid_notification_is_not_starved_by_newer_failures(self):
+        first, second = await self._notification_retry_fairness_case(
+            valid_is_oldest=True
+        )
+
+        self.assertTrue(first)
+        self.assertTrue(second)
+
+    async def test_newer_valid_notification_runs_after_one_failure_rotation(self):
+        first, second = await self._notification_retry_fairness_case(
+            valid_is_oldest=False
+        )
+
+        self.assertFalse(first)
+        self.assertTrue(second)
+
+    async def test_invalid_notification_claims_are_retired_without_touching_other_phases(self):
+        from sqlalchemy import select
+
+        from app.models.trading_playbook import (
+            TradingPlanVersion,
+            TradingPlaybookJobClaim,
+        )
+
+        scheduler, engine, _orchestrator, alert, _review = (
+            await self._scheduler_fixture()
+        )
+        old = datetime(2026, 7, 1, 9, 0)
+        try:
+            async with scheduler._playbook_session_factory() as db:
+                expired = TradingPlanVersion(
+                    source_trade_date=date(2026, 7, 13),
+                    target_trade_date=date(2026, 7, 14),
+                    stage="overnight",
+                    version_no=1,
+                    status="expired",
+                    input_hash="expired-notification-plan",
+                    generated_at=old,
+                )
+                db.add(expired)
+                await db.flush()
+                db.add_all(
+                    [
+                        TradingPlaybookJobClaim(
+                            job_key="playbook:notify:invalid:none",
+                            job_type="plan",
+                            phase="notify",
+                            generation_key=None,
+                            owner="retired-worker",
+                            status="retry",
+                            lease_expires_at=old,
+                            created_at=old,
+                            updated_at=old,
+                        ),
+                        TradingPlaybookJobClaim(
+                            job_key="playbook:notify:invalid:text",
+                            job_type="plan",
+                            phase="notify",
+                            generation_key="not-an-id",
+                            owner="retired-worker",
+                            status="retry",
+                            lease_expires_at=old,
+                            created_at=old,
+                            updated_at=old,
+                        ),
+                        TradingPlaybookJobClaim(
+                            job_key="playbook:notify:missing-plan",
+                            job_type="plan",
+                            phase="notify",
+                            generation_key="999999",
+                            owner="retired-worker",
+                            status="retry",
+                            lease_expires_at=old,
+                            created_at=old,
+                            updated_at=old,
+                        ),
+                        TradingPlaybookJobClaim(
+                            job_key="playbook:notify:expired-plan",
+                            job_type="plan",
+                            phase="notify",
+                            generation_key=str(expired.id),
+                            owner="retired-worker",
+                            status="retry",
+                            lease_expires_at=old,
+                            created_at=old,
+                            updated_at=old,
+                        ),
+                        TradingPlaybookJobClaim(
+                            job_key="playbook:build:unrelated",
+                            job_type="stage",
+                            phase="build",
+                            generation_key="not-an-id",
+                            owner="builder",
+                            status="retry",
+                            lease_expires_at=old,
+                            created_at=old,
+                            updated_at=old,
+                        ),
+                        TradingPlaybookJobClaim(
+                            job_key="playbook:notify:already-completed",
+                            job_type="plan",
+                            phase="notify",
+                            generation_key="999998",
+                            owner="retired-worker",
+                            status="completed",
+                            completed_at=old,
+                            last_error="preserve-completed",
+                            created_at=old,
+                            updated_at=old,
+                        ),
+                    ]
+                )
+                await db.commit()
+
+            await scheduler._retry_incomplete_playbook_notifications(None, None)
+            async with scheduler._playbook_session_factory() as db:
+                claims = {
+                    claim.job_key: claim
+                    for claim in (
+                        await db.execute(select(TradingPlaybookJobClaim))
+                    )
+                    .scalars()
+                    .all()
+                }
+        finally:
+            await engine.dispose()
+
+        for key in (
+            "playbook:notify:invalid:none",
+            "playbook:notify:invalid:text",
+            "playbook:notify:missing-plan",
+            "playbook:notify:expired-plan",
+        ):
+            self.assertEqual(claims[key].status, "completed")
+            self.assertIn("notification retry retired", claims[key].last_error)
+        self.assertEqual(claims["playbook:build:unrelated"].status, "retry")
+        self.assertEqual(
+            claims["playbook:notify:already-completed"].last_error,
+            "preserve-completed",
+        )
+        alert.notify_plan_ready.assert_not_awaited()
+
     async def test_broken_business_sessions_fail_claims_in_fresh_sessions(self):
         from sqlalchemy import select
         from sqlalchemy.exc import IntegrityError
@@ -436,17 +654,18 @@ class TradingPlaybookSchedulerClaimTests(unittest.IsolatedAsyncioTestCase):
         try:
             await scheduler._build_trading_playbook_after_close()
             async with scheduler._playbook_session_factory() as db:
-                db.add(
-                    TradingPlanVersion(
-                        source_trade_date=date(2026, 7, 13),
-                        target_trade_date=date(2026, 7, 14),
-                        stage="overnight",
-                        version_no=1,
-                        status="draft",
-                        input_hash="historical-no-notify-claim",
-                        generated_at=datetime(2026, 7, 13, 8, 50),
-                    )
+                historical = TradingPlanVersion(
+                    source_trade_date=date(2026, 7, 13),
+                    target_trade_date=date(2026, 7, 14),
+                    stage="overnight",
+                    version_no=1,
+                    status="draft",
+                    input_hash="historical-no-notify-claim",
+                    generated_at=datetime(2026, 7, 13, 8, 50),
                 )
+                db.add(historical)
+                await db.flush()
+                historical_plan_id = historical.id
                 old_claim_time = datetime(2026, 7, 1, 9, 0)
                 db.add_all(
                     [
@@ -483,6 +702,30 @@ class TradingPlaybookSchedulerClaimTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
             await restarted._monitor_trading_playbook()
+            async with restarted._playbook_session_factory() as db:
+                first_round_claims = list(
+                    (
+                        await db.execute(
+                            select(TradingPlaybookJobClaim).where(
+                                TradingPlaybookJobClaim.phase == "notify"
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+            self.assertEqual(
+                len(
+                    [
+                        claim
+                        for claim in first_round_claims
+                        if claim.status == "completed"
+                    ]
+                ),
+                100,
+            )
+            self.assertEqual(alert.notify_plan_ready.await_count, 1)
+            await restarted._monitor_trading_playbook()
             await restarted._monitor_trading_playbook()
             async with restarted._playbook_session_factory() as db:
                 notify_claims = list(
@@ -504,7 +747,23 @@ class TradingPlaybookSchedulerClaimTests(unittest.IsolatedAsyncioTestCase):
         completed_claims = [
             claim for claim in notify_claims if claim.status == "completed"
         ]
-        self.assertEqual(len(completed_claims), 1)
+        self.assertEqual(len(completed_claims), 101)
+        retired = [
+            claim
+            for claim in notify_claims
+            if (claim.generation_key or "").startswith("10")
+        ]
+        self.assertEqual(len(retired), 100)
+        self.assertTrue(
+            all(
+                "notification retry retired" in (claim.last_error or "")
+                for claim in retired
+            )
+        )
+        self.assertNotIn(
+            str(historical_plan_id),
+            {claim.generation_key for claim in notify_claims},
+        )
 
     async def test_multiple_after_close_plan_ids_finalize_trade_date_once(self):
         scheduler, engine, orchestrator, alert, review = await self._scheduler_fixture()

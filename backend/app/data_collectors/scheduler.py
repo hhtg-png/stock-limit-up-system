@@ -963,64 +963,136 @@ class DataScheduler:
         service = self._trading_playbook_alert_service
         if not callable(getattr(service, "notify_plan_ready", None)):
             return
-        from sqlalchemy import select
+        from sqlalchemy import or_, select, update
         from app.models.trading_playbook import (
             TradingPlanVersion,
             TradingPlaybookJobClaim,
         )
 
+        now = self._claim_now()
         async with self._playbook_sessions() as db:
-            generation_keys = (
-                await db.execute(
-                    select(TradingPlaybookJobClaim.generation_key)
-                    .where(
-                        TradingPlaybookJobClaim.job_type == "plan",
-                        TradingPlaybookJobClaim.phase == "notify",
-                        TradingPlaybookJobClaim.status != "completed",
-                        TradingPlaybookJobClaim.generation_key.is_not(None),
+            claims = list(
+                (
+                    await db.execute(
+                        select(TradingPlaybookJobClaim)
+                        .where(
+                            TradingPlaybookJobClaim.job_type == "plan",
+                            TradingPlaybookJobClaim.phase == "notify",
+                            TradingPlaybookJobClaim.status != "completed",
+                            or_(
+                                TradingPlaybookJobClaim.status == "retry",
+                                TradingPlaybookJobClaim.lease_expires_at.is_(None),
+                                TradingPlaybookJobClaim.lease_expires_at <= now,
+                            ),
+                        )
+                        .order_by(
+                            TradingPlaybookJobClaim.updated_at.asc(),
+                            TradingPlaybookJobClaim.id.asc(),
+                        )
+                        .limit(_PLAYBOOK_NOTIFICATION_RETRY_BATCH_SIZE)
                     )
-                    .order_by(
-                        TradingPlaybookJobClaim.updated_at.desc(),
-                        TradingPlaybookJobClaim.id.desc(),
-                    )
-                    .limit(_PLAYBOOK_NOTIFICATION_RETRY_BATCH_SIZE)
                 )
-            ).scalars().all()
-            plan_ids = set()
-            for value in generation_keys:
-                try:
-                    plan_ids.add(int(value))
-                except (TypeError, ValueError):
-                    continue
-            if not plan_ids:
+                .scalars()
+                .all()
+            )
+            if not claims:
                 return
-            plan_filters = [
-                TradingPlanVersion.id.in_(plan_ids),
-                TradingPlanVersion.status.in_(("draft", "confirmed", "active")),
-            ]
-            if earliest_target_date is not None:
-                plan_filters.append(
-                    TradingPlanVersion.target_trade_date
-                    >= earliest_target_date
-                )
-            if latest_target_date is not None:
-                plan_filters.append(
-                    TradingPlanVersion.target_trade_date
-                    <= latest_target_date
-                )
-            plans = (
-                await db.execute(
-                    select(TradingPlanVersion)
-                    .where(*plan_filters)
-                    .order_by(
-                        TradingPlanVersion.target_trade_date,
-                        TradingPlanVersion.generated_at,
-                        TradingPlanVersion.id,
+            plan_id_by_claim_id = {}
+            plan_ids = set()
+            retirement_reason_by_claim_id = {}
+            for claim in claims:
+                try:
+                    plan_id = int(claim.generation_key)
+                except (TypeError, ValueError):
+                    retirement_reason_by_claim_id[claim.id] = (
+                        "invalid generation key"
                     )
-                    .limit(_PLAYBOOK_NOTIFICATION_RETRY_BATCH_SIZE)
+                    continue
+                if plan_id < 1:
+                    retirement_reason_by_claim_id[claim.id] = (
+                        "invalid generation key"
+                    )
+                    continue
+                plan_id_by_claim_id[claim.id] = plan_id
+                plan_ids.add(plan_id)
+            plans = []
+            if plan_ids:
+                plans = list(
+                    (
+                        await db.execute(
+                            select(TradingPlanVersion).where(
+                                TradingPlanVersion.id.in_(plan_ids)
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
                 )
-            ).scalars().all()
-        for plan in plans:
+            plan_by_id = {plan.id: plan for plan in plans}
+            eligible_plans = []
+            deferred_claim_ids = set()
+            for claim in claims:
+                if claim.id in retirement_reason_by_claim_id:
+                    continue
+                plan = plan_by_id.get(plan_id_by_claim_id[claim.id])
+                if plan is None:
+                    retirement_reason_by_claim_id[claim.id] = "plan missing"
+                    continue
+                if plan.status not in ("draft", "confirmed", "active"):
+                    retirement_reason_by_claim_id[claim.id] = (
+                        f"plan status {plan.status!r} is not notifiable"
+                    )
+                    continue
+                if (
+                    earliest_target_date is not None
+                    and plan.target_trade_date < earliest_target_date
+                ) or (
+                    latest_target_date is not None
+                    and plan.target_trade_date > latest_target_date
+                ):
+                    deferred_claim_ids.add(claim.id)
+                    continue
+                eligible_plans.append(plan)
+
+            for claim in claims:
+                reason = retirement_reason_by_claim_id.get(claim.id)
+                values = None
+                if reason is not None:
+                    values = {
+                        "status": "completed",
+                        "completed_at": now,
+                        "lease_expires_at": None,
+                        "last_error": (
+                            f"notification retry retired: {reason}"
+                        )[:2000],
+                        "updated_at": now,
+                    }
+                elif claim.id in deferred_claim_ids:
+                    values = {
+                        "status": "retry",
+                        "lease_expires_at": now,
+                        "last_error": (
+                            "notification retry deferred: target date "
+                            "outside current window"
+                        ),
+                        "updated_at": now,
+                    }
+                if values is None:
+                    continue
+                await db.execute(
+                    update(TradingPlaybookJobClaim)
+                    .where(
+                        TradingPlaybookJobClaim.id == claim.id,
+                        TradingPlaybookJobClaim.status == claim.status,
+                        TradingPlaybookJobClaim.owner == claim.owner,
+                        TradingPlaybookJobClaim.attempt_no == claim.attempt_no,
+                        TradingPlaybookJobClaim.updated_at == claim.updated_at,
+                        TradingPlaybookJobClaim.status != "completed",
+                    )
+                    .values(**values)
+                )
+            await db.commit()
+        for plan in eligible_plans:
             await self._notify_trading_playbook_plan(plan)
 
     async def _compensate_trading_playbook_phases(
