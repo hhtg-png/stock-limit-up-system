@@ -5,6 +5,7 @@ import unittest
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import AsyncMock
 
 from sqlalchemy import event, func, select
 from sqlalchemy.dialects import postgresql
@@ -16,7 +17,9 @@ from app.models.trading_playbook import (
     TradingExecutionReview,
     TradingPlanCandidate,
     TradingPlanVersion,
+    TradingPlaybookSettings,
 )
+from app.services.trading_playbook.alert_service import TradingPlaybookAlertService
 from app.services.trading_playbook.errors import (
     InvalidTransitionError,
     PlaybookNotFoundError,
@@ -29,6 +32,24 @@ from app.utils.time_utils import CN_TZ
 
 TRADE_DATE = date(2026, 7, 14)
 FINALIZED_AT = CN_TZ.localize(datetime(2026, 7, 14, 15, 31))
+
+
+class _ReviewRecordingChannel:
+    channel_name = "in_app"
+    supports_provider_idempotency = False
+
+    def __init__(self):
+        self.sends = []
+
+    async def send(self, event, *, idempotency_key):
+        self.sends.append((dict(event), idempotency_key))
+        return {"accepted": True}
+
+    async def reconcile(self, *, idempotency_key):
+        return None
+
+    async def healthcheck(self):
+        return {"channel": "in_app", "status": "ready"}
 
 
 class TradingPlaybookReviewSummaryTests(unittest.TestCase):
@@ -294,6 +315,7 @@ class TradingPlaybookReviewPersistenceTests(unittest.IsolatedAsyncioTestCase):
                 TradingPlanCandidate.__table__,
                 TradingAlertEvent.__table__,
                 TradingExecutionReview.__table__,
+                TradingPlaybookSettings.__table__,
                 MarketReviewStockDaily.__table__,
             ):
                 await connection.run_sync(table.create)
@@ -558,6 +580,89 @@ class TradingPlaybookReviewPersistenceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(row.data_quality_json["status"], "ready")
         self.assertNotIn("account_profit", json.dumps(row.signal_review_json))
+
+    async def test_successful_review_build_emits_review_ready_through_shared_alert_service(self):
+        plan_id, _ = await self._add_plan()
+        alert_service = type(
+            "FakeAlertService",
+            (),
+            {"notify_review_ready": AsyncMock()},
+        )()
+        service = TradingPlaybookReviewService(
+            now_provider=lambda: FINALIZED_AT,
+            alert_service=alert_service,
+        )
+
+        async with self.sessions[0]() as db:
+            await service.build(db, TRADE_DATE, finalized=False)
+        async with self.sessions[0]() as db:
+            await service.build(db, TRADE_DATE, finalized=True)
+
+        self.assertEqual(alert_service.notify_review_ready.await_count, 2)
+        for call in alert_service.notify_review_ready.await_args_list:
+            self.assertEqual(call.args[1].id, plan_id)
+            self.assertEqual(call.args[2], TRADE_DATE)
+            self.assertTrue(call.kwargs["send"])
+
+    async def test_alert_failure_leaves_committed_review_for_idempotent_retry(self):
+        await self._add_plan()
+
+        class FailOnceAlertService(TradingPlaybookAlertService):
+            failed = False
+
+            async def _deliver(self, db, event):
+                if not self.failed:
+                    self.failed = True
+                    raise RuntimeError("send failed")
+                return await super()._deliver(db, event)
+
+        channel = _ReviewRecordingChannel()
+        alert_service = FailOnceAlertService(channel)
+        service = TradingPlaybookReviewService(
+            now_provider=lambda: FINALIZED_AT,
+            alert_service=alert_service,
+        )
+
+        async with self.sessions[0]() as db:
+            db.add(
+                TradingPlaybookSettings(
+                    id=1,
+                    enabled=True,
+                    in_app_enabled=True,
+                    wechat_enabled=False,
+                )
+            )
+            await db.commit()
+            with self.assertRaisesRegex(RuntimeError, "send failed"):
+                await service.build(db, TRADE_DATE, finalized=False)
+        async with self.sessions[0]() as db:
+            rows = list((await db.scalars(select(TradingExecutionReview))).all())
+            self.assertEqual(len(rows), 1)
+            events = list(
+                (
+                    await db.scalars(
+                        select(TradingAlertEvent).where(
+                            TradingAlertEvent.event_type == "review_ready"
+                        )
+                    )
+                ).all()
+            )
+            self.assertEqual(len(events), 1)
+        async with self.sessions[0]() as db:
+            retried = await service.build(db, TRADE_DATE, finalized=False)
+            self.assertEqual(len(retried), 1)
+        self.assertEqual(len(channel.sends), 1)
+        async with self.sessions[0]() as db:
+            events = list(
+                (
+                    await db.scalars(
+                        select(TradingAlertEvent).where(
+                            TradingAlertEvent.event_type == "review_ready"
+                        )
+                    )
+                ).all()
+            )
+            self.assertEqual(len(events), 1)
 
     async def test_missing_same_day_outcome_is_explicitly_partial_and_never_falls_back(self):
         await self._add_plan()

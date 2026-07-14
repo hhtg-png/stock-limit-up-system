@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.models.trading_playbook import (
     TradingAlertEvent,
+    TradingExecutionReview,
     TradingModeRule,
     TradingPlanVersion,
     TradingPlaybookSettings,
@@ -575,6 +576,54 @@ async def update_manual_execution(
     except IntegrityError as exc:
         await _rollback_quietly(db)
         raise HTTPException(status_code=409, detail="Review update conflict") from exc
+    except SQLAlchemyError as exc:
+        await _rollback_quietly(db)
+        raise _service_unavailable() from exc
+    except Exception as exc:
+        await _rollback_quietly(db)
+        raise _service_unavailable() from exc
+
+
+@router.get("/reviews", summary="查询交易执行复盘")
+async def list_reviews(
+    trade_date: str = Query(..., pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$"),
+    plan_id: int | None = Query(None, gt=0),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        try:
+            parsed_trade_date = date.fromisoformat(trade_date)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail="trade_date must be a canonical ISO date",
+            ) from exc
+        if trade_date != parsed_trade_date.isoformat():
+            raise HTTPException(
+                status_code=422,
+                detail="trade_date must be a canonical ISO date",
+            )
+        statement = select(TradingExecutionReview).where(
+            TradingExecutionReview.trade_date == parsed_trade_date
+        )
+        if plan_id is not None:
+            statement = statement.where(
+                TradingExecutionReview.plan_version_id == plan_id
+            )
+        rows = list(
+            (
+                await db.scalars(
+                    statement.order_by(
+                        TradingExecutionReview.plan_version_id,
+                        TradingExecutionReview.id,
+                    )
+                )
+            ).all()
+        )
+        return {"items": [_serialize_review(row) for row in rows]}
+    except HTTPException:
+        await _rollback_quietly(db)
+        raise
     except SQLAlchemyError as exc:
         await _rollback_quietly(db)
         raise _service_unavailable() from exc

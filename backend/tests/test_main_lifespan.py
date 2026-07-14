@@ -372,6 +372,10 @@ class MainLifespanTests(unittest.IsolatedAsyncioTestCase):
             async with app_main.lifespan(app_main.app):
                 self.assertIs(scheduler.review_service, review_service)
                 self.assertIs(
+                    review_factory.call_args.kwargs["alert_service"],
+                    scheduler.alert_service,
+                )
+                self.assertIs(
                     trading_playbook_runtime.get_review_service(),
                     review_service,
                 )
@@ -393,7 +397,7 @@ class MainLifespanTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(response.json(), review_payload)
                 review_service.update_manual_execution.assert_awaited_once()
 
-        review_factory.assert_called_once_with()
+        review_factory.assert_called_once()
         self.assertIsNone(scheduler.review_service)
         self.assertIsNone(trading_playbook_runtime.get_review_service())
         self.assertFalse(

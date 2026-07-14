@@ -119,9 +119,11 @@ class TradingPlaybookReviewService:
         *,
         now_provider: Callable[[], datetime] = now_cn,
         outcome_loader: Optional[Callable[..., Any]] = None,
+        alert_service: Any = None,
     ) -> None:
         self._now_provider = now_provider
         self._outcome_loader = outcome_loader or self.load_outcomes
+        self._alert_service = alert_service
 
     @classmethod
     def summarize(
@@ -358,15 +360,24 @@ class TradingPlaybookReviewService:
         rows: list[TradingExecutionReview] = []
         for plan_id in plan_ids:
             row = await self._ensure_review(db, trade_date, plan_id)
-            rows.append(
-                await self._reconcile_review(
-                    db,
-                    row.id,
-                    trade_date,
-                    plan_id,
-                    finalized=finalized,
-                )
+            reconciled = await self._reconcile_review(
+                db,
+                row.id,
+                trade_date,
+                plan_id,
+                finalized=finalized,
             )
+            rows.append(reconciled)
+            if self._alert_service is not None:
+                plan = await db.get(TradingPlanVersion, plan_id)
+                if plan is None:
+                    raise PlaybookNotFoundError("review plan not found")
+                await self._alert_service.notify_review_ready(
+                    db,
+                    plan,
+                    trade_date,
+                    send=True,
+                )
         return rows
 
     async def update_manual_execution(

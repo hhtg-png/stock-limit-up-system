@@ -2,7 +2,7 @@ import asyncio
 import json
 import unittest
 from datetime import date, datetime, timedelta
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI
@@ -25,6 +25,7 @@ from app.api.v1.trading_playbook import (
 from app.database import Base, get_db
 from app.models.trading_playbook import (
     TradingAlertEvent,
+    TradingExecutionReview,
     TradingModeRule,
     TradingPlanCandidate,
     TradingPlanVersion,
@@ -1651,6 +1652,120 @@ class TradingPlaybookApiTests(unittest.TestCase):
         )
         self.assertEqual(invalid.status_code, 422)
 
+    def test_review_list_filters_exactly_and_has_stable_order(self):
+        async def seed_reviews():
+            async with self.Session() as db:
+                db.add_all(
+                    [
+                        TradingExecutionReview(
+                            trade_date=date(2026, 7, 10),
+                            plan_version_id=2,
+                            signal_review_json={"plan": 2},
+                            manual_execution_json={},
+                            plan_compliance_json={},
+                            outcome_snapshot_json={},
+                            data_quality_json={},
+                            generated_at=datetime(2026, 7, 10, 15, 10),
+                        ),
+                        TradingExecutionReview(
+                            trade_date=date(2026, 7, 10),
+                            plan_version_id=1,
+                            signal_review_json={"plan": 1},
+                            manual_execution_json={},
+                            plan_compliance_json={},
+                            outcome_snapshot_json={},
+                            data_quality_json={},
+                            generated_at=datetime(2026, 7, 10, 15, 11),
+                        ),
+                    ]
+                )
+                await db.commit()
+
+        asyncio.run(seed_reviews())
+        response = self.client.get(
+            "/trading-playbook/reviews",
+            params={"trade_date": "2026-07-10"},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            [row["plan_version_id"] for row in response.json()["items"]],
+            [1, 2],
+        )
+        self.assertEqual(
+            set(response.json()["items"][0]),
+            {
+                "id",
+                "trade_date",
+                "plan_version_id",
+                "signal_review_json",
+                "manual_execution_json",
+                "plan_compliance_json",
+                "outcome_snapshot_json",
+                "data_quality_json",
+                "generated_at",
+                "finalized_at",
+            },
+        )
+
+        filtered = self.client.get(
+            "/trading-playbook/reviews",
+            params={"trade_date": "2026-07-10", "plan_id": 2},
+        )
+        self.assertEqual(filtered.status_code, 200, filtered.text)
+        self.assertEqual(
+            [row["plan_version_id"] for row in filtered.json()["items"]],
+            [2],
+        )
+        empty = self.client.get(
+            "/trading-playbook/reviews",
+            params={"trade_date": "2026-07-11"},
+        )
+        self.assertEqual(empty.status_code, 200, empty.text)
+        self.assertEqual(empty.json(), {"items": []})
+
+    def test_review_list_requires_strict_filters(self):
+        self.assertEqual(
+            self.client.get("/trading-playbook/reviews").status_code,
+            422,
+        )
+        self.assertEqual(
+            self.client.get(
+                "/trading-playbook/reviews",
+                params={"trade_date": "2026-07-10T00:00:00", "plan_id": 1},
+            ).status_code,
+            422,
+        )
+        self.assertEqual(
+            self.client.get(
+                "/trading-playbook/reviews",
+                params={"trade_date": "2026-07-10", "plan_id": 0},
+            ).status_code,
+            422,
+        )
+
+    def test_review_list_database_failure_rolls_back_and_returns_safe_503(self):
+        async def fail(*_args, **_kwargs):
+            raise RuntimeError("database secret")
+
+        rollback = AsyncMock()
+        with patch.object(AsyncSession, "scalars", new=fail), patch.object(
+            AsyncSession,
+            "rollback",
+            new=rollback,
+        ), TestClient(self.app, raise_server_exceptions=False) as client:
+            response = client.get(
+                "/trading-playbook/reviews",
+                params={"trade_date": "2026-07-10"},
+            )
+
+        self.assertEqual(response.status_code, 503, response.text)
+        self.assertEqual(
+            response.json()["detail"],
+            "Trading playbook service is unavailable",
+        )
+        self.assertNotIn("secret", response.text)
+        rollback.assert_awaited_once()
+
     def test_review_execution_contract_rejects_false_facts_and_invalid_unplanned(self):
         for field, value in (
             ("execution_price", 10.0),
@@ -1787,8 +1902,8 @@ class TradingPlaybookApiTests(unittest.TestCase):
             if route.path.startswith("/trading-playbook")
             for method in route.methods
         ]
-        self.assertEqual(len(operations), 12)
-        self.assertEqual(len(set(operations)), 12)
+        self.assertEqual(len(operations), 13)
+        self.assertEqual(len(set(operations)), 13)
 
 
 if __name__ == "__main__":

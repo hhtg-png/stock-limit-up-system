@@ -189,6 +189,122 @@ class TradingPlaybookDurableAlertTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
+    async def test_review_ready_is_durable_and_deduplicated_by_trade_date_and_plan(self):
+        from app.services.trading_playbook.alert_service import (
+            TradingPlaybookAlertService,
+        )
+
+        channel = _RecordingInAppChannel()
+        service = TradingPlaybookAlertService(channel)
+        trade_date = date(2026, 7, 14)
+        async with self.Session() as db:
+            first = await service.notify_review_ready(
+                db,
+                self.plan,
+                trade_date,
+                send=True,
+            )
+        async with self.Session() as db:
+            second = await service.notify_review_ready(
+                db,
+                self.plan,
+                trade_date,
+                send=True,
+            )
+
+        events = await self._events()
+        self.assertEqual(first.id, second.id)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].event_type, "review_ready")
+        self.assertEqual(
+            events[0].dedup_key,
+            f"review:{trade_date.isoformat()}:{self.plan_id}:in_app:review_ready",
+        )
+        self.assertEqual(
+            events[0].market_snapshot_json["trade_date"],
+            trade_date.isoformat(),
+        )
+        self.assertEqual(len(channel.sends), 1)
+
+    async def test_review_ready_accepts_superseded_and_expired_reviewed_plans(self):
+        from app.services.trading_playbook.alert_service import (
+            TradingPlaybookAlertService,
+        )
+
+        channel = _RecordingInAppChannel()
+        service = TradingPlaybookAlertService(channel)
+        for offset, status in enumerate(("superseded", "expired")):
+            with self.subTest(status=status):
+                self.plan.status = status
+                async with self.Session() as db:
+                    event_row = await service.notify_review_ready(
+                        db,
+                        self.plan,
+                        date(2026, 7, 14) + timedelta(days=offset),
+                        send=True,
+                    )
+                self.assertEqual(event_row.event_type, "review_ready")
+
+        self.assertEqual(len(await self._events()), 2)
+        self.assertEqual(len(channel.sends), 2)
+
+    async def test_disabled_review_ready_is_terminally_skipped(self):
+        from app.services.trading_playbook.alert_service import (
+            TradingPlaybookAlertService,
+        )
+
+        channel = _RecordingInAppChannel()
+        service = TradingPlaybookAlertService(channel)
+        async with self.Session() as db:
+            settings = await db.get(TradingPlaybookSettings, 1)
+            settings.in_app_enabled = False
+            await db.commit()
+            event_row = await service.notify_review_ready(
+                db,
+                self.plan,
+                date(2026, 7, 14),
+                send=True,
+            )
+
+        status = event_row.channel_status_json["in_app"]
+        self.assertEqual(status["status"], "skipped")
+        self.assertEqual(status["reason"], "disabled")
+        self.assertTrue(status["skipped_at"])
+        self.assertEqual(channel.sends, [])
+
+    async def test_review_ready_accepted_then_commit_failure_is_not_resent(self):
+        from app.services.trading_playbook.alert_service import (
+            TradingPlaybookAlertService,
+        )
+
+        class CrashAfterAcceptance(TradingPlaybookAlertService):
+            async def _mark_delivered(self, *_args, **_kwargs):
+                raise RuntimeError("process died before review delivered commit")
+
+        channel = _RecordingInAppChannel()
+        trade_date = date(2026, 7, 14)
+        crashing = CrashAfterAcceptance(channel)
+        with self.assertRaisesRegex(RuntimeError, "review delivered"):
+            async with self.Session() as db:
+                await crashing.notify_review_ready(
+                    db,
+                    self.plan,
+                    trade_date,
+                    send=True,
+                )
+
+        takeover = TradingPlaybookAlertService(channel)
+        async with self.Session() as db:
+            await takeover.notify_review_ready(
+                db,
+                self.plan,
+                trade_date,
+                send=True,
+            )
+
+        self.assertEqual(len(channel.sends), 1)
+        self.assertEqual(len(await self._events()), 1)
+
     async def test_accepted_send_then_delivered_write_failure_is_not_resent(self):
         from app.services.trading_playbook.alert_service import (
             TradingPlaybookAlertService,

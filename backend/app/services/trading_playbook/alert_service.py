@@ -133,6 +133,12 @@ class TradingPlaybookAlertService:
     def _dedup_key(self, plan_id: int, event_type: str) -> str:
         return f"plan:{plan_id}:{self.channel_name}:{event_type}"
 
+    def _review_dedup_key(self, plan_id: int, trade_date: date) -> str:
+        return (
+            f"review:{trade_date.isoformat()}:{plan_id}:"
+            f"{self.channel_name}:review_ready"
+        )
+
     @staticmethod
     def _message(plan: Any, event_type: str) -> str:
         stage = TradingPlaybookAlertService._plan_value(plan, "stage") or ""
@@ -144,6 +150,8 @@ class TradingPlaybookAlertService:
         )
         if event_type == "confirmation_required":
             return f"交易预案待确认：{target} {stage}"
+        if event_type == "review_ready":
+            return f"交易执行复盘已生成：{target}"
         return f"交易预案已生成：{target} {stage}"
 
     async def notify_plan_ready(self, db, plan: Any, *, send: bool = True):
@@ -185,6 +193,36 @@ class TradingPlaybookAlertService:
                 self._dedup_key(self._plan_value(plan, "id"), event_type),
                 enabled=channel_enabled,
             ),
+        )
+        if send:
+            await self._deliver(db, event)
+        return event
+
+    async def notify_review_ready(
+        self,
+        db,
+        plan: Any,
+        trade_date: date,
+        *,
+        send: bool = True,
+    ) -> TradingAlertEvent:
+        if isinstance(trade_date, datetime) or not isinstance(trade_date, date):
+            raise ValueError("review alert requires a trade date")
+        plan_id = self._plan_value(plan, "id")
+        if not isinstance(plan_id, int):
+            raise ValueError("review alert requires a persisted integer plan id")
+        dedup_key = self._review_dedup_key(plan_id, trade_date)
+        channel_enabled = await self._channel_enabled(db)
+        event = await self._ensure_event(
+            db,
+            plan,
+            "review_ready",
+            initial_channel_status=self._initial_channel_status(
+                dedup_key,
+                enabled=channel_enabled,
+            ),
+            dedup_key=dedup_key,
+            snapshot_extra={"trade_date": trade_date},
         )
         if send:
             await self._deliver(db, event)
@@ -1576,11 +1614,14 @@ class TradingPlaybookAlertService:
         event_type: str,
         *,
         initial_channel_status: Mapping[str, Any],
+        dedup_key: str | None = None,
+        snapshot_extra: Mapping[str, Any] | None = None,
     ) -> TradingAlertEvent:
         plan_id = self._plan_value(plan, "id")
         if not isinstance(plan_id, int):
             raise ValueError("plan alert requires a persisted integer plan id")
-        dedup_key = self._dedup_key(plan_id, event_type)
+        if dedup_key is None:
+            dedup_key = self._dedup_key(plan_id, event_type)
         existing = (
             await db.execute(
                 select(TradingAlertEvent).where(
@@ -1591,6 +1632,18 @@ class TradingPlaybookAlertService:
         if existing is not None:
             return existing
 
+        market_snapshot = {
+            "source_trade_date": self._plan_value(
+                plan, "source_trade_date"
+            ),
+            "target_trade_date": self._plan_value(
+                plan, "target_trade_date"
+            ),
+            "stage": self._plan_value(plan, "stage"),
+            "status": self._plan_value(plan, "status"),
+        }
+        if snapshot_extra:
+            market_snapshot.update(dict(snapshot_extra))
         event = TradingAlertEvent(
             plan_version_id=plan_id,
             event_type=event_type,
@@ -1601,16 +1654,7 @@ class TradingPlaybookAlertService:
             ),
             dedup_key=dedup_key,
             triggered_at=now_cn().replace(tzinfo=None),
-            market_snapshot_json={
-                "source_trade_date": self._plan_value(
-                    plan, "source_trade_date"
-                ),
-                "target_trade_date": self._plan_value(
-                    plan, "target_trade_date"
-                ),
-                "stage": self._plan_value(plan, "stage"),
-                "status": self._plan_value(plan, "status"),
-            },
+            market_snapshot_json=market_snapshot,
             message=self._message(plan, event_type),
             channel_status_json={
                 self.channel_name: copy.deepcopy(

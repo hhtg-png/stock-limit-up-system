@@ -76,7 +76,9 @@ async def lifespan(app: FastAPI):
                 trading_calendar=calendar,
             )
             data_scheduler.install_trading_playbook_alert_service(alert_service)
-            review_service = TradingPlaybookReviewService()
+            review_service = TradingPlaybookReviewService(
+                alert_service=alert_service,
+            )
             data_scheduler.install_trading_playbook_review_service(
                 review_service
             )
