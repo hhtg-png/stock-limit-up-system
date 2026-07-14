@@ -1291,9 +1291,10 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
             async with self.Session() as session:
                 return await self.service.confirm(session, plan_id, user)
 
-        await asyncio.gather(
+        results = await asyncio.gather(
             confirm(first_id, "first-user"),
             confirm(second_id, "second-user"),
+            return_exceptions=True,
         )
 
         async with self.Session() as db:
@@ -1305,7 +1306,108 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
                 )
             ).all()
         self.assertEqual(sum(row.status == "active" for row in plans), 1)
-        self.assertEqual(sum(row.status == "superseded" for row in plans), 1)
+        self.assertEqual(sum(row.status == "draft" for row in plans), 1)
+        self.assertEqual(
+            sum(isinstance(result, InvalidTransitionError) for result in results),
+            1,
+        )
+
+    async def test_file_sqlite_different_drafts_cannot_replace_same_observed_active(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            database_path = Path(directory) / "confirm-drafts.db"
+            url = f"sqlite+aiosqlite:///{database_path.as_posix()}"
+            first_engine = create_async_engine(url, connect_args={"timeout": 5})
+            second_engine = create_async_engine(url, connect_args={"timeout": 5})
+            FirstSession = async_sessionmaker(first_engine, expire_on_commit=False)
+            SecondSession = async_sessionmaker(second_engine, expire_on_commit=False)
+            try:
+                async with first_engine.begin() as connection:
+                    await connection.run_sync(Base.metadata.create_all)
+                async with FirstSession() as setup:
+                    old_active = TradingPlanVersion(
+                        source_trade_date=SOURCE_DATE,
+                        target_trade_date=TARGET_DATE,
+                        stage="preclose",
+                        version_no=1,
+                        status="active",
+                        input_hash="old-active",
+                    )
+                    first_draft = TradingPlanVersion(
+                        source_trade_date=SOURCE_DATE,
+                        target_trade_date=TARGET_DATE,
+                        stage="after_close",
+                        version_no=1,
+                        status="draft",
+                        input_hash="first-draft",
+                    )
+                    second_draft = TradingPlanVersion(
+                        source_trade_date=SOURCE_DATE,
+                        target_trade_date=TARGET_DATE,
+                        stage="overnight",
+                        version_no=1,
+                        status="draft",
+                        input_hash="second-draft",
+                    )
+                    setup.add_all([old_active, first_draft, second_draft])
+                    await setup.commit()
+                    old_id = old_active.id
+                    first_id = first_draft.id
+                    second_id = second_draft.id
+
+                async def confirm(session_factory, plan_id, user):
+                    async with session_factory() as session:
+                        self.assertEqual(
+                            (await session.get(TradingPlanVersion, plan_id)).status,
+                            "draft",
+                        )
+                        return await TradingPlanService().confirm(
+                            session,
+                            plan_id,
+                            user,
+                        )
+
+                results = await asyncio.gather(
+                    confirm(FirstSession, first_id, "worker-one"),
+                    confirm(SecondSession, second_id, "worker-two"),
+                    return_exceptions=True,
+                )
+                self.assertEqual(
+                    sum(
+                        isinstance(result, TradingPlanVersion)
+                        for result in results
+                    ),
+                    1,
+                )
+                self.assertEqual(
+                    sum(
+                        isinstance(result, InvalidTransitionError)
+                        for result in results
+                    ),
+                    1,
+                )
+
+                async with FirstSession() as verify:
+                    winner_id = next(
+                        result.id
+                        for result in results
+                        if isinstance(result, TradingPlanVersion)
+                    )
+                    loser_id = second_id if winner_id == first_id else first_id
+                    self.assertEqual(
+                        (await verify.get(TradingPlanVersion, old_id)).status,
+                        "superseded",
+                    )
+                    self.assertEqual(
+                        (await verify.get(TradingPlanVersion, winner_id)).status,
+                        "active",
+                    )
+                    self.assertEqual(
+                        (await verify.get(TradingPlanVersion, loser_id)).status,
+                        "draft",
+                    )
+            finally:
+                await first_engine.dispose()
+                await second_engine.dispose()
 
     async def test_file_sqlite_confirm_cancel_cas_has_one_winner_in_both_orders(self):
         async def run_order(cancel_first: bool):
@@ -1454,9 +1556,20 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
                         )
                     ).all()
                 self.assertEqual(sum(row.status == "active" for row in plans), 1)
-                self.assertTrue(
-                    sum(row.status == "superseded" for row in plans) == 1
-                    or any(isinstance(result, ValueError) for result in results)
+                self.assertEqual(sum(row.status == "draft" for row in plans), 1)
+                self.assertEqual(
+                    sum(
+                        isinstance(result, TradingPlanVersion)
+                        for result in results
+                    ),
+                    1,
+                )
+                self.assertEqual(
+                    sum(
+                        isinstance(result, InvalidTransitionError)
+                        for result in results
+                    ),
+                    1,
                 )
             finally:
                 await first_engine.dispose()

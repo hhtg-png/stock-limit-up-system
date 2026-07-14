@@ -1676,6 +1676,16 @@ class TradingPlanService:
         if expected_status not in {"draft", "confirmed"}:
             raise InvalidTransitionError("plan cannot be confirmed")
         target_trade_date = plan.target_trade_date
+        observed_active_id = await db.scalar(
+            select(TradingPlanVersion.id)
+            .where(
+                TradingPlanVersion.target_trade_date == target_trade_date,
+                TradingPlanVersion.status == "active",
+                TradingPlanVersion.id != plan_id,
+            )
+            .order_by(TradingPlanVersion.id.desc())
+            .limit(1)
+        )
         lock_key = (db.bind, target_trade_date)
         async with self._lock_manager.hold(lock_key):
             try:
@@ -1693,21 +1703,27 @@ class TradingPlanService:
                 )
                 if claim.rowcount != 1:
                     raise InvalidTransitionError("plan cannot be confirmed")
-                await db.execute(
-                    update(TradingPlanVersion)
-                    .where(
-                        TradingPlanVersion.target_trade_date
-                        == target_trade_date,
-                        TradingPlanVersion.status == "active",
-                        TradingPlanVersion.id != plan_id,
+                if observed_active_id is not None:
+                    active_claim = await db.execute(
+                        update(TradingPlanVersion)
+                        .where(
+                            TradingPlanVersion.id == observed_active_id,
+                            TradingPlanVersion.target_trade_date
+                            == target_trade_date,
+                            TradingPlanVersion.status == "active",
+                        )
+                        .values(status="superseded")
+                        .execution_options(synchronize_session="fetch")
                     )
-                    .values(status="superseded")
-                    .execution_options(synchronize_session="fetch")
-                )
+                    if active_claim.rowcount != 1:
+                        raise InvalidTransitionError(
+                            "active plan changed during confirmation"
+                        )
                 transition = await db.execute(
                     update(TradingPlanVersion)
                     .where(
                         TradingPlanVersion.id == plan_id,
+                        TradingPlanVersion.status == "confirmed",
                     )
                     .values(
                         status="active",
