@@ -259,7 +259,7 @@ class TradingPlaybookAlertService:
             return None
         return snapshot_date if snapshot_date == dedup_date else None
 
-    async def _update_recoverable_action_event(
+    async def _update_recoverable_event(
         self,
         db,
         event: TradingAlertEvent,
@@ -307,6 +307,39 @@ class TradingPlaybookAlertService:
         event.channel_status_json = status
         return True
 
+    async def _recover_sending_for_retry(
+        self,
+        db,
+        event: TradingAlertEvent,
+    ) -> bool:
+        channel_status = copy.deepcopy(
+            dict(
+                (event.channel_status_json or {}).get(self.channel_name)
+                or {}
+            )
+        )
+        if channel_status.get("status") == "pending":
+            return True
+        if (
+            channel_status.get("status") != "sending"
+            or channel_status.get("channel_started_at") is not None
+        ):
+            return False
+        channel_status.update(
+            {
+                "status": "pending",
+                "recovered_at": now_cn().isoformat(),
+                "pre_send_error": "recovered after restart",
+            }
+        )
+        channel_status.pop("owner", None)
+        channel_status.pop("sending_at", None)
+        return await self._update_recoverable_event(
+            db,
+            event,
+            channel_status,
+        )
+
     async def _drain_action_outbox(
         self,
         db,
@@ -345,7 +378,7 @@ class TradingPlaybookAlertService:
                 channel_status.pop("owner", None)
                 channel_status.pop("sending_at", None)
                 channel_status.pop("channel_started_at", None)
-                if await self._update_recoverable_action_event(
+                if await self._update_recoverable_event(
                     db,
                     event,
                     channel_status,
@@ -354,22 +387,6 @@ class TradingPlaybookAlertService:
                 continue
             if action_date > trade_date:
                 continue
-            if channel_status.get("status") == "sending":
-                channel_status.update(
-                    {
-                        "status": "pending",
-                        "recovered_at": now_cn().isoformat(),
-                        "pre_send_error": "recovered after restart",
-                    }
-                )
-                channel_status.pop("owner", None)
-                channel_status.pop("sending_at", None)
-                if not await self._update_recoverable_action_event(
-                    db,
-                    event,
-                    channel_status,
-                ):
-                    continue
             await self._deliver(db, event)
             drained.append(event)
         await db.commit()
@@ -1806,16 +1823,28 @@ class TradingPlaybookAlertService:
                     or channel_status.get("owner") != self.owner
                 ):
                     return
-                channel_status.update(
-                    {
-                        "status": "pending",
-                        "pre_send_error": str(error),
-                        "recovered_at": now_cn().isoformat(),
-                    }
+                channel_started_at = channel_status.get(
+                    "channel_started_at"
                 )
-                channel_status.pop("owner", None)
-                channel_status.pop("sending_at", None)
-                channel_status.pop("channel_started_at", None)
+                if channel_started_at is None:
+                    channel_status.update(
+                        {
+                            "status": "pending",
+                            "pre_send_error": str(error),
+                            "recovered_at": now_cn().isoformat(),
+                        }
+                    )
+                    channel_status.pop("owner", None)
+                    channel_status.pop("sending_at", None)
+                    channel_status.pop("channel_started_at", None)
+                else:
+                    channel_status.update(
+                        {
+                            "status": "uncertain",
+                            "error": str(error),
+                            "uncertain_at": now_cn().isoformat(),
+                        }
+                    )
                 status[self.channel_name] = channel_status
                 status_path = TradingAlertEvent.channel_status_json[
                     self.channel_name
@@ -1823,12 +1852,20 @@ class TradingPlaybookAlertService:
                 owner_path = TradingAlertEvent.channel_status_json[
                     self.channel_name
                 ]["owner"].as_string()
+                channel_started_path = TradingAlertEvent.channel_status_json[
+                    self.channel_name
+                ]["channel_started_at"].as_string()
                 result = await fresh_db.execute(
                     update(TradingAlertEvent)
                     .where(
                         TradingAlertEvent.id == event_id,
                         status_path == "sending",
                         owner_path == self.owner,
+                        (
+                            channel_started_path.is_(None)
+                            if channel_started_at is None
+                            else channel_started_path == channel_started_at
+                        ),
                     )
                     .values(channel_status_json=status)
                 )
@@ -1846,6 +1883,8 @@ class TradingPlaybookAlertService:
             )
 
     async def _deliver(self, db, event: TradingAlertEvent) -> None:
+        if not await self._recover_sending_for_retry(db, event):
+            return
         if not await self._claim_pending(db, event):
             return
         try:

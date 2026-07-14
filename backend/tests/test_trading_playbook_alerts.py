@@ -433,7 +433,7 @@ class TradingPlaybookDurableAlertTests(unittest.IsolatedAsyncioTestCase):
             "delivered",
         )
 
-    async def test_second_settings_lock_failure_after_fence_recovers_before_send(self):
+    async def test_second_settings_lock_failure_after_marker_is_uncertain(self):
         from app.services.trading_playbook.alert_service import (
             TradingPlaybookAlertService,
         )
@@ -476,11 +476,15 @@ class TradingPlaybookDurableAlertTests(unittest.IsolatedAsyncioTestCase):
         persisted = (await self._events())[0]
         self.assertEqual(
             persisted.channel_status_json["in_app"]["status"],
-            "pending",
+            "uncertain",
         )
         self.assertIn(
             "second settings lock failed",
-            persisted.channel_status_json["in_app"]["pre_send_error"],
+            persisted.channel_status_json["in_app"]["error"],
+        )
+        self.assertIn(
+            "channel_started_at",
+            persisted.channel_status_json["in_app"],
         )
 
         restarted = TradingPlaybookAlertService(
@@ -490,7 +494,72 @@ class TradingPlaybookDurableAlertTests(unittest.IsolatedAsyncioTestCase):
         async with self.SecondSession() as db:
             row = await db.get(TradingAlertEvent, event_id)
             await restarted._deliver(db, row)
-        self.assertEqual(len(channel.sends), 1)
+        self.assertEqual(channel.sends, [])
+
+    async def test_cancellation_after_channel_marker_is_uncertain(self):
+        from app.services.trading_playbook.alert_service import (
+            TradingPlaybookAlertService,
+        )
+
+        channel = _RecordingInAppChannel()
+        service = TradingPlaybookAlertService(
+            channel,
+            session_factory=self.SecondSession,
+        )
+        async with self.Session() as db:
+            row = await service.emit_plan_event(
+                db,
+                self.plan,
+                event_type="plan_ready",
+                send=False,
+            )
+            event_id = row.id
+
+        lock_settings = service._lock_delivery_settings
+        second_lock_started = asyncio.Event()
+        lock_calls = 0
+
+        async def block_second_lock(db):
+            nonlocal lock_calls
+            lock_calls += 1
+            if lock_calls == 2:
+                second_lock_started.set()
+                await asyncio.Event().wait()
+            return await lock_settings(db)
+
+        service._lock_delivery_settings = block_second_lock
+
+        async def deliver():
+            async with self.Session() as db:
+                row = await db.get(TradingAlertEvent, event_id)
+                await service._deliver(db, row)
+
+        task = asyncio.create_task(deliver())
+        await asyncio.wait_for(second_lock_started.wait(), timeout=2)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        self.assertEqual(lock_calls, 2)
+        self.assertEqual(channel.sends, [])
+        persisted = (await self._events())[0]
+        self.assertEqual(
+            persisted.channel_status_json["in_app"]["status"],
+            "uncertain",
+        )
+        self.assertIn(
+            "channel_started_at",
+            persisted.channel_status_json["in_app"],
+        )
+
+        restarted = TradingPlaybookAlertService(
+            channel,
+            session_factory=self.Session,
+        )
+        async with self.SecondSession() as db:
+            row = await db.get(TradingAlertEvent, event_id)
+            await restarted._deliver(db, row)
+        self.assertEqual(channel.sends, [])
 
     async def test_cancellation_before_channel_fence_recovers_then_reraises(self):
         from app.services.trading_playbook.alert_service import (
@@ -534,6 +603,157 @@ class TradingPlaybookDurableAlertTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             (await self._events())[0].channel_status_json["in_app"]["status"],
             "pending",
+        )
+
+    async def test_restart_recovers_both_plan_events_left_before_channel_start(self):
+        from app.services.trading_playbook.alert_service import (
+            TradingPlaybookAlertService,
+        )
+
+        channel = _RecordingInAppChannel()
+        seeder = TradingPlaybookAlertService(channel)
+        event_ids = []
+        for event_type in ("plan_ready", "confirmation_required"):
+            async with self.Session() as db:
+                row = await seeder.emit_plan_event(
+                    db,
+                    self.plan,
+                    event_type=event_type,
+                    send=False,
+                )
+                status = dict(row.channel_status_json or {})
+                channel_status = dict(status["in_app"])
+                channel_status.update(
+                    {
+                        "status": "sending",
+                        "owner": "crashed-worker",
+                        "sending_at": "2026-07-14T10:00:00+08:00",
+                    }
+                )
+                status["in_app"] = channel_status
+                row.channel_status_json = status
+                await db.commit()
+                event_ids.append(row.id)
+
+        restarted = TradingPlaybookAlertService(
+            channel,
+            session_factory=self.SecondSession,
+        )
+        for event_type in ("plan_ready", "confirmation_required"):
+            async with self.SecondSession() as db:
+                await restarted.emit_plan_event(
+                    db,
+                    self.plan,
+                    event_type=event_type,
+                    send=True,
+                )
+
+        self.assertEqual(
+            [payload[0]["event_type"] for payload in channel.sends],
+            ["plan_ready", "confirmation_required"],
+        )
+        events = {event.id: event for event in await self._events()}
+        self.assertTrue(
+            all(
+                events[event_id].channel_status_json["in_app"]["status"]
+                == "delivered"
+                for event_id in event_ids
+            )
+        )
+
+    async def test_restart_never_recovers_plan_event_after_channel_marker(self):
+        from app.services.trading_playbook.alert_service import (
+            TradingPlaybookAlertService,
+        )
+
+        channel = _RecordingInAppChannel()
+        service = TradingPlaybookAlertService(channel)
+        async with self.Session() as db:
+            row = await service.emit_plan_event(
+                db,
+                self.plan,
+                event_type="plan_ready",
+                send=False,
+            )
+            status = dict(row.channel_status_json or {})
+            channel_status = dict(status["in_app"])
+            channel_status.update(
+                {
+                    "status": "sending",
+                    "owner": "crashed-after-marker",
+                    "sending_at": "2026-07-14T10:00:00+08:00",
+                    "channel_started_at": "2026-07-14T10:00:01+08:00",
+                }
+            )
+            status["in_app"] = channel_status
+            row.channel_status_json = status
+            await db.commit()
+            event_id = row.id
+
+        restarted = TradingPlaybookAlertService(
+            channel,
+            session_factory=self.SecondSession,
+        )
+        async with self.SecondSession() as db:
+            await restarted.emit_plan_event(
+                db,
+                self.plan,
+                event_type="plan_ready",
+                send=True,
+            )
+
+        self.assertEqual(channel.sends, [])
+        event = next(item for item in await self._events() if item.id == event_id)
+        self.assertEqual(
+            event.channel_status_json["in_app"]["status"],
+            "sending",
+        )
+        self.assertIn(
+            "channel_started_at",
+            event.channel_status_json["in_app"],
+        )
+
+    async def test_pre_send_takeover_fences_original_owner_before_channel_call(self):
+        from app.services.trading_playbook.alert_service import (
+            TradingAlertDeliveryStateLost,
+            TradingPlaybookAlertService,
+        )
+
+        first_channel = _RecordingInAppChannel()
+        second_channel = _RecordingInAppChannel()
+        first = TradingPlaybookAlertService(first_channel)
+        second = TradingPlaybookAlertService(
+            second_channel,
+            session_factory=self.SecondSession,
+        )
+        async with self.Session() as db:
+            row = await first.emit_plan_event(
+                db,
+                self.plan,
+                event_type="plan_ready",
+                send=False,
+            )
+            event_id = row.id
+
+        async with self.Session() as first_db:
+            first_row = await first_db.get(TradingAlertEvent, event_id)
+            self.assertTrue(await first._claim_pending(first_db, first_row))
+
+            async with self.SecondSession() as second_db:
+                second_row = await second_db.get(
+                    TradingAlertEvent,
+                    event_id,
+                )
+                await second._deliver(second_db, second_row)
+
+            with self.assertRaises(TradingAlertDeliveryStateLost):
+                await first._mark_channel_started(first_db, first_row)
+
+        self.assertEqual(first_channel.sends, [])
+        self.assertEqual(len(second_channel.sends), 1)
+        self.assertEqual(
+            (await self._events())[0].channel_status_json["in_app"]["status"],
+            "delivered",
         )
 
     async def test_cancel_swallowed_after_acceptance_then_takeover_does_not_resend(self):
