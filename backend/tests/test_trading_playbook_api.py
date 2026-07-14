@@ -337,6 +337,156 @@ class TradingPlaybookApiTests(unittest.TestCase):
         self.assertEqual(len(response.json()["candidates"]), 1)
         self.assertNotIn("_sa_instance_state", response.json())
 
+    def test_plan_responses_normalize_nonfinite_audit_history(self):
+        async def corrupt_audit_history():
+            async with self.Session() as db:
+                plan = await db.get(TradingPlanVersion, 1)
+                plan.market_state_json = {
+                    "breadth_score": float("nan"),
+                    "extremes": [float("inf"), float("-inf")],
+                }
+                plan.mode_radar_json = [
+                    {"mode_key": "a_mode", "score": float("nan")}
+                ]
+                candidate = await db.get(TradingPlanCandidate, 1)
+                candidate.recognition_json = {"audit_score": float("inf")}
+                await db.commit()
+
+        asyncio.run(corrupt_audit_history())
+        response = self.client.get("/trading-playbook/plans/1")
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual(payload["market_state_json"]["breadth_score"], "NaN")
+        self.assertEqual(
+            payload["market_state_json"]["extremes"],
+            ["Infinity", "-Infinity"],
+        )
+        self.assertEqual(payload["mode_radar_json"][0]["score"], "NaN")
+        self.assertEqual(
+            payload["candidates"][0]["recognition_json"]["audit_score"],
+            "Infinity",
+        )
+
+    def test_every_plan_endpoint_rejects_nonfinite_strong_history_with_fixed_503(self):
+        async def add_bad_plan(index: int):
+            target = date(2026, 7, 20 + index)
+            async with self.Session() as db:
+                plan = TradingPlanVersion(
+                    source_trade_date=date(2026, 7, 10),
+                    target_trade_date=target,
+                    stage="after_close",
+                    version_no=1,
+                    status="draft",
+                    risk_settings_json={
+                        "trial": 10.0,
+                        "confirmed": 30.0,
+                        "hard_stop": 5.0,
+                        "max_candidates": 3,
+                    },
+                    input_hash=f"bad-plan-{index}",
+                    generated_at=datetime(2026, 7, 10, 15, 30),
+                )
+                db.add(plan)
+                await db.flush()
+                db.add(
+                    TradingPlanCandidate(
+                        plan_version_id=plan.id,
+                        stock_code=f"00{index:04d}",
+                        stock_name=f"bad-{index}",
+                        action_trade_date=target,
+                        theme_name="history",
+                        primary_mode_key="a_mode",
+                        role="leader",
+                        rank=1,
+                        entry_trigger_json={"reference_price": 10.0},
+                        invalidation_json={"price_lte": 9.5},
+                        exit_trigger_json={"label": "exit"},
+                        risk_level="trial",
+                        position_reference=float("inf"),
+                        status="waiting",
+                    )
+                )
+                await db.commit()
+                return plan.id, target
+
+        plans = [asyncio.run(add_bad_plan(index)) for index in range(1, 7)]
+        list_id, list_date = plans[0]
+        requests = [
+            lambda: self.client.get(
+                "/trading-playbook/plans",
+                params={"trade_date": list_date.isoformat()},
+            ),
+            lambda: self.client.get(f"/trading-playbook/plans/{plans[1][0]}"),
+            lambda: self.client.put(
+                f"/trading-playbook/plans/{plans[3][0]}",
+                json={"change_note": "must reject unsafe history"},
+            ),
+            lambda: self.client.post(
+                f"/trading-playbook/plans/{plans[4][0]}/confirm",
+                json={"confirmed_by": "local-user"},
+            ),
+            lambda: self.client.post(
+                f"/trading-playbook/plans/{plans[5][0]}/cancel"
+            ),
+        ]
+
+        async def return_bad_plan(db, *_args, **_kwargs):
+            return await db.get(TradingPlanVersion, plans[2][0])
+
+        self.orchestrator.build_stage = return_bad_plan
+        requests.insert(
+            2,
+            lambda: self.client.post(
+                "/trading-playbook/plans/generate",
+                json={
+                    "source_trade_date": "2026-07-10",
+                    "stage": "after_close",
+                },
+            ),
+        )
+        for request in requests:
+            with self.subTest(request=request):
+                response = request()
+                self.assertEqual(response.status_code, 503, response.text)
+                self.assertEqual(
+                    response.json()["detail"],
+                    "Trading playbook service is unavailable",
+                )
+                self.assertNotIn("inf", response.text.lower())
+
+        async def statuses_and_children():
+            async with self.Session() as db:
+                statuses = [
+                    (await db.get(TradingPlanVersion, plan_id)).status
+                    for plan_id, _target in plans
+                ]
+                count = await db.scalar(
+                    text(
+                        "SELECT count(*) FROM trading_plan_versions "
+                        "WHERE parent_plan_version_id IS NOT NULL"
+                    )
+                )
+                return statuses, count
+
+        statuses, child_count = asyncio.run(statuses_and_children())
+        self.assertEqual(statuses, ["draft"] * 6)
+        self.assertEqual(child_count, 0)
+
+    def test_plan_response_rejects_nonfinite_risk_setting(self):
+        async def corrupt_risk_history():
+            async with self.Session() as db:
+                plan = await db.get(TradingPlanVersion, 1)
+                plan.risk_settings_json = {"hard_stop": float("nan")}
+                await db.commit()
+
+        asyncio.run(corrupt_risk_history())
+        response = self.client.get("/trading-playbook/plans/1")
+        self.assertEqual(response.status_code, 503, response.text)
+        self.assertEqual(
+            response.json()["detail"],
+            "Trading playbook service is unavailable",
+        )
+
     def test_generate_and_review_are_503_until_production_dependencies_exist(self):
         app = FastAPI()
         app.include_router(router, prefix="/trading-playbook")

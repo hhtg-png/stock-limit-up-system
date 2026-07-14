@@ -102,7 +102,13 @@ def _json_value(value: Any) -> Any:
     if value is None or isinstance(value, (str, bool, int)):
         return value
     if isinstance(value, float):
-        return value if math.isfinite(value) else str(value)
+        if math.isnan(value):
+            return "NaN"
+        if value == math.inf:
+            return "Infinity"
+        if value == -math.inf:
+            return "-Infinity"
+        return value
     if isinstance(value, datetime):
         return _china_iso(value)
     if isinstance(value, date):
@@ -112,6 +118,72 @@ def _json_value(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_json_value(item) for item in value]
     return str(value)
+
+
+def _reject_nonfinite_numbers(value: Any) -> None:
+    if isinstance(value, bool) or value is None:
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise UnsafePlanDataError("plan contains an unsafe numeric value")
+        return
+    if isinstance(value, Mapping):
+        for item in value.values():
+            _reject_nonfinite_numbers(item)
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            _reject_nonfinite_numbers(item)
+
+
+def _normalize_plan_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    detached = copy.deepcopy(dict(payload))
+    for risk_key in ("risk_settings_json", "risk_settings"):
+        if risk_key in detached:
+            _reject_nonfinite_numbers(detached[risk_key])
+    candidates = detached.get("candidates", [])
+    if not isinstance(candidates, list):
+        raise UnsafePlanDataError("plan candidates are malformed")
+    for candidate in candidates:
+        if not isinstance(candidate, Mapping):
+            raise UnsafePlanDataError("plan candidate is malformed")
+        position = candidate.get("position_reference")
+        if (
+            isinstance(position, bool)
+            or not isinstance(position, (int, float))
+        ):
+            raise UnsafePlanDataError("candidate position is malformed")
+        try:
+            position_is_finite = math.isfinite(float(position))
+        except (OverflowError, TypeError, ValueError):
+            position_is_finite = False
+        if not position_is_finite:
+            raise UnsafePlanDataError("candidate position is unsafe")
+        for trigger_key in (
+            "entry_trigger_json",
+            "invalidation_json",
+            "exit_trigger_json",
+        ):
+            _reject_nonfinite_numbers(candidate.get(trigger_key))
+    return _json_value(detached)
+
+
+async def _serialize_plan_response(
+    db: AsyncSession,
+    plan_or_id: TradingPlanVersion | int,
+) -> dict[str, Any] | None:
+    try:
+        payload = await _plan_service.serialize(db, plan_or_id)
+        if payload is None:
+            return None
+        return _normalize_plan_payload(payload)
+    except HTTPException:
+        raise
+    except (UnsafePlanDataError, OverflowError, TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=SERVICE_UNAVAILABLE_DETAIL,
+        ) from exc
 
 
 def _priority(rule: TradingModeRule) -> tuple[int, float]:
@@ -244,9 +316,9 @@ async def generate_plan(
             now.astimezone(CN_TZ),
         )
         if isinstance(result, TradingPlanVersion):
-            return await _plan_service.serialize(db, result)
+            return await _serialize_plan_response(db, result)
         if isinstance(result, Mapping):
-            return _json_value(copy.deepcopy(dict(result)))
+            return _normalize_plan_payload(result)
         raise HTTPException(
             status_code=503,
             detail="Trading playbook pipeline returned an invalid result",
@@ -311,13 +383,13 @@ async def list_plans(
         ).all()
     )
     return {
-        "items": [await _plan_service.serialize(db, plan) for plan in plans]
+        "items": [await _serialize_plan_response(db, plan) for plan in plans]
     }
 
 
 @router.get("/plans/{plan_id}", summary="查询预案详情")
 async def get_plan(plan_id: int, db: AsyncSession = Depends(get_db)):
-    payload = await _plan_service.serialize(db, plan_id)
+    payload = await _serialize_plan_response(db, plan_id)
     if payload is None:
         raise HTTPException(status_code=404, detail="Trading plan not found")
     return payload
@@ -331,8 +403,11 @@ async def revise_plan(
 ):
     changes = request.model_dump(mode="python", exclude_unset=True)
     try:
+        await _serialize_plan_response(db, plan_id)
         child = await _plan_service.revise(db, plan_id, changes)
-        return await _plan_service.serialize(db, child)
+        return await _serialize_plan_response(db, child)
+    except HTTPException:
+        raise
     except PlaybookNotFoundError as exc:
         raise HTTPException(status_code=404, detail=NOT_FOUND_DETAIL) from exc
     except InvalidRequestError as exc:
@@ -363,8 +438,11 @@ async def confirm_plan(
     db: AsyncSession = Depends(get_db),
 ):
     try:
+        await _serialize_plan_response(db, plan_id)
         plan = await _plan_service.confirm(db, plan_id, request.confirmed_by)
-        return await _plan_service.serialize(db, plan)
+        return await _serialize_plan_response(db, plan)
+    except HTTPException:
+        raise
     except PlaybookNotFoundError as exc:
         raise HTTPException(status_code=404, detail=NOT_FOUND_DETAIL) from exc
     except InvalidRequestError as exc:
@@ -391,8 +469,11 @@ async def confirm_plan(
 @router.post("/plans/{plan_id}/cancel", summary="取消预案")
 async def cancel_plan(plan_id: int, db: AsyncSession = Depends(get_db)):
     try:
+        await _serialize_plan_response(db, plan_id)
         plan = await _plan_service.cancel(db, plan_id)
-        return await _plan_service.serialize(db, plan)
+        return await _serialize_plan_response(db, plan)
+    except HTTPException:
+        raise
     except PlaybookNotFoundError as exc:
         raise HTTPException(status_code=404, detail=NOT_FOUND_DETAIL) from exc
     except InvalidTransitionError as exc:
