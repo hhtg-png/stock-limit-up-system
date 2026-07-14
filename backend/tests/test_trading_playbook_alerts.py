@@ -6,7 +6,7 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from sqlalchemy import select
+from sqlalchemy import event, select
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -166,6 +166,93 @@ class TradingPlaybookDurableAlertTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(channel.sends), 1)
         self.assertEqual(len(await self._events()), 1)
+
+    async def test_real_delivered_commit_failure_uses_fresh_compensation(self):
+        from app.data_collectors.scheduler import DataScheduler
+        from app.models.trading_playbook import TradingPlaybookJobClaim
+        from app.services.trading_playbook.alert_service import (
+            TradingPlaybookAlertService,
+        )
+        from app.utils.time_utils import CN_TZ
+
+        channel = _RecordingInAppChannel()
+        service = TradingPlaybookAlertService(
+            channel,
+            session_factory=self.SecondSession,
+        )
+        scheduler = DataScheduler(
+            trading_playbook_alert_service=service,
+            session_factory=self.Session,
+            now_provider=lambda: CN_TZ.localize(
+                datetime(2026, 7, 13, 15, 35)
+            ),
+        )
+        commits = 0
+        injected = False
+
+        def fail_delivered_commit(_connection):
+            nonlocal commits, injected
+            commits += 1
+            if commits == 5 and not injected:
+                injected = True
+                raise RuntimeError("real delivered commit failure")
+
+        event.listen(self.engine.sync_engine, "commit", fail_delivered_commit)
+        try:
+            result = await scheduler._notify_trading_playbook_plan(self.plan)
+        finally:
+            event.remove(
+                self.engine.sync_engine,
+                "commit",
+                fail_delivered_commit,
+            )
+
+        self.assertIsNone(result)
+        self.assertTrue(injected)
+        events = await self._events()
+        statuses = {
+            row.event_type: row.channel_status_json["in_app"]["status"]
+            for row in events
+        }
+        self.assertEqual(statuses["plan_ready"], "uncertain")
+        self.assertEqual(statuses["confirmation_required"], "pending")
+        self.assertEqual(
+            sum(
+                payload["event_type"] == "plan_ready"
+                for payload, _key in channel.sends
+            ),
+            1,
+        )
+        async with self.Session() as db:
+            claim = (
+                await db.execute(select(TradingPlaybookJobClaim))
+            ).scalar_one()
+        self.assertEqual(claim.status, "retry")
+
+        await scheduler._notify_trading_playbook_plan(self.plan)
+        events = await self._events()
+        self.assertEqual(
+            sum(
+                payload["event_type"] == "plan_ready"
+                for payload, _key in channel.sends
+            ),
+            1,
+        )
+        self.assertEqual(
+            sum(
+                payload["event_type"] == "confirmation_required"
+                for payload, _key in channel.sends
+            ),
+            1,
+        )
+        self.assertTrue(
+            any(
+                row.event_type == "confirmation_required"
+                and row.channel_status_json["in_app"]["status"]
+                == "delivered"
+                for row in events
+            )
+        )
 
     async def test_cancel_swallowed_after_acceptance_then_takeover_does_not_resend(self):
         from app.data_collectors.scheduler import (

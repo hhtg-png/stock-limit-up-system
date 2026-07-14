@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
 from app.config import settings
-from app.database import init_db, close_db
+from app.database import async_session_maker, init_db, close_db
 from app.api.v1 import api_router
 from app.api.v1.websocket import router as ws_router
 from app.core.event_bus import event_bus
@@ -62,7 +62,8 @@ async def lifespan(app: FastAPI):
             )
             data_scheduler.install_trading_playbook_orchestrator(orchestrator)
             alert_service = TradingPlaybookAlertService(
-                InAppTradingPlanAlertChannel()
+                InAppTradingPlanAlertChannel(),
+                session_factory=async_session_maker,
             )
             data_scheduler.install_trading_playbook_alert_service(alert_service)
             trading_playbook_runtime.install_orchestrator(orchestrator)

@@ -251,6 +251,10 @@ class MainLifespanTests(unittest.IsolatedAsyncioTestCase):
                     app_main.app.state.trading_playbook_alert_service,
                     scheduler.alert_service,
                 )
+                self.assertIs(
+                    scheduler.alert_service.session_factory,
+                    app_main.async_session_maker,
+                )
                 transport = httpx.ASGITransport(app=app_main.app)
                 async with httpx.AsyncClient(
                     transport=transport,

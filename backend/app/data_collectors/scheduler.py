@@ -566,13 +566,13 @@ class DataScheduler:
                             **build_kwargs,
                         ),
                     )
-                except BaseException as exc:
-                    await self._playbook_job_claims.fail(
-                        db,
-                        token,
-                        now=self._claim_now(),
-                        error=exc,
-                    )
+                except asyncio.CancelledError as exc:
+                    await self._rollback_playbook_session(db)
+                    await self._fail_playbook_claim_fresh(token, exc)
+                    raise
+                except Exception as exc:
+                    await self._rollback_playbook_session(db)
+                    await self._fail_playbook_claim_fresh(token, exc)
                     if isinstance(exc, TradingPlaybookClaimLost):
                         logger.error("{}", exc)
                         return None
@@ -591,6 +591,31 @@ class DataScheduler:
 
     def _claim_now(self) -> datetime:
         return self._playbook_now().replace(tzinfo=None)
+
+    @staticmethod
+    async def _rollback_playbook_session(db) -> None:
+        try:
+            await db.rollback()
+        except Exception as exc:
+            logger.error("Trading playbook session rollback failed: {}", exc)
+
+    async def _fail_playbook_claim_fresh(self, token, error) -> bool:
+        """Mark retry without relying on a possibly broken business session."""
+        try:
+            async with self._playbook_sessions() as fail_db:
+                return await self._playbook_job_claims.fail(
+                    fail_db,
+                    token,
+                    now=self._claim_now(),
+                    error=error,
+                )
+        except Exception as fail_error:
+            logger.error(
+                "Trading playbook fresh claim failure update failed for {}: {}",
+                token.job_key,
+                fail_error,
+            )
+            return False
 
     async def _run_with_playbook_claim(self, token, operation):
         """Run work behind a renewable lease and cancel immediately if fenced."""
@@ -749,22 +774,15 @@ class DataScheduler:
                 except Exception:
                     return None
                 if token is not None:
-                    await self._playbook_job_claims.fail(
-                        db,
+                    await self._fail_playbook_claim_fresh(
                         token,
-                        now=self._claim_now(),
-                        error=claim_error,
+                        claim_error,
                     )
                 return None
             if token is None:
                 return None
             if date_error is not None:
-                await self._playbook_job_claims.fail(
-                    db,
-                    token,
-                    now=self._claim_now(),
-                    error=date_error,
-                )
+                await self._fail_playbook_claim_fresh(token, date_error)
                 logger.error("Trading playbook notification payload invalid: {}", date_error)
                 return None
             try:
@@ -772,13 +790,13 @@ class DataScheduler:
                     token,
                     lambda: notify(db, plan, send=True),
                 )
-            except BaseException as exc:
-                await self._playbook_job_claims.fail(
-                    db,
-                    token,
-                    now=self._claim_now(),
-                    error=exc,
-                )
+            except asyncio.CancelledError as exc:
+                await self._rollback_playbook_session(db)
+                await self._fail_playbook_claim_fresh(token, exc)
+                raise
+            except Exception as exc:
+                await self._rollback_playbook_session(db)
+                await self._fail_playbook_claim_fresh(token, exc)
                 logger.error("Trading playbook notification failed: {}", exc)
                 return None
             completed = await self._playbook_job_claims.complete(
@@ -863,13 +881,13 @@ class DataScheduler:
                     token,
                     lambda: build(db, review_date, finalized=finalized),
                 )
-            except BaseException as exc:
-                await self._playbook_job_claims.fail(
-                    db,
-                    token,
-                    now=self._claim_now(),
-                    error=exc,
-                )
+            except asyncio.CancelledError as exc:
+                await self._rollback_playbook_session(db)
+                await self._fail_playbook_claim_fresh(token, exc)
+                raise
+            except Exception as exc:
+                await self._rollback_playbook_session(db)
+                await self._fail_playbook_claim_fresh(token, exc)
                 logger.error("Trading playbook {} failed: {}", phase, exc)
                 return None
             completed = await self._playbook_job_claims.complete(

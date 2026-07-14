@@ -34,7 +34,12 @@ class TradingPlaybookAlertService:
 
     durable_delivery = True
 
-    def __init__(self, channel: TradingPlanAlertChannel) -> None:
+    def __init__(
+        self,
+        channel: TradingPlanAlertChannel,
+        *,
+        session_factory=None,
+    ) -> None:
         if not isinstance(channel, TradingPlanAlertChannel):
             raise TypeError(
                 "alert channel must provide send, reconcile and capability metadata"
@@ -51,6 +56,7 @@ class TradingPlaybookAlertService:
         self.channel = channel
         self.channel_name = name
         self.owner = uuid.uuid4().hex
+        self.session_factory = session_factory
 
     @staticmethod
     def _plan_value(plan: Any, key: str) -> Any:
@@ -258,7 +264,95 @@ class TradingPlaybookAlertService:
         except Exception as exc:
             await self._mark_uncertain_safely(db, event.id, exc)
             raise
-        await self._mark_delivered(db, event.id, receipt=receipt)
+        try:
+            await self._mark_delivered(db, event.id, receipt=receipt)
+        except asyncio.CancelledError as exc:
+            await self._recover_accepted_delivery(
+                db,
+                event.id,
+                receipt=receipt,
+                error=exc,
+            )
+            raise
+        except Exception as exc:
+            await self._recover_accepted_delivery(
+                db,
+                event.id,
+                receipt=receipt,
+                error=exc,
+            )
+            raise
+
+    async def _recover_accepted_delivery(
+        self,
+        db,
+        event_id: int,
+        *,
+        receipt: Mapping[str, Any],
+        error: BaseException,
+    ) -> None:
+        try:
+            await db.rollback()
+        except Exception as rollback_error:
+            logger.error(
+                "Unable to rollback failed alert delivery session for {}: {}",
+                event_id,
+                rollback_error,
+            )
+        if self.session_factory is None:
+            return
+        try:
+            async with self.session_factory() as fresh_db:
+                event = await fresh_db.get(TradingAlertEvent, event_id)
+                if event is None:
+                    return
+                status = copy.deepcopy(event.channel_status_json or {})
+                channel_status = dict(status.get(self.channel_name) or {})
+                current = channel_status.get("status")
+                if current == "delivered":
+                    return
+                if (
+                    current != "sending"
+                    or channel_status.get("owner") != self.owner
+                ):
+                    return
+                channel_status.update(
+                    {
+                        "status": "uncertain",
+                        "uncertain_at": now_cn().isoformat(),
+                        "accepted": True,
+                        "receipt": copy.deepcopy(dict(receipt or {})),
+                        "error": str(error),
+                    }
+                )
+                status[self.channel_name] = channel_status
+                status_path = TradingAlertEvent.channel_status_json[
+                    self.channel_name
+                ]["status"].as_string()
+                owner_path = TradingAlertEvent.channel_status_json[
+                    self.channel_name
+                ]["owner"].as_string()
+                result = await fresh_db.execute(
+                    update(TradingAlertEvent)
+                    .where(
+                        TradingAlertEvent.id == event_id,
+                        status_path == "sending",
+                        owner_path == self.owner,
+                    )
+                    .values(channel_status_json=status)
+                )
+                await fresh_db.commit()
+                if result.rowcount != 1:
+                    logger.error(
+                        "Fresh alert compensation lost state for event {}",
+                        event_id,
+                    )
+        except Exception as compensation_error:
+            logger.error(
+                "Unable to compensate accepted alert delivery for {}: {}",
+                event_id,
+                compensation_error,
+            )
 
     async def _mark_uncertain_safely(
         self,
@@ -287,14 +381,23 @@ class TradingPlaybookAlertService:
     ) -> None:
         event = await db.get(TradingAlertEvent, event_id)
         if event is None:
-            return
+            raise TradingAlertDeliveryStateLost(
+                f"alert delivery event missing: {event_id}"
+            )
         status = copy.deepcopy(event.channel_status_json or {})
         channel_status = dict(status.get(self.channel_name) or {})
+        if (
+            final_status == "delivered"
+            and channel_status.get("status") == "delivered"
+        ):
+            return
         if (
             channel_status.get("status") != "sending"
             or channel_status.get("owner") != self.owner
         ):
-            return
+            raise TradingAlertDeliveryStateLost(
+                f"alert delivery owner lost for event {event_id}"
+            )
         channel_status.update(detail)
         channel_status["status"] = final_status
         channel_status[f"{final_status}_at"] = now_cn().isoformat()

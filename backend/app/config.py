@@ -48,6 +48,7 @@ class Settings(BaseSettings):
     # WebSocket配置
     WS_HEARTBEAT_INTERVAL: int = 30  # 心跳间隔(秒)
     WS_MAX_CONNECTIONS: int = 100  # 最大连接数
+    WS_SEND_TIMEOUT_SECONDS: float = 1.0  # 单客户端广播发送超时
 
     # Tushare 配置
     TUSHARE_TOKEN: Optional[str] = None

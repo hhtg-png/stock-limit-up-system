@@ -209,6 +209,129 @@ class TradingPlaybookSchedulerClaimTests(unittest.IsolatedAsyncioTestCase):
             today_provider=lambda: date(2026, 7, 13),
         )
 
+    async def test_broken_business_sessions_fail_claims_in_fresh_sessions(self):
+        from sqlalchemy import select
+        from sqlalchemy.exc import IntegrityError
+        from sqlalchemy.pool import NullPool
+
+        from app.data_collectors.scheduler import DataScheduler
+        from app.database import Base
+        from app.models.trading_playbook import (
+            TradingPlanVersion,
+            TradingPlaybookJobClaim,
+        )
+        from app.utils.time_utils import CN_TZ
+
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "broken-phases.db"
+            engine = create_async_engine(
+                f"sqlite+aiosqlite:///{path.as_posix()}",
+                poolclass=NullPool,
+            )
+            maker = async_sessionmaker(engine, expire_on_commit=False)
+            async with engine.begin() as connection:
+                await connection.run_sync(Base.metadata.create_all)
+            async with maker() as db:
+                plan = TradingPlanVersion(
+                    source_trade_date=date(2026, 7, 13),
+                    target_trade_date=date(2026, 7, 14),
+                    stage="after_close",
+                    version_no=1,
+                    status="draft",
+                    input_hash="existing-plan",
+                    generated_at=datetime(2026, 7, 13, 15, 30),
+                )
+                db.add(plan)
+                await db.commit()
+                await db.refresh(plan)
+
+            async def poison(db):
+                db.add(
+                    TradingPlanVersion(
+                        source_trade_date=date(2026, 7, 13),
+                        target_trade_date=date(2026, 7, 14),
+                        stage="after_close",
+                        version_no=1,
+                        status="draft",
+                        input_hash="duplicate-plan",
+                        generated_at=datetime(2026, 7, 13, 15, 31),
+                    )
+                )
+                await db.commit()
+
+            class BrokenOrchestrator:
+                async def build_stage(self, db, *_args, **_kwargs):
+                    await poison(db)
+
+            class BrokenAlert:
+                durable_delivery = True
+
+                async def notify_plan_ready(self, db, *_args, **_kwargs):
+                    await poison(db)
+
+            class BrokenReview:
+                async def build(self, db, *_args, **_kwargs):
+                    await poison(db)
+
+            now = CN_TZ.localize(datetime(2026, 7, 13, 15, 35))
+            scheduler = DataScheduler(
+                trading_playbook_orchestrator=BrokenOrchestrator(),
+                trading_playbook_alert_service=BrokenAlert(),
+                trading_playbook_review_service=BrokenReview(),
+                session_factory=maker,
+                now_provider=lambda: now,
+                calendar_service=self._calendar(),
+            )
+            try:
+                try:
+                    await scheduler._build_trading_playbook_plan(
+                        "after_close",
+                        send_notifications=False,
+                    )
+                except IntegrityError:
+                    pass
+                else:
+                    self.fail("broken build commit must preserve IntegrityError")
+                self.assertIsNone(
+                    await scheduler._notify_trading_playbook_plan(plan)
+                )
+                self.assertIsNone(
+                    await scheduler._run_trading_playbook_review_phase(
+                        date(2026, 7, 13),
+                        finalized=False,
+                    )
+                )
+
+                async with maker() as db:
+                    claims = list(
+                        (
+                            await db.execute(
+                                select(TradingPlaybookJobClaim).order_by(
+                                    TradingPlaybookJobClaim.id
+                                )
+                            )
+                        )
+                        .scalars()
+                        .all()
+                    )
+            finally:
+                await engine.dispose()
+                # Release traceback-held aiosqlite adapters before Windows
+                # removes the temporary database file.
+                import gc
+
+                gc.collect()
+                await asyncio.sleep(0.05)
+
+        self.assertEqual(
+            {claim.phase: claim.status for claim in claims},
+            {
+                "build": "retry",
+                "notify": "retry",
+                "initial_review": "retry",
+            },
+        )
+
     async def test_two_schedulers_run_build_notify_and_finalize_exactly_once(self):
         from app.data_collectors.scheduler import DataScheduler
         from app.models.trading_playbook import (
