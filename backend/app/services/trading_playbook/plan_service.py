@@ -30,7 +30,7 @@ from .errors import (
     PlaybookNotFoundError,
     UpstreamUnavailableError,
 )
-from .serialization import normalize_plan_payload
+from .serialization import json_value, normalize_plan_payload
 
 
 CHINA_TZ = ZoneInfo("Asia/Shanghai")
@@ -1767,7 +1767,7 @@ class TradingPlanService:
                 "confirmed_by": confirmed_by,
             }
         )
-        payload = normalize_plan_payload(payload)
+        payload = json_value(payload)
         observed_active_id = await db.scalar(
             select(TradingPlanVersion.id)
             .where(
@@ -1855,7 +1855,7 @@ class TradingPlanService:
         candidates = await self._load_candidates(db, plan.id)
         payload = self._serialize_loaded(plan, candidates)
         payload["status"] = "expired"
-        payload = normalize_plan_payload(payload)
+        payload = json_value(payload)
         lock_key = (db.bind, target_trade_date)
         async with self._lock_manager.hold(lock_key):
             try:

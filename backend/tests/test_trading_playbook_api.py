@@ -1,7 +1,7 @@
 import asyncio
 import json
 import unittest
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
@@ -45,11 +45,31 @@ class _FakeOrchestrator:
 
     async def build_stage(self, db, source_trade_date, stage, as_of):
         self.calls.append((db, source_trade_date, stage, as_of))
+        target_trade_date = source_trade_date + timedelta(days=1)
         return {
             "id": 901,
             "source_trade_date": source_trade_date.isoformat(),
+            "target_trade_date": target_trade_date.isoformat(),
             "stage": stage,
+            "status": "draft",
             "generated_at": as_of.isoformat(),
+            "risk_settings_json": {
+                "trial": 10.0,
+                "confirmed": 30.0,
+                "hard_stop": 5.0,
+                "max_candidates": 1,
+            },
+            "candidates": [
+                {
+                    "stock_code": "000001",
+                    "action_trade_date": target_trade_date.isoformat(),
+                    "position_reference": 10.0,
+                    "risk_level": "trial",
+                    "entry_trigger_json": {"reference_price": 10.0},
+                    "invalidation_json": {"price_lte": 9.5},
+                    "exit_trigger_json": {"change_pct_lte": -5.0},
+                }
+            ],
         }
 
 
@@ -172,7 +192,12 @@ class TradingPlaybookApiTests(unittest.TestCase):
                 stage="after_close",
                 version_no=1,
                 status="draft",
-                risk_settings_json={"hard_stop": 5.0},
+                risk_settings_json={
+                    "trial": 10.0,
+                    "confirmed": 30.0,
+                    "hard_stop": 5.0,
+                    "max_candidates": 3,
+                },
                 input_hash="seed",
                 generated_at=datetime(2026, 7, 10, 15, 30),
             )
@@ -632,6 +657,186 @@ class TradingPlaybookApiTests(unittest.TestCase):
             response.json()["detail"],
             "Trading playbook service is unavailable",
         )
+
+    def test_plan_detail_rejects_out_of_domain_strong_history(self):
+        cases = [
+            ("missing-risk-fields", {"risk": {"hard_stop": 5.0}}),
+            (
+                "position-above-limit",
+                {"candidate": {"position_reference": 101.0}},
+            ),
+            (
+                "position-below-limit",
+                {"candidate": {"position_reference": -1.0}},
+            ),
+            (
+                "trial-below-limit",
+                {
+                    "risk": {
+                        "trial": -1.0,
+                        "confirmed": 30.0,
+                        "hard_stop": 5.0,
+                        "max_candidates": 3,
+                    }
+                },
+            ),
+            (
+                "trial-above-confirmed",
+                {
+                    "risk": {
+                        "trial": 40.0,
+                        "confirmed": 30.0,
+                        "hard_stop": 5.0,
+                        "max_candidates": 3,
+                    }
+                },
+            ),
+            (
+                "hard-stop-above-limit",
+                {
+                    "risk": {
+                        "trial": 10.0,
+                        "confirmed": 30.0,
+                        "hard_stop": 21.0,
+                        "max_candidates": 3,
+                    }
+                },
+            ),
+            (
+                "hard-stop-zero",
+                {
+                    "risk": {
+                        "trial": 10.0,
+                        "confirmed": 30.0,
+                        "hard_stop": 0.0,
+                        "max_candidates": 3,
+                    }
+                },
+            ),
+            (
+                "max-candidates-above-limit",
+                {
+                    "risk": {
+                        "trial": 10.0,
+                        "confirmed": 30.0,
+                        "hard_stop": 5.0,
+                        "max_candidates": 4,
+                    }
+                },
+            ),
+            (
+                "max-candidates-zero",
+                {
+                    "risk": {
+                        "trial": 10.0,
+                        "confirmed": 30.0,
+                        "hard_stop": 5.0,
+                        "max_candidates": 0,
+                    }
+                },
+            ),
+            ("candidate-count-zero", {"empty": True}),
+            ("candidate-count-above-max", {"max_candidates": 1, "extra": True}),
+            ("duplicate-stock", {"duplicate": True}),
+            (
+                "nonpositive-reference-price",
+                {"candidate": {"entry_trigger_json": {"reference_price": 0}}},
+            ),
+            (
+                "missing-reference-price",
+                {"candidate": {"entry_trigger_json": {"sealed": True}}},
+            ),
+            (
+                "nonpositive-price-threshold",
+                {"candidate": {"invalidation_json": {"price_lte": -1}}},
+            ),
+            (
+                "percentage-out-of-range",
+                {"candidate": {"exit_trigger_json": {"change_pct_lte": -101}}},
+            ),
+            ("action-date-outside-plan", {"outside_action_date": True}),
+            ("source-after-target", {"source_after_target": True}),
+        ]
+
+        async def add_bad_plan(index: int, case: dict):
+            target = date(2026, 8, 1) + timedelta(days=index)
+            risk = case.get(
+                "risk",
+                {
+                    "trial": 10.0,
+                    "confirmed": 30.0,
+                    "hard_stop": 5.0,
+                    "max_candidates": case.get("max_candidates", 3),
+                },
+            )
+            async with self.Session() as db:
+                plan = TradingPlanVersion(
+                    source_trade_date=(
+                        target + timedelta(days=1)
+                        if case.get("source_after_target")
+                        else target - timedelta(days=1)
+                    ),
+                    target_trade_date=target,
+                    stage="after_close",
+                    version_no=1,
+                    status="draft",
+                    risk_settings_json=risk,
+                    input_hash=f"domain-invalid-{index}",
+                    generated_at=datetime(2026, 7, 10, 15, 30),
+                )
+                db.add(plan)
+                await db.flush()
+                candidate_values = {
+                    "plan_version_id": plan.id,
+                    "stock_code": f"10{index:04d}",
+                    "stock_name": f"bad-domain-{index}",
+                    "action_trade_date": (
+                        target + timedelta(days=2)
+                        if case.get("outside_action_date")
+                        else target
+                    ),
+                    "theme_name": "history",
+                    "primary_mode_key": "a_mode",
+                    "role": "leader",
+                    "rank": 1,
+                    "entry_trigger_json": {"reference_price": 10.0},
+                    "invalidation_json": {"price_lte": 9.5},
+                    "exit_trigger_json": {"change_pct_lte": -5.0},
+                    "risk_level": "trial",
+                    "position_reference": 10.0,
+                    "status": "waiting",
+                }
+                candidate_values.update(case.get("candidate", {}))
+                if not case.get("empty"):
+                    db.add(TradingPlanCandidate(**candidate_values))
+                if case.get("extra") or case.get("duplicate"):
+                    db.add(
+                        TradingPlanCandidate(
+                            **{
+                                **candidate_values,
+                                "stock_code": (
+                                    candidate_values["stock_code"]
+                                    if case.get("duplicate")
+                                    else f"20{index:04d}"
+                                ),
+                                "stock_name": f"bad-domain-extra-{index}",
+                                "primary_mode_key": "z_mode",
+                                "rank": 2,
+                            }
+                        )
+                    )
+                await db.commit()
+                return plan.id
+
+        for index, (name, case) in enumerate(cases):
+            plan_id = asyncio.run(add_bad_plan(index, case))
+            with self.subTest(case=name):
+                response = self.client.get(f"/trading-playbook/plans/{plan_id}")
+                self.assertEqual(response.status_code, 503, response.text)
+                self.assertEqual(
+                    response.json()["detail"],
+                    "Trading playbook service is unavailable",
+                )
 
     def test_generate_and_review_are_503_until_production_dependencies_exist(self):
         app = FastAPI()
