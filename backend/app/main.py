@@ -13,37 +13,84 @@ from app.api.v1.websocket import router as ws_router
 from app.core.event_bus import event_bus
 from app.utils.logger import setup_logging, logger
 from app.services.data_init_service import data_init_service
-from app.data_collectors.scheduler import data_scheduler
+from app.data_collectors.scheduler import (
+    TradingCalendarLookupError,
+    _get_cn_trading_dates,
+    data_scheduler,
+)
+from app.services.trading_playbook.composition import (
+    build_production_trading_playbook_orchestrator,
+)
+from app.services.trading_playbook.runtime import trading_playbook_runtime
+
+
+def _next_cn_trade_date(value):
+    from datetime import timedelta
+
+    dates = _get_cn_trading_dates(
+        value + timedelta(days=1),
+        value + timedelta(days=15),
+    )
+    if not dates:
+        raise TradingCalendarLookupError(
+            f"Unable to resolve next China trading date after {value}"
+        )
+    return dates[0]
+
+
+def _clear_trading_playbook_runtime(app: FastAPI) -> None:
+    trading_playbook_runtime.reset()
+    data_scheduler.reset_trading_playbook_services()
+    if hasattr(app.state, "trading_playbook_orchestrator"):
+        delattr(app.state, "trading_playbook_orchestrator")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
-    # 启动时
     setup_logging()
     logger.info(f"Starting {settings.APP_NAME} v{settings.APP_VERSION}")
-    
-    # 初始化数据库
-    await init_db()
-    logger.info("Database initialized")
-    
-    # 启动事件总线
-    await event_bus.start()
-    logger.info("EventBus started")
+    try:
+        await init_db()
+        logger.info("Database initialized")
 
-    # 启动定时任务：盘中采集、盘后统计、市场复盘、每日分析
-    data_scheduler.start()
-    
-    # 自动爬取最近交易日数据（后台任务）
-    asyncio.create_task(data_init_service.initialize())
-    
-    yield
-    
-    # 关闭时
-    data_scheduler.stop()
-    await event_bus.stop()
-    await close_db()
-    logger.info("Application shutdown complete")
+        await event_bus.start()
+        logger.info("EventBus started")
+
+        _clear_trading_playbook_runtime(app)
+        if settings.TRADING_PLAYBOOK_ENABLED:
+            orchestrator = build_production_trading_playbook_orchestrator(
+                next_trade_date=_next_cn_trade_date,
+            )
+            data_scheduler.install_trading_playbook_orchestrator(orchestrator)
+            trading_playbook_runtime.install_orchestrator(orchestrator)
+            app.state.trading_playbook_orchestrator = orchestrator
+
+        # 启动定时任务：盘中采集、盘后统计、市场复盘、每日分析
+        data_scheduler.start()
+
+        # 自动爬取最近交易日数据（后台任务）
+        asyncio.create_task(data_init_service.initialize())
+
+        yield
+    finally:
+        try:
+            data_scheduler.stop()
+        except Exception as exc:
+            logger.error(f"DataScheduler shutdown failed: {exc}")
+        try:
+            _clear_trading_playbook_runtime(app)
+        except Exception as exc:
+            logger.error(f"Trading playbook runtime cleanup failed: {exc}")
+        try:
+            await event_bus.stop()
+        except Exception as exc:
+            logger.error(f"EventBus shutdown failed: {exc}")
+        try:
+            await close_db()
+        except Exception as exc:
+            logger.error(f"Database shutdown failed: {exc}")
+        logger.info("Application shutdown complete")
 
 
 # 创建FastAPI应用

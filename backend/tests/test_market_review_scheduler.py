@@ -78,6 +78,15 @@ from app.utils.time_utils import CN_TZ
 from scripts.backfill_market_review import backfill_market_review
 
 
+def _cron_value(trigger, name):
+    if hasattr(trigger, "kwargs"):
+        return trigger.kwargs[name]
+    if name == "timezone":
+        return trigger.timezone
+    field_index = {"hour": 5, "minute": 6}[name]
+    return int(str(trigger.fields[field_index]))
+
+
 class FakeScheduler:
     def __init__(self):
         self.jobs = []
@@ -118,6 +127,10 @@ class MarketReviewSchedulerTests(unittest.IsolatedAsyncioTestCase):
             mock_settings.MARKET_REVIEW_REPAIR_ENABLED = True
             mock_settings.MARKET_REVIEW_REPAIR_HOUR = 20
             mock_settings.MARKET_REVIEW_REPAIR_MINUTE = 15
+            mock_settings.INTELLIGENCE_ENABLED = False
+            mock_settings.DAILY_ANALYSIS_INTRADAY_HOUR = 14
+            mock_settings.DAILY_ANALYSIS_INTRADAY_MINUTE = 50
+            mock_settings.TRADING_PLAYBOOK_ENABLED = False
 
             scheduler.start()
 
@@ -126,10 +139,23 @@ class MarketReviewSchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("market_review_build", job_ids)
         self.assertIn("market_review_repair", job_ids)
         self.assertEqual(getattr(CN_TZ, "zone", None), "Asia/Shanghai")
-        self.assertIs(jobs_by_id["market_review_build"]["trigger"].kwargs["timezone"], CN_TZ)
-        self.assertIs(jobs_by_id["market_review_repair"]["trigger"].kwargs["timezone"], CN_TZ)
+        self.assertIs(
+            _cron_value(jobs_by_id["market_review_build"]["trigger"], "timezone"),
+            CN_TZ,
+        )
+        self.assertIs(
+            _cron_value(jobs_by_id["market_review_repair"]["trigger"], "timezone"),
+            CN_TZ,
+        )
         self.assertEqual(
-            getattr(jobs_by_id["market_review_build"]["trigger"].kwargs["timezone"], "zone", None),
+            getattr(
+                _cron_value(
+                    jobs_by_id["market_review_build"]["trigger"],
+                    "timezone",
+                ),
+                "zone",
+                None,
+            ),
             "Asia/Shanghai",
         )
         self.assertIn("after_close_catchup", job_ids)
@@ -151,6 +177,7 @@ class MarketReviewSchedulerTests(unittest.IsolatedAsyncioTestCase):
             mock_settings.INTELLIGENCE_ENABLED = False
             mock_settings.DAILY_ANALYSIS_INTRADAY_HOUR = 14
             mock_settings.DAILY_ANALYSIS_INTRADAY_MINUTE = 50
+            mock_settings.TRADING_PLAYBOOK_ENABLED = False
 
             scheduler.start()
 
@@ -174,6 +201,7 @@ class MarketReviewSchedulerTests(unittest.IsolatedAsyncioTestCase):
             mock_settings.INTELLIGENCE_ENABLED = False
             mock_settings.DAILY_ANALYSIS_INTRADAY_HOUR = 14
             mock_settings.DAILY_ANALYSIS_INTRADAY_MINUTE = 50
+            mock_settings.TRADING_PLAYBOOK_ENABLED = False
 
             scheduler.start()
 
@@ -197,6 +225,7 @@ class MarketReviewSchedulerTests(unittest.IsolatedAsyncioTestCase):
             mock_settings.INTELLIGENCE_ENABLED = False
             mock_settings.DAILY_ANALYSIS_INTRADAY_HOUR = 14
             mock_settings.DAILY_ANALYSIS_INTRADAY_MINUTE = 50
+            mock_settings.TRADING_PLAYBOOK_ENABLED = False
 
             scheduler.start()
 
@@ -204,9 +233,9 @@ class MarketReviewSchedulerTests(unittest.IsolatedAsyncioTestCase):
         job = jobs_by_id["tdx_limit_up_broadcast_refresh"]
         self.assertIs(job["func"].__self__, scheduler)
         self.assertEqual(job["func"].__name__, "_refresh_tdx_limit_up_broadcast")
-        self.assertEqual(job["trigger"].kwargs["hour"], 9)
-        self.assertEqual(job["trigger"].kwargs["minute"], 0)
-        self.assertIs(job["trigger"].kwargs["timezone"], CN_TZ)
+        self.assertEqual(_cron_value(job["trigger"], "hour"), 9)
+        self.assertEqual(_cron_value(job["trigger"], "minute"), 0)
+        self.assertIs(_cron_value(job["trigger"], "timezone"), CN_TZ)
         self.assertEqual(job["max_instances"], 1)
 
     def test_start_skips_market_review_jobs_when_disabled(self):
@@ -223,6 +252,10 @@ class MarketReviewSchedulerTests(unittest.IsolatedAsyncioTestCase):
             mock_settings.MARKET_REVIEW_REPAIR_ENABLED = True
             mock_settings.MARKET_REVIEW_REPAIR_HOUR = 20
             mock_settings.MARKET_REVIEW_REPAIR_MINUTE = 15
+            mock_settings.INTELLIGENCE_ENABLED = False
+            mock_settings.DAILY_ANALYSIS_INTRADAY_HOUR = 14
+            mock_settings.DAILY_ANALYSIS_INTRADAY_MINUTE = 50
+            mock_settings.TRADING_PLAYBOOK_ENABLED = False
 
             scheduler.start()
 
@@ -244,6 +277,10 @@ class MarketReviewSchedulerTests(unittest.IsolatedAsyncioTestCase):
             mock_settings.MARKET_REVIEW_REPAIR_ENABLED = False
             mock_settings.MARKET_REVIEW_REPAIR_HOUR = 20
             mock_settings.MARKET_REVIEW_REPAIR_MINUTE = 15
+            mock_settings.INTELLIGENCE_ENABLED = False
+            mock_settings.DAILY_ANALYSIS_INTRADAY_HOUR = 14
+            mock_settings.DAILY_ANALYSIS_INTRADAY_MINUTE = 50
+            mock_settings.TRADING_PLAYBOOK_ENABLED = False
 
             scheduler.start()
 
