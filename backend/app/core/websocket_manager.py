@@ -243,9 +243,13 @@ class ConnectionManager:
             stock_code,
         )
 
-    async def broadcast_trading_plan_alert(self, data: dict):
+    async def broadcast_trading_plan_alert(
+        self,
+        data: dict,
+        stock_code: Optional[str] = None,
+    ):
         """Broadcast a hint for an event already persisted in the alert inbox."""
-        await self.broadcast(data, "trading_plan_alert")
+        await self.broadcast(data, "trading_plan_alert", stock_code)
     
     @property
     def connection_count(self) -> int:

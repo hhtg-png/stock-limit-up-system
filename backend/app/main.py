@@ -66,6 +66,7 @@ async def lifespan(app: FastAPI):
                 InAppTradingPlanAlertChannel(),
                 session_factory=async_session_maker,
                 quote_api=tencent_api,
+                trading_calendar=calendar,
             )
             data_scheduler.install_trading_playbook_alert_service(alert_service)
             trading_playbook_runtime.install_orchestrator(orchestrator)

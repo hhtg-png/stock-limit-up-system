@@ -80,7 +80,26 @@ class WebSocketManagerTests(unittest.IsolatedAsyncioTestCase):
         manager.broadcast.assert_awaited_once_with(
             payload,
             "trading_plan_alert",
+            None,
         )
+
+    async def test_trading_plan_action_alert_respects_stock_subscriptions(self):
+        manager = ConnectionManager()
+        matching = AsyncMock()
+        different = AsyncMock()
+        await manager.connect(matching, "matching")
+        await manager.connect(different, "different")
+        await manager.subscribe_stock("matching", ["000001"])
+        await manager.subscribe_stock("different", ["000002"])
+
+        payload = {"event_type": "entry_triggered", "stock_code": "000001"}
+        await manager.broadcast_trading_plan_alert(
+            payload,
+            stock_code="000001",
+        )
+
+        matching.send_json.assert_awaited_once()
+        different.send_json.assert_not_awaited()
 
     async def test_broadcast_limit_up_alert_deduplicates_same_stock(self):
         manager = ConnectionManager()

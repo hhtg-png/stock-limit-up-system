@@ -60,13 +60,15 @@ class TradingPlaybookAlertService:
         *,
         session_factory=None,
         quote_api=None,
+        trading_calendar=None,
         quote_timeout_seconds: float = 5.0,
         quote_max_age_seconds: float | None = None,
         max_monitor_candidates: int = 240,
     ) -> None:
         if not isinstance(channel, TradingPlanAlertChannel):
             raise TypeError(
-                "alert channel must provide send, reconcile and capability metadata"
+                "alert channel must provide send, reconcile, healthcheck and "
+                "capability metadata"
             )
         name = str(getattr(channel, "channel_name", "")).strip()
         if not name:
@@ -82,6 +84,7 @@ class TradingPlaybookAlertService:
         self.owner = uuid.uuid4().hex
         self.session_factory = session_factory
         self.quote_api = quote_api
+        self.trading_calendar = trading_calendar
         self.quote_timeout_seconds = max(float(quote_timeout_seconds), 0.01)
         max_age = (
             app_settings.TRADING_PLAYBOOK_ALERT_QUOTE_MAX_AGE_SECONDS
@@ -121,12 +124,21 @@ class TradingPlaybookAlertService:
         return f"交易预案已生成：{target} {stage}"
 
     async def notify_plan_ready(self, db, plan: Any, *, send: bool = True):
+        channel_enabled = await self._channel_enabled(db)
         # Both rows are durable before either external side effect starts.
         events = [
-            await self._ensure_event(db, plan, event_type)
+            await self._ensure_event(
+                db,
+                plan,
+                event_type,
+                initial_channel_status=self._initial_channel_status(
+                    self._dedup_key(self._plan_value(plan, "id"), event_type),
+                    enabled=channel_enabled,
+                ),
+            )
             for event_type in _PLAN_EVENT_TYPES
         ]
-        if send and await self._channel_enabled(db):
+        if send and channel_enabled:
             for event in events:
                 await self._deliver(db, event)
         return events
@@ -141,8 +153,17 @@ class TradingPlaybookAlertService:
     ) -> TradingAlertEvent:
         if event_type not in _PLAN_EVENT_TYPES:
             raise ValueError(f"unsupported plan alert event: {event_type}")
-        event = await self._ensure_event(db, plan, event_type)
-        if send and await self._channel_enabled(db):
+        channel_enabled = await self._channel_enabled(db)
+        event = await self._ensure_event(
+            db,
+            plan,
+            event_type,
+            initial_channel_status=self._initial_channel_status(
+                self._dedup_key(self._plan_value(plan, "id"), event_type),
+                enabled=channel_enabled,
+            ),
+        )
+        if send and channel_enabled:
             await self._deliver(db, event)
         return event
 
@@ -155,6 +176,31 @@ class TradingPlaybookAlertService:
         else:
             current = now.astimezone(CN_TZ)
         trade_date = current.date()
+        calendar = self.trading_calendar
+        ensure_date = getattr(calendar, "ensure_date", None)
+        is_trading_day = getattr(calendar, "is_trading_day", None)
+        if not callable(ensure_date) or not callable(is_trading_day):
+            logger.error(
+                "Trading playbook monitor skipped: authoritative calendar missing"
+            )
+            return []
+        try:
+            await ensure_date(trade_date)
+            trading_day = bool(is_trading_day(trade_date))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(
+                "Trading playbook monitor calendar lookup failed: {}",
+                exc,
+            )
+            return []
+        if not trading_day:
+            logger.info(
+                "Trading playbook monitor skipped on closed market date {}",
+                trade_date,
+            )
+            return []
         if not self._is_continuous_trading_time(current):
             return []
 
@@ -250,6 +296,7 @@ class TradingPlaybookAlertService:
         if not quotes:
             return []
 
+        channel_enabled = await self._channel_enabled(db)
         persisted: list[TradingAlertEvent] = []
         for plan, candidate in rows:
             quote = quotes.get(candidate.stock_code)
@@ -278,11 +325,15 @@ class TradingPlaybookAlertService:
                         quote,
                         trade_date=trade_date,
                         triggered_at=current,
+                        initial_channel_status=self._initial_channel_status(
+                            dedup_key,
+                            enabled=channel_enabled,
+                        ),
                         lookup_existing=False,
                     )
                     existing_by_dedup[event.dedup_key] = event
                 persisted.append(event)
-        if await self._channel_enabled(db):
+        if channel_enabled:
             for event in persisted:
                 await self._deliver(db, event)
         return persisted
@@ -536,6 +587,7 @@ class TradingPlaybookAlertService:
         *,
         trade_date: date,
         triggered_at: datetime,
+        initial_channel_status: Mapping[str, Any],
         lookup_existing: bool = True,
     ) -> TradingAlertEvent:
         plan_id = self._plan_value(plan, "id")
@@ -567,7 +619,6 @@ class TradingPlaybookAlertService:
         mode_key = str(
             self._candidate_value(candidate, "primary_mode_key") or ""
         )
-        idempotency_key = dedup_key
         event = TradingAlertEvent(
             plan_version_id=plan_id,
             candidate_id=candidate_id,
@@ -583,11 +634,9 @@ class TradingPlaybookAlertService:
             },
             message=f"交易预案提醒：{stock_code} {stock_name} {event_type}",
             channel_status_json={
-                self.channel_name: {
-                    "status": "pending",
-                    "idempotency_key": idempotency_key,
-                    "attempts": 0,
-                }
+                self.channel_name: copy.deepcopy(
+                    dict(initial_channel_status)
+                )
             },
         )
         db.add(event)
@@ -616,11 +665,35 @@ class TradingPlaybookAlertService:
             bool(settings.enabled) and bool(settings.in_app_enabled)
         )
 
+    @staticmethod
+    def _initial_channel_status(
+        idempotency_key: str,
+        *,
+        enabled: bool,
+    ) -> dict[str, Any]:
+        status: dict[str, Any] = {
+            "idempotency_key": idempotency_key,
+            "attempts": 0,
+        }
+        if enabled:
+            status["status"] = "pending"
+        else:
+            status.update(
+                {
+                    "status": "skipped",
+                    "reason": "disabled",
+                    "skipped_at": now_cn().isoformat(),
+                }
+            )
+        return status
+
     async def _ensure_event(
         self,
         db,
         plan: Any,
         event_type: str,
+        *,
+        initial_channel_status: Mapping[str, Any],
     ) -> TradingAlertEvent:
         plan_id = self._plan_value(plan, "id")
         if not isinstance(plan_id, int):
@@ -636,7 +709,6 @@ class TradingPlaybookAlertService:
         if existing is not None:
             return existing
 
-        idempotency_key = dedup_key
         event = TradingAlertEvent(
             plan_version_id=plan_id,
             event_type=event_type,
@@ -659,11 +731,9 @@ class TradingPlaybookAlertService:
             },
             message=self._message(plan, event_type),
             channel_status_json={
-                self.channel_name: {
-                    "status": "pending",
-                    "idempotency_key": idempotency_key,
-                    "attempts": 0,
-                }
+                self.channel_name: copy.deepcopy(
+                    dict(initial_channel_status)
+                )
             },
         )
         event.market_snapshot_json = {
@@ -745,6 +815,11 @@ class TradingPlaybookAlertService:
             "message": event.message,
             "market_snapshot": copy.deepcopy(event.market_snapshot_json or {}),
         }
+        stock_code = str(
+            (event.market_snapshot_json or {}).get("stock_code") or ""
+        ).strip()
+        if stock_code:
+            payload["stock_code"] = stock_code
         try:
             receipt = await self.channel.send(
                 payload,

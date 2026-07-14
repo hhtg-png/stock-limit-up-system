@@ -27,6 +27,8 @@ class TradingPlanAlertChannel(Protocol):
         idempotency_key: str,
     ) -> Mapping[str, Any] | None: ...
 
+    async def healthcheck(self) -> Mapping[str, Any]: ...
+
 
 class InAppTradingPlanAlertChannel:
     """At-most-once websocket hint; the alerts API is the durable inbox."""
@@ -42,7 +44,11 @@ class InAppTradingPlanAlertChannel:
     ) -> Mapping[str, Any]:
         payload = dict(event)
         payload["idempotency_key"] = idempotency_key
-        await manager.broadcast_trading_plan_alert(payload)
+        stock_code = str(event.get("stock_code") or "").strip() or None
+        await manager.broadcast_trading_plan_alert(
+            payload,
+            stock_code=stock_code,
+        )
         return {
             "accepted": True,
             "delivery": "at_most_once",
@@ -57,6 +63,13 @@ class InAppTradingPlanAlertChannel:
         # In-app websocket delivery has no provider receipt.  Consumers recover
         # from disconnects through GET /trading-playbook/alerts.
         return None
+
+    async def healthcheck(self) -> Mapping[str, Any]:
+        return {
+            "channel": self.channel_name,
+            "status": "ready",
+            "connections": manager.connection_count,
+        }
 
 
 __all__ = [

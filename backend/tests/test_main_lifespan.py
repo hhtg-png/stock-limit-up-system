@@ -111,6 +111,9 @@ class LifecycleScheduler:
         def next_trade_date(self, value):
             return value + timedelta(days=1)
 
+        def is_trading_day(self, _value):
+            return True
+
         async def close(self):
             self.close_calls += 1
 
@@ -254,6 +257,10 @@ class MainLifespanTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIs(
                     scheduler.alert_service.session_factory,
                     app_main.async_session_maker,
+                )
+                self.assertIs(
+                    scheduler.alert_service.trading_calendar,
+                    scheduler.calendar,
                 )
                 transport = httpx.ASGITransport(app=app_main.app)
                 async with httpx.AsyncClient(
