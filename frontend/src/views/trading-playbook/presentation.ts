@@ -30,7 +30,11 @@ export interface UnplannedExecutionDraft {
 type PlanConfirmationState = Pick<TradingPlanVersion, 'status' | 'data_quality_json'>
 
 export function canEnableActionAlerts(plan: PlanConfirmationState | null | undefined) {
-  return plan?.status === 'draft' && plan.data_quality_json?.status !== 'missing'
+  return (
+    plan?.status === 'draft' &&
+    plan.data_quality_json?.status === 'ready' &&
+    plan.data_quality_json.stale !== true
+  )
 }
 
 export function isObservationOnly(plan: PlanConfirmationState | null | undefined) {
@@ -86,6 +90,20 @@ export function formatChinaDateTime(value: string | null | undefined) {
   }).format(timestamp)
 }
 
+export function riskPermissionSummary(settings: Record<string, unknown>) {
+  const trial = settings.trial
+  const confirmed = settings.confirmed
+  const hardStop = settings.hard_stop
+  const maximum = settings.max_candidates
+  if (
+    typeof trial !== 'number' || !Number.isFinite(trial) ||
+    typeof confirmed !== 'number' || !Number.isFinite(confirmed) ||
+    typeof hardStop !== 'number' || !Number.isFinite(hardStop) ||
+    typeof maximum !== 'number' || !Number.isInteger(maximum)
+  ) return '-'
+  return `试错 ${trial}% · 确认上限 ${confirmed}% · 刚性止损 ${hardStop}% · 最多 ${maximum} 只`
+}
+
 function positiveNumber(value: unknown) {
   return typeof value === 'number' && Number.isFinite(value) && value > 0
 }
@@ -113,7 +131,12 @@ function manualExecution(
   tradeDate: string,
   draft: ManualExecutionDraft
 ): TradingManualExecution {
-  if (!draft.executed) return { executed: false }
+  if (!draft.executed) {
+    const result: TradingManualExecution = { executed: false }
+    const note = draft.manual_note?.trim()
+    if (note) result.manual_note = note
+    return result
+  }
   const result: TradingManualExecution = { executed: true }
   if (positiveNumber(draft.execution_price)) result.execution_price = draft.execution_price
   if (positiveInteger(draft.quantity)) result.quantity = draft.quantity

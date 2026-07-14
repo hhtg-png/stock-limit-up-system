@@ -1302,6 +1302,7 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
                 stage="preclose",
                 version_no=1,
                 status="active",
+                data_quality_json={"status": "ready"},
                 input_hash="old",
             )
             target = TradingPlanVersion(
@@ -1310,6 +1311,7 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
                 stage="after_close",
                 version_no=1,
                 status="draft",
+                data_quality_json={"status": "ready"},
                 input_hash="target",
             )
             other_active = TradingPlanVersion(
@@ -1318,6 +1320,7 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
                 stage="preclose",
                 version_no=1,
                 status="active",
+                data_quality_json={"status": "ready"},
                 input_hash="other",
             )
             db.add_all([old_active, target, other_active])
@@ -1345,6 +1348,30 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ValueError):
                 await self.service.confirm(db, other_active_id, "")
 
+    async def test_confirm_rejects_non_ready_or_stale_plan_quality(self):
+        cases = [
+            ("degraded", _snapshot(quality_status="degraded")),
+            ("stale", _snapshot(stale=True)),
+        ]
+        async with self.Session() as db:
+            for case, snapshot in cases:
+                with self.subTest(case=case):
+                    generated = await self._generate(
+                        db,
+                        [_evaluation(f"leader-{case}", "000001")],
+                        snapshot=snapshot,
+                    )
+                    with self.assertRaisesRegex(
+                        InvalidTransitionError,
+                        "data quality",
+                    ):
+                        await self.service.confirm(
+                            db,
+                            generated["id"],
+                            "local-user",
+                        )
+                    await db.rollback()
+
     async def test_confirm_rolls_back_all_status_changes_when_commit_fails(self):
         async with self.Session() as db:
             old_active = TradingPlanVersion(
@@ -1353,6 +1380,7 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
                 stage="preclose",
                 version_no=1,
                 status="active",
+                data_quality_json={"status": "ready"},
                 input_hash="old",
             )
             target = TradingPlanVersion(
@@ -1361,6 +1389,7 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
                 stage="after_close",
                 version_no=1,
                 status="draft",
+                data_quality_json={"status": "ready"},
                 input_hash="target",
             )
             db.add_all([old_active, target])
@@ -1446,6 +1475,7 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
                 stage="preclose",
                 version_no=1,
                 status="draft",
+                data_quality_json={"status": "ready"},
                 input_hash="first",
             )
             second = TradingPlanVersion(
@@ -1454,6 +1484,7 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
                 stage="after_close",
                 version_no=1,
                 status="draft",
+                data_quality_json={"status": "ready"},
                 input_hash="second",
             )
             db.add_all([first, second])
@@ -1503,6 +1534,7 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
                         stage="preclose",
                         version_no=1,
                         status="active",
+                        data_quality_json={"status": "ready"},
                         input_hash="old-active",
                     )
                     first_draft = TradingPlanVersion(
@@ -1511,6 +1543,7 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
                         stage="after_close",
                         version_no=1,
                         status="draft",
+                        data_quality_json={"status": "ready"},
                         input_hash="first-draft",
                     )
                     second_draft = TradingPlanVersion(
@@ -1519,6 +1552,7 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
                         stage="overnight",
                         version_no=1,
                         status="draft",
+                        data_quality_json={"status": "ready"},
                         input_hash="second-draft",
                     )
                     setup.add_all([old_active, first_draft, second_draft])
@@ -1607,6 +1641,7 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
                             stage="preclose",
                             version_no=1,
                             status="active",
+                            data_quality_json={"status": "ready"},
                             input_hash="existing-active",
                         )
                         selected = TradingPlanVersion(
@@ -1615,6 +1650,7 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
                             stage="after_close",
                             version_no=1,
                             status="draft",
+                            data_quality_json={"status": "ready"},
                             input_hash="selected-draft",
                         )
                         setup.add_all([existing, selected])
@@ -1697,6 +1733,7 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
                         stage="preclose",
                         version_no=1,
                         status="draft",
+                        data_quality_json={"status": "ready"},
                         input_hash="first-engine",
                     )
                     second = TradingPlanVersion(
@@ -1705,6 +1742,7 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
                         stage="after_close",
                         version_no=1,
                         status="draft",
+                        data_quality_json={"status": "ready"},
                         input_hash="second-engine",
                     )
                     db.add_all([first, second])

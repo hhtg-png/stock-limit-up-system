@@ -393,6 +393,19 @@ class TradingPlaybookAlertService:
             .scalars()
             .all()
         )
+        plans_by_id: dict[int, TradingPlanVersion] = {}
+        if events:
+            plan_ids = {event.plan_version_id for event in events}
+            plans = list(
+                (
+                    await db.scalars(
+                        select(TradingPlanVersion).where(
+                            TradingPlanVersion.id.in_(plan_ids)
+                        )
+                    )
+                ).all()
+            )
+            plans_by_id = {plan.id: plan for plan in plans}
         drained: list[TradingAlertEvent] = []
         for event in events:
             action_date = self._persisted_action_date(event)
@@ -402,6 +415,26 @@ class TradingPlaybookAlertService:
                     or {}
                 )
             )
+            if not self._plan_action_quality_ready(
+                plans_by_id.get(event.plan_version_id)
+            ):
+                channel_status.update(
+                    {
+                        "status": "skipped",
+                        "reason": "unsafe_plan_quality",
+                        "skipped_at": now_cn().isoformat(),
+                    }
+                )
+                channel_status.pop("owner", None)
+                channel_status.pop("sending_at", None)
+                channel_status.pop("channel_started_at", None)
+                if await self._update_recoverable_event(
+                    db,
+                    event,
+                    channel_status,
+                ):
+                    drained.append(event)
+                continue
             if action_date is None or action_date < trade_date:
                 channel_status.update(
                     {
@@ -430,6 +463,15 @@ class TradingPlaybookAlertService:
             drained.append(event)
         await db.commit()
         return drained
+
+    @classmethod
+    def _plan_action_quality_ready(cls, plan: Any) -> bool:
+        quality = cls._plan_value(plan, "data_quality_json")
+        return (
+            isinstance(quality, Mapping)
+            and quality.get("status") == "ready"
+            and quality.get("stale") is not True
+        )
 
     async def monitor(self, db, now: datetime):
         """Evaluate today's confirmed candidate conditions from one batch quote."""
@@ -483,6 +525,14 @@ class TradingPlaybookAlertService:
                     )
                     .where(
                         TradingPlanVersion.status == _MONITOR_PLAN_STATUS,
+                        TradingPlanVersion.data_quality_json[
+                            "status"
+                        ].as_string()
+                        == "ready",
+                        TradingPlanVersion.data_quality_json[
+                            "stale"
+                        ].as_boolean()
+                        .is_not(True),
                         TradingPlanCandidate.action_trade_date == trade_date,
                     )
                     .order_by(
@@ -494,6 +544,11 @@ class TradingPlaybookAlertService:
                 )
             ).all()
         )
+        rows = [
+            (plan, candidate)
+            for plan, candidate in rows
+            if self._plan_action_quality_ready(plan)
+        ]
         if len(rows) > self.max_monitor_candidates:
             logger.warning(
                 "Trading playbook monitor candidate limit reached: {}",

@@ -47,6 +47,8 @@ test('standalone playbook page exposes the complete working sections', () => {
   assert.match(view, /启用行动提醒/, 'confirmation must describe enabling reminders')
   assert.match(view, /仅生成预案与提醒，不会自动下单\/交易/, 'page should reject auto-trading semantics')
   assert.match(view, /confirmTradingPlan/, 'page should call the confirmation API')
+  assert.match(view, /reviseTradingPlan/, 'page should create an audited child revision before confirmation')
+  assert.match(view, /确认前修订/, 'draft plan should expose a revision editor')
   assert.match(view, /cancelTradingPlan/, 'page should allow cancelling eligible plans')
   assert.match(view, /\.slice\(0,\s*3\)/, 'action candidates should remain capped at three')
 })
@@ -69,6 +71,8 @@ test('page binds every section to live store or API data and remains isolated', 
   assert.match(view, /预案目标交易日/, 'plan date should be labelled as a target date')
   assert.match(view, /复盘交易日/, 'review date should be independently labelled')
   assert.match(view, /acknowledged_at/, 'visible unread alerts must use persisted acknowledgement state')
+  assert.match(view, /riskPermissionSummary\(selectedPlan\.risk_settings_json\)/, 'risk permission must use the persisted risk snapshot')
+  assert.doesNotMatch(view, /marketValue\(['"]risk_permission['"]\)/, 'market state has no risk_permission field')
   assert.doesNotMatch(view, /alertsLoadedUnreadOnly/, 'view must not infer visibility from request metadata')
   assert.doesNotMatch(view, /useAlertStore|useSpeech|Notification\s*\(/, 'page must not enter global alert paths')
 })
@@ -109,6 +113,8 @@ test('presentation helpers implement confirmation, canonical inbox, and section 
     assert.equal(helpers.canEnableActionAlerts(draft), true)
     assert.equal(helpers.canEnableActionAlerts({ ...draft, status: 'active' }), false)
     assert.equal(helpers.canEnableActionAlerts({ ...draft, data_quality_json: { status: 'missing' } }), false)
+    assert.equal(helpers.canEnableActionAlerts({ ...draft, data_quality_json: { status: 'degraded' } }), false)
+    assert.equal(helpers.canEnableActionAlerts({ ...draft, data_quality_json: { status: 'ready', stale: true } }), false)
     assert.equal(helpers.canEnableActionAlerts(null), false)
 
     const alerts = [
@@ -122,6 +128,11 @@ test('presentation helpers implement confirmation, canonical inbox, and section 
     assert.equal(helpers.collectionState(false, 'failed', []), 'error')
     assert.equal(helpers.collectionState(false, null, []), 'empty')
     assert.equal(helpers.collectionState(false, null, [{}]), 'ready')
+    assert.equal(
+      helpers.riskPermissionSummary({ trial: 10, confirmed: 30, hard_stop: 5, max_candidates: 3 }),
+      '试错 10% · 确认上限 30% · 刚性止损 5% · 最多 3 只'
+    )
+    assert.equal(helpers.riskPermissionSummary({}), '-')
   })
 })
 
@@ -155,7 +166,7 @@ test('settings and review helpers create safe backend payloads in China time', a
       '2026-07-14',
       {
         '7': { executed: true, execution_price: 12.3, quantity: 100, executed_time: '10:05:00', manual_note: '按计划' },
-        '8': { executed: false, execution_price: 8.8, quantity: 200, executed_time: '14:00:00', manual_note: '' }
+        '8': { executed: false, execution_price: 8.8, quantity: 200, executed_time: '14:00:00', manual_note: '  放弃追高  ' }
       },
       [{ stock_code: '600000', stock_name: '浦发银行', execution_price: 9.5, quantity: 300, executed_time: '14:20:00', manual_note: '计划外记录' }]
     )
@@ -168,7 +179,7 @@ test('settings and review helpers create safe backend payloads in China time', a
           executed_at: '2026-07-14T10:05:00+08:00',
           manual_note: '按计划'
         },
-        '8': { executed: false }
+        '8': { executed: false, manual_note: '放弃追高' }
       },
       unplanned_executions: [{
         executed: true,

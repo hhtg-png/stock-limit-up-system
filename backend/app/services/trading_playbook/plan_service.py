@@ -1806,6 +1806,15 @@ class TradingPlanService:
         expected_status = plan.status
         if expected_status not in {"draft", "confirmed"}:
             raise InvalidTransitionError("plan cannot be confirmed")
+        quality = plan.data_quality_json
+        if (
+            not isinstance(quality, Mapping)
+            or quality.get("status") != "ready"
+            or quality.get("stale") is True
+        ):
+            raise InvalidTransitionError(
+                "plan data quality does not allow action alerts"
+            )
         target_trade_date = plan.target_trade_date
         candidates = await self._load_candidates(db, plan.id)
         confirmed_at = _now_cn()

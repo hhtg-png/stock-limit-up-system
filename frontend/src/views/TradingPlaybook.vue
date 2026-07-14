@@ -64,7 +64,7 @@
             {{ marketValue('window') }}
           </el-descriptions-item>
           <el-descriptions-item label="风险权限">
-            {{ marketValue('risk_permission') }}
+            {{ riskPermissionSummary(selectedPlan.risk_settings_json) }}
           </el-descriptions-item>
           <el-descriptions-item label="来源交易日">
             {{ selectedPlan.source_trade_date }}
@@ -120,8 +120,16 @@
         <div class="section-actions">
           <el-button
             v-if="selectedPlan?.status === 'draft'"
+            plain
+            :disabled="Boolean(planActionLoading) || revisionSaving"
+            @click="openRevisionDialog"
+          >
+            修订预案
+          </el-button>
+          <el-button
+            v-if="selectedPlan?.status === 'draft'"
             type="primary"
-            :disabled="!canConfirm"
+            :disabled="!canConfirm || Boolean(planActionLoading) || revisionSaving"
             :loading="planActionLoading === 'confirm'"
             @click="confirmSelectedPlan"
           >
@@ -131,6 +139,7 @@
             v-if="canCancel"
             type="danger"
             plain
+            :disabled="Boolean(planActionLoading) || revisionSaving"
             :loading="planActionLoading === 'cancel'"
             @click="cancelSelectedPlan"
           >
@@ -234,8 +243,8 @@
             <el-button
               link
               type="primary"
-              :disabled="Boolean(row.acknowledged_at)"
-              :loading="acknowledgingAlertId === row.id"
+              :disabled="Boolean(row.acknowledged_at) || acknowledgingAlertIds.has(row.id)"
+              :loading="acknowledgingAlertIds.has(row.id)"
               @click="acknowledge(row.id)"
             >
               {{ row.acknowledged_at ? '已确认' : '确认已读' }}
@@ -291,10 +300,10 @@
       </el-table>
       <el-empty v-else-if="reviewState === 'empty'" description="该复盘交易日暂无执行复盘" />
 
-      <div v-if="selectedReview" class="execution-editor">
+      <div v-if="reviewEditorReady" class="execution-editor">
         <div class="editor-toolbar">
           <div>
-            <h5>人工执行记录 · 预案 #{{ selectedReview.plan_version_id }}</h5>
+            <h5>人工执行记录 · 预案 #{{ selectedReviewPlanId }}</h5>
             <span>点击上方复盘行可切换版本；时间按北京时间保存</span>
           </div>
           <el-switch
@@ -447,6 +456,96 @@
       </el-table>
       <el-empty v-else-if="rulesState === 'empty'" description="暂无规则来源数据" />
     </section>
+
+    <el-dialog
+      v-model="revisionDialogVisible"
+      title="确认前修订"
+      width="min(920px, 94vw)"
+      :close-on-click-modal="false"
+      :close-on-press-escape="!revisionSaving"
+      :show-close="!revisionSaving"
+    >
+      <el-alert
+        type="info"
+        title="修订会创建可审计的草稿子版本，不会原地覆盖，也不会自动下单/交易。"
+        :closable="false"
+        show-icon
+      />
+      <el-alert
+        v-if="revisionError"
+        class="revision-error"
+        type="error"
+        :title="revisionError"
+        :closable="false"
+        show-icon
+      />
+      <el-form label-position="top" class="revision-form">
+        <el-form-item label="修订说明（必填）">
+          <el-input
+            v-model="revisionChangeNote"
+            maxlength="500"
+            show-word-limit
+            placeholder="说明为什么要调整候选或条件"
+          />
+        </el-form-item>
+        <div v-for="item in revisionDrafts" :key="item.candidate_id" class="revision-candidate">
+          <div class="revision-candidate-title">
+            <strong>{{ item.stock_name }}（{{ item.stock_code }}）</strong>
+            <span>{{ item.primary_mode_key }}</span>
+          </div>
+          <div class="revision-current">
+            <p>当前触发：{{ readable(item.current_entry) }}</p>
+            <p>当前失效：{{ readable(item.current_invalidation) }}</p>
+            <p>当前退出：{{ readable(item.current_exit) }}</p>
+          </div>
+          <div class="revision-fields">
+            <el-form-item label="行动交易日（留空表示不修改）">
+              <el-date-picker
+                v-model="item.action_trade_date"
+                type="date"
+                value-format="YYYY-MM-DD"
+                placeholder="不修改"
+                clearable
+              />
+            </el-form-item>
+            <el-form-item label="人工备注（留空表示不修改）">
+              <el-input v-model="item.manual_note" maxlength="500" placeholder="补充审计说明" />
+            </el-form-item>
+          </div>
+          <el-form-item label="触发条件增量 JSON">
+            <el-input
+              v-model="item.entry_trigger_text"
+              type="textarea"
+              :rows="2"
+              placeholder='例如 {"label":"突破确认","price_gte":12.3}'
+            />
+          </el-form-item>
+          <el-form-item label="失效条件增量 JSON">
+            <el-input
+              v-model="item.invalidation_text"
+              type="textarea"
+              :rows="2"
+              placeholder='例如 {"change_pct_lte":-3}'
+            />
+          </el-form-item>
+          <el-form-item label="退出条件增量 JSON">
+            <el-input
+              v-model="item.exit_trigger_text"
+              type="textarea"
+              :rows="2"
+              placeholder='例如 {"change_pct_lte":-5}'
+            />
+          </el-form-item>
+        </div>
+        <p class="revision-help">
+          支持 label、reference_price、price_gte、price_lte、change_pct_gte、change_pct_lte、sealed、open_count_gte；未知字段会被拒绝。
+        </p>
+      </el-form>
+      <template #footer>
+        <el-button :disabled="revisionSaving" @click="revisionDialogVisible = false">取消</el-button>
+        <el-button type="primary" :loading="revisionSaving" @click="submitRevision">创建修订版本</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -458,6 +557,7 @@ import {
   confirmTradingPlan,
   getTradingPlan,
   getTradingRules,
+  reviseTradingPlan,
   updateTradingExecutionReview,
   updateTradingPlaybookSettings
 } from '@/api/trading-playbook'
@@ -478,13 +578,34 @@ import {
   filterTradingAlerts,
   formatChinaDateTime,
   isObservationOnly,
+  riskPermissionSummary,
   type ManualExecutionDraft,
   type TradingAlertFilter,
   type UnplannedExecutionDraft
 } from '@/views/trading-playbook/presentation'
+import {
+  canEditReview,
+  buildPlanRevision,
+  createPlanRevisionController,
+  createConcurrentIdGuard,
+  createPlanMutationController,
+  createReviewDomainController,
+  runAndClearErrorOnSuccess,
+  saveReviewIfEditable,
+  type CandidateRevisionDraft
+} from '@/views/trading-playbook/interactions'
 
 interface UnplannedExecutionRow extends UnplannedExecutionDraft {
   key: number
+}
+
+interface CandidateRevisionRow extends CandidateRevisionDraft {
+  stock_code: string
+  stock_name: string
+  primary_mode_key: string
+  current_entry: Record<string, unknown>
+  current_invalidation: Record<string, unknown>
+  current_exit: Record<string, unknown>
 }
 
 const store = useTradingPlaybookStore()
@@ -503,14 +624,18 @@ let rulesRequestId = 0
 const reviewPlan = ref<TradingPlanVersion | null>(null)
 const reviewPlanLoading = ref(false)
 const reviewPlanError = ref<string | null>(null)
-let reviewPlanRequestId = 0
 
 const planActionLoading = ref<'confirm' | 'cancel' | null>(null)
 const planActionError = ref<string | null>(null)
-const acknowledgingAlertId = ref<number | null>(null)
+const acknowledgingAlertIds = ref<Set<number>>(new Set())
 const reviewSaving = ref(false)
 const settingsSaving = ref(false)
 const settingsActionError = ref<string | null>(null)
+const revisionDialogVisible = ref(false)
+const revisionSaving = ref(false)
+const revisionError = ref<string | null>(null)
+const revisionChangeNote = ref('')
+const revisionDrafts = ref<CandidateRevisionRow[]>([])
 const restrictReviewToPlan = ref(true)
 
 const plannedDrafts = ref<Record<string, ManualExecutionDraft>>({})
@@ -556,10 +681,80 @@ const reviewRows = computed(() => store.reviews)
 const selectedReview = computed(() => (
   reviewRows.value.find(item => item.plan_version_id === selectedReviewPlanId.value) || null
 ))
+const reviewEditorReady = computed(() => canEditReview(
+  selectedReview.value,
+  reviewPlan.value,
+  reviewPlanLoading.value
+))
 
 const planState = computed(() => collectionState(store.plansLoading, store.plansError, plans.value))
 const reviewState = computed(() => collectionState(store.reviewsLoading, store.reviewsError, reviewRows.value))
 const rulesState = computed(() => collectionState(rulesLoading.value, rulesError.value, rules.value))
+
+const reviewController = createReviewDomainController<TradingExecutionReview, TradingPlanVersion>({
+  async loadReviews(tradeDate) {
+    await store.loadReviews(tradeDate)
+    return [...store.reviews]
+  },
+  loadPlan: getTradingPlan,
+  update(patch) {
+    if ('selectedPlanId' in patch) selectedReviewPlanId.value = patch.selectedPlanId ?? null
+    if ('reviewPlan' in patch) {
+      reviewPlan.value = patch.reviewPlan ?? null
+      if (!patch.reviewPlan) {
+        plannedDrafts.value = {}
+        unplannedDrafts.value = []
+      }
+    }
+    if ('reviewPlanLoading' in patch) reviewPlanLoading.value = Boolean(patch.reviewPlanLoading)
+    if ('reviewPlanError' in patch) reviewPlanError.value = patch.reviewPlanError ?? null
+  },
+  onPlanLoaded(plan, review) {
+    hydrateExecutionDrafts(plan, review)
+  }
+})
+
+const planMutationController = createPlanMutationController({
+  confirm: planId => confirmTradingPlan(planId, 'local-user'),
+  cancel: cancelTradingPlan,
+  reload: loadPlanDomain,
+  success(kind) {
+    ElMessage.success(
+      kind === 'confirm'
+        ? '预案已确认，行动级提醒已启用'
+        : '预案已取消，相关行动提醒已停用'
+    )
+  },
+  failure(error) {
+    planActionError.value = errorMessage(error)
+  },
+  updatePending(kind) {
+    planActionLoading.value = kind
+  }
+})
+
+const acknowledgeGuard = createConcurrentIdGuard(activeIds => {
+  acknowledgingAlertIds.value = new Set(activeIds)
+})
+
+const planRevisionController = createPlanRevisionController({
+  revise: reviseTradingPlan,
+  reload: loadPlanDomain,
+  select(planId) {
+    selectedPlanId.value = planId
+  },
+  success() {
+    revisionDialogVisible.value = false
+    revisionError.value = null
+    ElMessage.success('修订子版本已创建，请核对后再启用行动提醒')
+  },
+  failure(error) {
+    revisionError.value = errorMessage(error)
+  },
+  updatePending(pending) {
+    revisionSaving.value = pending
+  }
+})
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error)
@@ -673,36 +868,7 @@ async function loadRules() {
 }
 
 async function loadReviewDomain() {
-  try {
-    await store.loadReviews(reviewDate.value)
-    if (!reviewRows.value.some(item => item.plan_version_id === selectedReviewPlanId.value)) {
-      selectedReviewPlanId.value = reviewRows.value[0]?.plan_version_id || null
-    }
-    await loadSelectedReviewPlan()
-  } catch {
-    reviewPlan.value = null
-  }
-}
-
-async function loadSelectedReviewPlan() {
-  const planId = selectedReviewPlanId.value
-  const requestId = ++reviewPlanRequestId
-  reviewPlan.value = null
-  reviewPlanError.value = null
-  plannedDrafts.value = {}
-  unplannedDrafts.value = []
-  if (!planId) return
-  reviewPlanLoading.value = true
-  try {
-    const plan = await getTradingPlan(planId)
-    if (requestId !== reviewPlanRequestId) return
-    reviewPlan.value = plan
-    hydrateExecutionDrafts(plan, selectedReview.value)
-  } catch (error) {
-    if (requestId === reviewPlanRequestId) reviewPlanError.value = errorMessage(error)
-  } finally {
-    if (requestId === reviewPlanRequestId) reviewPlanLoading.value = false
-  }
+  await reviewController.load(reviewDate.value)
 }
 
 function executionTime(value: unknown) {
@@ -742,8 +908,7 @@ function hydrateExecutionDrafts(plan: TradingPlanVersion, review: TradingExecuti
 
 function selectReviewRow(row: TradingExecutionReview) {
   if (selectedReviewPlanId.value === row.plan_version_id) return
-  selectedReviewPlanId.value = row.plan_version_id
-  void loadSelectedReviewPlan()
+  void reviewController.select(row.plan_version_id)
 }
 
 function addUnplannedExecution() {
@@ -755,57 +920,83 @@ function removeUnplannedExecution(index: number) {
 }
 
 async function confirmSelectedPlan() {
+  if (planActionLoading.value || revisionSaving.value) return
   const plan = selectedPlan.value
   if (!plan || !canEnableActionAlerts(plan)) return
-  planActionLoading.value = 'confirm'
   planActionError.value = null
-  try {
-    await confirmTradingPlan(plan.id, 'local-user')
-    await loadPlanDomain()
-    ElMessage.success('预案已确认，行动级提醒已启用')
-  } catch (error) {
-    planActionError.value = errorMessage(error)
-  } finally {
-    planActionLoading.value = null
-  }
+  await planMutationController.run('confirm', plan.id)
 }
 
 async function cancelSelectedPlan() {
+  if (planActionLoading.value || revisionSaving.value) return
   const plan = selectedPlan.value
   if (!plan || !['draft', 'active'].includes(plan.status)) return
-  planActionLoading.value = 'cancel'
   planActionError.value = null
+  await planMutationController.run('cancel', plan.id)
+}
+
+function openRevisionDialog() {
+  const plan = selectedPlan.value
+  if (!plan || plan.status !== 'draft' || planActionLoading.value || revisionSaving.value) return
+  revisionChangeNote.value = ''
+  revisionError.value = null
+  revisionDrafts.value = plan.candidates.slice(0, 3).map(candidate => ({
+    candidate_id: candidate.id,
+    stock_code: candidate.stock_code,
+    stock_name: candidate.stock_name,
+    primary_mode_key: candidate.primary_mode_key,
+    current_entry: candidate.entry_trigger_json,
+    current_invalidation: candidate.invalidation_json,
+    current_exit: candidate.exit_trigger_json,
+    action_trade_date: undefined,
+    manual_note: '',
+    entry_trigger_text: '',
+    invalidation_text: '',
+    exit_trigger_text: ''
+  }))
+  revisionDialogVisible.value = true
+}
+
+async function submitRevision() {
+  const plan = selectedPlan.value
+  if (!plan || plan.status !== 'draft' || revisionSaving.value || planActionLoading.value) return
+  revisionError.value = null
+  let revision
   try {
-    await cancelTradingPlan(plan.id)
-    await loadPlanDomain()
-    ElMessage.success('预案已取消，相关行动提醒已停用')
+    revision = buildPlanRevision(revisionChangeNote.value, revisionDrafts.value)
   } catch (error) {
-    planActionError.value = errorMessage(error)
-  } finally {
-    planActionLoading.value = null
+    revisionError.value = errorMessage(error)
+    return
   }
+  await planRevisionController.run(plan.id, revision)
 }
 
 async function acknowledge(alertId: number) {
-  acknowledgingAlertId.value = alertId
-  try {
-    await store.acknowledgeAlert(alertId)
-  } catch (error) {
-    ElMessage.error(`提醒确认失败：${errorMessage(error)}`)
-  } finally {
-    acknowledgingAlertId.value = null
-  }
+  await acknowledgeGuard.run(alertId, async () => {
+    try {
+      await store.acknowledgeAlert(alertId)
+    } catch (error) {
+      ElMessage.error(`提醒确认失败：${errorMessage(error)}`)
+    }
+  })
 }
 
 async function saveExecutionReview() {
-  if (!selectedReview.value) return
+  if (!reviewEditorReady.value) return
   reviewSaving.value = true
   try {
-    const payload = buildManualExecutionUpdate(reviewDate.value, plannedDrafts.value, unplannedDrafts.value)
-    const planId = restrictReviewToPlan.value ? selectedReview.value.plan_version_id : undefined
-    await updateTradingExecutionReview(reviewDate.value, payload, planId)
-    await loadReviewDomain()
-    ElMessage.success('人工执行记录已保存')
+    await saveReviewIfEditable(
+      selectedReview.value,
+      reviewPlan.value,
+      reviewPlanLoading.value,
+      async () => {
+        const payload = buildManualExecutionUpdate(reviewDate.value, plannedDrafts.value, unplannedDrafts.value)
+        const planId = restrictReviewToPlan.value ? selectedReview.value?.plan_version_id : undefined
+        await updateTradingExecutionReview(reviewDate.value, payload, planId)
+        await loadReviewDomain()
+        ElMessage.success('人工执行记录已保存')
+      }
+    )
   } catch (error) {
     ElMessage.error(`执行记录保存失败：${errorMessage(error)}`)
   } finally {
@@ -828,10 +1019,15 @@ function syncSettingsDraft() {
 
 async function loadSettings() {
   try {
-    await store.loadSettings()
+    await runAndClearErrorOnSuccess(
+      () => store.loadSettings(),
+      () => { settingsActionError.value = null }
+    )
     syncSettingsDraft()
+    return true
   } catch {
     // The store exposes the latest settings error.
+    return false
   }
 }
 
@@ -841,7 +1037,9 @@ async function saveSettings() {
   try {
     const patch = buildSettingsUpdate(settingsDraft.value)
     await updateTradingPlaybookSettings(patch)
-    await loadSettings()
+    if (!await loadSettings()) {
+      throw new Error(store.settingsError || '设置重新加载失败')
+    }
     ElMessage.success('独立提醒与风控设置已保存')
   } catch (error) {
     settingsActionError.value = errorMessage(error)
@@ -1147,6 +1345,60 @@ h5 {
   }
 }
 
+.revision-error {
+  margin-top: 12px;
+}
+
+.revision-form {
+  margin-top: 16px;
+}
+
+.revision-candidate {
+  margin-top: 14px;
+  padding: 14px;
+  border: 1px solid var(--panel-border);
+  border-radius: 10px;
+  background: #f8fafc;
+}
+
+.revision-candidate-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+
+  span {
+    color: var(--muted);
+    font-size: 12px;
+  }
+}
+
+.revision-current {
+  display: grid;
+  gap: 5px;
+  margin: 10px 0 14px;
+
+  p {
+    color: #475569;
+    font-size: 12px;
+    line-height: 1.5;
+    overflow-wrap: anywhere;
+  }
+}
+
+.revision-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.revision-help {
+  margin-top: 12px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
 :deep(.el-table) {
   --el-table-header-bg-color: #f8fafc;
 }
@@ -1164,6 +1416,10 @@ h5 {
 
   .settings-form {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .revision-fields {
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 

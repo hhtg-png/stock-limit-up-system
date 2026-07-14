@@ -227,6 +227,7 @@ class TradingPlaybookApiTests(unittest.TestCase):
                     "hard_stop": 5.0,
                     "max_candidates": 3,
                 },
+                data_quality_json={"status": "ready"},
                 input_hash="seed",
                 generated_at=datetime(2026, 7, 10, 15, 30),
             )
