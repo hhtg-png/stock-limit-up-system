@@ -127,6 +127,24 @@ TABLE_COLUMNS = {
         "generated_at",
         "finalized_at",
     },
+    "trading_playbook_job_claims": {
+        "id",
+        "job_key",
+        "job_type",
+        "phase",
+        "source_trade_date",
+        "target_trade_date",
+        "stage",
+        "generation_key",
+        "owner",
+        "status",
+        "attempt_no",
+        "lease_expires_at",
+        "completed_at",
+        "last_error",
+        "created_at",
+        "updated_at",
+    },
     "trading_playbook_settings": {
         "id",
         "enabled",
@@ -239,6 +257,24 @@ COLUMN_TYPES = {
         "generated_at": (DateTime, None),
         "finalized_at": (DateTime, None),
     },
+    "trading_playbook_job_claims": {
+        "id": (Integer, None),
+        "job_key": (String, 255),
+        "job_type": (String, 40),
+        "phase": (String, 40),
+        "source_trade_date": (Date, None),
+        "target_trade_date": (Date, None),
+        "stage": (String, 20),
+        "generation_key": (String, 120),
+        "owner": (String, 80),
+        "status": (String, 20),
+        "attempt_no": (Integer, None),
+        "lease_expires_at": (DateTime, None),
+        "completed_at": (DateTime, None),
+        "last_error": (Text, None),
+        "created_at": (DateTime, None),
+        "updated_at": (DateTime, None),
+    },
     "trading_playbook_settings": {
         "id": (Integer, None),
         "enabled": (Boolean, None),
@@ -261,6 +297,13 @@ NULLABLE_COLUMNS = {
     ("trading_alert_events", "candidate_id"),
     ("trading_alert_events", "acknowledged_at"),
     ("trading_execution_reviews", "finalized_at"),
+    ("trading_playbook_job_claims", "source_trade_date"),
+    ("trading_playbook_job_claims", "target_trade_date"),
+    ("trading_playbook_job_claims", "stage"),
+    ("trading_playbook_job_claims", "generation_key"),
+    ("trading_playbook_job_claims", "lease_expires_at"),
+    ("trading_playbook_job_claims", "completed_at"),
+    ("trading_playbook_job_claims", "last_error"),
 }
 
 SCALAR_DEFAULTS = {
@@ -271,6 +314,8 @@ SCALAR_DEFAULTS = {
     ("trading_plan_candidates", "theme_name"): "",
     ("trading_plan_candidates", "position_reference"): 0,
     ("trading_plan_candidates", "status"): "waiting",
+    ("trading_playbook_job_claims", "status"): "running",
+    ("trading_playbook_job_claims", "attempt_no"): 1,
     ("trading_playbook_settings", "id"): 1,
     ("trading_playbook_settings", "enabled"): True,
     ("trading_playbook_settings", "trial_position_pct"): 10,
@@ -287,6 +332,8 @@ DATETIME_DEFAULTS = {
     ("trading_plan_versions", "generated_at"),
     ("trading_alert_events", "triggered_at"),
     ("trading_execution_reviews", "generated_at"),
+    ("trading_playbook_job_claims", "created_at"),
+    ("trading_playbook_job_claims", "updated_at"),
     ("trading_playbook_settings", "updated_at"),
 }
 
@@ -357,6 +404,9 @@ UNIQUE_CONSTRAINTS = {
     "trading_execution_reviews": {
         ("uq_trading_execution_review", ("trade_date", "plan_version_id")),
     },
+    "trading_playbook_job_claims": {
+        ("uq_trading_playbook_job_claim_key", ("job_key",)),
+    },
     "trading_playbook_settings": set(),
 }
 
@@ -378,6 +428,15 @@ INDEXED_COLUMNS = {
     },
     "trading_alert_events": {"plan_version_id", "candidate_id"},
     "trading_execution_reviews": {"trade_date"},
+}
+
+COMPOSITE_INDEXES = {
+    "trading_playbook_job_claims": {
+        (
+            "ix_trading_playbook_job_claim_status_lease",
+            ("status", "lease_expires_at"),
+        ),
+    },
 }
 
 
@@ -484,6 +543,16 @@ class TradingPlaybookModelTests(unittest.TestCase):
                 with self.subTest(table=table_name, column=column_name):
                     self.assertIn((column_name,), indexed_columns)
 
+    def test_required_composite_indexes_are_registered(self):
+        for table_name, expected_indexes in COMPOSITE_INDEXES.items():
+            table = Base.metadata.tables[table_name]
+            actual_indexes = {
+                (index.name, tuple(column.name for column in index.columns))
+                for index in table.indexes
+            }
+            with self.subTest(table=table_name):
+                self.assertTrue(expected_indexes.issubset(actual_indexes))
+
     def test_primary_keys_and_autoincrement_match_contract(self):
         autoincrement_tables = set(TABLE_COLUMNS) - {"trading_playbook_settings"}
         for table_name in TABLE_COLUMNS:
@@ -495,6 +564,13 @@ class TradingPlaybookModelTests(unittest.TestCase):
 
     def test_settings_updated_at_has_callable_onupdate(self):
         updated_at = Base.metadata.tables["trading_playbook_settings"].c.updated_at
+        self.assertIsNotNone(updated_at.onupdate)
+        self.assertTrue(callable(updated_at.onupdate.arg))
+
+    def test_job_claim_updated_at_has_callable_onupdate(self):
+        updated_at = Base.metadata.tables[
+            "trading_playbook_job_claims"
+        ].c.updated_at
         self.assertIsNotNone(updated_at.onupdate)
         self.assertTrue(callable(updated_at.onupdate.arg))
 

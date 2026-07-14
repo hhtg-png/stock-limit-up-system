@@ -188,9 +188,19 @@ class TradingPlaybookDomainContractTests(unittest.TestCase):
         )
         self.assertEqual(
             [field.name for field in fields(quality)],
-            ["status", "as_of", "source", "stale", "warnings"],
+            [
+                "status",
+                "as_of",
+                "source",
+                "stale",
+                "warnings",
+                "forced_degraded",
+                "degradation_reason",
+            ],
         )
         self.assertEqual(quality.warnings, [])
+        self.assertFalse(quality.forced_degraded)
+        self.assertIsNone(quality.degradation_reason)
         with self.assertRaises(FrozenInstanceError):
             quality.status = "degraded"
 
@@ -473,6 +483,7 @@ class TradingPlaybookQuoteSnapshotTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(set(snapshot.quotes), {"000001", "000002"})
         self.assertEqual(snapshot.quality.status, "degraded")
+        self.assertFalse(snapshot.quality.forced_degraded)
         self.assertTrue(any("chunk" in warning for warning in snapshot.quality.warnings))
         self.assertEqual(len(api.calls), 2)
         self.assertLessEqual(api.max_active, 2)
@@ -3041,6 +3052,7 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(snapshot.quality.status, "degraded")
+        self.assertTrue(snapshot.quality.forced_degraded)
         self.assertEqual(snapshot.market_features["full_market_speed_ranks"], {})
         self.assertNotIn("speed_rank", snapshot.candidates[0].features)
         self.assertNotIn("speed_pct", snapshot.candidates[0].features)

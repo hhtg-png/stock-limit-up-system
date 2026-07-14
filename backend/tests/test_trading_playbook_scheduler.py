@@ -14,7 +14,11 @@ from app.data_collectors.scheduler import (
     TradingCalendarLookupError,
 )
 from app.models.market_review import MarketReviewDailyMetric
-from app.models.trading_playbook import TradingPlanVersion
+from app.models.trading_playbook import (
+    TradingExecutionReview,
+    TradingPlanVersion,
+    TradingPlaybookJobClaim,
+)
 from app.utils.time_utils import CN_TZ
 
 
@@ -51,6 +55,33 @@ class ScalarResult:
 
     def scalar_one_or_none(self):
         return self.value
+
+
+class InMemoryClaimService:
+    """Deterministic phase claim fake for tests that use mock DB sessions."""
+
+    def __init__(self):
+        self.active = set()
+        self.completed = set()
+
+    async def claim(self, _db, *, job_key, owner, **_kwargs):
+        if job_key in self.active or job_key in self.completed:
+            return None
+        self.active.add(job_key)
+        return SimpleNamespace(
+            job_key=job_key,
+            owner=owner,
+            attempt_no=1,
+        )
+
+    async def complete(self, _db, token, **_kwargs):
+        self.active.discard(token.job_key)
+        self.completed.add(token.job_key)
+        return True
+
+    async def fail(self, _db, token, **_kwargs):
+        self.active.discard(token.job_key)
+        return True
 
 
 class TradingPlaybookSchedulerRegistrationTests(unittest.TestCase):
@@ -130,7 +161,9 @@ class TradingPlaybookSchedulerStageTests(unittest.IsolatedAsyncioTestCase):
             session_factory=lambda: AsyncSessionContext(self.db),
             now_provider=lambda: self.now,
             sleep=AsyncMock(),
+            job_claim_service=InMemoryClaimService(),
         )
+        self.scheduler._playbook_review_exists = AsyncMock(return_value=False)
 
     async def test_build_plan_uses_aware_china_now_same_session_and_notifies_when_installed(self):
         alert_service = SimpleNamespace(notify_plan_ready=AsyncMock())
@@ -138,7 +171,7 @@ class TradingPlaybookSchedulerStageTests(unittest.IsolatedAsyncioTestCase):
 
         with patch(
             "app.data_collectors.scheduler._get_cn_trading_dates",
-            return_value=[self.now.date()],
+            return_value=[self.now.date(), self.now.date() + timedelta(days=1)],
         ):
             result = await self.scheduler._build_trading_playbook_plan(
                 "after_close",
@@ -175,7 +208,7 @@ class TradingPlaybookSchedulerStageTests(unittest.IsolatedAsyncioTestCase):
 
         with patch(
             "app.data_collectors.scheduler._get_cn_trading_dates",
-            return_value=[self.now.date()],
+            return_value=[self.now.date(), self.now.date() + timedelta(days=1)],
         ):
             await self.scheduler._build_trading_playbook_plan(
                 "after_close",
@@ -373,11 +406,26 @@ class TradingPlaybookDataReadyBarrierTests(unittest.IsolatedAsyncioTestCase):
         calls = []
         scheduler._wait_for_trading_playbook_data = AsyncMock(return_value=False)
 
-        async def build(stage, *, degraded=False, send_notifications=True):
-            calls.append(("build", stage, degraded, send_notifications))
+        async def build(
+            stage,
+            *,
+            degraded=False,
+            degradation_reason=None,
+            send_notifications=True,
+        ):
+            calls.append(
+                (
+                    "build",
+                    stage,
+                    degraded,
+                    degradation_reason,
+                    send_notifications,
+                )
+            )
+            return SimpleNamespace(id=7)
 
-        async def finalize():
-            calls.append(("finalize",))
+        async def finalize(*, plan_version_id=None):
+            calls.append(("finalize", plan_version_id))
 
         scheduler._build_trading_playbook_plan = build
         scheduler._finalize_trading_playbook_review = finalize
@@ -393,8 +441,14 @@ class TradingPlaybookDataReadyBarrierTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             calls,
             [
-                ("build", "after_close", True, False),
-                ("finalize",),
+                (
+                    "build",
+                    "after_close",
+                    True,
+                    "after_close_barrier_timeout",
+                    False,
+                ),
+                ("finalize", 7),
             ],
         )
 
@@ -419,11 +473,13 @@ class TradingPlaybookDataReadyBarrierTests(unittest.IsolatedAsyncioTestCase):
                 unittest.mock.call(
                     "after_close",
                     degraded=True,
+                    degradation_reason="after_close_barrier_timeout",
                     send_notifications=True,
                 ),
                 unittest.mock.call(
                     "after_close",
                     degraded=False,
+                    degradation_reason=None,
                     send_notifications=True,
                 ),
             ],
@@ -431,6 +487,29 @@ class TradingPlaybookDataReadyBarrierTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TradingPlaybookForcedUpgradeTests(unittest.IsolatedAsyncioTestCase):
+    def test_forced_upgrade_marker_prefers_structured_quality_with_legacy_compatibility(self):
+        structured = SimpleNamespace(
+            data_quality_json={
+                "status": "degraded",
+                "forced_degraded": True,
+                "degradation_reason": "after_close_barrier_timeout",
+                "warnings": ["ordinary warning"],
+            }
+        )
+        explicit_false = SimpleNamespace(
+            data_quality_json={
+                "forced_degraded": False,
+                "warnings": ["force_degraded requested"],
+            }
+        )
+        legacy = SimpleNamespace(
+            data_quality_json={"warnings": ["force_degraded requested"]}
+        )
+
+        self.assertTrue(DataScheduler._is_forced_degraded_plan(structured))
+        self.assertFalse(DataScheduler._is_forced_degraded_plan(explicit_false))
+        self.assertTrue(DataScheduler._is_forced_degraded_plan(legacy))
+
     @staticmethod
     def _after_close_plan(source_date, target_date, version_no, warning):
         return TradingPlanVersion(
@@ -593,6 +672,12 @@ class TradingPlaybookForcedUpgradeTests(unittest.IsolatedAsyncioTestCase):
                     MarketReviewDailyMetric.__table__.create
                 )
                 await connection.run_sync(TradingPlanVersion.__table__.create)
+                await connection.run_sync(
+                    TradingExecutionReview.__table__.create
+                )
+                await connection.run_sync(
+                    TradingPlaybookJobClaim.__table__.create
+                )
             async with writer_maker() as writer:
                 writer.add(
                     MarketReviewDailyMetric(
@@ -615,6 +700,7 @@ class TradingPlaybookForcedUpgradeTests(unittest.IsolatedAsyncioTestCase):
                     stage,
                     as_of,
                     degraded=False,
+                    degradation_reason=None,
                 ):
                     latest = (
                         await db.execute(
@@ -637,6 +723,8 @@ class TradingPlaybookForcedUpgradeTests(unittest.IsolatedAsyncioTestCase):
                         risk_settings_json={},
                         data_quality_json={
                             "status": "degraded" if degraded else "ready",
+                            "forced_degraded": degradation_reason is not None,
+                            "degradation_reason": degradation_reason,
                             "warnings": (
                                 ["force_degraded requested"]
                                 if degraded
@@ -771,12 +859,15 @@ class TradingPlaybookForcedUpgradeTests(unittest.IsolatedAsyncioTestCase):
             trading_playbook_review_service=review_service,
             session_factory=lambda: AsyncSessionContext(db),
             now_provider=lambda: now,
+            job_claim_service=InMemoryClaimService(),
         )
-        scheduler._is_cn_trading_day = MagicMock(return_value=True)
         scheduler._playbook_stage_exists = AsyncMock(return_value=True)
-        scheduler._playbook_review_exists = AsyncMock(return_value=True)
+        scheduler._playbook_review_exists = AsyncMock(
+            side_effect=[True, False, False]
+        )
         scheduler._latest_relevant_after_close_plan = AsyncMock(
             return_value=SimpleNamespace(
+                id=2,
                 source_trade_date=now.date(),
                 data_quality_json={
                     "warnings": ["force_degraded requested"],
@@ -787,7 +878,7 @@ class TradingPlaybookForcedUpgradeTests(unittest.IsolatedAsyncioTestCase):
 
         with patch(
             "app.data_collectors.scheduler._get_cn_trading_dates",
-            return_value=[date(2026, 7, 14)],
+            return_value=[date(2026, 7, 13), date(2026, 7, 14)],
         ):
             await scheduler._run_trading_playbook_catchup(now)
 

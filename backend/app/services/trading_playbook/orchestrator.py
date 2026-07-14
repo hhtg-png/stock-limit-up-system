@@ -53,17 +53,29 @@ class TradingPlaybookOrchestrator:
         stage: str,
         as_of: datetime,
         degraded: bool = False,
+        degradation_reason: str | None = None,
     ) -> Any:
         self._validate_request(source_trade_date, stage, as_of, degraded)
         target_trade_date = self._target_trade_date(source_trade_date, stage)
 
-        raw_snapshot = await self.market_data.build_market_snapshot(
+        market_data_kwargs = dict(
             db=db,
             source_trade_date=source_trade_date,
             target_trade_date=target_trade_date,
             stage=stage,
             as_of=as_of,
             force_degraded=degraded,
+        )
+        if degradation_reason is not None:
+            if not degraded or not str(degradation_reason).strip():
+                raise InvalidRequestError(
+                    "degradation_reason requires a degraded request"
+                )
+            market_data_kwargs["force_degraded_reason"] = str(
+                degradation_reason
+            ).strip()
+        raw_snapshot = await self.market_data.build_market_snapshot(
+            **market_data_kwargs
         )
         self._validate_snapshot_identity(
             raw_snapshot,

@@ -99,6 +99,8 @@ def _snapshot(
     stale: bool = False,
     warnings: list[str] | None = None,
     quality_as_of: datetime = AS_OF,
+    forced_degraded: bool = False,
+    degradation_reason: str | None = None,
 ) -> MarketSnapshot:
     candidates = [
         CandidateSnapshot(
@@ -135,6 +137,8 @@ def _snapshot(
             "test",
             stale=stale,
             warnings=warnings or [],
+            forced_degraded=forced_degraded,
+            degradation_reason=degradation_reason,
         ),
     )
 
@@ -172,6 +176,36 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
             if rule_snapshot is not None
             else _rule_snapshot(*(row.mode_key for row in evaluations)),
         )
+
+    async def test_structured_forced_degradation_survives_many_ordinary_warnings(self):
+        warnings = [f"ordinary warning {index}" for index in range(51)]
+        snapshot = _snapshot(
+            stage="after_close",
+            quality_status="degraded",
+            warnings=warnings,
+            forced_degraded=True,
+            degradation_reason="after_close_barrier_timeout",
+        )
+
+        async with self.Session() as db:
+            await self._generate(
+                db,
+                [_evaluation("leader", "000001")],
+                snapshot=_snapshot(stage="preclose"),
+            )
+            payload = await self._generate(
+                db,
+                [_evaluation("leader", "000001")],
+                snapshot=snapshot,
+            )
+
+        quality = payload["data_quality_json"]
+        self.assertTrue(quality["forced_degraded"])
+        self.assertEqual(
+            quality["degradation_reason"],
+            "after_close_barrier_timeout",
+        )
+        self.assertEqual(quality["warnings"], warnings)
 
     async def test_generate_limits_unique_action_candidates_and_preserves_radar(self):
         evaluations = [

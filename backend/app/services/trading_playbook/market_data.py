@@ -623,6 +623,7 @@ class TradingPlaybookMarketDataProvider:
         stage: str,
         as_of: datetime,
         force_degraded: bool = False,
+        force_degraded_reason: Optional[str] = None,
     ) -> MarketSnapshot:
         local_as_of = self._china_datetime(as_of)
         database_as_of = local_as_of.replace(tzinfo=None)
@@ -1196,6 +1197,10 @@ class TradingPlaybookMarketDataProvider:
                 source="trading_playbook_market_data",
                 stale=quote_snapshot.quality.stale,
                 warnings=warnings,
+                forced_degraded=force_degraded,
+                degradation_reason=(
+                    force_degraded_reason if force_degraded else None
+                ),
             ),
         )
 

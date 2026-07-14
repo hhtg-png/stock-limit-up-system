@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, field
 from datetime import date, datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 
 @dataclass(frozen=True)
@@ -12,6 +12,8 @@ class DataQuality:
     source: str
     stale: bool = False
     warnings: List[str] = field(default_factory=list)
+    forced_degraded: bool = False
+    degradation_reason: Optional[str] = None
 
 
 @dataclass(frozen=True)

@@ -377,6 +377,12 @@ class TradingPlanService:
                     snapshot.quality.warnings,
                     path="snapshot.quality.warnings",
                 ),
+                "forced_degraded": bool(snapshot.quality.forced_degraded),
+                "degradation_reason": (
+                    str(snapshot.quality.degradation_reason)
+                    if snapshot.quality.degradation_reason is not None
+                    else None
+                ),
             },
         }
         _canonical_json(payload)

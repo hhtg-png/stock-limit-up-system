@@ -219,6 +219,42 @@ class TradingExecutionReview(Base):
     finalized_at = Column(DateTime, nullable=True)
 
 
+class TradingPlaybookJobClaim(Base):
+    """Cross-process lease for one idempotent playbook work phase."""
+
+    __tablename__ = "trading_playbook_job_claims"
+    __table_args__ = (
+        UniqueConstraint("job_key", name="uq_trading_playbook_job_claim_key"),
+        Index(
+            "ix_trading_playbook_job_claim_status_lease",
+            "status",
+            "lease_expires_at",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    job_key = Column(String(255), nullable=False)
+    job_type = Column(String(40), nullable=False)
+    phase = Column(String(40), nullable=False)
+    source_trade_date = Column(Date, nullable=True)
+    target_trade_date = Column(Date, nullable=True)
+    stage = Column(String(20), nullable=True)
+    generation_key = Column(String(120), nullable=True)
+    owner = Column(String(80), nullable=False)
+    status = Column(String(20), default="running", nullable=False)
+    attempt_no = Column(Integer, default=1, nullable=False)
+    lease_expires_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    last_error = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.now, nullable=False)
+    updated_at = Column(
+        DateTime,
+        default=datetime.now,
+        onupdate=datetime.now,
+        nullable=False,
+    )
+
+
 class TradingPlaybookSettings(Base):
     """Singleton configuration for playbook sizing and alert channels."""
 

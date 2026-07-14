@@ -94,6 +94,59 @@ class DatabaseSqliteConfigTests(unittest.TestCase):
                     "trial_position_pct=25, confirmed_position_pct=20"
                 )
 
+    def test_sqlite_schema_compat_creates_idempotent_playbook_job_claim_schema(self):
+        engine = create_engine("sqlite:///:memory:", future=True)
+        with engine.begin() as connection:
+            connection.exec_driver_sql(
+                "CREATE TABLE market_review_stock_daily (id INTEGER PRIMARY KEY)"
+            )
+            connection.exec_driver_sql(
+                "CREATE TABLE market_review_limitup_event (id INTEGER PRIMARY KEY)"
+            )
+            connection.exec_driver_sql(
+                "CREATE TABLE daily_analysis_records (id INTEGER PRIMARY KEY)"
+            )
+
+            database.ensure_sqlite_schema_compat(connection)
+            database.ensure_sqlite_schema_compat(connection)
+
+            columns = {
+                row[1]
+                for row in connection.exec_driver_sql(
+                    "PRAGMA table_info(trading_playbook_job_claims)"
+                )
+            }
+            indexes = {
+                row[1]
+                for row in connection.exec_driver_sql(
+                    "PRAGMA index_list(trading_playbook_job_claims)"
+                )
+            }
+
+        self.assertEqual(
+            columns,
+            {
+                "id",
+                "job_key",
+                "job_type",
+                "phase",
+                "source_trade_date",
+                "target_trade_date",
+                "stage",
+                "generation_key",
+                "owner",
+                "status",
+                "attempt_no",
+                "lease_expires_at",
+                "completed_at",
+                "last_error",
+                "created_at",
+                "updated_at",
+            },
+        )
+        self.assertIn("uq_trading_playbook_job_claim_key", indexes)
+        self.assertIn("ix_trading_playbook_job_claim_status_lease", indexes)
+
 
 class DatabasePostgresqlCompatTests(unittest.IsolatedAsyncioTestCase):
     def test_postgresql_schema_compat_locks_repairs_and_indexes_existing_table(self):
@@ -139,6 +192,25 @@ class DatabasePostgresqlCompatTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(
             "conrelid='trading_playbook_settings'::regclass",
             constraint_sql,
+        )
+        self.assertTrue(
+            any(
+                "CREATE TABLE IF NOT EXISTS trading_playbook_job_claims" in statement
+                for statement in sql
+            )
+        )
+        self.assertTrue(
+            any(
+                "uq_trading_playbook_job_claim_key" in statement
+                for statement in sql
+            )
+        )
+        self.assertTrue(
+            any(
+                "ix_trading_playbook_job_claim_status_lease" in statement
+                and "(status, lease_expires_at)" in statement
+                for statement in sql
+            )
         )
 
     async def test_init_db_runs_postgresql_compat_after_create_all(self):
