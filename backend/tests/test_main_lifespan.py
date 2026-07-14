@@ -1,7 +1,7 @@
 import unittest
 import sys
 import types
-from datetime import timedelta, tzinfo
+from datetime import date, timedelta, tzinfo
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -81,12 +81,30 @@ from app.services.trading_playbook.serialization import ValidatedPlanPayload
 
 
 class LifecycleScheduler:
-    def __init__(self, *, start_error=None):
+    class Calendar:
+        def __init__(self, *, ensure_error=None):
+            self.ensure_calls = []
+            self.close_calls = 0
+            self.ensure_error = ensure_error
+
+        async def ensure_date(self, value):
+            self.ensure_calls.append(value)
+            if self.ensure_error is not None:
+                raise self.ensure_error
+
+        def next_trade_date(self, value):
+            return value + timedelta(days=1)
+
+        async def close(self):
+            self.close_calls += 1
+
+    def __init__(self, *, start_error=None, calendar_error=None):
         self.orchestrator = None
         self.start_calls = 0
         self.stop_calls = 0
         self.reset_calls = 0
         self.start_error = start_error
+        self.calendar = self.Calendar(ensure_error=calendar_error)
 
     def install_trading_playbook_orchestrator(self, orchestrator):
         self.orchestrator = orchestrator
@@ -97,6 +115,9 @@ class LifecycleScheduler:
     def reset_trading_playbook_services(self):
         self.reset_calls += 1
         self.orchestrator = None
+
+    def get_trading_calendar_service(self):
+        return self.calendar
 
     def start(self):
         self.start_calls += 1
@@ -228,6 +249,8 @@ class MainLifespanTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(scheduler.start_calls, 1)
         self.assertEqual(scheduler.stop_calls, 1)
         self.assertEqual(scheduler.reset_calls, 2)
+        self.assertEqual(len(scheduler.calendar.ensure_calls), 1)
+        self.assertEqual(scheduler.calendar.close_calls, 1)
         self.assertIsNone(trading_playbook_runtime.get_orchestrator())
         self.assertFalse(
             hasattr(app_main.app.state, "trading_playbook_orchestrator")
@@ -262,6 +285,36 @@ class MainLifespanTests(unittest.IsolatedAsyncioTestCase):
         factory.assert_not_called()
         self.assertIsNone(scheduler.orchestrator)
         self.assertIsNone(trading_playbook_runtime.get_orchestrator())
+
+    async def test_calendar_warm_failure_is_logged_and_startup_continues(self):
+        scheduler = LifecycleScheduler(
+            calendar_error=RuntimeError("calendar offline")
+        )
+        sentinel = types.SimpleNamespace(build_stage=AsyncMock())
+        patches = self._lifecycle_patches(scheduler)
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7], patch.object(
+            app_main.settings,
+            "TRADING_PLAYBOOK_ENABLED",
+            True,
+        ), patch.object(
+            app_main,
+            "build_production_trading_playbook_orchestrator",
+            return_value=sentinel,
+        ) as factory, patch.object(app_main.logger, "error") as log_error:
+            async with app_main.lifespan(app_main.app):
+                self.assertEqual(scheduler.start_calls, 1)
+                self.assertIs(scheduler.orchestrator, sentinel)
+
+        factory.assert_called_once_with(
+            next_trade_date=scheduler.calendar.next_trade_date,
+        )
+        self.assertTrue(
+            any(
+                "Trading calendar warm-up failed" in str(call.args[0])
+                for call in log_error.call_args_list
+            )
+        )
+        self.assertEqual(scheduler.calendar.close_calls, 1)
 
     async def test_startup_failure_still_resets_registry_scheduler_and_database(self):
         scheduler = LifecycleScheduler(start_error=RuntimeError("start failed"))

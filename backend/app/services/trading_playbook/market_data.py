@@ -20,25 +20,14 @@ from app.services.trading_playbook.domain import (
     QuotePoint,
     QuoteSnapshot,
 )
+from app.services.trading_playbook.context_service import (
+    FULL_MARKET_CONTEXT_FIELDS,
+)
 from app.utils.market_data_sanitizer import normalize_change_pct
 
 QuoteFieldQuality = Dict[str, Dict[str, str]]
 _NONFINITE = object()
-_FULL_MARKET_CONTEXT_FIELDS = (
-    "limit_up_count",
-    "limit_up_count_prev",
-    "trend_new_high_count",
-    "trend_new_high_count_prev",
-    "limit_down_count",
-    "max_board_height",
-    "seal_rate",
-    "negative_feedback",
-    "divergence_days",
-    "sell_pressure_falling",
-    "breadth_recovered",
-    "prior_window",
-    "sell_pressure_rising",
-)
+_FULL_MARKET_CONTEXT_FIELDS = FULL_MARKET_CONTEXT_FIELDS
 _FULL_MARKET_PRIOR_WINDOWS = {
     "",
     "outbreak",
@@ -120,11 +109,16 @@ class TradingPlaybookMarketDataProvider:
         stock_codes: List[str],
         trade_date: date,
         as_of: datetime,
+        *,
+        stage: Optional[str] = None,
+        evidence_trade_date: Optional[date] = None,
     ) -> Tuple[QuoteSnapshot, QuoteFieldQuality]:
         return await self._collect_quote_snapshot(
             stock_codes,
             trade_date,
             as_of,
+            stage=stage,
+            evidence_trade_date=evidence_trade_date,
         )
 
     async def _collect_quote_snapshot(
@@ -132,6 +126,9 @@ class TradingPlaybookMarketDataProvider:
         stock_codes: List[str],
         trade_date: date,
         as_of: datetime,
+        *,
+        stage: Optional[str] = None,
+        evidence_trade_date: Optional[date] = None,
     ) -> Tuple[QuoteSnapshot, QuoteFieldQuality]:
         requested_codes = sorted(
             {
@@ -227,7 +224,17 @@ class TradingPlaybookMarketDataProvider:
                     )
                     continue
                 quality["timestamp"] = "ready"
-                if age_seconds > self.STALE_AFTER_SECONDS:
+                baseline_ready = self._quote_baseline_ready(
+                    stage=stage,
+                    trade_date=trade_date,
+                    evidence_trade_date=evidence_trade_date,
+                    captured_at=captured_at,
+                    as_of=as_of,
+                )
+                quality["_baseline_freshness"] = (
+                    "ready" if baseline_ready else "stale"
+                )
+                if not baseline_ready:
                     stale_codes.append(code)
                     warnings.append(
                         f"stale quote for {code} at {captured_at.isoformat()}"
@@ -353,11 +360,15 @@ class TradingPlaybookMarketDataProvider:
                 change_pct = math.nan
                 quality["change_pct"] = "missing"
 
+            speed_timestamp_ready = (
+                quality["timestamp"] == "ready"
+                and self._speed_timestamp_ready(captured_at, as_of, trade_date)
+            )
             speed_pct, quality["speed_pct"] = await self._speed_and_cache(
                 code,
                 price,
                 captured_at,
-                timestamp_ready=quality["timestamp"] == "ready",
+                timestamp_ready=speed_timestamp_ready,
             )
             quotes[code] = QuotePoint(
                 stock_code=code,
@@ -418,6 +429,51 @@ class TradingPlaybookMarketDataProvider:
             field_quality,
         )
 
+    @classmethod
+    def _quote_baseline_ready(
+        cls,
+        *,
+        stage: Optional[str],
+        trade_date: date,
+        evidence_trade_date: Optional[date],
+        captured_at: datetime,
+        as_of: datetime,
+    ) -> bool:
+        local_captured = cls._china_datetime(captured_at)
+        local_as_of = cls._china_datetime(as_of)
+        if local_captured > local_as_of:
+            return False
+        captured_time = local_captured.time().replace(tzinfo=None)
+        if stage == "after_close":
+            return (
+                local_captured.date() == trade_date
+                and captured_time >= time(15, 0)
+            )
+        if stage == "overnight":
+            return (
+                evidence_trade_date is not None
+                and local_captured.date() == evidence_trade_date
+                and captured_time >= time(15, 0)
+            )
+        if stage == "auction":
+            return cls._is_auction_timestamp(local_captured, trade_date)
+        return cls._age_seconds(local_as_of, local_captured) <= cls.STALE_AFTER_SECONDS
+
+    @classmethod
+    def _speed_timestamp_ready(
+        cls,
+        captured_at: datetime,
+        as_of: datetime,
+        trade_date: date,
+    ) -> bool:
+        local_captured = cls._china_datetime(captured_at)
+        local_as_of = cls._china_datetime(as_of)
+        return (
+            local_captured.date() == trade_date
+            and 0 <= cls._age_seconds(local_as_of, local_captured)
+            <= cls.SPEED_MAX_INTERVAL_SECONDS
+        )
+
     async def kline_features(
         self,
         stock_code: str,
@@ -426,6 +482,7 @@ class TradingPlaybookMarketDataProvider:
     ) -> Dict[str, Any]:
         missing = {
             "n_day_high": False,
+            "prior_n_day_high": False,
             "consolidation_days": 0,
             "trend_established": False,
             "kline_quality": "missing",
@@ -449,6 +506,7 @@ class TradingPlaybookMarketDataProvider:
     def _calculate_kline_features(points: Any) -> Dict[str, Any]:
         missing = {
             "n_day_high": False,
+            "prior_n_day_high": False,
             "consolidation_days": 0,
             "trend_established": False,
             "kline_quality": "missing",
@@ -476,6 +534,7 @@ class TradingPlaybookMarketDataProvider:
             band = (max(recent) - min(recent)) / max(min(recent), 0.01)
             return {
                 "n_day_high": closes[-1] > prior_high,
+                "prior_n_day_high": closes[-2] > max(closes[:-2]),
                 "consolidation_days": 4 if band <= 0.08 else 0,
                 "trend_established": closes[-1] > sum(closes[-6:-1]) / 5,
                 "kline_quality": "ready",
@@ -574,6 +633,13 @@ class TradingPlaybookMarketDataProvider:
                 as_of,
             )
         )
+        evidence_trade_date = source_trade_date
+        if market_context_evidence:
+            parsed_evidence_date = self._parse_date_value(
+                market_context_evidence[0].get("evidence_trade_date")
+            )
+            if parsed_evidence_date is not None:
+                evidence_trade_date = parsed_evidence_date
         stock_result = await db.execute(select(Stock).order_by(Stock.stock_code))
         eligible_stocks = [
             stock
@@ -589,6 +655,8 @@ class TradingPlaybookMarketDataProvider:
             universe_codes,
             min(target_trade_date, local_as_of.date()),
             as_of,
+            stage=stage,
+            evidence_trade_date=evidence_trade_date,
         )
 
         change_order = sorted(
@@ -647,16 +715,24 @@ class TradingPlaybookMarketDataProvider:
             warnings.append(context_warning)
 
         realtime_rows: List[Dict[str, Any]] = []
+        realtime_loaded = False
         pool_trade_date = min(target_trade_date, local_as_of.date())
         try:
             realtime_rows = await self._load_realtime_limit_up(pool_trade_date)
+            realtime_loaded = True
         except Exception as exc:
             warnings.append(f"realtime limit-up pool failed: {exc}")
         realtime_by_code: Dict[str, Dict[str, Any]] = {}
         realtime_provenance_by_code: Dict[str, datetime] = {}
+        realtime_context_rows: List[Dict[str, Any]] = []
+        realtime_context_complete = realtime_loaded
+        expected_realtime_date = (
+            evidence_trade_date if stage == "overnight" else pool_trade_date
+        )
         for row in realtime_rows or []:
             if not isinstance(row, dict):
                 warnings.append("invalid realtime limit-up row")
+                realtime_context_complete = False
                 continue
             code = self._normalize_code(
                 self._pick(row, "stock_code", "code", "symbol")
@@ -666,12 +742,27 @@ class TradingPlaybookMarketDataProvider:
                 warnings.append(
                     f"realtime row missing usable provenance for {code or 'unknown'}"
                 )
+                realtime_context_complete = False
                 continue
             if available_at > local_as_of:
                 warnings.append(f"future realtime row for {code or 'unknown'}")
+                realtime_context_complete = False
                 continue
+            row_trade_date = self._parse_date_value(
+                self._pick(row, "trade_date", "date")
+            )
+            if row_trade_date is None:
+                row_trade_date = available_at.date()
+            if row_trade_date != expected_realtime_date:
+                warnings.append(
+                    f"mismatched realtime row date for {code or 'unknown'}"
+                )
+                realtime_context_complete = False
+                continue
+            normalized_realtime = self._normalize_realtime_row(row)
+            realtime_context_rows.append(normalized_realtime)
             if code in stock_by_code:
-                realtime_by_code[code] = self._normalize_realtime_row(row)
+                realtime_by_code[code] = normalized_realtime
                 realtime_provenance_by_code[code] = self._evidence_datetime(
                     available_at,
                     as_of,
@@ -799,6 +890,24 @@ class TradingPlaybookMarketDataProvider:
             *(load_kline(code) for code in ordered_candidate_codes)
         )
         kline_by_code = dict(kline_pairs)
+        market_context, market_context_evidence, completion_warning = (
+            self._complete_market_context(
+                market_context,
+                market_context_evidence,
+                source_trade_date=source_trade_date,
+                stage=stage,
+                as_of=as_of,
+                universe_codes=universe_codes,
+                quote_snapshot=quote_snapshot,
+                quote_field_quality=quote_field_quality,
+                realtime_rows=realtime_context_rows,
+                realtime_complete=realtime_context_complete,
+                kline_by_code=kline_by_code,
+                review_history_by_code=review_history_by_code,
+            )
+        )
+        if completion_warning:
+            warnings.append(completion_warning)
 
         candidates: List[CandidateSnapshot] = []
         for code in ordered_candidate_codes:
@@ -1090,6 +1199,307 @@ class TradingPlaybookMarketDataProvider:
             ),
         )
 
+    @classmethod
+    def _complete_market_context(
+        cls,
+        context: Mapping[str, Any],
+        evidence: List[Dict[str, Any]],
+        *,
+        source_trade_date: date,
+        stage: str,
+        as_of: datetime,
+        universe_codes: List[str],
+        quote_snapshot: QuoteSnapshot,
+        quote_field_quality: QuoteFieldQuality,
+        realtime_rows: List[Dict[str, Any]],
+        realtime_complete: bool,
+        kline_by_code: Mapping[str, _KlineBuildResult],
+        review_history_by_code: Mapping[str, List[MarketReviewStockDaily]],
+    ) -> Tuple[Dict[str, Any], List[Dict[str, Any]], Optional[str]]:
+        values = dict(context)
+        field_quality = {
+            key: "missing" for key in _FULL_MARKET_CONTEXT_FIELDS
+        }
+        field_provenance: Dict[str, Dict[str, Any]] = {}
+        comparison_baseline: Mapping[str, Any] = {}
+        if evidence:
+            declared = evidence[0].get("field_quality")
+            if isinstance(declared, Mapping):
+                field_quality.update(
+                    {
+                        key: str(declared.get(key) or "missing")
+                        for key in _FULL_MARKET_CONTEXT_FIELDS
+                    }
+                )
+            declared_provenance = evidence[0].get("field_provenance")
+            if isinstance(declared_provenance, Mapping):
+                field_provenance.update(
+                    {
+                        str(key): dict(value)
+                        for key, value in declared_provenance.items()
+                        if isinstance(value, Mapping)
+                    }
+                )
+            baseline = evidence[0].get("comparison_baseline")
+            if isinstance(baseline, Mapping):
+                comparison_baseline = baseline
+
+        computed_fields: Dict[str, Dict[str, Any]] = {}
+
+        def publish(
+            key: str,
+            value: Any,
+            *,
+            source: str,
+            evidence_date: date,
+            coverage: Optional[float] = None,
+        ) -> None:
+            if field_quality.get(key) in {"ready", "computed"} or value is None:
+                return
+            values[key] = value
+            field_quality[key] = "computed"
+            provenance = {"source": source, "trade_date": evidence_date}
+            if coverage is not None:
+                provenance["coverage"] = coverage
+            field_provenance[key] = provenance
+            computed_fields[key] = provenance
+
+        if realtime_complete:
+            realtime_date = (
+                cls._parse_date_value(evidence[0].get("evidence_trade_date"))
+                if evidence
+                else None
+            ) or source_trade_date
+            publish(
+                "limit_up_count",
+                len(realtime_rows),
+                source="realtime_limit_up_pool",
+                evidence_date=realtime_date,
+                coverage=1.0,
+            )
+            board_heights = []
+            seal_flags = []
+            broken_flags = []
+            for row in realtime_rows:
+                raw_height = cls._pick(
+                    row,
+                    "continuous_limit_up_days",
+                    "today_continuous_days",
+                    "board_height",
+                )
+                height = cls._optional_float(raw_height)
+                if (
+                    height is not None
+                    and height >= 0
+                    and float(height).is_integer()
+                ):
+                    board_heights.append(int(height))
+                sealed = cls._fact_flag(row, "sealed", "today_sealed_close")
+                broken = cls._fact_flag(row, "broken", "today_broken")
+                seal_flags.append(sealed)
+                broken_flags.append(broken)
+            if len(board_heights) == len(realtime_rows):
+                publish(
+                    "max_board_height",
+                    max(board_heights, default=0),
+                    source="realtime_limit_up_pool",
+                    evidence_date=realtime_date,
+                    coverage=1.0,
+                )
+            if realtime_rows and all(
+                isinstance(value, bool)
+                for value in [*seal_flags, *broken_flags]
+            ):
+                attempts = sum(
+                    bool(sealed) or bool(broken)
+                    for sealed, broken in zip(seal_flags, broken_flags)
+                )
+                if attempts:
+                    publish(
+                        "seal_rate",
+                        round(100 * sum(seal_flags) / attempts, 4),
+                        source="realtime_limit_up_pool",
+                        evidence_date=realtime_date,
+                        coverage=1.0,
+                    )
+
+        quote_ready_codes = [
+            code
+            for code in universe_codes
+            if code in quote_snapshot.quotes
+            and quote_field_quality.get(code, {}).get("_baseline_freshness")
+            == "ready"
+            and quote_field_quality.get(code, {}).get("change_pct")
+            in {"ready", "computed"}
+        ]
+        quote_coverage = (
+            len(quote_ready_codes) / len(universe_codes)
+            if universe_codes
+            else 0.0
+        )
+        quote_complete = bool(universe_codes) and quote_coverage >= 0.9
+        if quote_complete:
+            limit_down_count = sum(
+                cls._is_limit_down_quote(
+                    code,
+                    quote_snapshot.quotes[code].change_pct,
+                )
+                for code in quote_ready_codes
+            )
+            publish(
+                "limit_down_count",
+                limit_down_count,
+                source="full_market_quote",
+                evidence_date=source_trade_date,
+                coverage=quote_coverage,
+            )
+            prior_limit_down = cls._optional_float(
+                comparison_baseline.get("limit_down_count")
+            )
+            if prior_limit_down is not None:
+                publish(
+                    "sell_pressure_falling",
+                    limit_down_count < prior_limit_down,
+                    source="full_market_quote_vs_daily_metric",
+                    evidence_date=source_trade_date,
+                    coverage=quote_coverage,
+                )
+                publish(
+                    "sell_pressure_rising",
+                    limit_down_count > prior_limit_down,
+                    source="full_market_quote_vs_daily_metric",
+                    evidence_date=source_trade_date,
+                    coverage=quote_coverage,
+                )
+            prior_up = cls._optional_float(
+                comparison_baseline.get("up_count_ex_st")
+            )
+            prior_down = cls._optional_float(
+                comparison_baseline.get("down_count_ex_st")
+            )
+            if prior_up is not None and prior_down is not None:
+                current_up = sum(
+                    quote_snapshot.quotes[code].change_pct > 0
+                    for code in quote_ready_codes
+                )
+                current_down = sum(
+                    quote_snapshot.quotes[code].change_pct < 0
+                    for code in quote_ready_codes
+                )
+                publish(
+                    "breadth_recovered",
+                    current_up > current_down and prior_up <= prior_down,
+                    source="full_market_quote_vs_daily_metric",
+                    evidence_date=source_trade_date,
+                    coverage=quote_coverage,
+                )
+
+        ready_klines = [
+            result
+            for result in kline_by_code.values()
+            if result.features.get("kline_quality") == "ready"
+        ]
+        kline_coverage = (
+            len(ready_klines) / len(kline_by_code)
+            if kline_by_code
+            else 0.0
+        )
+        if kline_by_code and kline_coverage >= 0.8:
+            publish(
+                "trend_new_high_count",
+                sum(bool(row.features.get("n_day_high")) for row in ready_klines),
+                source="bounded_kline_candidate_union",
+                evidence_date=source_trade_date,
+                coverage=kline_coverage,
+            )
+            publish(
+                "trend_new_high_count_prev",
+                sum(
+                    bool(row.features.get("prior_n_day_high"))
+                    for row in ready_klines
+                ),
+                source="bounded_kline_candidate_union",
+                evidence_date=source_trade_date,
+                coverage=kline_coverage,
+            )
+
+        if field_quality.get("negative_feedback") == "missing" and quote_complete:
+            prior_rows = {}
+            for code in universe_codes:
+                rows = [
+                    row
+                    for row in review_history_by_code.get(code, [])
+                    if row.trade_date < source_trade_date
+                ]
+                if rows:
+                    prior_rows[code] = rows[0]
+            if len(prior_rows) == len(universe_codes):
+                popular_codes = [
+                    code
+                    for code, row in prior_rows.items()
+                    if row.today_continuous_days >= 2
+                ]
+                publish(
+                    "negative_feedback",
+                    any(
+                        cls._is_limit_down_quote(
+                            code,
+                            quote_snapshot.quotes[code].change_pct,
+                        )
+                        for code in popular_codes
+                    ),
+                    source="daily_analysis_popular_to_quote_limit_down",
+                    evidence_date=source_trade_date,
+                    coverage=quote_coverage,
+                )
+
+        complete = all(
+            field_quality[key] in {"ready", "computed"}
+            for key in _FULL_MARKET_CONTEXT_FIELDS
+        )
+        aggregate = dict(evidence[0]) if evidence else {
+            "source": "full_market_context",
+            "scope": "full_market",
+            "trade_date": source_trade_date,
+            "evidence_trade_date": source_trade_date,
+            "as_of": as_of,
+        }
+        aggregate["quality"] = "ready" if complete else "degraded"
+        aggregate["field_quality"] = field_quality
+        aggregate["field_provenance"] = field_provenance
+        merged_evidence = [aggregate]
+        if computed_fields:
+            merged_evidence.append(
+                {
+                    "source": "computed_market_context",
+                    "as_of": as_of,
+                    "quality": "ready" if complete else "degraded",
+                    "field_quality": {
+                        key: field_quality[key] for key in computed_fields
+                    },
+                    "field_provenance": computed_fields,
+                }
+            )
+        missing = [
+            key
+            for key in _FULL_MARKET_CONTEXT_FIELDS
+            if field_quality[key] not in {"ready", "computed"}
+        ]
+        warning = (
+            "incomplete full-market context: " + ",".join(missing)
+            if missing
+            else None
+        )
+        return values, merged_evidence, warning
+
+    @staticmethod
+    def _is_limit_down_quote(stock_code: str, change_pct: float) -> bool:
+        if stock_code.startswith(("300", "301", "688")):
+            return change_pct <= -19.5
+        if stock_code.startswith(("8", "920")):
+            return change_pct <= -29.5
+        return change_pct <= -9.5
+
     async def _load_full_market_context(
         self,
         trade_date: date,
@@ -1117,6 +1527,13 @@ class TradingPlaybookMarketDataProvider:
             return {}, [], "invalid full-market context trade date"
         if payload_trade_date != trade_date:
             return {}, [], "mismatched full-market context trade date"
+        evidence_trade_date = self._parse_date_value(
+            payload.get("evidence_trade_date")
+        )
+        if evidence_trade_date is None:
+            evidence_trade_date = trade_date
+        if evidence_trade_date > trade_date:
+            return {}, [], "future full-market context evidence date"
         captured_at = self._parse_temporal_value(payload.get("as_of"))
         if captured_at is None:
             captured_at = self._parse_temporal_value(payload.get("captured_at"))
@@ -1126,8 +1543,13 @@ class TradingPlaybookMarketDataProvider:
         if captured_at > local_as_of:
             return {}, [], "future full-market context"
         if (
-            captured_at.date() < trade_date
-            or payload.get("stale") is True
+            stage in {"preclose", "after_close"}
+            and evidence_trade_date == trade_date
+            and self._china_datetime(captured_at).date() != trade_date
+        ):
+            return {}, [], "stale full-market context"
+        if (
+            payload.get("stale") is True
             or str(payload.get("quality") or "").strip().lower() == "stale"
         ):
             return {}, [], "stale full-market context"
@@ -1202,6 +1624,7 @@ class TradingPlaybookMarketDataProvider:
             "source": "full_market_context",
             "scope": "full_market",
             "trade_date": trade_date,
+            "evidence_trade_date": evidence_trade_date,
             "as_of": self._evidence_datetime(captured_at, as_of),
             "quality": (
                 "ready"
@@ -1212,15 +1635,25 @@ class TradingPlaybookMarketDataProvider:
                 key: accepted_quality.get(key, "missing")
                 for key in _FULL_MARKET_CONTEXT_FIELDS
             },
+            "field_provenance": self._sanitize_fact(
+                payload.get("field_provenance")
+                if isinstance(payload.get("field_provenance"), Mapping)
+                else {}
+            ),
+            "comparison_baseline": self._sanitize_fact(
+                payload.get("comparison_baseline")
+                if isinstance(payload.get("comparison_baseline"), Mapping)
+                else {}
+            ),
         }]
         warnings = []
         if invalid_fields:
-            warnings.append(
+            return (
+                {},
+                [],
                 "invalid full-market context fields: "
-                + ",".join(sorted(invalid_fields))
+                + ",".join(sorted(invalid_fields)),
             )
-        if not complete or explicitly_degraded:
-            warnings.append("incomplete full-market context")
         warning = "; ".join(warnings) if warnings else None
         return normalized, evidence, warning
 
@@ -1259,9 +1692,13 @@ class TradingPlaybookMarketDataProvider:
     ) -> str:
         if field_quality.get("timestamp") != "ready":
             return "degraded"
-        if self._age_seconds(as_of, quote.captured_at) > self.STALE_AFTER_SECONDS:
+        if field_quality.get("_baseline_freshness") != "ready":
             return "stale"
-        if "missing" in field_quality.values():
+        if any(
+            value == "missing"
+            for key, value in field_quality.items()
+            if not key.startswith("_")
+        ):
             return "degraded"
         return "ready"
 
@@ -1273,7 +1710,7 @@ class TradingPlaybookMarketDataProvider:
     ) -> str:
         if field_quality.get("timestamp") != "ready":
             return "degraded"
-        if self._age_seconds(as_of, quote.captured_at) > self.STALE_AFTER_SECONDS:
+        if field_quality.get("_baseline_freshness") != "ready":
             return "stale"
         return "ready"
 
@@ -1600,8 +2037,12 @@ class TradingPlaybookMarketDataProvider:
             "today_sealed_close": row.today_sealed_close,
             "today_broken": row.today_broken,
             "today_continuous_days": row.today_continuous_days,
-            "first_limit_time": row.first_limit_time,
-            "final_seal_time": row.final_seal_time,
+            "first_limit_time": (
+                row.first_limit_time.isoformat() if row.first_limit_time else None
+            ),
+            "final_seal_time": (
+                row.final_seal_time.isoformat() if row.final_seal_time else None
+            ),
             "change_pct": row.change_pct,
             "amount": row.amount,
             "turnover_rate": row.turnover_rate,

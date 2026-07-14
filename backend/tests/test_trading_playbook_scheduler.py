@@ -73,13 +73,13 @@ class TradingPlaybookSchedulerRegistrationTests(unittest.TestCase):
 
         jobs = {job["id"]: job for job in scheduler.scheduler.jobs}
         expected = {
-            "trading_playbook_preclose": (14, 40),
-            "trading_playbook_review": (15, 10),
-            "trading_playbook_after_close": (15, 30),
-            "trading_playbook_overnight": (8, 50),
-            "trading_playbook_auction": (9, 26),
+            "trading_playbook_preclose": (14, 40, 19 * 60),
+            "trading_playbook_review": (15, 10, 19 * 60),
+            "trading_playbook_after_close": (15, 30, 30 * 60),
+            "trading_playbook_overnight": (8, 50, 35 * 60),
+            "trading_playbook_auction": (9, 26, 3 * 60),
         }
-        for job_id, (hour, minute) in expected.items():
+        for job_id, (hour, minute, misfire_seconds) in expected.items():
             with self.subTest(job_id=job_id):
                 job = jobs[job_id]
                 trigger = job["trigger"]
@@ -87,12 +87,18 @@ class TradingPlaybookSchedulerRegistrationTests(unittest.TestCase):
                 self.assertEqual(str(trigger.fields[6]), str(minute))
                 self.assertIs(trigger.timezone, CN_TZ)
                 self.assertEqual(job["max_instances"], 1)
+                self.assertTrue(job["coalesce"])
+                self.assertEqual(job["misfire_grace_time"], misfire_seconds)
 
         monitor = jobs["trading_playbook_monitor"]
         self.assertEqual(monitor["trigger"].interval.total_seconds(), 7)
         self.assertIs(monitor["trigger"].timezone, CN_TZ)
         self.assertEqual(monitor["max_instances"], 1)
-        self.assertIn("trading_playbook_startup_catchup", jobs)
+        self.assertTrue(monitor["coalesce"])
+        self.assertEqual(monitor["misfire_grace_time"], 21)
+        catchup = jobs["trading_playbook_startup_catchup"]
+        self.assertTrue(catchup["coalesce"])
+        self.assertEqual(catchup["misfire_grace_time"], 60)
         self.assertEqual(len(jobs), len(set(jobs)))
 
     def test_start_is_idempotent_and_disabled_mode_registers_no_playbook_jobs(self):
@@ -478,10 +484,7 @@ class TradingPlaybookForcedUpgradeTests(unittest.IsolatedAsyncioTestCase):
 
                 with patch(
                     "app.data_collectors.scheduler._get_cn_trading_dates",
-                    side_effect=[
-                        [date(2026, 7, 13)],
-                        [date(2026, 7, 14)],
-                    ],
+                    return_value=[date(2026, 7, 13), date(2026, 7, 14)],
                 ):
                     result = (
                         await scheduler._upgrade_forced_trading_playbook_after_close(
@@ -533,7 +536,7 @@ class TradingPlaybookForcedUpgradeTests(unittest.IsolatedAsyncioTestCase):
 
                 with patch(
                     "app.data_collectors.scheduler._get_cn_trading_dates",
-                    return_value=[date(2026, 7, 14)],
+                    return_value=[date(2026, 7, 13), date(2026, 7, 14)],
                 ):
                     result = await scheduler._latest_relevant_after_close_plan(
                         date(2026, 7, 13)
@@ -670,7 +673,7 @@ class TradingPlaybookForcedUpgradeTests(unittest.IsolatedAsyncioTestCase):
             try:
                 with patch(
                     "app.data_collectors.scheduler._get_cn_trading_dates",
-                    return_value=[date(2026, 7, 13)],
+                    return_value=[date(2026, 7, 13), date(2026, 7, 14)],
                 ):
                     await scheduler._build_trading_playbook_after_close()
 
@@ -682,11 +685,7 @@ class TradingPlaybookForcedUpgradeTests(unittest.IsolatedAsyncioTestCase):
 
                 with patch(
                     "app.data_collectors.scheduler._get_cn_trading_dates",
-                    side_effect=lambda start, end: (
-                        [date(2026, 7, 13)]
-                        if start == end
-                        else [date(2026, 7, 14)]
-                    ),
+                    return_value=[date(2026, 7, 13), date(2026, 7, 14)],
                 ):
                     await asyncio.gather(
                         scheduler._monitor_trading_playbook(),
@@ -749,7 +748,7 @@ class TradingPlaybookForcedUpgradeTests(unittest.IsolatedAsyncioTestCase):
 
         with patch(
             "app.data_collectors.scheduler._get_cn_trading_dates",
-            return_value=[date(2026, 7, 13)],
+            return_value=[date(2026, 7, 13), date(2026, 7, 14)],
         ):
             result = await scheduler._upgrade_forced_trading_playbook_after_close(
                 send_notifications=True
@@ -844,11 +843,7 @@ class TradingPlaybookForcedUpgradeTests(unittest.IsolatedAsyncioTestCase):
 
         with patch(
             "app.data_collectors.scheduler._get_cn_trading_dates",
-            side_effect=lambda start, end: (
-                [date(2026, 7, 13)]
-                if start == end
-                else [date(2026, 7, 14)]
-            ),
+            return_value=[date(2026, 7, 13), date(2026, 7, 14)],
         ):
             await scheduler._monitor_trading_playbook()
 
@@ -878,7 +873,7 @@ class TradingPlaybookCatchupTests(unittest.IsolatedAsyncioTestCase):
         now = datetime.combine(self.today, local_time, tzinfo=CN_TZ)
         with patch(
             "app.data_collectors.scheduler._get_cn_trading_dates",
-            side_effect=[[self.today], [self.next_day]],
+            return_value=[self.today, self.next_day],
         ):
             await self.scheduler._run_trading_playbook_catchup(now)
 
@@ -911,13 +906,9 @@ class TradingPlaybookCatchupTests(unittest.IsolatedAsyncioTestCase):
             "preclose",
         )
 
-    async def test_1500_includes_auction_boundary_but_not_preclose(self):
+    async def test_1500_does_not_catch_up_auction_or_preclose(self):
         await self._run(datetime.min.replace(hour=15).time(), set())
-        self.scheduler._build_trading_playbook_plan.assert_awaited_once_with(
-            "auction",
-            degraded=True,
-            send_notifications=False,
-        )
+        self.scheduler._build_trading_playbook_plan.assert_not_awaited()
         self.assertNotIn(
             unittest.mock.call(self.next_day, "preclose"),
             self.scheduler._playbook_stage_exists.await_args_list,

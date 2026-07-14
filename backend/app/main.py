@@ -13,29 +13,12 @@ from app.api.v1.websocket import router as ws_router
 from app.core.event_bus import event_bus
 from app.utils.logger import setup_logging, logger
 from app.services.data_init_service import data_init_service
-from app.data_collectors.scheduler import (
-    TradingCalendarLookupError,
-    _get_cn_trading_dates,
-    data_scheduler,
-)
+from app.data_collectors.scheduler import data_scheduler
 from app.services.trading_playbook.composition import (
     build_production_trading_playbook_orchestrator,
 )
 from app.services.trading_playbook.runtime import trading_playbook_runtime
-
-
-def _next_cn_trade_date(value):
-    from datetime import timedelta
-
-    dates = _get_cn_trading_dates(
-        value + timedelta(days=1),
-        value + timedelta(days=15),
-    )
-    if not dates:
-        raise TradingCalendarLookupError(
-            f"Unable to resolve next China trading date after {value}"
-        )
-    return dates[0]
+from app.utils.time_utils import today_cn
 
 
 def _clear_trading_playbook_runtime(app: FastAPI) -> None:
@@ -43,6 +26,8 @@ def _clear_trading_playbook_runtime(app: FastAPI) -> None:
     data_scheduler.reset_trading_playbook_services()
     if hasattr(app.state, "trading_playbook_orchestrator"):
         delattr(app.state, "trading_playbook_orchestrator")
+    if hasattr(app.state, "trading_playbook_calendar"):
+        delattr(app.state, "trading_playbook_calendar")
 
 
 @asynccontextmanager
@@ -59,12 +44,18 @@ async def lifespan(app: FastAPI):
 
         _clear_trading_playbook_runtime(app)
         if settings.TRADING_PLAYBOOK_ENABLED:
+            calendar = data_scheduler.get_trading_calendar_service()
+            try:
+                await calendar.ensure_date(today_cn())
+            except Exception as exc:
+                logger.error(f"Trading calendar warm-up failed: {exc}")
             orchestrator = build_production_trading_playbook_orchestrator(
-                next_trade_date=_next_cn_trade_date,
+                next_trade_date=calendar.next_trade_date,
             )
             data_scheduler.install_trading_playbook_orchestrator(orchestrator)
             trading_playbook_runtime.install_orchestrator(orchestrator)
             app.state.trading_playbook_orchestrator = orchestrator
+            app.state.trading_playbook_calendar = calendar
 
         # 启动定时任务：盘中采集、盘后统计、市场复盘、每日分析
         data_scheduler.start()
@@ -82,6 +73,10 @@ async def lifespan(app: FastAPI):
             _clear_trading_playbook_runtime(app)
         except Exception as exc:
             logger.error(f"Trading playbook runtime cleanup failed: {exc}")
+        try:
+            await data_scheduler.get_trading_calendar_service().close()
+        except Exception as exc:
+            logger.error(f"Trading calendar cleanup failed: {exc}")
         try:
             await event_bus.stop()
         except Exception as exc:

@@ -731,6 +731,7 @@ class TradingPlaybookKlineFeatureTests(unittest.IsolatedAsyncioTestCase):
             features,
             {
                 "n_day_high": True,
+                "prior_n_day_high": False,
                 "consolidation_days": 4,
                 "trend_established": True,
                 "kline_quality": "ready",
@@ -771,6 +772,7 @@ class TradingPlaybookKlineFeatureTests(unittest.IsolatedAsyncioTestCase):
 
         expected = {
             "n_day_high": False,
+            "prior_n_day_high": False,
             "consolidation_days": 0,
             "trend_established": False,
             "kline_quality": "missing",
@@ -818,6 +820,7 @@ class TradingPlaybookKlineFeatureTests(unittest.IsolatedAsyncioTestCase):
         )
         expected = {
             "n_day_high": False,
+            "prior_n_day_high": False,
             "consolidation_days": 0,
             "trend_established": False,
             "kline_quality": "missing",
@@ -1394,12 +1397,15 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
                     assert_waiting(snapshot)
                     invalid_field = header.get("_invalid_field")
                     if invalid_field:
-                        self.assertNotIn(invalid_field, snapshot.market_features)
                         self.assertEqual(
-                            snapshot.market_features["_feature_quality"][
-                                invalid_field
-                            ],
-                            "invalid",
+                            snapshot.market_features["_feature_quality"][invalid_field],
+                            "computed",
+                        )
+                        self.assertEqual(
+                            snapshot.market_features["_evidence"][0][
+                                "field_provenance"
+                            ][invalid_field]["source"],
+                            "realtime_limit_up_pool",
                         )
                         self.assertTrue(
                             any(
@@ -1484,7 +1490,7 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
 
             with self.subTest(field=field, value=invalid_value):
                 self.assertNotIn(field, normalized)
-                self.assertEqual(evidence[0]["field_quality"][field], "invalid")
+                self.assertEqual(evidence, [])
                 self.assertIn(field, warning)
 
     async def test_full_market_context_accepts_integer_and_zero_boundaries(self):

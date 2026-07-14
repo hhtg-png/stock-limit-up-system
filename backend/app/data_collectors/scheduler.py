@@ -13,11 +13,11 @@ from loguru import logger
 from app.config import settings
 from app.services.intelligence_service import intelligence_service
 from app.services.market_review_pipeline_service import market_review_pipeline_service
+from app.services.trading_playbook.calendar_service import (
+    TradingCalendarLookupError,
+    TradingCalendarService,
+)
 from app.utils.time_utils import CN_TZ, get_market_status, is_trading_time, today_cn
-
-
-class TradingCalendarLookupError(RuntimeError):
-    """Raised when the China trading calendar cannot be loaded reliably."""
 
 
 def _normalize_trade_calendar_date(raw_value) -> Optional[date]:
@@ -93,6 +93,7 @@ class DataScheduler:
         session_factory: Optional[Callable[[], Any]] = None,
         now_provider: Optional[Callable[[], datetime]] = None,
         sleep: Optional[Callable[[float], Awaitable[None]]] = None,
+        calendar_service: Optional[TradingCalendarService] = None,
     ):
         self.scheduler = AsyncIOScheduler()
         self._is_running = False
@@ -104,6 +105,15 @@ class DataScheduler:
             lambda: datetime.now(CN_TZ)
         )
         self._playbook_sleep = sleep or asyncio.sleep
+        self._playbook_calendar = calendar_service or TradingCalendarService(
+            loader=lambda start, end: _get_cn_trading_dates(start, end),
+            refresh_timeout_seconds=(
+                settings.TRADING_PLAYBOOK_CALENDAR_REFRESH_TIMEOUT_SECONDS
+            ),
+            retry_interval_seconds=(
+                settings.TRADING_PLAYBOOK_CALENDAR_RETRY_INTERVAL_SECONDS
+            ),
+        )
         self._playbook_upgrade_lock = asyncio.Lock()
         # 监控股票缓存
         self._monitored_stocks: List[Dict] = []
@@ -291,30 +301,35 @@ class DataScheduler:
                 CronTrigger(hour=14, minute=40, timezone=CN_TZ),
                 "trading_playbook_preclose",
                 "交易作战手册14:40预案",
+                19 * 60,
             ),
             (
                 self._review_trading_playbook,
                 CronTrigger(hour=15, minute=10, timezone=CN_TZ),
                 "trading_playbook_review",
                 "交易作战手册15:10复盘",
+                19 * 60,
             ),
             (
                 self._build_trading_playbook_after_close,
                 CronTrigger(hour=15, minute=30, timezone=CN_TZ),
                 "trading_playbook_after_close",
                 "交易作战手册15:30定稿",
+                30 * 60,
             ),
             (
                 self._build_trading_playbook_overnight,
                 CronTrigger(hour=8, minute=50, timezone=CN_TZ),
                 "trading_playbook_overnight",
                 "交易作战手册08:50隔夜刷新",
+                35 * 60,
             ),
             (
                 self._build_trading_playbook_auction,
                 CronTrigger(hour=9, minute=26, timezone=CN_TZ),
                 "trading_playbook_auction",
                 "交易作战手册09:26竞价确认",
+                3 * 60,
             ),
             (
                 self._monitor_trading_playbook,
@@ -324,15 +339,18 @@ class DataScheduler:
                 ),
                 "trading_playbook_monitor",
                 "交易作战手册盘中监控",
+                self._calendar_misfire_seconds(),
             ),
         )
-        for func, trigger, job_id, name in jobs:
+        for func, trigger, job_id, name, misfire_seconds in jobs:
             self.scheduler.add_job(
                 func,
                 trigger,
                 id=job_id,
                 name=name,
                 max_instances=1,
+                misfire_grace_time=misfire_seconds,
+                coalesce=True,
             )
         self.scheduler.add_job(
             self._run_trading_playbook_catchup,
@@ -344,6 +362,8 @@ class DataScheduler:
             name="交易作战手册启动补跑",
             max_instances=1,
             replace_existing=True,
+            misfire_grace_time=60,
+            coalesce=True,
         )
     
     def stop(self):
@@ -397,20 +417,21 @@ class DataScheduler:
         return value.astimezone(CN_TZ)
 
     @staticmethod
-    def _is_cn_trading_day(value: date) -> bool:
-        return bool(_get_cn_trading_dates(value, value))
+    def _calendar_misfire_seconds() -> int:
+        return max(settings.TRADING_PLAYBOOK_MONITOR_INTERVAL_SECONDS * 3, 15)
 
-    @staticmethod
-    def _next_cn_trading_date(value: date) -> date:
-        next_dates = _get_cn_trading_dates(
-            value + timedelta(days=1),
-            value + timedelta(days=15),
-        )
-        if not next_dates:
-            raise TradingCalendarLookupError(
-                f"Unable to resolve next China trading date after {value}"
-            )
-        return next_dates[0]
+    async def _ensure_playbook_calendar(self, value: date) -> bool:
+        await self._playbook_calendar.ensure_date(value)
+        return self._is_cn_trading_day(value)
+
+    def _is_cn_trading_day(self, value: date) -> bool:
+        return self._playbook_calendar.is_trading_day(value)
+
+    def _next_cn_trading_date(self, value: date) -> date:
+        return self._playbook_calendar.next_trade_date(value)
+
+    def get_trading_calendar_service(self) -> TradingCalendarService:
+        return self._playbook_calendar
 
     async def _build_trading_playbook_plan(
         self,
@@ -421,7 +442,7 @@ class DataScheduler:
     ):
         now = self._playbook_now()
         source_trade_date = now.date()
-        if not self._is_cn_trading_day(source_trade_date):
+        if not await self._ensure_playbook_calendar(source_trade_date):
             logger.info(
                 "Skipping trading playbook {} because {} is not a China trading day",
                 stage,
@@ -460,7 +481,7 @@ class DataScheduler:
 
     async def _review_trading_playbook(self):
         now = self._playbook_now()
-        if not self._is_cn_trading_day(now.date()):
+        if not await self._ensure_playbook_calendar(now.date()):
             logger.info("Skipping trading playbook review on non-trading day")
             return None
         service = self._trading_playbook_review_service
@@ -477,7 +498,7 @@ class DataScheduler:
     ):
         now = self._playbook_now()
         review_date = trade_date or now.date()
-        if not self._is_cn_trading_day(review_date):
+        if not await self._ensure_playbook_calendar(review_date):
             logger.info("Skipping trading playbook final review on non-trading day")
             return None
         service = self._trading_playbook_review_service
@@ -490,9 +511,17 @@ class DataScheduler:
 
     async def _monitor_trading_playbook(self):
         now = self._playbook_now()
+        monitor_result = None
+        service = self._trading_playbook_alert_service
+        monitor = getattr(service, "monitor", None)
+        if callable(monitor):
+            async with self._playbook_sessions() as db:
+                monitor_result = await monitor(db, now)
+        else:
+            logger.debug("Trading playbook alert monitor is not installed")
         try:
-            if not self._is_cn_trading_day(now.date()):
-                return None
+            if not await self._ensure_playbook_calendar(now.date()):
+                return monitor_result
             next_trade_date = self._next_cn_trading_date(now.date())
             await self._upgrade_forced_trading_playbook_after_close(
                 send_notifications=True,
@@ -504,13 +533,7 @@ class DataScheduler:
                 "Trading playbook forced after-close upgrade failed: {}",
                 exc,
             )
-        service = self._trading_playbook_alert_service
-        monitor = getattr(service, "monitor", None)
-        if not callable(monitor):
-            logger.debug("Trading playbook alert monitor is not installed")
-            return None
-        async with self._playbook_sessions() as db:
-            return await monitor(db, now)
+        return monitor_result
 
     async def _latest_relevant_after_close_plan(
         self,
@@ -520,9 +543,11 @@ class DataScheduler:
         from sqlalchemy import select
         from app.models.trading_playbook import TradingPlanVersion
 
-        target_trade_date = (
-            next_trade_date or self._next_cn_trading_date(trade_date)
-        )
+        if next_trade_date is None:
+            if not await self._ensure_playbook_calendar(trade_date):
+                return None
+            next_trade_date = self._next_cn_trading_date(trade_date)
+        target_trade_date = next_trade_date
         async with self._playbook_sessions() as db:
             result = await db.execute(
                 select(TradingPlanVersion)
@@ -563,7 +588,7 @@ class DataScheduler:
         source_trade_date = trade_date or now.date()
         target_trade_date = next_trade_date
         if target_trade_date is None:
-            if not self._is_cn_trading_day(source_trade_date):
+            if not await self._ensure_playbook_calendar(source_trade_date):
                 return None
             target_trade_date = self._next_cn_trading_date(source_trade_date)
         orchestrator = self._trading_playbook_orchestrator
@@ -660,7 +685,7 @@ class DataScheduler:
         send_notifications: bool = True,
     ):
         now = self._playbook_now()
-        if not self._is_cn_trading_day(now.date()):
+        if not await self._ensure_playbook_calendar(now.date()):
             logger.info("Skipping trading playbook after-close on non-trading day")
             return None
         ready = await self._wait_for_trading_playbook_data(now.date())
@@ -712,7 +737,7 @@ class DataScheduler:
             raise ValueError("trading playbook catch-up time must be timezone-aware")
         current = current.astimezone(CN_TZ)
         today = current.date()
-        if not self._is_cn_trading_day(today):
+        if not await self._ensure_playbook_calendar(today):
             logger.info("Skipping trading playbook catch-up on non-trading day")
             return
         next_trade_date = self._next_cn_trading_date(today)
@@ -724,7 +749,7 @@ class DataScheduler:
                     "overnight",
                     send_notifications=False,
                 )
-        elif time(9, 26) <= current_time <= time(15, 0):
+        elif time(9, 26) <= current_time < time(15, 0):
             if not await self._playbook_stage_exists(today, "auction"):
                 await self._build_trading_playbook_plan(
                     "auction",
