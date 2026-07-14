@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.database import Base
 from app.models.trading_playbook import (
+    TradingAlertConditionState,
     TradingAlertEvent,
     TradingPlanCandidate,
     TradingPlanVersion,
@@ -992,6 +993,96 @@ class TradingPlaybookActionMonitorTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(events, [])
 
+    async def test_condition_result_distinguishes_unknown_from_recovery(self):
+        from app.services.trading_playbook.alert_service import (
+            TradingPlaybookAlertService,
+        )
+
+        condition = {"price_gte": 10, "change_pct_gte": 2}
+
+        self.assertIsNone(
+            TradingPlaybookAlertService._condition_result(
+                condition,
+                {"price": 11, "_missing_fields": ["change_pct"]},
+            )
+        )
+        self.assertFalse(
+            TradingPlaybookAlertService._condition_result(
+                condition,
+                {"price": 9, "_missing_fields": ["change_pct"]},
+            )
+        )
+        self.assertTrue(
+            TradingPlaybookAlertService._condition_result(
+                condition,
+                {"price": 11, "change_pct": 3},
+            )
+        )
+
+    def test_condition_version_is_stable_and_event_specific(self):
+        from app.services.trading_playbook.alert_service import (
+            TradingPlaybookAlertService,
+        )
+
+        first = TradingPlaybookAlertService._condition_version(
+            "entry_triggered",
+            {"price_gte": 10, "nested": {"b": 2.0, "a": 1}},
+        )
+        reordered = TradingPlaybookAlertService._condition_version(
+            "entry_triggered",
+            {"nested": {"a": 1.0, "b": 2}, "price_gte": 10.0},
+        )
+        different_event = TradingPlaybookAlertService._condition_version(
+            "invalidated",
+            {"price_gte": 10, "nested": {"b": 2, "a": 1}},
+        )
+
+        self.assertEqual(first, reordered)
+        self.assertEqual(len(first), 64)
+        self.assertNotEqual(first, different_event)
+
+    def test_condition_state_statements_compile_for_postgresql(self):
+        from app.services.trading_playbook.alert_service import (
+            TradingPlaybookAlertService,
+        )
+
+        observed_at = datetime(2026, 7, 14, 10, 5)
+        insert_sql = str(
+            TradingPlaybookAlertService._condition_state_insert_statement(
+                "postgresql",
+                {
+                    "candidate_id": 1,
+                    "event_type": "entry_triggered",
+                    "condition_version": "a" * 64,
+                    "active": False,
+                    "occurrence_no": 0,
+                    "updated_at": observed_at,
+                },
+            ).compile(dialect=postgresql.dialect())
+        )
+        activate_sql = str(
+            TradingPlaybookAlertService._condition_activate_statement(
+                1,
+                "entry_triggered",
+                "a" * 64,
+                observed_at,
+            ).compile(dialect=postgresql.dialect())
+        )
+        recover_sql = str(
+            TradingPlaybookAlertService._condition_recover_statement(
+                1,
+                observed_at,
+            ).compile(dialect=postgresql.dialect())
+        )
+
+        self.assertIn(
+            "ON CONFLICT (candidate_id, event_type, condition_version) DO NOTHING",
+            insert_sql,
+        )
+        self.assertIn("occurrence_no +", activate_sql)
+        self.assertIn("active IS false", activate_sql)
+        self.assertIn("active IS true", recover_sql)
+
     async def test_real_tencent_missing_numeric_fields_never_trigger_terminal_actions(self):
         from app.data_collectors.tencent_api import TencentStockAPI
 
@@ -1211,48 +1302,143 @@ class TradingPlaybookActionMonitorTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(len(channel.sends), 1)
         self.assertEqual(channel.sends[0][0]["stock_code"], "000001")
+        async with self.Session() as db:
+            candidate = await db.get(TradingPlanCandidate, candidate_id)
+            state = (
+                await db.execute(
+                    select(TradingAlertConditionState).where(
+                        TradingAlertConditionState.candidate_id == candidate_id,
+                        TradingAlertConditionState.event_type
+                        == "entry_triggered",
+                    )
+                )
+            ).scalar_one()
+        self.assertEqual(candidate.status, "triggered")
+        self.assertTrue(state.active)
+        self.assertEqual(state.occurrence_no, 1)
+        self.assertEqual(
+            events[0].market_snapshot_json["condition_version"],
+            state.condition_version,
+        )
+        self.assertEqual(events[0].market_snapshot_json["occurrence_no"], 1)
         self.assertEqual(
             events[0].dedup_key,
             f"action:{self.today.isoformat()}:{plan_id}:{candidate_id}:"
-            "leader_turn_two:entry_triggered",
+            "leader_turn_two:entry_triggered:"
+            f"{state.condition_version[:16]}:1",
         )
+
+    async def test_restart_delivers_committed_pending_occurrence(self):
+        await self._create_candidate()
+        quote_api = _BatchQuoteAPI(
+            {"000001": _fresh_quote("000001", 10.5)}
+        )
+        channel = _RecordingInAppChannel()
+        first = self._monitor_service(channel, quote_api=quote_api)
+        first._deliver = AsyncMock()
+        async with self.Session() as db:
+            await first.monitor(db, self.now)
+
+        persisted = (await self._events())[0]
+        self.assertEqual(
+            persisted.channel_status_json["in_app"]["status"],
+            "pending",
+        )
+
+        async with self.SecondSession() as db:
+            await self._monitor_service(
+                channel,
+                quote_api=_BatchQuoteAPI(
+                    {"000001": _fresh_quote("000001", 9.0)}
+                ),
+            ).monitor(db, self.now)
+
+        self.assertEqual(len(await self._events()), 1)
+        self.assertEqual(len(channel.sends), 1)
+
+    async def test_pending_occurrence_drains_before_higher_priority_trigger(self):
+        await self._create_candidate(
+            entry={"price_gte": 10},
+            invalidation={"price_lte": 9},
+        )
+        channel = _RecordingInAppChannel()
+        first = self._monitor_service(
+            channel,
+            quote_api=_BatchQuoteAPI(
+                {"000001": _fresh_quote("000001", 11.0)}
+            ),
+        )
+        first._deliver = AsyncMock()
+        async with self.Session() as db:
+            await first.monitor(db, self.now)
+
+        later = CN_TZ.localize(datetime(2026, 7, 14, 10, 6))
+        async with self.SecondSession() as db:
+            await self._monitor_service(
+                channel,
+                quote_api=_BatchQuoteAPI(
+                    {
+                        "000001": _fresh_quote(
+                            "000001",
+                            8.0,
+                            captured_at="20260714100600",
+                        )
+                    }
+                ),
+            ).monitor(db, later)
+
+        self.assertEqual(
+            [payload[0]["event_type"] for payload in channel.sends],
+            ["entry_triggered", "invalidated"],
+        )
+
+    async def test_two_engines_drain_pending_occurrence_once(self):
+        await self._create_candidate()
+        channel = _RecordingInAppChannel()
+        first = self._monitor_service(
+            channel,
+            quote_api=_BatchQuoteAPI(
+                {"000001": _fresh_quote("000001", 10.5)}
+            ),
+        )
+        first._deliver = AsyncMock()
+        async with self.Session() as db:
+            await first.monitor(db, self.now)
+
+        quote_barrier = asyncio.Barrier(2)
+        quote_api = _BatchQuoteAPI(
+            {"000001": _fresh_quote("000001", 9.0)},
+            barrier=quote_barrier,
+        )
+
+        async def run(service, sessions):
+            async with sessions() as db:
+                return await service.monitor(db, self.now)
+
+        await asyncio.gather(
+            run(
+                self._monitor_service(channel, quote_api=quote_api),
+                self.Session,
+            ),
+            run(
+                self._monitor_service(channel, quote_api=quote_api),
+                self.SecondSession,
+            ),
+        )
+
+        self.assertEqual(len(await self._events()), 1)
+        self.assertEqual(len(channel.sends), 1)
 
     async def test_two_engines_racing_monitor_send_once(self):
-        from app.services.trading_playbook.alert_service import (
-            TradingPlaybookAlertService,
-        )
-
-        plan_id, candidate_id = await self._create_candidate()
+        await self._create_candidate()
+        quote_barrier = asyncio.Barrier(2)
         quote_api = _BatchQuoteAPI(
             {"000001": _fresh_quote("000001", 10.5)},
+            barrier=quote_barrier,
         )
         channel = _RecordingInAppChannel()
         first = self._monitor_service(channel, quote_api=quote_api)
         second = self._monitor_service(channel, quote_api=quote_api)
-
-        async with self.Session() as db:
-            plan = await db.get(TradingPlanVersion, plan_id)
-            candidate = await db.get(TradingPlanCandidate, candidate_id)
-            dedup_key = first._action_dedup_key(
-                plan,
-                candidate,
-                "entry_triggered",
-                self.today,
-            )
-            await first._ensure_action_event(
-                db,
-                plan,
-                candidate,
-                {"event_type": "entry_triggered"},
-                _fresh_quote("000001", 10.5),
-                trade_date=self.today,
-                triggered_at=self.now,
-                initial_channel_status=first._initial_channel_status(
-                    dedup_key,
-                    enabled=True,
-                ),
-            )
-        self.assertEqual(channel.sends, [])
 
         async def run(service, sessions):
             async with sessions() as db:
@@ -1265,6 +1451,60 @@ class TradingPlaybookActionMonitorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(await self._events()), 1)
         self.assertEqual(len(channel.sends), 1)
+        async with self.Session() as db:
+            candidate = await db.scalar(select(TradingPlanCandidate))
+            states = list(
+                (await db.scalars(select(TradingAlertConditionState))).all()
+            )
+        self.assertEqual(candidate.status, "triggered")
+        entry_state = next(
+            state for state in states if state.event_type == "entry_triggered"
+        )
+        self.assertTrue(entry_state.active)
+        self.assertEqual(entry_state.occurrence_no, 1)
+
+    async def test_event_state_and_candidate_rollback_together_on_commit_failure(self):
+        _plan_id, candidate_id = await self._create_candidate()
+        quote_api = _BatchQuoteAPI(
+            {"000001": _fresh_quote("000001", 10.5)}
+        )
+
+        async with self.Session() as db:
+            commit_count = 0
+
+            def fail_action_commit(_session):
+                nonlocal commit_count
+                commit_count += 1
+                if commit_count == 2:
+                    raise RuntimeError("injected action transaction failure")
+
+            event.listen(db.sync_session, "before_commit", fail_action_commit)
+            try:
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "injected action transaction failure",
+                ):
+                    await self._monitor_service(
+                        _RecordingInAppChannel(),
+                        quote_api=quote_api,
+                    ).monitor(db, self.now)
+            finally:
+                event.remove(
+                    db.sync_session,
+                    "before_commit",
+                    fail_action_commit,
+                )
+                await db.rollback()
+
+        async with self.SecondSession() as db:
+            candidate = await db.get(TradingPlanCandidate, candidate_id)
+            states = list(
+                (await db.scalars(select(TradingAlertConditionState))).all()
+            )
+            events = list((await db.scalars(select(TradingAlertEvent))).all())
+        self.assertEqual(candidate.status, "waiting")
+        self.assertEqual(states, [])
+        self.assertEqual(events, [])
 
     async def test_monitor_filters_non_today_action_before_fetching_quotes(self):
         from app.services.trading_playbook.alert_service import (
@@ -1549,27 +1789,26 @@ class TradingPlaybookActionMonitorTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(cancelled.is_set())
         self.assertEqual(await self._events(), [])
 
-    async def test_invalidated_candidate_is_terminal_across_monitor_ticks(self):
+    async def test_invalidated_candidate_recovers_and_can_trigger_new_occurrence(self):
         from app.services.trading_playbook.alert_service import (
             TradingPlaybookAlertService,
         )
 
         await self._create_candidate(
-            entry={"price_gte": 10},
+            entry={"price_gte": 20},
             invalidation={"price_lte": 9},
         )
-        first_channel = _RecordingInAppChannel()
+        channel = _RecordingInAppChannel()
         first_quotes = _BatchQuoteAPI(
             {"000001": _fresh_quote("000001", 8.0)}
         )
         async with self.Session() as db:
             await self._monitor_service(
-                first_channel,
+                channel,
                 quote_api=first_quotes,
             ).monitor(db, self.now)
 
         later = CN_TZ.localize(datetime(2026, 7, 14, 10, 6))
-        second_channel = _RecordingInAppChannel()
         second_quotes = _BatchQuoteAPI(
             {
                 "000001": _fresh_quote(
@@ -1581,15 +1820,253 @@ class TradingPlaybookActionMonitorTests(unittest.IsolatedAsyncioTestCase):
         )
         async with self.SecondSession() as db:
             await self._monitor_service(
-                second_channel,
+                channel,
                 quote_api=second_quotes,
+            ).monitor(db, later)
+            candidate = await db.scalar(select(TradingPlanCandidate))
+            self.assertEqual(candidate.status, "waiting")
+
+        latest = CN_TZ.localize(datetime(2026, 7, 14, 10, 7))
+        third_quotes = _BatchQuoteAPI(
+            {
+                "000001": _fresh_quote(
+                    "000001",
+                    8.0,
+                    captured_at="20260714100700",
+                )
+            }
+        )
+        async with self.Session() as db:
+            await self._monitor_service(
+                channel,
+                quote_api=third_quotes,
+            ).monitor(db, latest)
+
+        events = await self._events()
+        self.assertEqual(
+            [event.event_type for event in events],
+            ["invalidated", "invalidated"],
+        )
+        self.assertEqual(len(channel.sends), 2)
+        self.assertEqual(len(second_quotes.calls), 1)
+        self.assertEqual(len(third_quotes.calls), 1)
+        self.assertNotEqual(events[0].dedup_key, events[1].dedup_key)
+        self.assertEqual(
+            [
+                event.market_snapshot_json["occurrence_no"]
+                for event in events
+            ],
+            [1, 2],
+        )
+
+    async def test_active_higher_priority_condition_blocks_lower_trigger(self):
+        _plan_id, candidate_id = await self._create_candidate(
+            entry={"price_gte": 10},
+            invalidation={"price_lte": 11},
+            exit_trigger={"price_gte": 10},
+        )
+        channel = _RecordingInAppChannel()
+        first_quote_api = _BatchQuoteAPI(
+            {"000001": _fresh_quote("000001", 10.5)}
+        )
+        async with self.Session() as db:
+            await self._monitor_service(
+                channel,
+                quote_api=first_quote_api,
+            ).monitor(db, self.now)
+
+        later = CN_TZ.localize(datetime(2026, 7, 14, 10, 6))
+        second_quote_api = _BatchQuoteAPI(
+            {
+                "000001": _fresh_quote(
+                    "000001",
+                    10.5,
+                    captured_at="20260714100600",
+                )
+            }
+        )
+        async with self.SecondSession() as db:
+            await self._monitor_service(
+                channel,
+                quote_api=second_quote_api,
             ).monitor(db, later)
 
         events = await self._events()
         self.assertEqual([event.event_type for event in events], ["invalidated"])
-        self.assertEqual(len(first_channel.sends), 1)
-        self.assertEqual(second_channel.sends, [])
-        self.assertEqual(second_quotes.calls, [])
+        async with self.Session() as db:
+            states = list(
+                (
+                    await db.execute(
+                        select(TradingAlertConditionState).where(
+                            TradingAlertConditionState.candidate_id
+                            == candidate_id
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        by_type = {state.event_type: state for state in states}
+        self.assertTrue(by_type["invalidated"].active)
+        self.assertEqual(by_type["invalidated"].occurrence_no, 1)
+        self.assertFalse(by_type["exit_triggered"].active)
+        self.assertEqual(by_type["exit_triggered"].occurrence_no, 0)
+        self.assertFalse(by_type["entry_triggered"].active)
+        self.assertEqual(by_type["entry_triggered"].occurrence_no, 0)
+
+    async def test_invalidated_candidate_recovers_to_triggered_after_prior_entry(self):
+        _plan_id, candidate_id = await self._create_candidate(
+            entry={"price_gte": 10},
+            invalidation={"price_lte": 5},
+        )
+        channel = _RecordingInAppChannel()
+        ticks = (
+            (self.now, 11.0, "20260714100500"),
+            (CN_TZ.localize(datetime(2026, 7, 14, 10, 6)), 4.0, "20260714100600"),
+            (CN_TZ.localize(datetime(2026, 7, 14, 10, 7)), 6.0, "20260714100700"),
+        )
+        for current, price, captured_at in ticks:
+            async with self.Session() as db:
+                await self._monitor_service(
+                    channel,
+                    quote_api=_BatchQuoteAPI(
+                        {
+                            "000001": _fresh_quote(
+                                "000001",
+                                price,
+                                captured_at=captured_at,
+                            )
+                        }
+                    ),
+                ).monitor(db, current)
+
+        self.assertEqual(
+            [event.event_type for event in await self._events()],
+            ["entry_triggered", "invalidated"],
+        )
+        async with self.Session() as db:
+            candidate = await db.get(TradingPlanCandidate, candidate_id)
+        self.assertEqual(candidate.status, "triggered")
+
+    async def test_unknown_tick_does_not_rearm_active_condition(self):
+        await self._create_candidate(
+            entry={"price_gte": 20},
+            invalidation={"price_lte": 9},
+        )
+        channel = _RecordingInAppChannel()
+        ticks = (
+            (self.now, {"price": 8.0, "datetime": "20260714100500"}),
+            (
+                CN_TZ.localize(datetime(2026, 7, 14, 10, 6)),
+                {
+                    "price": 0.0,
+                    "datetime": "20260714100600",
+                    "_missing_fields": ["price"],
+                },
+            ),
+            (
+                CN_TZ.localize(datetime(2026, 7, 14, 10, 7)),
+                {"price": 8.0, "datetime": "20260714100700"},
+            ),
+            (
+                CN_TZ.localize(datetime(2026, 7, 14, 10, 8)),
+                {"price": 10.0, "datetime": "20260714100800"},
+            ),
+            (
+                CN_TZ.localize(datetime(2026, 7, 14, 10, 9)),
+                {"price": 8.0, "datetime": "20260714100900"},
+            ),
+        )
+        for current, quote in ticks:
+            async with self.Session() as db:
+                await self._monitor_service(
+                    channel,
+                    quote_api=_BatchQuoteAPI(
+                        {"000001": {"code": "000001", **quote}}
+                    ),
+                ).monitor(db, current)
+
+        events = await self._events()
+        self.assertEqual(
+            [event.market_snapshot_json["occurrence_no"] for event in events],
+            [1, 2],
+        )
+        self.assertEqual(len(channel.sends), 2)
+
+    async def test_unknown_replacement_does_not_recover_obsolete_active_version(self):
+        _plan_id, candidate_id = await self._create_candidate(
+            entry={"price_gte": 20},
+            invalidation={"price_lte": 9},
+            exit_trigger={"price_gte": 10},
+        )
+        channel = _RecordingInAppChannel()
+        async with self.Session() as db:
+            await self._monitor_service(
+                channel,
+                quote_api=_BatchQuoteAPI(
+                    {"000001": _fresh_quote("000001", 8.0)}
+                ),
+            ).monitor(db, self.now)
+            candidate = await db.get(TradingPlanCandidate, candidate_id)
+            candidate.invalidation_json = {"change_pct_lte": -5}
+            await db.commit()
+
+        later = CN_TZ.localize(datetime(2026, 7, 14, 10, 6))
+        async with self.SecondSession() as db:
+            await self._monitor_service(
+                channel,
+                quote_api=_BatchQuoteAPI(
+                    {
+                        "000001": {
+                            **_fresh_quote(
+                                "000001",
+                                10.0,
+                                captured_at="20260714100600",
+                            ),
+                            "_missing_fields": ["change_pct"],
+                        }
+                    }
+                ),
+            ).monitor(db, later)
+            candidate = await db.get(TradingPlanCandidate, candidate_id)
+            candidate.invalidation_json = {}
+            await db.commit()
+
+        latest = CN_TZ.localize(datetime(2026, 7, 14, 10, 7))
+        async with self.Session() as db:
+            await self._monitor_service(
+                channel,
+                quote_api=_BatchQuoteAPI(
+                    {
+                        "000001": _fresh_quote(
+                            "000001",
+                            10.0,
+                            captured_at="20260714100700",
+                        )
+                    }
+                ),
+            ).monitor(db, latest)
+
+        self.assertEqual(
+            [event.event_type for event in await self._events()],
+            ["invalidated"],
+        )
+        async with self.Session() as db:
+            candidate = await db.get(TradingPlanCandidate, candidate_id)
+            states = list(
+                (
+                    await db.scalars(
+                        select(TradingAlertConditionState).where(
+                            TradingAlertConditionState.candidate_id
+                            == candidate_id,
+                            TradingAlertConditionState.event_type
+                            == "invalidated",
+                        )
+                    )
+                ).all()
+            )
+        self.assertEqual(candidate.status, "invalidated")
+        self.assertEqual(sum(state.active for state in states), 1)
 
     async def test_exit_candidate_is_terminal_across_monitor_ticks(self):
         from app.services.trading_playbook.alert_service import (
@@ -1683,7 +2160,7 @@ class TradingPlaybookActionMonitorTests(unittest.IsolatedAsyncioTestCase):
             "skipped",
         )
 
-    async def test_disabled_terminal_is_skipped_and_remains_terminal_after_reenable(self):
+    async def test_disabled_invalidation_continues_observing_without_resend(self):
         await self._create_candidate(
             entry={"price_gte": 20},
             invalidation={"price_lte": 9},
@@ -1727,7 +2204,7 @@ class TradingPlaybookActionMonitorTests(unittest.IsolatedAsyncioTestCase):
             ).monitor(db, later)
 
         self.assertEqual(channel.sends, [])
-        self.assertEqual(later_quotes.calls, [])
+        self.assertEqual(later_quotes.calls, [["000001"]])
         self.assertEqual(len(await self._events()), 1)
 
     async def test_monitor_persists_all_matching_events_before_first_send(self):

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
+import json
 import math
 import uuid
 from collections.abc import Mapping
@@ -11,11 +13,14 @@ from datetime import date, datetime, time
 from typing import Any
 
 from sqlalchemy import select, update
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 from loguru import logger
 
 from app.config import settings as app_settings
 from app.models.trading_playbook import (
+    TradingAlertConditionState,
     TradingAlertEvent,
     TradingPlanCandidate,
     TradingPlanVersion,
@@ -43,7 +48,12 @@ _ACTION_EVENT_SEVERITIES = {
     "exit_triggered": "warning",
     "entry_triggered": "action",
 }
-_TERMINAL_ACTION_EVENT_TYPES = ("invalidated", "exit_triggered")
+_ACTION_CONDITION_SPECS = (
+    ("invalidation_json", "invalidated"),
+    ("exit_trigger_json", "exit_triggered"),
+    ("entry_trigger_json", "entry_triggered"),
+)
+_TERMINAL_ACTION_EVENT_TYPES = ("exit_triggered",)
 
 
 class TradingAlertDeliveryStateLost(RuntimeError):
@@ -235,15 +245,13 @@ class TradingPlaybookAlertService:
                 self.max_monitor_candidates,
             )
             rows = rows[: self.max_monitor_candidates]
-        if not rows:
-            return []
-
-        candidate_ids = [candidate.id for _plan, candidate in rows]
         existing_action_events = list(
             (
                 await db.execute(
                     select(TradingAlertEvent).where(
-                        TradingAlertEvent.candidate_id.in_(candidate_ids),
+                        TradingAlertEvent.event_type.in_(
+                            tuple(_ACTION_EVENT_SEVERITIES)
+                        ),
                         TradingAlertEvent.dedup_key.like(
                             f"action:{trade_date.isoformat()}:%"
                         ),
@@ -253,9 +261,20 @@ class TradingPlaybookAlertService:
             .scalars()
             .all()
         )
-        existing_by_dedup = {
-            event.dedup_key: event for event in existing_action_events
-        }
+        pending_action_events = [
+            event
+            for event in existing_action_events
+            if dict(
+                (event.channel_status_json or {}).get(self.channel_name) or {}
+            ).get("status")
+            == "pending"
+        ]
+        await db.commit()
+        for event in pending_action_events:
+            await self._deliver(db, event)
+
+        if not rows:
+            return pending_action_events
         terminal_candidate_ids = {
             event.candidate_id
             for event in existing_action_events
@@ -268,14 +287,14 @@ class TradingPlaybookAlertService:
                 if candidate.id not in terminal_candidate_ids
             ]
         if not rows:
-            return []
+            return pending_action_events
         if self.quote_api is None or not callable(
             getattr(self.quote_api, "get_quotes_batch", None)
         ):
             logger.warning(
                 "Trading playbook monitor skipped: batch quote provider missing"
             )
-            return []
+            return pending_action_events
 
         # End the read transaction before waiting on the network.  The project
         # session factory keeps loaded rows usable with expire_on_commit=False.
@@ -288,14 +307,14 @@ class TradingPlaybookAlertService:
             needs_open_count=needs_open_count,
         )
         if response is None:
-            return []
+            return pending_action_events
         quotes = self._normalize_quotes(
             response,
             requested_codes=set(codes),
             as_of=current,
         )
         if not quotes:
-            return []
+            return pending_action_events
         if needs_open_count:
             open_counts = self._normalize_open_counts(
                 open_count_snapshot,
@@ -308,46 +327,454 @@ class TradingPlaybookAlertService:
                     quote["open_count"] = open_count
 
         channel_enabled = await self._channel_enabled(db)
-        persisted: list[TradingAlertEvent] = []
+        persisted: list[TradingAlertEvent] = list(pending_action_events)
+        newly_persisted: list[TradingAlertEvent] = []
         for plan, candidate in rows:
             quote = quotes.get(candidate.stock_code)
             if quote is None:
                 continue
-            evaluated = self._evaluate_candidate(
-                plan.status,
+            event = await self._apply_candidate_tick(
+                db,
+                plan,
                 candidate,
                 quote,
-                use_memory_dedup=False,
+                trade_date=trade_date,
+                triggered_at=current,
+                channel_enabled=channel_enabled,
             )
-            for payload in evaluated:
-                dedup_key = self._action_dedup_key(
-                    plan,
-                    candidate,
-                    str(payload.get("event_type") or ""),
-                    trade_date,
-                )
-                event = existing_by_dedup.get(dedup_key)
-                if event is None:
-                    event = await self._ensure_action_event(
-                        db,
-                        plan,
-                        candidate,
-                        payload,
-                        quote,
-                        trade_date=trade_date,
-                        triggered_at=current,
-                        initial_channel_status=self._initial_channel_status(
-                            dedup_key,
-                            enabled=channel_enabled,
-                        ),
-                        lookup_existing=False,
-                    )
-                    existing_by_dedup[event.dedup_key] = event
+            if event is not None:
                 persisted.append(event)
+                newly_persisted.append(event)
         if channel_enabled:
-            for event in persisted:
+            for event in newly_persisted:
                 await self._deliver(db, event)
         return persisted
+
+    @classmethod
+    def _normalized_condition_value(cls, value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return {
+                str(key): cls._normalized_condition_value(value[key])
+                for key in sorted(value, key=lambda item: str(item))
+            }
+        if isinstance(value, (list, tuple)):
+            return [cls._normalized_condition_value(item) for item in value]
+        if isinstance(value, bool) or value is None or isinstance(value, str):
+            return value
+        if isinstance(value, (int, float)):
+            number = cls._finite_number(value)
+            if number is None:
+                return None
+            return int(number) if number.is_integer() else number
+        if isinstance(value, (date, datetime)):
+            return value.isoformat()
+        return str(value)
+
+    @classmethod
+    def _condition_version(cls, event_type: str, condition: Mapping[str, Any]) -> str:
+        canonical = json.dumps(
+            {
+                "condition": cls._normalized_condition_value(condition),
+                "event_type": event_type,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _condition_state_insert_statement(
+        dialect_name: str,
+        values: Mapping[str, Any],
+    ):
+        if dialect_name == "postgresql":
+            statement = postgresql_insert(TradingAlertConditionState)
+        else:
+            statement = sqlite_insert(TradingAlertConditionState)
+        return statement.values(**dict(values)).on_conflict_do_nothing(
+            index_elements=["candidate_id", "event_type", "condition_version"]
+        )
+
+    @staticmethod
+    def _condition_activate_statement(
+        candidate_id: int,
+        event_type: str,
+        condition_version: str,
+        matched_at: datetime,
+    ):
+        return (
+            update(TradingAlertConditionState)
+            .where(
+                TradingAlertConditionState.candidate_id == candidate_id,
+                TradingAlertConditionState.event_type == event_type,
+                TradingAlertConditionState.condition_version
+                == condition_version,
+                TradingAlertConditionState.active.is_(False),
+            )
+            .values(
+                active=True,
+                occurrence_no=TradingAlertConditionState.occurrence_no + 1,
+                last_matched_at=matched_at,
+                updated_at=matched_at,
+            )
+            .execution_options(synchronize_session=False)
+        )
+
+    @staticmethod
+    def _condition_recover_statement(
+        state_id: int,
+        recovered_at: datetime,
+    ):
+        return (
+            update(TradingAlertConditionState)
+            .where(
+                TradingAlertConditionState.id == state_id,
+                TradingAlertConditionState.active.is_(True),
+            )
+            .values(
+                active=False,
+                last_recovered_at=recovered_at,
+                updated_at=recovered_at,
+            )
+            .execution_options(synchronize_session=False)
+        )
+
+    @classmethod
+    def _current_condition_specs(cls, candidate: Any, quote: Mapping[str, Any]):
+        specs = []
+        for condition_name, event_type in _ACTION_CONDITION_SPECS:
+            condition = cls._candidate_value(candidate, condition_name) or {}
+            if not isinstance(condition, Mapping) or not any(
+                key not in _CONDITION_METADATA for key in condition
+            ):
+                continue
+            specs.append(
+                {
+                    "event_type": event_type,
+                    "condition": condition,
+                    "condition_version": cls._condition_version(
+                        event_type,
+                        condition,
+                    ),
+                    "result": cls._condition_result(condition, quote),
+                }
+            )
+        return specs
+
+    async def _apply_candidate_tick(
+        self,
+        db,
+        plan: Any,
+        candidate: Any,
+        quote: Mapping[str, Any],
+        *,
+        trade_date: date,
+        triggered_at: datetime,
+        channel_enabled: bool,
+    ) -> TradingAlertEvent | None:
+        candidate_id = self._candidate_value(candidate, "id")
+        plan_id = self._plan_value(plan, "id")
+        if not isinstance(candidate_id, int) or not isinstance(plan_id, int):
+            return None
+        specs = self._current_condition_specs(candidate, quote)
+        if not specs:
+            await db.commit()
+            return None
+        observed_at = triggered_at.astimezone(CN_TZ).replace(tzinfo=None)
+        dialect_name = db.get_bind().dialect.name
+        for spec in specs:
+            await db.execute(
+                self._condition_state_insert_statement(
+                    dialect_name,
+                    {
+                        "candidate_id": candidate_id,
+                        "event_type": spec["event_type"],
+                        "condition_version": spec["condition_version"],
+                        "active": False,
+                        "occurrence_no": 0,
+                        "updated_at": observed_at,
+                    },
+                )
+            )
+
+        locked_candidate = await db.scalar(
+            select(TradingPlanCandidate)
+            .where(TradingPlanCandidate.id == candidate_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if locked_candidate is None or locked_candidate.status == "exit":
+            await db.commit()
+            return None
+        states = list(
+            (
+                await db.execute(
+                    select(TradingAlertConditionState)
+                    .where(
+                        TradingAlertConditionState.candidate_id == candidate_id
+                    )
+                    .execution_options(populate_existing=True)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        state_by_key = {
+            (state.event_type, state.condition_version): state for state in states
+        }
+        invalidation_recovered = False
+        effective_active = {
+            key: bool(state.active) for key, state in state_by_key.items()
+        }
+
+        for spec in specs:
+            key = (spec["event_type"], spec["condition_version"])
+            state = state_by_key[key]
+            result = spec["result"]
+            if result is False and effective_active.get(key, False):
+                recovered = await db.execute(
+                    self._condition_recover_statement(state.id, observed_at)
+                )
+                if recovered.rowcount == 1:
+                    effective_active[key] = False
+                    invalidation_recovered = (
+                        invalidation_recovered
+                        or spec["event_type"] == "invalidated"
+                    )
+            elif result is True and effective_active.get(key, False):
+                await db.execute(
+                    update(TradingAlertConditionState)
+                    .where(
+                        TradingAlertConditionState.id == state.id,
+                        TradingAlertConditionState.active.is_(True),
+                    )
+                    .values(
+                        last_matched_at=observed_at,
+                        updated_at=observed_at,
+                    )
+                    .execution_options(synchronize_session=False)
+                )
+
+        active_state_by_event = {
+            state.event_type: state
+            for state in states
+            if effective_active.get(
+                (state.event_type, state.condition_version),
+                False,
+            )
+        }
+
+        if invalidation_recovered and locked_candidate.status == "invalidated":
+            had_entry = (
+                await db.scalar(
+                    select(TradingAlertConditionState.id)
+                    .where(
+                        TradingAlertConditionState.candidate_id == candidate_id,
+                        TradingAlertConditionState.event_type == "entry_triggered",
+                        TradingAlertConditionState.occurrence_no > 0,
+                    )
+                    .limit(1)
+                )
+            ) is not None
+            recovered_status = "triggered" if had_entry else "waiting"
+            await db.execute(
+                update(TradingPlanCandidate)
+                .where(
+                    TradingPlanCandidate.id == candidate_id,
+                    TradingPlanCandidate.status == "invalidated",
+                )
+                .values(status=recovered_status)
+                .execution_options(synchronize_session=False)
+            )
+            locked_candidate.status = recovered_status
+
+        chosen = None
+        active_occurrence = None
+        event_priority = {
+            event_type: index
+            for index, (_condition_name, event_type) in enumerate(
+                _ACTION_CONDITION_SPECS
+            )
+        }
+        highest_active_state = min(
+            active_state_by_event.values(),
+            key=lambda state: event_priority[state.event_type],
+            default=None,
+        )
+        for spec in specs:
+            key = (spec["event_type"], spec["condition_version"])
+            if (
+                highest_active_state is not None
+                and event_priority[highest_active_state.event_type]
+                < event_priority[spec["event_type"]]
+            ):
+                active_occurrence = {
+                    "event_type": highest_active_state.event_type,
+                    "condition_version": highest_active_state.condition_version,
+                }
+                break
+            if spec["result"] is True:
+                if not effective_active.get(key, False):
+                    chosen = spec
+                else:
+                    active_occurrence = spec
+                break
+            blocking_state = active_state_by_event.get(spec["event_type"])
+            if blocking_state is not None:
+                active_occurrence = {
+                    "event_type": blocking_state.event_type,
+                    "condition_version": blocking_state.condition_version,
+                }
+                break
+        if chosen is None:
+            await db.commit()
+            if active_occurrence is not None:
+                existing = await self._existing_occurrence_event(
+                    db,
+                    plan,
+                    candidate,
+                    active_occurrence["event_type"],
+                    active_occurrence["condition_version"],
+                    trade_date,
+                )
+                channel_status = dict(
+                    (existing.channel_status_json or {}).get(self.channel_name)
+                    or {}
+                ) if existing is not None else {}
+                if channel_status.get("status") == "pending":
+                    return existing
+            return None
+
+        event_type = chosen["event_type"]
+        condition_version = chosen["condition_version"]
+        activated = await db.execute(
+            self._condition_activate_statement(
+                candidate_id,
+                event_type,
+                condition_version,
+                observed_at,
+            )
+        )
+        if activated.rowcount != 1:
+            await db.rollback()
+            return await self._existing_occurrence_event(
+                db,
+                plan,
+                candidate,
+                event_type,
+                condition_version,
+                trade_date,
+            )
+        occurrence_no = await db.scalar(
+            select(TradingAlertConditionState.occurrence_no).where(
+                TradingAlertConditionState.candidate_id == candidate_id,
+                TradingAlertConditionState.event_type == event_type,
+                TradingAlertConditionState.condition_version
+                == condition_version,
+            )
+        )
+        if not isinstance(occurrence_no, int) or occurrence_no < 1:
+            await db.rollback()
+            return None
+
+        target_status = {
+            "entry_triggered": "triggered",
+            "invalidated": "invalidated",
+            "exit_triggered": "exit",
+        }[event_type]
+        allowed_statuses = {
+            "entry_triggered": ("waiting", "triggered"),
+            "invalidated": ("waiting", "triggered", "invalidated"),
+            "exit_triggered": ("waiting", "triggered", "invalidated"),
+        }[event_type]
+        candidate_update = await db.execute(
+            update(TradingPlanCandidate)
+            .where(
+                TradingPlanCandidate.id == candidate_id,
+                TradingPlanCandidate.status.in_(allowed_statuses),
+            )
+            .values(status=target_status)
+            .execution_options(synchronize_session=False)
+        )
+        if candidate_update.rowcount != 1:
+            await db.rollback()
+            return None
+
+        dedup_key = self._action_dedup_key(
+            plan,
+            candidate,
+            event_type,
+            trade_date,
+            condition_version=condition_version,
+            occurrence_no=occurrence_no,
+        )
+        event = self._new_action_event(
+            plan,
+            candidate,
+            quote,
+            event_type=event_type,
+            dedup_key=dedup_key,
+            trade_date=trade_date,
+            triggered_at=triggered_at,
+            condition_version=condition_version,
+            occurrence_no=occurrence_no,
+            initial_channel_status=self._initial_channel_status(
+                dedup_key,
+                enabled=channel_enabled,
+            ),
+        )
+        db.add(event)
+        try:
+            await db.commit()
+            await db.refresh(event)
+            return event
+        except IntegrityError:
+            await db.rollback()
+            return (
+                await db.execute(
+                    select(TradingAlertEvent).where(
+                        TradingAlertEvent.dedup_key == dedup_key
+                    )
+                )
+            ).scalar_one_or_none()
+
+    async def _existing_occurrence_event(
+        self,
+        db,
+        plan: Any,
+        candidate: Any,
+        event_type: str,
+        condition_version: str,
+        trade_date: date,
+    ) -> TradingAlertEvent | None:
+        candidate_id = self._candidate_value(candidate, "id")
+        occurrence_no = await db.scalar(
+            select(TradingAlertConditionState.occurrence_no).where(
+                TradingAlertConditionState.candidate_id == candidate_id,
+                TradingAlertConditionState.event_type == event_type,
+                TradingAlertConditionState.condition_version
+                == condition_version,
+            )
+        )
+        if not isinstance(occurrence_no, int) or occurrence_no < 1:
+            return None
+        dedup_key = self._action_dedup_key(
+            plan,
+            candidate,
+            event_type,
+            trade_date,
+            condition_version=condition_version,
+            occurrence_no=occurrence_no,
+        )
+        return (
+            await db.execute(
+                select(TradingAlertEvent).where(
+                    TradingAlertEvent.dedup_key == dedup_key
+                )
+            )
+        ).scalar_one_or_none()
 
     @classmethod
     def _rows_need_open_count(cls, rows: list[tuple[Any, Any]]) -> bool:
@@ -530,14 +957,15 @@ class TradingPlaybookAlertService:
         return number if math.isfinite(number) else None
 
     @classmethod
-    def _condition_matches(
+    def _condition_result(
         cls,
         condition: Any,
         quote: Mapping[str, Any],
-    ) -> bool:
+    ) -> bool | None:
         if not isinstance(condition, Mapping) or not isinstance(quote, Mapping):
-            return False
+            return None
         actionable = False
+        unknown = False
         raw_missing_fields = quote.get("_missing_fields")
         missing_fields = {
             str(value)
@@ -553,34 +981,54 @@ class TradingPlaybookAlertService:
             actionable = True
             if key == "sealed":
                 if not isinstance(expected, bool):
-                    return False
+                    unknown = True
+                    continue
                 if "sealed" in missing_fields:
-                    return False
+                    unknown = True
+                    continue
                 actual = quote.get("sealed")
-                if not isinstance(actual, bool) or actual is not expected:
+                if not isinstance(actual, bool):
+                    unknown = True
+                    continue
+                if actual is not expected:
                     return False
                 continue
             numeric = _NUMERIC_CONDITIONS.get(key)
             if numeric is None:
-                return False
+                unknown = True
+                continue
             quote_key, operation = numeric
             if quote_key in missing_fields:
-                return False
+                unknown = True
+                continue
             if quote_key == "open_count":
                 open_count = quote.get(quote_key)
                 if type(open_count) is not int or open_count < 0:
-                    return False
+                    unknown = True
+                    continue
             actual_number = cls._finite_number(quote.get(quote_key))
             expected_number = cls._finite_number(expected)
             if actual_number is None or expected_number is None:
-                return False
+                unknown = True
+                continue
             if quote_key == "price" and actual_number <= 0:
-                return False
+                unknown = True
+                continue
             if operation == "gte" and actual_number < expected_number:
                 return False
             if operation == "lte" and actual_number > expected_number:
                 return False
-        return actionable
+        if not actionable or unknown:
+            return None
+        return True
+
+    @classmethod
+    def _condition_matches(
+        cls,
+        condition: Any,
+        quote: Mapping[str, Any],
+    ) -> bool:
+        return cls._condition_result(condition, quote) is True
 
     @staticmethod
     def _candidate_value(candidate: Any, key: str) -> Any:
@@ -704,7 +1152,27 @@ class TradingPlaybookAlertService:
         candidate: Any,
         event_type: str,
         trade_date: date,
+        *,
+        condition_version: str | None = None,
+        occurrence_no: int = 1,
     ) -> str:
+        if condition_version is None:
+            condition_name = next(
+                (
+                    name
+                    for name, spec_event_type in _ACTION_CONDITION_SPECS
+                    if spec_event_type == event_type
+                ),
+                None,
+            )
+            condition = (
+                self._candidate_value(candidate, condition_name) or {}
+                if condition_name is not None
+                else {}
+            )
+            if not isinstance(condition, Mapping):
+                condition = {}
+            condition_version = self._condition_version(event_type, condition)
         return ":".join(
             (
                 "action",
@@ -713,6 +1181,8 @@ class TradingPlaybookAlertService:
                 str(self._candidate_value(candidate, "id")),
                 str(self._candidate_value(candidate, "primary_mode_key") or ""),
                 event_type,
+                condition_version[:16],
+                str(occurrence_no),
             )
         )
 
@@ -738,6 +1208,52 @@ class TradingPlaybookAlertService:
                 snapshot[key] = value
         return snapshot
 
+    def _new_action_event(
+        self,
+        plan: Any,
+        candidate: Any,
+        quote: Mapping[str, Any],
+        *,
+        event_type: str,
+        dedup_key: str,
+        trade_date: date,
+        triggered_at: datetime,
+        condition_version: str,
+        occurrence_no: int,
+        initial_channel_status: Mapping[str, Any],
+    ) -> TradingAlertEvent:
+        plan_id = self._plan_value(plan, "id")
+        candidate_id = self._candidate_value(candidate, "id")
+        if not isinstance(plan_id, int) or not isinstance(candidate_id, int):
+            raise ValueError("action alert requires persisted plan and candidate ids")
+        if event_type not in _ACTION_EVENT_SEVERITIES:
+            raise ValueError(f"unsupported action alert event: {event_type}")
+        stock_code = str(self._candidate_value(candidate, "stock_code") or "")
+        stock_name = str(self._candidate_value(candidate, "stock_name") or "")
+        mode_key = str(
+            self._candidate_value(candidate, "primary_mode_key") or ""
+        )
+        return TradingAlertEvent(
+            plan_version_id=plan_id,
+            candidate_id=candidate_id,
+            event_type=event_type,
+            severity=_ACTION_EVENT_SEVERITIES[event_type],
+            dedup_key=dedup_key,
+            triggered_at=triggered_at.astimezone(CN_TZ).replace(tzinfo=None),
+            market_snapshot_json={
+                "trade_date": trade_date.isoformat(),
+                "stock_code": stock_code,
+                "mode_key": mode_key,
+                "condition_version": condition_version,
+                "occurrence_no": occurrence_no,
+                "quote": self._snapshot_quote(quote),
+            },
+            message=f"交易预案提醒：{stock_code} {stock_name} {event_type}",
+            channel_status_json={
+                self.channel_name: copy.deepcopy(dict(initial_channel_status))
+            },
+        )
+
     async def _ensure_action_event(
         self,
         db,
@@ -758,11 +1274,23 @@ class TradingPlaybookAlertService:
         event_type = str(payload.get("event_type") or "")
         if event_type not in _ACTION_EVENT_SEVERITIES:
             raise ValueError(f"unsupported action alert event: {event_type}")
+        condition_name = next(
+            name
+            for name, spec_event_type in _ACTION_CONDITION_SPECS
+            if spec_event_type == event_type
+        )
+        condition = self._candidate_value(candidate, condition_name) or {}
+        if not isinstance(condition, Mapping):
+            condition = {}
+        condition_version = self._condition_version(event_type, condition)
+        occurrence_no = 1
         dedup_key = self._action_dedup_key(
             plan,
             candidate,
             event_type,
             trade_date,
+            condition_version=condition_version,
+            occurrence_no=occurrence_no,
         )
         if lookup_existing:
             existing = (
@@ -775,30 +1303,17 @@ class TradingPlaybookAlertService:
             if existing is not None:
                 return existing
 
-        stock_code = str(self._candidate_value(candidate, "stock_code") or "")
-        stock_name = str(self._candidate_value(candidate, "stock_name") or "")
-        mode_key = str(
-            self._candidate_value(candidate, "primary_mode_key") or ""
-        )
-        event = TradingAlertEvent(
-            plan_version_id=plan_id,
-            candidate_id=candidate_id,
+        event = self._new_action_event(
+            plan,
+            candidate,
+            quote,
             event_type=event_type,
-            severity=_ACTION_EVENT_SEVERITIES[event_type],
             dedup_key=dedup_key,
-            triggered_at=triggered_at.astimezone(CN_TZ).replace(tzinfo=None),
-            market_snapshot_json={
-                "trade_date": trade_date.isoformat(),
-                "stock_code": stock_code,
-                "mode_key": mode_key,
-                "quote": self._snapshot_quote(quote),
-            },
-            message=f"交易预案提醒：{stock_code} {stock_name} {event_type}",
-            channel_status_json={
-                self.channel_name: copy.deepcopy(
-                    dict(initial_channel_status)
-                )
-            },
+            trade_date=trade_date,
+            triggered_at=triggered_at,
+            condition_version=condition_version,
+            occurrence_no=occurrence_no,
+            initial_channel_status=initial_channel_status,
         )
         db.add(event)
         try:

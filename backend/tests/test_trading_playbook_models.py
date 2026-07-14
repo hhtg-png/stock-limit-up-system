@@ -115,6 +115,17 @@ TABLE_COLUMNS = {
         "channel_status_json",
         "acknowledged_at",
     },
+    "trading_alert_condition_states": {
+        "id",
+        "candidate_id",
+        "event_type",
+        "condition_version",
+        "active",
+        "occurrence_no",
+        "last_matched_at",
+        "last_recovered_at",
+        "updated_at",
+    },
     "trading_execution_reviews": {
         "id",
         "trade_date",
@@ -245,6 +256,17 @@ COLUMN_TYPES = {
         "channel_status_json": (JSON, None),
         "acknowledged_at": (DateTime, None),
     },
+    "trading_alert_condition_states": {
+        "id": (Integer, None),
+        "candidate_id": (Integer, None),
+        "event_type": (String, 40),
+        "condition_version": (String, 64),
+        "active": (Boolean, None),
+        "occurrence_no": (Integer, None),
+        "last_matched_at": (DateTime, None),
+        "last_recovered_at": (DateTime, None),
+        "updated_at": (DateTime, None),
+    },
     "trading_execution_reviews": {
         "id": (Integer, None),
         "trade_date": (Date, None),
@@ -296,6 +318,8 @@ NULLABLE_COLUMNS = {
     ("trading_plan_versions", "confirmed_by"),
     ("trading_alert_events", "candidate_id"),
     ("trading_alert_events", "acknowledged_at"),
+    ("trading_alert_condition_states", "last_matched_at"),
+    ("trading_alert_condition_states", "last_recovered_at"),
     ("trading_execution_reviews", "finalized_at"),
     ("trading_playbook_job_claims", "source_trade_date"),
     ("trading_playbook_job_claims", "target_trade_date"),
@@ -314,6 +338,8 @@ SCALAR_DEFAULTS = {
     ("trading_plan_candidates", "theme_name"): "",
     ("trading_plan_candidates", "position_reference"): 0,
     ("trading_plan_candidates", "status"): "waiting",
+    ("trading_alert_condition_states", "active"): False,
+    ("trading_alert_condition_states", "occurrence_no"): 0,
     ("trading_playbook_job_claims", "status"): "running",
     ("trading_playbook_job_claims", "attempt_no"): 1,
     ("trading_playbook_settings", "id"): 1,
@@ -331,6 +357,7 @@ DATETIME_DEFAULTS = {
     ("trading_mode_rules", "created_at"),
     ("trading_plan_versions", "generated_at"),
     ("trading_alert_events", "triggered_at"),
+    ("trading_alert_condition_states", "updated_at"),
     ("trading_execution_reviews", "generated_at"),
     ("trading_playbook_job_claims", "created_at"),
     ("trading_playbook_job_claims", "updated_at"),
@@ -401,6 +428,12 @@ UNIQUE_CONSTRAINTS = {
     "trading_alert_events": {
         ("uq_trading_alert_dedup", ("dedup_key",)),
     },
+    "trading_alert_condition_states": {
+        (
+            "uq_trading_alert_condition_version",
+            ("candidate_id", "event_type", "condition_version"),
+        ),
+    },
     "trading_execution_reviews": {
         ("uq_trading_execution_review", ("trade_date", "plan_version_id")),
     },
@@ -415,6 +448,10 @@ FOREIGN_KEYS = {
     ("trading_plan_candidates", "plan_version_id"): "trading_plan_versions.id",
     ("trading_alert_events", "plan_version_id"): "trading_plan_versions.id",
     ("trading_alert_events", "candidate_id"): "trading_plan_candidates.id",
+    (
+        "trading_alert_condition_states",
+        "candidate_id",
+    ): "trading_plan_candidates.id",
     ("trading_execution_reviews", "plan_version_id"): "trading_plan_versions.id",
 }
 
@@ -427,6 +464,7 @@ INDEXED_COLUMNS = {
         "action_trade_date",
     },
     "trading_alert_events": {"plan_version_id", "candidate_id"},
+    "trading_alert_condition_states": {"candidate_id"},
     "trading_execution_reviews": {"trade_date"},
 }
 
@@ -435,6 +473,12 @@ COMPOSITE_INDEXES = {
         (
             "ix_trading_playbook_job_claim_status_lease",
             ("status", "lease_expires_at"),
+        ),
+    },
+    "trading_alert_condition_states": {
+        (
+            "ix_trading_alert_condition_candidate_active",
+            ("candidate_id", "event_type", "active"),
         ),
     },
 }

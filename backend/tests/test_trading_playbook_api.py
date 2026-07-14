@@ -366,6 +366,20 @@ class TradingPlaybookApiTests(unittest.TestCase):
         self.assertEqual(confirmed.json()["confirmed_by"], "local-user")
         self.assertTrue(confirmed.json()["confirmed_at"].endswith("+08:00"))
 
+    def test_plan_detail_reads_current_candidate_monitor_status(self):
+        async def mark_triggered():
+            async with self.Session() as db:
+                candidate = await db.get(TradingPlanCandidate, 1)
+                candidate.status = "triggered"
+                await db.commit()
+
+        asyncio.run(mark_triggered())
+
+        response = self.client.get("/trading-playbook/plans/1")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["candidates"][0]["status"], "triggered")
+
     def test_confirm_response_does_not_serialize_after_commit(self):
         original = trading_playbook_api._plan_service.serialize
         calls = 0

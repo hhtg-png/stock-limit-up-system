@@ -25,6 +25,7 @@ from .order_flow import OrderBookSnapshot  # noqa: F401
 from .stock import Stock  # noqa: F401
 from .tdx_cache import TdxStockMoveCache  # noqa: F401
 from .trading_playbook import (  # noqa: F401
+    TradingAlertConditionState,
     TradingAlertEvent,
     TradingExecutionReview,
     TradingModeRule,
@@ -57,6 +58,7 @@ __all__ = [
     "Stock",
     "TdxStockMoveCache",
     "TradingAlertEvent",
+    "TradingAlertConditionState",
     "TradingExecutionReview",
     "TradingModeRule",
     "TradingPlanCandidate",

@@ -160,6 +160,46 @@ class TradingPlanCandidate(Base):
     status = Column(String(20), default="waiting", nullable=False)
 
 
+class TradingAlertConditionState(Base):
+    """Persistent occurrence state for one normalized candidate condition."""
+
+    __tablename__ = "trading_alert_condition_states"
+    __table_args__ = (
+        UniqueConstraint(
+            "candidate_id",
+            "event_type",
+            "condition_version",
+            name="uq_trading_alert_condition_version",
+        ),
+        Index(
+            "ix_trading_alert_condition_candidate_active",
+            "candidate_id",
+            "event_type",
+            "active",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    candidate_id = Column(
+        Integer,
+        ForeignKey("trading_plan_candidates.id"),
+        nullable=False,
+        index=True,
+    )
+    event_type = Column(String(40), nullable=False)
+    condition_version = Column(String(64), nullable=False)
+    active = Column(Boolean, default=False, nullable=False)
+    occurrence_no = Column(Integer, default=0, nullable=False)
+    last_matched_at = Column(DateTime, nullable=True)
+    last_recovered_at = Column(DateTime, nullable=True)
+    updated_at = Column(
+        DateTime,
+        default=datetime.now,
+        onupdate=datetime.now,
+        nullable=False,
+    )
+
+
 class TradingAlertEvent(Base):
     """Deduplicated alert emitted while monitoring a trading plan."""
 
