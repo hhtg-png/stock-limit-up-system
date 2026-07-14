@@ -94,9 +94,16 @@ class _FakeReviewService:
         executions,
         *,
         unplanned_executions=None,
+        plan_version_id=None,
     ):
         self.calls.append(
-            (db, trade_date, executions, unplanned_executions or [])
+            (
+                db,
+                trade_date,
+                executions,
+                unplanned_executions or [],
+                plan_version_id,
+            )
         )
         manual = dict(executions)
         if unplanned_executions:
@@ -1618,8 +1625,9 @@ class TradingPlaybookApiTests(unittest.TestCase):
             },
         )
         self.assertEqual(response.status_code, 200, response.text)
-        _, trade_date, executions, unplanned = self.review_service.calls[0]
+        _, trade_date, executions, unplanned, plan_id = self.review_service.calls[0]
         self.assertEqual(trade_date, date(2026, 7, 10))
+        self.assertIsNone(plan_id)
         self.assertEqual(
             executions,
             {
@@ -1814,6 +1822,30 @@ class TradingPlaybookApiTests(unittest.TestCase):
             json={"unplanned_executions": too_many},
         )
         self.assertEqual(response.status_code, 422, response.text)
+
+    def test_review_put_forwards_strict_explicit_plan_selection(self):
+        response = self.client.put(
+            "/trading-playbook/reviews/2026-07-10",
+            params={"plan_id": 22},
+            json={
+                "unplanned_executions": [
+                    {
+                        "executed": True,
+                        "stock_code": "600000",
+                        "stock_name": "浦发银行",
+                    }
+                ]
+            },
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.review_service.calls[-1][4], 22)
+        invalid = self.client.put(
+            "/trading-playbook/reviews/2026-07-10",
+            params={"plan_id": 0},
+            json={"executions": {}},
+        )
+        self.assertEqual(invalid.status_code, 422, invalid.text)
 
     def test_review_invalid_request_is_fixed_422_without_internal_detail(self):
         async def fail(*_args, **_kwargs):

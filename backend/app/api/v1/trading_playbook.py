@@ -533,6 +533,7 @@ async def acknowledge_alert(
 async def update_manual_execution(
     trade_date: date,
     request: ManualExecutionUpdate,
+    plan_id: int | None = Query(None, gt=0),
     db: AsyncSession = Depends(get_db),
     review_service: Any = Depends(get_trading_playbook_review_service),
 ):
@@ -550,6 +551,7 @@ async def update_manual_execution(
             trade_date,
             executions,
             unplanned_executions=unplanned_executions,
+            plan_version_id=plan_id,
         )
         return _serialize_review(review)
     except InvalidRequestError as exc:

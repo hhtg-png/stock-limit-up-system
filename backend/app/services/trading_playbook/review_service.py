@@ -102,14 +102,18 @@ def _cn_datetime(value: Any) -> Optional[datetime]:
     return value.astimezone(CN_TZ)
 
 
-def _event_price(event: Any) -> Optional[float]:
+def _event_raw_price(event: Any) -> Any:
     snapshot = _value(event, "market_snapshot_json", {})
     if not isinstance(snapshot, Mapping):
         return None
     quote = snapshot.get("quote")
     if not isinstance(quote, Mapping):
         return None
-    price = _finite_optional(quote.get("price"))
+    return quote.get("price")
+
+
+def _event_price(event: Any) -> Optional[float]:
+    price = _finite_optional(_event_raw_price(event))
     return price if price is not None and price > 0 else None
 
 
@@ -218,22 +222,74 @@ class TradingPlaybookReviewService:
             else:
                 not_triggered.append(stock_code)
 
-            entry_event = next(
-                (
-                    event
-                    for event in candidate_event_rows
-                    if _value(event, "event_type") in _TRIGGER_EVENT_TYPES
-                ),
-                None,
+            transition_events: list[
+                tuple[datetime, int, int, Any]
+            ] = []
+            entry_events: list[tuple[datetime, int, Any]] = []
+            has_entry_evidence = False
+            for event_index, event in enumerate(candidate_event_rows):
+                transition_type = _value(event, "event_type")
+                if transition_type in _TRIGGER_EVENT_TYPES:
+                    has_entry_evidence = True
+                if transition_type not in (
+                    *_TRIGGER_EVENT_TYPES,
+                    "invalidated",
+                ):
+                    continue
+                transition_at = _cn_datetime(_value(event, "triggered_at"))
+                if transition_at is None:
+                    continue
+                priority = 1 if transition_type == "invalidated" else 0
+                transition_events.append(
+                    (transition_at, priority, event_index, event)
+                )
+                if transition_type in _TRIGGER_EVENT_TYPES:
+                    entry_events.append((transition_at, event_index, event))
+            transition_events.sort(key=lambda item: item[:3])
+            entry_events.sort(key=lambda item: item[:2])
+
+            entry_event = entry_events[-1][2] if entry_events else None
+            invalidation_event = None
+            executed_at = (
+                _cn_datetime(execution.get("executed_at"))
+                if was_executed and isinstance(execution, Mapping)
+                else None
             )
-            invalidation_event = next(
-                (
-                    event
-                    for event in candidate_event_rows
-                    if _value(event, "event_type") == "invalidated"
-                ),
-                None,
-            )
+            if not was_executed:
+                execution_timing = "not_executed"
+            elif not has_entry_evidence:
+                execution_timing = "without_signal"
+            elif executed_at is None:
+                execution_timing = "unknown_time"
+            else:
+                prior_transitions = [
+                    item for item in transition_events if item[0] <= executed_at
+                ]
+                if prior_transitions:
+                    latest = prior_transitions[-1]
+                    if _value(latest[3], "event_type") == "invalidated":
+                        execution_timing = "after_invalidation"
+                        invalidation_event = latest[3]
+                        prior_entries = [
+                            item
+                            for item in entry_events
+                            if item[0] <= latest[0]
+                        ]
+                        entry_event = (
+                            prior_entries[-1][2] if prior_entries else None
+                        )
+                    else:
+                        execution_timing = "after_signal"
+                        entry_event = latest[3]
+                else:
+                    future_entries = [
+                        item for item in entry_events if item[0] > executed_at
+                    ]
+                    if future_entries:
+                        execution_timing = "before_signal"
+                        entry_event = future_entries[0][2]
+                    else:
+                        execution_timing = "unknown_time"
             entry_at_raw = (
                 _value(entry_event, "triggered_at")
                 if entry_event is not None
@@ -244,27 +300,6 @@ class TradingPlaybookReviewService:
                 if invalidation_event is not None
                 else None
             )
-            entry_at = _cn_datetime(entry_at_raw)
-            invalidation_at = _cn_datetime(invalidation_at_raw)
-            executed_at = (
-                _cn_datetime(execution.get("executed_at"))
-                if was_executed and isinstance(execution, Mapping)
-                else None
-            )
-            if not was_executed:
-                execution_timing = "not_executed"
-            elif entry_event is None:
-                execution_timing = "without_signal"
-            elif executed_at is None:
-                execution_timing = "unknown_time"
-            elif invalidation_at is not None and executed_at >= invalidation_at:
-                execution_timing = "after_invalidation"
-            elif entry_at is None:
-                execution_timing = "unknown_time"
-            elif executed_at >= entry_at:
-                execution_timing = "after_signal"
-            else:
-                execution_timing = "before_signal"
             if execution_timing in {
                 "before_signal",
                 "after_invalidation",
@@ -278,25 +313,60 @@ class TradingPlaybookReviewService:
                     }
                 )
 
+            raw_entry_price = (
+                _event_raw_price(entry_event) if entry_event is not None else None
+            )
             entry_price = _event_price(entry_event) if entry_event is not None else None
             close_fact = outcome_by_code.get(stock_code)
-            close_price = (
-                _finite_optional(close_fact.get("close_price"))
+            raw_close_price = (
+                close_fact.get("close_price")
                 if isinstance(close_fact, Mapping)
                 else None
             )
-            if entry_price is None:
+            close_price = (
+                _finite_optional(raw_close_price)
+                if isinstance(close_fact, Mapping)
+                else None
+            )
+            close_freshness = (
+                str(close_fact.get("freshness") or "unknown")
+                if isinstance(close_fact, Mapping)
+                else "unknown"
+            )
+            close_quality = (
+                str(close_fact.get("data_quality_flag") or "missing")
+                if isinstance(close_fact, Mapping)
+                else "missing"
+            )
+            invalid_entry_price = (
+                raw_entry_price is not None and entry_price is None
+            )
+            invalid_close_price = raw_close_price is not None and (
+                close_price is None or close_price <= 0
+            )
+            if invalid_entry_price or invalid_close_price:
+                signal_return_quality = "invalid_numeric"
+                signal_to_close_pct = None
+            elif entry_price is None:
                 signal_return_quality = "missing_entry_price"
                 signal_to_close_pct = None
             elif close_price is None:
                 signal_return_quality = "missing_close"
                 signal_to_close_pct = None
+            elif close_freshness != "fresh":
+                signal_return_quality = f"{close_freshness}_close_fact"
+                signal_to_close_pct = None
+            elif close_quality != "ok":
+                signal_return_quality = "degraded_close_fact"
+                signal_to_close_pct = None
             else:
-                signal_return_quality = "ready"
-                signal_to_close_pct = round(
-                    (close_price - entry_price) / entry_price * 100,
-                    4,
-                )
+                raw_return = (close_price - entry_price) / entry_price * 100
+                if not math.isfinite(raw_return):
+                    signal_return_quality = "invalid_numeric"
+                    signal_to_close_pct = None
+                else:
+                    signal_return_quality = "ready"
+                    signal_to_close_pct = round(raw_return, 4)
 
             signal_outcome = {
                 "candidate_id": candidate_id,
@@ -304,12 +374,15 @@ class TradingPlaybookReviewService:
                 "status": status,
                 "event_types": list(candidate_events),
                 "events": copy.deepcopy(event_audit.get(candidate_id, [])),
+                "signal_event_id": _json_value(
+                    _value(entry_event, "id") if entry_event is not None else None
+                ),
                 "entry_signal_at": _json_value(entry_at_raw),
                 "invalidation_at": _json_value(invalidation_at_raw),
                 "execution_timing": execution_timing,
                 "signal_entry_price": entry_price,
                 "signal_entry_price_source": (
-                    "first_entry_event.market_snapshot_json.quote.price"
+                    "execution_relevant_entry_event.market_snapshot_json.quote.price"
                     if entry_price is not None
                     else None
                 ),
@@ -360,6 +433,8 @@ class TradingPlaybookReviewService:
             raise InvalidRequestError("trade_date must be a date")
         if not isinstance(finalized, bool):
             raise InvalidRequestError("finalized must be a boolean")
+        build_now = self._now_provider()
+        _db_datetime(build_now)
         plan_ids = await self._selected_plan_ids(
             db,
             trade_date,
@@ -381,6 +456,7 @@ class TradingPlaybookReviewService:
             db,
             pending_plan_ids,
             trade_date,
+            build_now=build_now,
         )
         plan_snapshots = {
             row.id: {
@@ -417,6 +493,7 @@ class TradingPlaybookReviewService:
                 trade_date,
                 plan_id,
                 finalized=finalized,
+                build_now=build_now,
                 prefetched=(
                     *facts_by_plan.get(plan_id, ([], [], [])),
                     loaded_outcomes,
@@ -468,13 +545,21 @@ class TradingPlaybookReviewService:
         executions: Mapping[str, Mapping[str, Any]],
         *,
         unplanned_executions: Optional[Sequence[Mapping[str, Any]]] = None,
+        plan_version_id: Optional[int] = None,
     ) -> TradingExecutionReview:
         """Replace one unambiguously selected review's manual execution map."""
         if isinstance(trade_date, datetime) or not isinstance(trade_date, date):
             raise InvalidRequestError("trade_date must be a date")
-        manual = self._normalize_manual_execution(executions)
+        if plan_version_id is not None and (
+            isinstance(plan_version_id, bool)
+            or not isinstance(plan_version_id, int)
+            or plan_version_id <= 0
+        ):
+            raise InvalidRequestError("plan_version_id must be positive")
+        manual = self._normalize_manual_execution(executions, trade_date)
         unplanned = self._normalize_unplanned_executions(
-            unplanned_executions or []
+            unplanned_executions or [],
+            trade_date,
         )
         if unplanned:
             manual["_unplanned"] = unplanned
@@ -482,6 +567,7 @@ class TradingPlaybookReviewService:
             db,
             trade_date,
             set(manual) - {"_unplanned"},
+            plan_version_id=plan_version_id,
         )
         for attempt in range(_MAX_WRITE_ATTEMPTS):
             try:
@@ -498,6 +584,7 @@ class TradingPlaybookReviewService:
                     db,
                     plan_id,
                     trade_date,
+                    build_now=self._now_provider(),
                 )
                 outcomes = copy.deepcopy(row.outcome_snapshot_json or {})
                 summary = self.summarize(
@@ -671,6 +758,8 @@ class TradingPlaybookReviewService:
         db,
         plan_ids: Sequence[int],
         trade_date: date,
+        *,
+        build_now: datetime,
     ) -> tuple[
         dict[
             int,
@@ -734,7 +823,11 @@ class TradingPlaybookReviewService:
                 if event.plan_version_id in events_by_plan:
                     events_by_plan[event.plan_version_id].append(event)
             for plan_id, plan_events in events_by_plan.items():
-                valid, warnings = self._filter_events(plan_events, trade_date)
+                valid, warnings = self._filter_events(
+                    plan_events,
+                    trade_date,
+                    build_now=build_now,
+                )
                 grouped[plan_id][1].extend(valid)
                 grouped[plan_id][2].extend(warnings)
         stock_codes = [candidate.stock_code for candidate in candidates]
@@ -789,6 +882,7 @@ class TradingPlaybookReviewService:
         plan_id: int,
         *,
         finalized: bool,
+        build_now: datetime,
         prefetched: Optional[
             tuple[
                 Sequence[TradingPlanCandidate],
@@ -827,7 +921,10 @@ class TradingPlaybookReviewService:
                         events,
                         event_warnings,
                     ) = await self._review_inputs(
-                        db, plan_id, trade_date
+                        db,
+                        plan_id,
+                        trade_date,
+                        build_now=build_now,
                     )
                     stock_codes = [
                         candidate.stock_code for candidate in candidates
@@ -862,6 +959,7 @@ class TradingPlaybookReviewService:
                     stock_codes,
                     loaded_outcomes,
                     finalized=finalized,
+                    build_now=build_now,
                 )
                 data_quality["event_warnings"] = copy.deepcopy(
                     event_warnings
@@ -925,6 +1023,8 @@ class TradingPlaybookReviewService:
         db,
         plan_id: int,
         trade_date: date,
+        *,
+        build_now: datetime,
     ) -> tuple[
         list[TradingPlanCandidate],
         list[TradingAlertEvent],
@@ -955,19 +1055,28 @@ class TradingPlaybookReviewService:
                 )
             ).all()
         )
-        events, warnings = self._filter_events(persisted_events, trade_date)
+        events, warnings = self._filter_events(
+            persisted_events,
+            trade_date,
+            build_now=build_now,
+        )
         return candidates, events, warnings
 
     @staticmethod
     def _filter_events(
         persisted_events: Sequence[TradingAlertEvent],
         trade_date: date,
+        *,
+        build_now: datetime,
     ) -> tuple[list[TradingAlertEvent], list[dict[str, Any]]]:
         events: list[TradingAlertEvent] = []
         warnings: list[dict[str, Any]] = []
         expected = trade_date.isoformat()
+        normalized_now = _cn_datetime(build_now)
+        if normalized_now is None:
+            raise TypeError("review build_now must be a datetime")
         for event in persisted_events:
-            snapshot = event.market_snapshot_json
+            snapshot = _value(event, "market_snapshot_json", {})
             raw_trade_date = (
                 snapshot.get("trade_date")
                 if isinstance(snapshot, Mapping)
@@ -988,14 +1097,55 @@ class TradingPlaybookReviewService:
                     elif raw_trade_date != expected:
                         reason = "trade_date_mismatch"
                     else:
-                        events.append(event)
-                        continue
+                        reason = None
+            dedup_key = _value(event, "dedup_key")
+            dedup_trade_date = None
+            if reason is None:
+                if not isinstance(dedup_key, str):
+                    reason = "invalid_dedup_key"
+                else:
+                    parts = dedup_key.split(":")
+                    if len(parts) < 2 or parts[0] != "action":
+                        reason = "invalid_dedup_key"
+                    else:
+                        try:
+                            parsed_dedup_date = date.fromisoformat(parts[1])
+                        except ValueError:
+                            reason = "invalid_dedup_trade_date"
+                        else:
+                            if parts[1] != parsed_dedup_date.isoformat():
+                                reason = "invalid_dedup_trade_date"
+                            else:
+                                dedup_trade_date = parts[1]
+                                if dedup_trade_date != expected:
+                                    reason = "dedup_trade_date_mismatch"
+            raw_triggered_at = _value(event, "triggered_at")
+            triggered_at = None
+            if reason is None:
+                if not isinstance(raw_triggered_at, datetime):
+                    reason = "invalid_triggered_at"
+                else:
+                    triggered_at = _cn_datetime(raw_triggered_at)
+                    if triggered_at is None:
+                        reason = "invalid_triggered_at"
+                    elif triggered_at.date() != trade_date:
+                        reason = "triggered_at_trade_date_mismatch"
+                    elif (
+                        normalized_now.date() == trade_date
+                        and triggered_at > normalized_now
+                    ):
+                        reason = "future_triggered_at"
+            if reason is None:
+                events.append(event)
+                continue
             warnings.append(
                 {
-                    "event_id": event.id,
-                    "event_type": event.event_type,
+                    "event_id": _value(event, "id"),
+                    "event_type": _value(event, "event_type"),
                     "reason": reason,
                     "observed_trade_date": _json_value(raw_trade_date),
+                    "dedup_trade_date": dedup_trade_date,
+                    "triggered_at": _json_value(raw_triggered_at),
                 }
             )
         return events, warnings
@@ -1008,12 +1158,15 @@ class TradingPlaybookReviewService:
         rows: Sequence[Any],
         *,
         finalized: bool,
+        build_now: Optional[datetime] = None,
     ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
         wanted = sorted({str(code) for code in stock_codes if str(code)})
         outcome: dict[str, dict[str, Any]] = {}
         degraded: list[str] = []
         stale: list[str] = []
+        future: list[str] = []
         freshness_unknown: list[str] = []
+        freshness_reasons: dict[str, str] = {}
         for row in rows:
             row_date = _value(row, "trade_date")
             stock_code = str(_value(row, "stock_code", "") or "")
@@ -1034,9 +1187,16 @@ class TradingPlaybookReviewService:
                 else None
             )
             updated_at = _value(row, "updated_at")
-            freshness = cls._outcome_freshness(updated_at, trade_date)
+            freshness, freshness_reason = cls._outcome_freshness(
+                updated_at,
+                trade_date,
+                build_now=build_now,
+            )
+            freshness_reasons[stock_code] = freshness_reason
             if freshness == "stale":
                 stale.append(stock_code)
+            elif freshness == "future":
+                future.append(stock_code)
             elif freshness == "unknown":
                 freshness_unknown.append(stock_code)
             if (
@@ -1066,6 +1226,7 @@ class TradingPlaybookReviewService:
                 "data_quality_flag": quality or "missing",
                 "updated_at": _json_value(updated_at),
                 "freshness": freshness,
+                "freshness_reason": freshness_reason,
             }
         missing = sorted(set(wanted) - set(outcome))
         status = "ready"
@@ -1081,28 +1242,55 @@ class TradingPlaybookReviewService:
             "missing_stock_codes": missing,
             "degraded_stock_codes": sorted(set(degraded)),
             "stale_stock_codes": sorted(set(stale)),
+            "future_stock_codes": sorted(set(future)),
             "freshness_unknown_stock_codes": sorted(
                 set(freshness_unknown)
             ),
+            "freshness_reasons": {
+                code: freshness_reasons[code]
+                for code in sorted(freshness_reasons)
+            },
         }
         return outcome, quality
 
     @staticmethod
-    def _outcome_freshness(value: Any, trade_date: date) -> str:
+    def _outcome_freshness(
+        value: Any,
+        trade_date: date,
+        *,
+        build_now: Optional[datetime] = None,
+    ) -> tuple[str, str]:
+        if value is None:
+            return "unknown", "missing_updated_at"
         if not isinstance(value, datetime):
-            return "unknown"
-        observed_date = (
-            value.date()
-            if value.tzinfo is None or value.utcoffset() is None
-            else value.astimezone(CN_TZ).date()
+            return "unknown", "invalid_updated_at"
+        observed = _cn_datetime(value)
+        if observed is None:
+            return "unknown", "invalid_updated_at"
+        if observed.date() != trade_date:
+            return "stale", "trade_date_mismatch"
+        market_close = datetime.combine(trade_date, datetime.min.time()).replace(
+            hour=15
         )
-        return "fresh" if observed_date == trade_date else "stale"
+        market_close = CN_TZ.localize(market_close)
+        if observed < market_close:
+            return "stale", "before_market_close"
+        normalized_build_now = _cn_datetime(build_now)
+        if (
+            normalized_build_now is not None
+            and normalized_build_now.date() == trade_date
+            and observed > normalized_build_now
+        ):
+            return "future", "after_build_now"
+        return "fresh", "post_close_as_of_build"
 
     async def _select_manual_review(
         self,
         db,
         trade_date: date,
         execution_ids: set[str],
+        *,
+        plan_version_id: Optional[int] = None,
     ) -> tuple[int, int]:
         reviews = list(
             (
@@ -1115,7 +1303,23 @@ class TradingPlaybookReviewService:
         )
         if not reviews:
             raise PlaybookNotFoundError("review not found")
+        selected_review = None
+        if plan_version_id is not None:
+            selected_review = next(
+                (
+                    review
+                    for review in reviews
+                    if review.plan_version_id == plan_version_id
+                ),
+                None,
+            )
+            if selected_review is None:
+                raise PlaybookNotFoundError(
+                    "plan review not found for trade date"
+                )
         if not execution_ids:
+            if selected_review is not None:
+                return selected_review.id, selected_review.plan_version_id
             if len(reviews) == 1:
                 return reviews[0].id, reviews[0].plan_version_id
             raise InvalidTransitionError(
@@ -1148,6 +1352,15 @@ class TradingPlaybookReviewService:
             raise InvalidTransitionError(
                 "known candidate action date does not match review date"
             )
+        if selected_review is not None:
+            if any(
+                row.plan_version_id != selected_review.plan_version_id
+                for row in candidate_rows
+            ):
+                raise InvalidTransitionError(
+                    "candidate does not belong to selected plan review"
+                )
+            return selected_review.id, selected_review.plan_version_id
         touched_plans = {row.plan_version_id for row in candidate_rows}
         if not touched_plans:
             raise InvalidTransitionError(
@@ -1170,10 +1383,18 @@ class TradingPlaybookReviewService:
     @staticmethod
     def _normalize_manual_execution(
         executions: Mapping[str, Mapping[str, Any]],
+        trade_date: date,
     ) -> dict[str, dict[str, Any]]:
         if not isinstance(executions, Mapping):
             raise InvalidRequestError("executions must be a mapping")
         normalized: dict[str, dict[str, Any]] = {}
+        allowed = {
+            "executed",
+            "execution_price",
+            "quantity",
+            "executed_at",
+            "manual_note",
+        }
         for candidate_id, execution in executions.items():
             if (
                 not isinstance(candidate_id, str)
@@ -1184,6 +1405,9 @@ class TradingPlaybookReviewService:
                 raise InvalidRequestError("candidate ids must be positive strings")
             if not isinstance(execution, Mapping):
                 raise InvalidRequestError("execution entries must be mappings")
+            item = copy.deepcopy(dict(execution))
+            if set(item) - allowed:
+                raise InvalidRequestError("unknown planned execution field")
             if not isinstance(execution.get("executed"), bool):
                 raise InvalidRequestError("executed must be a boolean")
             if execution.get("executed") is False and any(
@@ -1193,8 +1417,13 @@ class TradingPlaybookReviewService:
                 raise InvalidRequestError(
                     "unexecuted entries must not contain execution facts"
                 )
+            TradingPlaybookReviewService._normalize_executed_at(
+                item,
+                trade_date,
+                path=f"executions.{candidate_id}.executed_at",
+            )
             normalized[candidate_id] = _json_value(
-                copy.deepcopy(dict(execution)),
+                item,
                 path=f"executions.{candidate_id}",
             )
         return normalized
@@ -1202,6 +1431,7 @@ class TradingPlaybookReviewService:
     @staticmethod
     def _normalize_unplanned_executions(
         executions: Sequence[Mapping[str, Any]],
+        trade_date: date,
     ) -> list[dict[str, Any]]:
         if isinstance(executions, (str, bytes)) or not isinstance(
             executions,
@@ -1240,10 +1470,43 @@ class TradingPlaybookReviewService:
             stock_name = item.get("stock_name")
             if not isinstance(stock_name, str) or not stock_name.strip():
                 raise InvalidRequestError("stock_name is required")
+            TradingPlaybookReviewService._normalize_executed_at(
+                item,
+                trade_date,
+                path=f"unplanned_executions[{index}].executed_at",
+            )
             normalized.append(
                 _json_value(item, path=f"unplanned_executions[{index}]")
             )
         return normalized
+
+    @staticmethod
+    def _normalize_executed_at(
+        item: dict[str, Any],
+        trade_date: date,
+        *,
+        path: str,
+    ) -> None:
+        if "executed_at" not in item:
+            return
+        value = item["executed_at"]
+        if isinstance(value, str):
+            try:
+                value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise InvalidRequestError(f"{path} must be ISO 8601") from exc
+        if (
+            not isinstance(value, datetime)
+            or value.tzinfo is None
+            or value.utcoffset() is None
+        ):
+            raise InvalidRequestError(f"{path} must be timezone-aware")
+        normalized = value.astimezone(CN_TZ)
+        if normalized.date() != trade_date:
+            raise InvalidRequestError(
+                f"{path} must belong to the review trade date"
+            )
+        item["executed_at"] = normalized.isoformat()
 
     @staticmethod
     async def _fresh_review(

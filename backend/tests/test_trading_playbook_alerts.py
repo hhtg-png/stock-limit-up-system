@@ -197,6 +197,7 @@ class TradingPlaybookDurableAlertTests(unittest.IsolatedAsyncioTestCase):
         channel = _RecordingInAppChannel()
         service = TradingPlaybookAlertService(channel)
         trade_date = date(2026, 7, 14)
+        self.plan.target_trade_date = trade_date + timedelta(days=1)
         async with self.Session() as db:
             first = await service.notify_review_ready(
                 db,
@@ -224,6 +225,8 @@ class TradingPlaybookDurableAlertTests(unittest.IsolatedAsyncioTestCase):
             events[0].market_snapshot_json["trade_date"],
             trade_date.isoformat(),
         )
+        self.assertIn(trade_date.isoformat(), events[0].message)
+        self.assertNotIn(self.plan.target_trade_date.isoformat(), events[0].message)
         self.assertEqual(len(channel.sends), 1)
 
     async def test_review_ready_accepts_superseded_and_expired_reviewed_plans(self):

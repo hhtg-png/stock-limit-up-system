@@ -21,6 +21,7 @@ from app.models.trading_playbook import (
 )
 from app.services.trading_playbook.alert_service import TradingPlaybookAlertService
 from app.services.trading_playbook.errors import (
+    InvalidRequestError,
     InvalidTransitionError,
     PlaybookNotFoundError,
 )
@@ -246,7 +247,11 @@ class TradingPlaybookReviewSummaryTests(unittest.TestCase):
                 "5": {"executed": True},
             },
             outcomes={
-                "000001": {"close_price": 11.0},
+                "000001": {
+                    "close_price": 11.0,
+                    "freshness": "fresh",
+                    "data_quality_flag": "ok",
+                },
                 "000002": {"close_price": float("inf")},
             },
         )
@@ -264,12 +269,93 @@ class TradingPlaybookReviewSummaryTests(unittest.TestCase):
         self.assertEqual(by_id[1]["signal_to_close_pct"], 10.0)
         self.assertEqual(by_id[1]["signal_return_quality"], "ready")
         self.assertIsNone(by_id[2]["signal_to_close_pct"])
-        self.assertEqual(by_id[2]["signal_return_quality"], "missing_close")
+        self.assertEqual(by_id[2]["signal_return_quality"], "invalid_numeric")
         self.assertEqual(result["plan_compliance"]["violations"], 3)
         self.assertEqual(
             [item["reason"] for item in result["plan_compliance"]["violation_details"]],
             ["before_signal", "after_invalidation", "without_signal"],
         )
+
+    def test_execution_timing_uses_latest_rearmed_signal_state(self):
+        def event_row(event_id, event_type, hour, minute, price=None):
+            snapshot = {"trade_date": TRADE_DATE.isoformat()}
+            if price is not None:
+                snapshot["quote"] = {"price": price}
+            return {
+                "id": event_id,
+                "candidate_id": 1,
+                "event_type": event_type,
+                "triggered_at": datetime(2026, 7, 14, hour, minute),
+                "market_snapshot_json": snapshot,
+            }
+
+        cases = [
+            (
+                "rearmed",
+                [
+                    event_row(1, "invalidated", 9, 30),
+                    event_row(2, "entry_triggered", 10, 0, 10.0),
+                ],
+                "2026-07-14T10:01:00+08:00",
+                "after_signal",
+                2,
+                10.0,
+            ),
+            (
+                "invalidated_after_entry",
+                [
+                    event_row(3, "entry_triggered", 10, 0, 10.0),
+                    event_row(4, "invalidated", 10, 5),
+                ],
+                "2026-07-14T10:06:00+08:00",
+                "after_invalidation",
+                3,
+                10.0,
+            ),
+            (
+                "before_first_entry",
+                [event_row(5, "entry_triggered", 10, 0, 10.0)],
+                "2026-07-14T09:59:00+08:00",
+                "before_signal",
+                5,
+                10.0,
+            ),
+            (
+                "second_occurrence",
+                [
+                    event_row(6, "entry_triggered", 9, 40, 9.0),
+                    event_row(7, "invalidated", 9, 50),
+                    event_row(8, "confirmation_triggered", 10, 0, 10.0),
+                ],
+                "2026-07-14T10:01:00+08:00",
+                "after_signal",
+                8,
+                10.0,
+            ),
+        ]
+
+        for name, events, executed_at, timing, event_id, entry_price in cases:
+            with self.subTest(name=name):
+                result = TradingPlaybookReviewService.summarize(
+                    [{"id": 1, "stock_code": "000001", "status": "triggered"}],
+                    events,
+                    {"1": {"executed": True, "executed_at": executed_at}},
+                    {
+                        "000001": {
+                            "close_price": 11.0,
+                            "freshness": "fresh",
+                            "data_quality_flag": "ok",
+                        }
+                    },
+                )
+                outcome = result["signal_outcomes"][0]
+                self.assertEqual(outcome["execution_timing"], timing)
+                self.assertEqual(outcome["signal_event_id"], event_id)
+                self.assertEqual(outcome["signal_entry_price"], entry_price)
+                self.assertEqual(
+                    result["plan_compliance"]["violations"],
+                    int(timing in {"before_signal", "after_invalidation"}),
+                )
 
     def test_exit_without_entry_evidence_is_not_classified_as_triggered(self):
         exit_only = TradingPlaybookReviewService().summarize(
@@ -400,7 +486,11 @@ class TradingPlaybookReviewPersistenceTests(unittest.IsolatedAsyncioTestCase):
                         candidate_id=candidate.id,
                         event_type="entry_triggered",
                         severity="info",
-                        dedup_key=f"entry-{plan.id}-{candidate.id}",
+                        dedup_key=(
+                            f"action:{action_trade_date.isoformat()}:"
+                            f"{plan.id}:{candidate.id}:mode-{version_no}:"
+                            "entry_triggered:test:1"
+                        ),
                         triggered_at=datetime(2026, 7, 14, 10, 0),
                         market_snapshot_json={
                             "price": 10.0,
@@ -455,6 +545,8 @@ class TradingPlaybookReviewPersistenceTests(unittest.IsolatedAsyncioTestCase):
         event_type,
         snapshot_trade_date,
         suffix,
+        triggered_at=None,
+        dedup_trade_date=None,
     ):
         snapshot = {"price": 10.0}
         if snapshot_trade_date is not None:
@@ -465,8 +557,13 @@ class TradingPlaybookReviewPersistenceTests(unittest.IsolatedAsyncioTestCase):
                 candidate_id=candidate_id,
                 event_type=event_type,
                 severity="info",
-                dedup_key=f"event-{plan_id}-{candidate_id}-{suffix}",
-                triggered_at=datetime(2026, 7, 14, 10, 0),
+                dedup_key=(
+                    f"action:{(dedup_trade_date or TRADE_DATE).isoformat()}:"
+                    f"{plan_id}:{candidate_id}:mode:{event_type}:test:{suffix}"
+                ),
+                triggered_at=(
+                    triggered_at or datetime(2026, 7, 14, 10, 0)
+                ),
                 market_snapshot_json=snapshot,
                 message=event_type,
                 channel_status_json={"in_app": "sent"},
@@ -545,6 +642,7 @@ class TradingPlaybookReviewPersistenceTests(unittest.IsolatedAsyncioTestCase):
             )
             outcome.close_price = 11.0
             outcome.change_pct = 10.0
+            outcome.updated_at = datetime(2026, 7, 14, 15, 30)
             db.add(
                 MarketReviewStockDaily(
                     trade_date=date(2026, 7, 15),
@@ -998,6 +1096,162 @@ class TradingPlaybookReviewPersistenceTests(unittest.IsolatedAsyncioTestCase):
                     ],
                 )
 
+    async def test_explicit_plan_selects_multi_review_for_unplanned_and_empty_updates(self):
+        first_plan_id, first_candidate_id = await self._add_plan(
+            version_no=1,
+            stock_code="000001",
+        )
+        second_plan_id, _ = await self._add_plan(
+            version_no=2,
+            target_trade_date=TRADE_DATE + timedelta(days=1),
+            stock_code="000002",
+            action_trade_date=TRADE_DATE,
+        )
+        service = TradingPlaybookReviewService(now_provider=lambda: FINALIZED_AT)
+        async with self.sessions[0]() as db:
+            await service.build(db, TRADE_DATE, finalized=False)
+            selected = await service.update_manual_execution(
+                db,
+                TRADE_DATE,
+                {},
+                unplanned_executions=[
+                    {
+                        "executed": True,
+                        "stock_code": "600000",
+                        "stock_name": "浦发银行",
+                    }
+                ],
+                plan_version_id=second_plan_id,
+            )
+        self.assertEqual(selected.plan_version_id, second_plan_id)
+        self.assertEqual(selected.plan_compliance_json["unplanned"], 1)
+
+        async with self.sessions[0]() as db:
+            cleared = await service.update_manual_execution(
+                db,
+                TRADE_DATE,
+                {},
+                plan_version_id=second_plan_id,
+            )
+        self.assertEqual(cleared.manual_execution_json, {})
+
+        async with self.sessions[0]() as db:
+            with self.assertRaises(InvalidTransitionError):
+                await service.update_manual_execution(
+                    db,
+                    TRADE_DATE,
+                    {str(first_candidate_id): {"executed": True}},
+                    plan_version_id=second_plan_id,
+                )
+            with self.assertRaises(PlaybookNotFoundError):
+                await service.update_manual_execution(
+                    db,
+                    TRADE_DATE,
+                    {},
+                    plan_version_id=999999,
+                )
+        self.assertNotEqual(first_plan_id, second_plan_id)
+
+    async def test_service_normalization_rejects_unknown_profit_and_cross_date_fields(self):
+        _, candidate_id = await self._add_plan()
+        service = TradingPlaybookReviewService(now_provider=lambda: FINALIZED_AT)
+        async with self.sessions[0]() as db:
+            await service.build(db, TRADE_DATE, finalized=False)
+
+        for field in ("account_profit", "profit", "pnl", "unknown"):
+            with self.subTest(scope="planned", field=field):
+                async with self.sessions[0]() as db:
+                    with self.assertRaises(InvalidRequestError):
+                        await service.update_manual_execution(
+                            db,
+                            TRADE_DATE,
+                            {
+                                str(candidate_id): {
+                                    "executed": True,
+                                    field: 1,
+                                }
+                            },
+                        )
+            with self.subTest(scope="unplanned", field=field):
+                async with self.sessions[0]() as db:
+                    with self.assertRaises(InvalidRequestError):
+                        await service.update_manual_execution(
+                            db,
+                            TRADE_DATE,
+                            {str(candidate_id): {"executed": False}},
+                            unplanned_executions=[
+                                {
+                                    "executed": True,
+                                    "stock_code": "600000",
+                                    "stock_name": "浦发银行",
+                                    field: 1,
+                                }
+                            ],
+                        )
+
+        invalid_times = [
+            "2026-07-14T10:00:00",
+            "2026-07-14T16:30:00+00:00",
+        ]
+        for executed_at in invalid_times:
+            with self.subTest(scope="planned", executed_at=executed_at):
+                async with self.sessions[0]() as db:
+                    with self.assertRaises(InvalidRequestError):
+                        await service.update_manual_execution(
+                            db,
+                            TRADE_DATE,
+                            {
+                                str(candidate_id): {
+                                    "executed": True,
+                                    "executed_at": executed_at,
+                                }
+                            },
+                        )
+            with self.subTest(scope="unplanned", executed_at=executed_at):
+                async with self.sessions[0]() as db:
+                    with self.assertRaises(InvalidRequestError):
+                        await service.update_manual_execution(
+                            db,
+                            TRADE_DATE,
+                            {str(candidate_id): {"executed": False}},
+                            unplanned_executions=[
+                                {
+                                    "executed": True,
+                                    "stock_code": "600000",
+                                    "stock_name": "浦发银行",
+                                    "executed_at": executed_at,
+                                }
+                            ],
+                        )
+
+        async with self.sessions[0]() as db:
+            accepted = await service.update_manual_execution(
+                db,
+                TRADE_DATE,
+                {
+                    str(candidate_id): {
+                        "executed": True,
+                        "executed_at": "2026-07-13T16:30:00+00:00",
+                    }
+                },
+                unplanned_executions=[
+                    {
+                        "executed": True,
+                        "stock_code": "600000",
+                        "stock_name": "浦发银行",
+                        "executed_at": "2026-07-14T02:00:00+00:00",
+                    }
+                ],
+            )
+        self.assertEqual(
+            accepted.manual_execution_json[str(candidate_id)]["executed_at"],
+            "2026-07-14T00:30:00+08:00",
+        )
+        self.assertEqual(
+            accepted.manual_execution_json["_unplanned"][0]["executed_at"],
+            "2026-07-14T10:00:00+08:00",
+        )
+
     async def test_update_without_a_review_is_not_found(self):
         service = TradingPlaybookReviewService()
         async with self.sessions[0]() as db:
@@ -1157,6 +1411,122 @@ class TradingPlaybookReviewPersistenceTests(unittest.IsolatedAsyncioTestCase):
             {"trade_date_mismatch", "missing_trade_date"},
         )
         self.assertEqual(row.data_quality_json["status"], "degraded")
+
+    async def test_event_filter_rejects_timestamp_dedup_and_build_future_mismatches(self):
+        plan_id, candidate_id = await self._add_plan(
+            candidate_status="exit",
+            add_entry_event=False,
+        )
+        await self._add_action_event(
+            plan_id,
+            candidate_id,
+            event_type="entry_triggered",
+            snapshot_trade_date=TRADE_DATE.isoformat(),
+            suffix="future-same-day",
+            triggered_at=datetime(2026, 7, 14, 14, 0),
+        )
+        await self._add_action_event(
+            plan_id,
+            candidate_id,
+            event_type="entry_triggered",
+            snapshot_trade_date=TRADE_DATE.isoformat(),
+            suffix="next-day",
+            triggered_at=datetime(2026, 7, 15, 0, 1),
+        )
+        await self._add_action_event(
+            plan_id,
+            candidate_id,
+            event_type="entry_triggered",
+            snapshot_trade_date=TRADE_DATE.isoformat(),
+            suffix="dedup-next-day",
+            triggered_at=datetime(2026, 7, 14, 10, 0),
+            dedup_trade_date=TRADE_DATE + timedelta(days=1),
+        )
+        now = CN_TZ.localize(datetime(2026, 7, 14, 13, 0))
+        service = TradingPlaybookReviewService(now_provider=lambda: now)
+
+        for finalized in (False, True):
+            with self.subTest(finalized=finalized):
+                async with self.sessions[0]() as db:
+                    row = (
+                        await service.build(
+                            db,
+                            TRADE_DATE,
+                            finalized=finalized,
+                        )
+                    )[0]
+                self.assertEqual(row.signal_review_json["not_triggered"], ["000001"])
+                self.assertEqual(
+                    {
+                        warning["reason"]
+                        for warning in row.data_quality_json["event_warnings"]
+                    },
+                    {
+                        "future_triggered_at",
+                        "triggered_at_trade_date_mismatch",
+                        "dedup_trade_date_mismatch",
+                    },
+                )
+
+    async def test_historical_review_accepts_same_date_postclose_event(self):
+        plan_id, candidate_id = await self._add_plan(
+            candidate_status="exit",
+            add_entry_event=False,
+        )
+        await self._add_action_event(
+            plan_id,
+            candidate_id,
+            event_type="entry_triggered",
+            snapshot_trade_date=TRADE_DATE.isoformat(),
+            suffix="late-history",
+            triggered_at=datetime(2026, 7, 14, 23, 59),
+        )
+        service = TradingPlaybookReviewService(
+            now_provider=lambda: CN_TZ.localize(
+                datetime(2026, 7, 15, 9, 0)
+            )
+        )
+
+        async with self.sessions[0]() as db:
+            row = (await service.build(db, TRADE_DATE, finalized=True))[0]
+
+        self.assertEqual(row.signal_review_json["triggered_not_executed"], ["000001"])
+        self.assertEqual(row.data_quality_json["event_warnings"], [])
+
+    def test_event_filter_rejects_malformed_and_cn_next_day_timestamps(self):
+        events, warnings = TradingPlaybookReviewService._filter_events(
+            [
+                {
+                    "id": 1,
+                    "event_type": "entry_triggered",
+                    "dedup_key": "action:2026-07-14:1:1:mode:entry:x:1",
+                    "triggered_at": "not-a-datetime",
+                    "market_snapshot_json": {"trade_date": "2026-07-14"},
+                },
+                {
+                    "id": 2,
+                    "event_type": "entry_triggered",
+                    "dedup_key": "action:2026-07-14:1:1:mode:entry:x:2",
+                    "triggered_at": datetime(
+                        2026,
+                        7,
+                        14,
+                        16,
+                        1,
+                        tzinfo=timezone.utc,
+                    ),
+                    "market_snapshot_json": {"trade_date": "2026-07-14"},
+                },
+            ],
+            TRADE_DATE,
+            build_now=CN_TZ.localize(datetime(2026, 7, 14, 15, 30)),
+        )
+
+        self.assertEqual(events, [])
+        self.assertEqual(
+            [warning["reason"] for warning in warnings],
+            ["invalid_triggered_at", "triggered_at_trade_date_mismatch"],
+        )
 
     async def test_final_build_racing_manual_update_never_overwrites_manual_json(self):
         _, candidate_id = await self._add_plan()
@@ -1366,36 +1736,74 @@ class TradingPlaybookReviewPersistenceTests(unittest.IsolatedAsyncioTestCase):
             "open_count": 0,
             "data_quality_flag": "ok",
         }
+        build_now = CN_TZ.localize(datetime(2026, 7, 14, 15, 30))
         cases = [
-            (datetime(2026, 7, 14, 15, 20), "ready", "fresh"),
+            (
+                datetime(2026, 7, 14, 15, 20),
+                "ready",
+                "fresh",
+                "post_close_as_of_build",
+            ),
             (
                 datetime(2026, 7, 14, 7, 20, tzinfo=timezone.utc),
                 "ready",
                 "fresh",
+                "post_close_as_of_build",
             ),
             (
                 datetime(2026, 7, 14, 16, 20, tzinfo=timezone.utc),
                 "degraded",
                 "stale",
+                "trade_date_mismatch",
             ),
-            (None, "degraded", "unknown"),
-            ("not-a-time", "degraded", "unknown"),
+            (
+                datetime(2026, 7, 14, 8, 0),
+                "degraded",
+                "stale",
+                "before_market_close",
+            ),
+            (
+                datetime(2026, 7, 14, 23, 59),
+                "degraded",
+                "future",
+                "after_build_now",
+            ),
+            (None, "degraded", "unknown", "missing_updated_at"),
+            ("not-a-time", "degraded", "unknown", "invalid_updated_at"),
         ]
 
-        for updated_at, expected_status, expected_freshness in cases:
+        for updated_at, expected_status, expected_freshness, expected_reason in cases:
             with self.subTest(updated_at=updated_at):
                 row = dict(base, updated_at=updated_at)
-                outcome, quality = TradingPlaybookReviewService._outcome_payload(
-                    TRADE_DATE,
-                    ["000001"],
-                    [row],
-                    finalized=True,
-                )
-                self.assertEqual(quality["status"], expected_status)
-                self.assertEqual(
-                    outcome["000001"]["freshness"],
-                    expected_freshness,
-                )
+                for finalized in (False, True):
+                    outcome, quality = TradingPlaybookReviewService._outcome_payload(
+                        TRADE_DATE,
+                        ["000001"],
+                        [row],
+                        finalized=finalized,
+                        build_now=build_now,
+                    )
+                    self.assertEqual(quality["status"], expected_status)
+                    self.assertEqual(
+                        outcome["000001"]["freshness"],
+                        expected_freshness,
+                    )
+                    self.assertEqual(
+                        outcome["000001"]["freshness_reason"],
+                        expected_reason,
+                    )
+
+        historical, historical_quality = (
+            TradingPlaybookReviewService._outcome_payload(
+                TRADE_DATE,
+                ["000001"],
+                [dict(base, updated_at=datetime(2026, 7, 14, 23, 59))],
+                finalized=True,
+                build_now=CN_TZ.localize(datetime(2026, 7, 15, 9, 0)),
+            )
+        )
+        self.assertEqual(historical_quality["status"], "ready")
+        self.assertEqual(historical["000001"]["freshness"], "fresh")
 
         _, preliminary_quality = TradingPlaybookReviewService._outcome_payload(
             TRADE_DATE,
@@ -1404,6 +1812,111 @@ class TradingPlaybookReviewPersistenceTests(unittest.IsolatedAsyncioTestCase):
             finalized=False,
         )
         self.assertEqual(preliminary_quality["status"], "degraded")
+
+    def test_signal_return_rejects_stale_or_degraded_close_facts(self):
+        events = [
+            {
+                "id": 1,
+                "candidate_id": 1,
+                "event_type": "entry_triggered",
+                "triggered_at": datetime(2026, 7, 14, 10, 0),
+                "market_snapshot_json": {
+                    "trade_date": TRADE_DATE.isoformat(),
+                    "quote": {"price": 10.0},
+                },
+            }
+        ]
+        for close_fact, expected_quality in (
+            (
+                {
+                    "close_price": 11.0,
+                    "freshness": "stale",
+                    "data_quality_flag": "ok",
+                },
+                "stale_close_fact",
+            ),
+            (
+                {
+                    "close_price": 11.0,
+                    "freshness": "fresh",
+                    "data_quality_flag": "degraded",
+                },
+                "degraded_close_fact",
+            ),
+        ):
+            with self.subTest(close_fact=close_fact):
+                outcome = TradingPlaybookReviewService.summarize(
+                    [{"id": 1, "stock_code": "000001", "status": "triggered"}],
+                    events,
+                    {},
+                    {"000001": close_fact},
+                )["signal_outcomes"][0]
+                self.assertIsNone(outcome["signal_to_close_pct"])
+                self.assertEqual(
+                    outcome["signal_return_quality"],
+                    expected_quality,
+                )
+
+    def test_signal_return_overflow_is_null_and_strict_json_safe(self):
+        result = TradingPlaybookReviewService.summarize(
+            [{"id": 1, "stock_code": "000001", "status": "triggered"}],
+            [
+                {
+                    "id": 1,
+                    "candidate_id": 1,
+                    "event_type": "entry_triggered",
+                    "triggered_at": datetime(2026, 7, 14, 10, 0),
+                    "market_snapshot_json": {
+                        "trade_date": TRADE_DATE.isoformat(),
+                        "quote": {"price": 1e-308},
+                    },
+                }
+            ],
+            {},
+            {
+                "000001": {
+                    "close_price": 1e308,
+                    "freshness": "fresh",
+                    "data_quality_flag": "ok",
+                }
+            },
+        )
+
+        outcome = result["signal_outcomes"][0]
+        self.assertIsNone(outcome["signal_to_close_pct"])
+        self.assertEqual(outcome["signal_return_quality"], "invalid_numeric")
+        json.dumps(result, allow_nan=False)
+
+    def test_signal_return_rejects_nonpositive_entry_or_close(self):
+        for entry_price, close_price in ((0.0, 11.0), (10.0, 0.0), (10.0, -1.0)):
+            with self.subTest(entry_price=entry_price, close_price=close_price):
+                result = TradingPlaybookReviewService.summarize(
+                    [{"id": 1, "stock_code": "000001", "status": "triggered"}],
+                    [
+                        {
+                            "id": 1,
+                            "candidate_id": 1,
+                            "event_type": "entry_triggered",
+                            "triggered_at": datetime(2026, 7, 14, 10, 0),
+                            "market_snapshot_json": {
+                                "trade_date": TRADE_DATE.isoformat(),
+                                "quote": {"price": entry_price},
+                            },
+                        }
+                    ],
+                    {},
+                    {
+                        "000001": {
+                            "close_price": close_price,
+                            "freshness": "fresh",
+                            "data_quality_flag": "ok",
+                        }
+                    },
+                )
+
+                outcome = result["signal_outcomes"][0]
+                self.assertIsNone(outcome["signal_to_close_pct"])
+                self.assertEqual(outcome["signal_return_quality"], "invalid_numeric")
 
 
 if __name__ == "__main__":

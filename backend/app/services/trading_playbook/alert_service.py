@@ -223,6 +223,7 @@ class TradingPlaybookAlertService:
             ),
             dedup_key=dedup_key,
             snapshot_extra={"trade_date": trade_date},
+            message=f"交易执行复盘已生成：{trade_date.isoformat()}",
         )
         if send:
             await self._deliver(db, event)
@@ -1616,6 +1617,7 @@ class TradingPlaybookAlertService:
         initial_channel_status: Mapping[str, Any],
         dedup_key: str | None = None,
         snapshot_extra: Mapping[str, Any] | None = None,
+        message: str | None = None,
     ) -> TradingAlertEvent:
         plan_id = self._plan_value(plan, "id")
         if not isinstance(plan_id, int):
@@ -1655,7 +1657,7 @@ class TradingPlaybookAlertService:
             dedup_key=dedup_key,
             triggered_at=now_cn().replace(tzinfo=None),
             market_snapshot_json=market_snapshot,
-            message=self._message(plan, event_type),
+            message=message or self._message(plan, event_type),
             channel_status_json={
                 self.channel_name: copy.deepcopy(
                     dict(initial_channel_status)
