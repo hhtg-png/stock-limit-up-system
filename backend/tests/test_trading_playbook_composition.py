@@ -310,6 +310,65 @@ class TradingPlaybookProductionCompositionTests(unittest.IsolatedAsyncioTestCase
         self.assertEqual(result["limit_up_count"], 43)
         self.assertEqual(result["limit_up_count_prev"], 31)
 
+    async def test_weekend_overnight_and_auction_inherit_friday_plan_only(self):
+        from app.services.trading_playbook.composition import (
+            load_production_full_market_context,
+        )
+
+        friday = date(2026, 7, 10)
+        thursday = date(2026, 7, 9)
+        monday = date(2026, 7, 13)
+        async with self.Session() as db:
+            db.add_all(
+                [
+                    self._metric(friday, limit_up_count=43),
+                    self._metric(thursday, limit_up_count=31),
+                    TradingPlanVersion(
+                        source_trade_date=friday,
+                        target_trade_date=monday,
+                        stage="after_close",
+                        version_no=1,
+                        status="active",
+                        market_state_json={
+                            "window": "first_divergence",
+                            "divergence_days": 4,
+                        },
+                        input_hash="friday-plan",
+                        generated_at=datetime(2026, 7, 10, 15, 30),
+                    ),
+                    TradingPlanVersion(
+                        source_trade_date=thursday,
+                        target_trade_date=friday,
+                        stage="after_close",
+                        version_no=1,
+                        status="active",
+                        market_state_json={
+                            "window": "second_divergence",
+                            "divergence_days": 99,
+                        },
+                        input_hash="thursday-plan",
+                        generated_at=datetime(2026, 7, 9, 15, 30),
+                    ),
+                ]
+            )
+            await db.commit()
+
+        for stage, as_of in (
+            ("overnight", CN_TZ.localize(datetime(2026, 7, 13, 8, 50))),
+            ("auction", CN_TZ.localize(datetime(2026, 7, 13, 9, 25))),
+        ):
+            with self.subTest(stage=stage):
+                result = await load_production_full_market_context(
+                    monday,
+                    stage,
+                    as_of,
+                    session_factory=self.Session,
+                )
+
+                self.assertEqual(result["evidence_trade_date"], friday)
+                self.assertEqual(result["prior_window"], "first_divergence")
+                self.assertEqual(result["divergence_days"], 5)
+
     async def test_missing_source_stays_explicitly_degraded_without_fake_values(self):
         from app.services.trading_playbook.composition import (
             load_production_full_market_context,

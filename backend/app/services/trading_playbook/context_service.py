@@ -83,7 +83,7 @@ class ProductionMarketContextService:
             )
             prior_plan = await self._prior_plan(
                 db,
-                previous.trade_date if previous is not None else None,
+                self._prior_plan_trade_date(current, previous, stage),
                 database_as_of,
             )
 
@@ -231,6 +231,19 @@ class ProductionMarketContextService:
             None,
         )
         return current, previous
+
+    @staticmethod
+    def _prior_plan_trade_date(current, previous, stage: str) -> Optional[date]:
+        """Resolve plan lineage independently from metric comparison roles.
+
+        Before the current session opens, ``current`` is already the most
+        recent completed trading session and therefore owns the prior plan.
+        During pre-close/after-close builds, ``current`` is today's metric and
+        the prior plan belongs to ``previous``.
+        """
+        if stage in {"overnight", "auction"}:
+            return current.trade_date if current is not None else None
+        return previous.trade_date if previous is not None else None
 
     @staticmethod
     async def _daily_analysis(db, evidence_date: date, database_as_of: datetime):

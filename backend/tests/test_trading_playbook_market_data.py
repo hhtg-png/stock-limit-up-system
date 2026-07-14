@@ -4,6 +4,8 @@ import math
 import unittest
 from dataclasses import FrozenInstanceError, fields
 from datetime import date, datetime, time, timedelta, timezone
+from pathlib import Path
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
@@ -3056,12 +3058,13 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
                 "realtime_limit_up_fact",
                 candidates[code].features,
             )
-            self.assertFalse(
-                any(
-                    evidence["source"] == "realtime_limit_up_pool"
-                    for evidence in candidates[code].evidence
-                )
+            realtime_evidence = next(
+                evidence
+                for evidence in candidates[code].evidence
+                if evidence["source"] == "realtime_limit_up_pool"
             )
+            self.assertEqual(realtime_evidence["quality"], "degraded")
+            self.assertTrue(realtime_evidence["candidate_discovery_only"])
         accepted = candidates["000003"]
         realtime_evidence = next(
             evidence
@@ -3076,6 +3079,126 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
             realtime_fact["nested_quality"],
             {"valid_ratio": 1.0},
         )
+
+    async def test_failed_refresh_with_30_minute_cache_is_discovery_only(self):
+        import copy
+        import json
+
+        from app.services.realtime_limit_up_service import RealtimeLimitUpService
+        from app.services.trading_playbook.domain import CandidateSnapshot
+        from app.services.trading_playbook.market_data import (
+            TradingPlaybookMarketDataProvider,
+        )
+        from app.services.trading_playbook.market_state import MarketStateAnalyzer
+        from app.services.trading_playbook.mode_features import ModeFeatureBuilder
+        from app.services.trading_playbook.mode_matcher import ModeMatcher
+
+        trade_date = date(2026, 7, 14)
+        as_of = datetime(2026, 7, 14, 10, 0)
+        code = "000099"
+        service = RealtimeLimitUpService()
+        service._pool_cache[trade_date] = [
+            {
+                "stock_code": code,
+                "theme_name": "stale-theme-must-not-match",
+                "_collected_at": as_of - timedelta(minutes=30),
+                "is_final_sealed": True,
+                "open_count": 2,
+            }
+        ]
+        service._pool_cache_time[trade_date] = __import__("time").time() - 1800
+
+        class FailingClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            async def get(self, *_args, **_kwargs):
+                raise RuntimeError("refresh unavailable")
+
+        with patch(
+            "app.services.realtime_limit_up_service.httpx.AsyncClient",
+            return_value=FailingClient(),
+        ):
+            stale_snapshot = await service.get_fast_limit_up_snapshot(trade_date)
+
+        self.assertFalse(stale_snapshot.authoritative)
+        self.assertFalse(stale_snapshot.complete)
+        self.assertIsNone(stale_snapshot.evidence_trade_date)
+        self.assertEqual(len(stale_snapshot.items), 1)
+
+        async def kline_loader(*_args, **_kwargs):
+            return [
+                {
+                    "date": trade_date - timedelta(days=offset),
+                    "close": 10,
+                }
+                for offset in range(5, -1, -1)
+            ]
+
+        async with self.session_factory() as db:
+            db.add(
+                Stock(
+                    stock_code=code,
+                    stock_name="Cache Candidate",
+                    market="SZ",
+                    is_st=0,
+                )
+            )
+            await db.commit()
+            raw = await TradingPlaybookMarketDataProvider(
+                quote_api=_FakeQuoteAPI(),
+                kline_loader=kline_loader,
+                realtime_limit_up_loader=lambda _trade_date: asyncio.sleep(
+                    0, result=stale_snapshot
+                ),
+            ).build_market_snapshot(
+                db=db,
+                source_trade_date=trade_date,
+                target_trade_date=trade_date,
+                stage="preclose",
+                as_of=as_of,
+            )
+
+        candidate = next(item for item in raw.candidates if item.stock_code == code)
+        self.assertNotIn("realtime_limit_up_fact", candidate.features)
+        realtime_evidence = next(
+            item
+            for item in candidate.evidence
+            if item["source"] == "realtime_limit_up_pool"
+        )
+        self.assertIn(realtime_evidence["quality"], {"degraded", "missing"})
+        self.assertNotEqual(candidate.theme_name, "stale-theme-must-not-match")
+        self.assertNotIn("limit_up_count", raw.market_features)
+        self.assertEqual(
+            raw.market_features["_feature_quality"]["limit_up_count"],
+            "missing",
+        )
+
+        enriched = MarketStateAnalyzer().enrich_snapshot(raw)
+        analyzed = next(
+            item for item in enriched.candidates if item.stock_code == code
+        )
+        built = ModeFeatureBuilder().build(enriched, analyzed)
+        match_candidate = CandidateSnapshot(
+            stock_code=analyzed.stock_code,
+            stock_name=analyzed.stock_name,
+            theme_name=analyzed.theme_name,
+            features=built,
+            evidence=copy.deepcopy(analyzed.evidence),
+        )
+        catalog = json.loads(
+            Path("app/data/trading_playbook_rules_v1.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        evaluations = ModeMatcher(
+            catalog["rules"],
+            catalog_version=catalog["catalog_version"],
+        ).evaluate(enriched.market_features, match_candidate)
+        self.assertFalse(any(row.risk_level == "trial" for row in evaluations))
 
     async def test_stale_and_fallback_quotes_never_enter_ready_ranks(self):
         from app.services.trading_playbook.market_data import (

@@ -801,12 +801,14 @@ class TradingPlaybookMarketDataProvider:
             warnings.append(f"realtime limit-up pool failed: {exc}")
         realtime_by_code: Dict[str, Dict[str, Any]] = {}
         realtime_provenance_by_code: Dict[str, datetime] = {}
+        realtime_discovery_by_code: Dict[str, Dict[str, Any]] = {}
         realtime_context_rows: List[Dict[str, Any]] = []
         realtime_context_complete = (
             realtime_snapshot.authoritative
             and realtime_snapshot.complete
             and realtime_snapshot.evidence_trade_date == expected_realtime_date
         )
+        realtime_snapshot_publishable = realtime_context_complete
         if (
             realtime_snapshot.evidence_trade_date is not None
             and realtime_snapshot.evidence_trade_date != expected_realtime_date
@@ -820,6 +822,24 @@ class TradingPlaybookMarketDataProvider:
             code = self._normalize_code(
                 self._pick(row, "stock_code", "code", "symbol")
             )
+            if code in stock_by_code:
+                # A non-authoritative snapshot may still broaden the bounded
+                # candidate union.  No other values from that row are allowed
+                # to enter matching until the complete snapshot contract and
+                # row provenance have both passed below.
+                candidate_codes.add(code)
+                realtime_candidate_codes.add(code)
+                realtime_discovery_by_code[code] = {
+                    "as_of": None,
+                    "evidence_trade_date": (
+                        realtime_snapshot.evidence_trade_date
+                    ),
+                    "quality": "degraded",
+                    "warning": (
+                        realtime_snapshot.warning
+                        or "realtime candidate row is not publishable"
+                    ),
+                }
             available_at = self._realtime_available_at(row, pool_trade_date)
             if available_at is None:
                 warnings.append(
@@ -827,6 +847,10 @@ class TradingPlaybookMarketDataProvider:
                 )
                 realtime_context_complete = False
                 continue
+            if code in realtime_discovery_by_code:
+                realtime_discovery_by_code[code]["as_of"] = (
+                    self._evidence_datetime(available_at, as_of)
+                )
             if available_at > local_as_of:
                 warnings.append(f"future realtime row for {code or 'unknown'}")
                 realtime_context_complete = False
@@ -844,14 +868,12 @@ class TradingPlaybookMarketDataProvider:
                 continue
             normalized_realtime = self._normalize_realtime_row(row)
             realtime_context_rows.append(normalized_realtime)
-            if code in stock_by_code:
+            if code in stock_by_code and realtime_snapshot_publishable:
                 realtime_by_code[code] = normalized_realtime
                 realtime_provenance_by_code[code] = self._evidence_datetime(
                     available_at,
                     as_of,
                 )
-                candidate_codes.add(code)
-                realtime_candidate_codes.add(code)
 
         review_dates_result = await db.execute(
             select(MarketReviewStockDaily.trade_date)
@@ -1186,6 +1208,20 @@ class TradingPlaybookMarketDataProvider:
                         "as_of": realtime_provenance_by_code[code],
                         "evidence_trade_date": realtime_snapshot.evidence_trade_date,
                         "quality": "ready",
+                    }
+                )
+            elif code in realtime_discovery_by_code:
+                discovery = realtime_discovery_by_code[code]
+                evidence.append(
+                    {
+                        "source": "realtime_limit_up_pool",
+                        "as_of": discovery["as_of"],
+                        "evidence_trade_date": discovery[
+                            "evidence_trade_date"
+                        ],
+                        "quality": discovery["quality"],
+                        "warning": discovery["warning"],
+                        "candidate_discovery_only": True,
                     }
                 )
 
