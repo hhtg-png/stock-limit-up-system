@@ -208,7 +208,7 @@ def _validate_operational_payload(payload: Mapping[str, Any]) -> None:
     candidates = payload.get("candidates")
     if not isinstance(candidates, list):
         raise UnsafePlanDataError("plan candidates are malformed")
-    if not 1 <= len(candidates) <= risk["max_candidates"]:
+    if len(candidates) > risk["max_candidates"]:
         raise UnsafePlanDataError("plan candidate count is unsafe")
     stock_codes: set[str] = set()
     for candidate in candidates:

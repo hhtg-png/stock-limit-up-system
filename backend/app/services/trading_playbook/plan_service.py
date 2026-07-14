@@ -177,9 +177,19 @@ class TradingPlanService:
                         input_hash,
                     )
                     if existing is not None:
+                        existing_candidates = await self._load_candidates(
+                            db,
+                            existing.id,
+                        )
+                        payload = normalize_plan_payload(
+                            self._serialize_loaded(
+                                existing,
+                                existing_candidates,
+                            )
+                        )
                         if created_settings:
                             await db.commit()
-                        return await self.serialize(db, existing)
+                        return payload
 
                     parent = await self._latest_parent_plan(
                         db,
@@ -223,21 +233,26 @@ class TradingPlanService:
                     )
                     db.add(plan)
                     await db.flush()
+                    plan_candidates = []
                     for rank, (primary, supporting) in enumerate(selected, start=1):
-                        db.add(
-                            self._candidate_from_evaluation(
-                                plan.id,
-                                snapshot,
-                                primary,
-                                supporting,
-                                normalized_names,
-                                candidate_sources,
-                                rank,
-                                risk_settings,
-                            )
+                        candidate = self._candidate_from_evaluation(
+                            plan.id,
+                            snapshot,
+                            primary,
+                            supporting,
+                            normalized_names,
+                            candidate_sources,
+                            rank,
+                            risk_settings,
                         )
+                        plan_candidates.append(candidate)
+                        db.add(candidate)
+                    await db.flush()
+                    payload = normalize_plan_payload(
+                        self._serialize_loaded(plan, plan_candidates)
+                    )
                     await db.commit()
-                    return await self.serialize(db, plan)
+                    return payload
                 except IntegrityError:
                     await db.rollback()
                     if risk_settings is None:
@@ -660,12 +675,15 @@ class TradingPlanService:
                 raise InvalidRequestError(
                     "settings conflict with current risk limits"
                 )
-            await db.commit()
-            return await db.scalar(
+            updated_row = await db.scalar(
                 select(TradingPlaybookSettings)
                 .where(TradingPlaybookSettings.id == 1)
                 .execution_options(populate_existing=True)
             )
+            if updated_row is None:
+                raise RuntimeError("updated settings row disappeared")
+            await db.commit()
+            return updated_row
         except InvalidRequestError:
             raise
         except IntegrityError as exc:
@@ -1252,6 +1270,26 @@ class TradingPlanService:
         async with self._lock_manager.hold(lock_key):
             for attempt in range(3):
                 try:
+                    # A no-op conditional UPDATE is a portable transaction
+                    # lock: PostgreSQL locks this parent row and SQLite takes
+                    # its write reservation before the hash check. Separate
+                    # workers therefore cannot pass check-then-insert for the
+                    # same revision parent at different version numbers.
+                    parent_claim = await db.execute(
+                        update(TradingPlanVersion)
+                        .where(
+                            TradingPlanVersion.id == plan_id,
+                            TradingPlanVersion.status.in_(
+                                ("draft", "confirmed", "active")
+                            ),
+                        )
+                        .values(status=TradingPlanVersion.status)
+                        .execution_options(synchronize_session=False)
+                    )
+                    if parent_claim.rowcount != 1:
+                        raise InvalidTransitionError(
+                            "plan cannot be revised"
+                        )
                     existing = await self._find_revision_by_hash(
                         db,
                         plan_id,
@@ -1269,14 +1307,8 @@ class TradingPlanService:
                             )
                         )
                     current_parent = await db.get(TradingPlanVersion, plan_id)
-                    if current_parent is None or current_parent.status not in {
-                        "draft",
-                        "confirmed",
-                        "active",
-                    }:
-                        raise InvalidTransitionError(
-                            "plan cannot be revised"
-                        )
+                    if current_parent is None:
+                        raise InvalidTransitionError("plan cannot be revised")
                     current_candidates = await self._load_candidates(
                         db,
                         current_parent.id,
@@ -1469,6 +1501,15 @@ class TradingPlanService:
                 normalized["manual_note"] = manual_note.strip()
             if not normalized:
                 raise ValueError("candidate override contains no changes")
+            # Exercise the exact merge and derived hard-stop calculation now,
+            # while failures still represent a client override (422). The
+            # persisted parent was strongly validated before this method.
+            cls._clone_candidate_for_revision(
+                candidate,
+                0,
+                normalized,
+                parent.risk_settings_json,
+            )
             normalized_by_id[candidate.id] = normalized
             audit_rows.append(
                 {

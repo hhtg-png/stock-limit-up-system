@@ -242,6 +242,25 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(settings_count, 1)
 
+    async def test_generate_does_not_serialize_after_successful_commit(self):
+        async with self.Session() as db:
+            with patch.object(
+                self.service,
+                "serialize",
+                AsyncMock(
+                    side_effect=RuntimeError(
+                        "post-commit generation serialization"
+                    )
+                ),
+            ) as serialize:
+                plan = await self._generate(
+                    db,
+                    [_evaluation("leader", "000001")],
+                )
+
+        self.assertEqual(plan["status"], "draft")
+        serialize.assert_not_awaited()
+
     async def test_generate_is_idempotent_and_hashes_every_effective_input(self):
         evaluation = _evaluation("leader", "000001")
         rules = _rule_snapshot("leader")
@@ -1618,29 +1637,29 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
             second_engine = create_async_engine(url, connect_args={"timeout": 5})
             FirstSession = async_sessionmaker(first_engine, expire_on_commit=False)
             SecondSession = async_sessionmaker(second_engine, expire_on_commit=False)
-            ready_count = 0
-            ready_lock = asyncio.Lock()
-            both_ready = asyncio.Event()
+            first_allocated = asyncio.Event()
+            release_first = asyncio.Event()
+            second_allocated = asyncio.Event()
 
-            class RacingService(TradingPlanService):
-                def __init__(self):
-                    super().__init__()
-                    self.waited = False
-
+            class PausingService(TradingPlanService):
                 async def _next_version_no(self, db, target_trade_date, stage):
-                    nonlocal ready_count
                     version_no = await super()._next_version_no(
                         db,
                         target_trade_date,
                         stage,
                     )
-                    if not self.waited:
-                        self.waited = True
-                        async with ready_lock:
-                            ready_count += 1
-                            if ready_count == 2:
-                                both_ready.set()
-                        await asyncio.wait_for(both_ready.wait(), timeout=5)
+                    first_allocated.set()
+                    await asyncio.wait_for(release_first.wait(), timeout=5)
+                    return version_no
+
+            class ObservingService(TradingPlanService):
+                async def _next_version_no(self, db, target_trade_date, stage):
+                    version_no = await super()._next_version_no(
+                        db,
+                        target_trade_date,
+                        stage,
+                    )
+                    second_allocated.set()
                     return version_no
 
             try:
@@ -1669,10 +1688,26 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
                     async with session_factory() as session:
                         return await service.revise(session, parent_id, changes)
 
-                first, second = await asyncio.gather(
-                    revise(RacingService(), FirstSession),
-                    revise(RacingService(), SecondSession),
+                first_task = asyncio.create_task(
+                    revise(PausingService(), FirstSession)
                 )
+                await asyncio.wait_for(first_allocated.wait(), timeout=5)
+                second_task = asyncio.create_task(
+                    revise(ObservingService(), SecondSession)
+                )
+                try:
+                    waiter = asyncio.create_task(second_allocated.wait())
+                    reached, _pending = await asyncio.wait(
+                        {waiter},
+                        timeout=0.2,
+                    )
+                    self.assertFalse(
+                        reached,
+                        "second engine allocated before the first transaction committed",
+                    )
+                finally:
+                    release_first.set()
+                first, second = await asyncio.gather(first_task, second_task)
 
                 self.assertEqual(first["id"], second["id"])
                 async with FirstSession() as verify:
@@ -1784,6 +1819,46 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(row.trial_position_pct, 50.0)
         self.assertEqual(row.confirmed_position_pct, 60.0)
+
+    async def test_update_settings_does_not_query_after_successful_commit(self):
+        async with self.Session() as db:
+            db.add(
+                TradingPlaybookSettings(
+                    id=1,
+                    trial_position_pct=10,
+                    confirmed_position_pct=30,
+                    hard_stop_pct=5,
+                    max_action_candidates=3,
+                    wechat_enabled=False,
+                )
+            )
+            await db.commit()
+            original_scalar = db.scalar
+            original_commit = db.commit
+            committed = False
+
+            async def guarded_scalar(*args, **kwargs):
+                if committed:
+                    raise RuntimeError("post-commit settings query")
+                return await original_scalar(*args, **kwargs)
+
+            async def tracked_commit():
+                nonlocal committed
+                await original_commit()
+                committed = True
+
+            with patch.object(db, "scalar", new=guarded_scalar), patch.object(
+                db,
+                "commit",
+                new=tracked_commit,
+            ):
+                row = await self.service.update_settings(
+                    db,
+                    {"trial_position_pct": 20.0},
+                    AS_OF.replace(tzinfo=ZoneInfo("Asia/Shanghai")),
+                )
+
+        self.assertEqual(row.trial_position_pct, 20.0)
 
     async def test_settings_can_lower_both_position_limits_atomically(self):
         async with self.Session() as db:

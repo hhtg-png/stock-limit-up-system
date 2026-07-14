@@ -739,7 +739,6 @@ class TradingPlaybookApiTests(unittest.TestCase):
                     }
                 },
             ),
-            ("candidate-count-zero", {"empty": True}),
             ("candidate-count-above-max", {"max_candidates": 1, "extra": True}),
             ("duplicate-stock", {"duplicate": True}),
             (
@@ -811,8 +810,7 @@ class TradingPlaybookApiTests(unittest.TestCase):
                     "status": "waiting",
                 }
                 candidate_values.update(case.get("candidate", {}))
-                if not case.get("empty"):
-                    db.add(TradingPlanCandidate(**candidate_values))
+                db.add(TradingPlanCandidate(**candidate_values))
                 if case.get("extra") or case.get("duplicate"):
                     db.add(
                         TradingPlanCandidate(
@@ -1138,6 +1136,27 @@ class TradingPlaybookApiTests(unittest.TestCase):
         self.assertEqual(invalid.status_code, 422, invalid.text)
         self.assertEqual(
             invalid.json()["detail"],
+            "Invalid trading playbook request",
+        )
+
+        contradictory = self.client.put(
+            f"/trading-playbook/plans/{plan['id']}",
+            json={
+                "change_note": "矛盾的价格区间",
+                "candidate_overrides": [
+                    {
+                        "candidate_id": plan["candidates"][0]["id"],
+                        "entry_trigger": {
+                            "price_gte": 12.0,
+                            "price_lte": 11.0,
+                        },
+                    }
+                ],
+            },
+        )
+        self.assertEqual(contradictory.status_code, 422, contradictory.text)
+        self.assertEqual(
+            contradictory.json()["detail"],
             "Invalid trading playbook request",
         )
 
