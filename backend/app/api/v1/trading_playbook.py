@@ -52,6 +52,22 @@ NOT_FOUND_DETAIL = "Trading plan not found"
 SERVICE_UNAVAILABLE_DETAIL = "Trading playbook service is unavailable"
 
 
+def _service_unavailable() -> HTTPException:
+    return HTTPException(
+        status_code=503,
+        detail=SERVICE_UNAVAILABLE_DETAIL,
+    )
+
+
+async def _rollback_quietly(db: AsyncSession) -> None:
+    try:
+        await db.rollback()
+    except Exception:
+        # Preserve the public error contract even when the broken connection
+        # cannot complete its cleanup. Session close performs the final reset.
+        pass
+
+
 def get_trading_playbook_now() -> datetime:
     """Injectable Beijing clock shared by all API-side state changes."""
     return datetime.now(CN_TZ)
@@ -59,34 +75,40 @@ def get_trading_playbook_now() -> datetime:
 
 def get_trading_playbook_orchestrator(request: Request):
     """Return the one app-owned pipeline; Task 9 wires it during startup."""
-    orchestrator = getattr(
-        request.app.state,
-        "trading_playbook_orchestrator",
-        None,
-    )
-    if orchestrator is None:
-        orchestrator = trading_playbook_runtime.get_orchestrator()
+    try:
+        orchestrator = getattr(
+            request.app.state,
+            "trading_playbook_orchestrator",
+            None,
+        )
+        if orchestrator is None:
+            orchestrator = trading_playbook_runtime.get_orchestrator()
+    except Exception as exc:
+        raise _service_unavailable() from exc
     if orchestrator is None:
         raise HTTPException(
             status_code=503,
-            detail="Trading playbook orchestrator is not configured",
+            detail=SERVICE_UNAVAILABLE_DETAIL,
         )
     return orchestrator
 
 
 def get_trading_playbook_review_service(request: Request):
     """Return the app-owned review service once Task 11 installs it."""
-    service = getattr(
-        request.app.state,
-        "trading_playbook_review_service",
-        None,
-    )
-    if service is None:
-        service = trading_playbook_runtime.get_review_service()
+    try:
+        service = getattr(
+            request.app.state,
+            "trading_playbook_review_service",
+            None,
+        )
+        if service is None:
+            service = trading_playbook_runtime.get_review_service()
+    except Exception as exc:
+        raise _service_unavailable() from exc
     if service is None:
         raise HTTPException(
             status_code=503,
-            detail="Trading playbook review service is not configured",
+            detail=SERVICE_UNAVAILABLE_DETAIL,
         )
     return service
 
@@ -112,11 +134,8 @@ async def _serialize_plan_response(
         return _normalize_plan_payload(payload)
     except HTTPException:
         raise
-    except (UnsafePlanDataError, OverflowError, TypeError, ValueError) as exc:
-        raise HTTPException(
-            status_code=503,
-            detail=SERVICE_UNAVAILABLE_DETAIL,
-        ) from exc
+    except Exception as exc:
+        raise _service_unavailable() from exc
 
 
 def _priority(rule: TradingModeRule) -> tuple[int, float]:
@@ -215,23 +234,30 @@ async def _settings_row(
 
 @router.get("/rules", summary="查询交易模式规则")
 async def list_rules(db: AsyncSession = Depends(get_db)):
-    rows = list(
-        (
-            await db.scalars(
-                select(TradingModeRule).where(TradingModeRule.enabled.is_(True))
-            )
-        ).all()
-    )
-    rows.sort(
-        key=lambda row: (
-            str(row.family or ""),
-            _priority(row),
-            str(row.mode_key or ""),
-            row.version,
-            row.id,
+    try:
+        rows = list(
+            (
+                await db.scalars(
+                    select(TradingModeRule).where(
+                        TradingModeRule.enabled.is_(True)
+                    )
+                )
+            ).all()
         )
-    )
-    return {"items": [_serialize_rule(row) for row in rows]}
+        rows.sort(
+            key=lambda row: (
+                str(row.family or ""),
+                _priority(row),
+                str(row.mode_key or ""),
+                row.version,
+                row.id,
+            )
+        )
+        return {"items": [_serialize_rule(row) for row in rows]}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise _service_unavailable() from exc
 
 
 @router.post("/plans/generate", summary="补跑指定预案阶段")
@@ -242,7 +268,7 @@ async def generate_plan(
     now: datetime = Depends(get_trading_playbook_now),
 ):
     if now.tzinfo is None or now.utcoffset() is None:
-        raise HTTPException(status_code=503, detail="Trading playbook clock is invalid")
+        raise _service_unavailable()
     try:
         result = await orchestrator.build_stage(
             db,
@@ -254,29 +280,27 @@ async def generate_plan(
             return await _serialize_plan_response(db, result)
         if isinstance(result, Mapping):
             return _normalize_plan_payload(result)
-        raise HTTPException(
-            status_code=503,
-            detail="Trading playbook pipeline returned an invalid result",
-        )
+        raise _service_unavailable()
     except HTTPException:
+        await _rollback_quietly(db)
         raise
     except InvalidRequestError as exc:
-        await db.rollback()
+        await _rollback_quietly(db)
         raise HTTPException(
             status_code=422,
             detail=INVALID_REQUEST_DETAIL,
         ) from exc
     except PlaybookNotFoundError as exc:
-        await db.rollback()
+        await _rollback_quietly(db)
         raise HTTPException(status_code=404, detail=NOT_FOUND_DETAIL) from exc
     except InvalidTransitionError as exc:
-        await db.rollback()
+        await _rollback_quietly(db)
         raise HTTPException(
             status_code=409,
             detail=STATE_CONFLICT_DETAIL,
         ) from exc
     except IntegrityError as exc:
-        await db.rollback()
+        await _rollback_quietly(db)
         raise HTTPException(status_code=409, detail="Plan generation conflict") from exc
     except (
         UnsafePlanDataError,
@@ -287,17 +311,11 @@ async def generate_plan(
         TimeoutError,
         OSError,
     ) as exc:
-        await db.rollback()
-        raise HTTPException(
-            status_code=503,
-            detail=SERVICE_UNAVAILABLE_DETAIL,
-        ) from exc
+        await _rollback_quietly(db)
+        raise _service_unavailable() from exc
     except Exception as exc:
-        await db.rollback()
-        raise HTTPException(
-            status_code=503,
-            detail=SERVICE_UNAVAILABLE_DETAIL,
-        ) from exc
+        await _rollback_quietly(db)
+        raise _service_unavailable() from exc
 
 
 @router.get("/plans", summary="查询交易日全部预案版本")
@@ -305,29 +323,42 @@ async def list_plans(
     trade_date: date = Query(...),
     db: AsyncSession = Depends(get_db),
 ):
-    plans = list(
-        (
-            await db.scalars(
-                select(TradingPlanVersion)
-                .where(TradingPlanVersion.target_trade_date == trade_date)
-                .order_by(
-                    TradingPlanVersion.generated_at.desc(),
-                    TradingPlanVersion.id.desc(),
+    try:
+        plans = list(
+            (
+                await db.scalars(
+                    select(TradingPlanVersion)
+                    .where(TradingPlanVersion.target_trade_date == trade_date)
+                    .order_by(
+                        TradingPlanVersion.generated_at.desc(),
+                        TradingPlanVersion.id.desc(),
+                    )
                 )
-            )
-        ).all()
-    )
-    return {
-        "items": [await _serialize_plan_response(db, plan) for plan in plans]
-    }
+            ).all()
+        )
+        return {
+            "items": [
+                await _serialize_plan_response(db, plan) for plan in plans
+            ]
+        }
+    except HTTPException:
+        await _rollback_quietly(db)
+        raise
+    except Exception as exc:
+        raise _service_unavailable() from exc
 
 
 @router.get("/plans/{plan_id}", summary="查询预案详情")
 async def get_plan(plan_id: int, db: AsyncSession = Depends(get_db)):
-    payload = await _serialize_plan_response(db, plan_id)
-    if payload is None:
-        raise HTTPException(status_code=404, detail="Trading plan not found")
-    return payload
+    try:
+        payload = await _serialize_plan_response(db, plan_id)
+        if payload is None:
+            raise HTTPException(status_code=404, detail=NOT_FOUND_DETAIL)
+        return payload
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise _service_unavailable() from exc
 
 
 @router.put("/plans/{plan_id}", summary="创建人工修订版本")
@@ -342,28 +373,29 @@ async def revise_plan(
         child = await _plan_service.revise(db, plan_id, changes)
         return child
     except HTTPException:
+        await _rollback_quietly(db)
         raise
     except PlaybookNotFoundError as exc:
+        await _rollback_quietly(db)
         raise HTTPException(status_code=404, detail=NOT_FOUND_DETAIL) from exc
     except InvalidRequestError as exc:
+        await _rollback_quietly(db)
         raise HTTPException(
             status_code=422,
             detail=INVALID_REQUEST_DETAIL,
         ) from exc
     except InvalidTransitionError as exc:
+        await _rollback_quietly(db)
         raise HTTPException(
             status_code=409,
             detail=STATE_CONFLICT_DETAIL,
         ) from exc
     except IntegrityError as exc:
-        await db.rollback()
+        await _rollback_quietly(db)
         raise HTTPException(status_code=409, detail="Plan revision conflict") from exc
     except Exception as exc:
-        await db.rollback()
-        raise HTTPException(
-            status_code=503,
-            detail=SERVICE_UNAVAILABLE_DETAIL,
-        ) from exc
+        await _rollback_quietly(db)
+        raise _service_unavailable() from exc
 
 
 @router.post("/plans/{plan_id}/confirm", summary="确认并激活预案")
@@ -377,28 +409,29 @@ async def confirm_plan(
         plan = await _plan_service.confirm(db, plan_id, request.confirmed_by)
         return plan
     except HTTPException:
+        await _rollback_quietly(db)
         raise
     except PlaybookNotFoundError as exc:
+        await _rollback_quietly(db)
         raise HTTPException(status_code=404, detail=NOT_FOUND_DETAIL) from exc
     except InvalidRequestError as exc:
+        await _rollback_quietly(db)
         raise HTTPException(
             status_code=422,
             detail=INVALID_REQUEST_DETAIL,
         ) from exc
     except InvalidTransitionError as exc:
+        await _rollback_quietly(db)
         raise HTTPException(
             status_code=409,
             detail=STATE_CONFLICT_DETAIL,
         ) from exc
     except IntegrityError as exc:
-        await db.rollback()
+        await _rollback_quietly(db)
         raise HTTPException(status_code=409, detail="Plan confirmation conflict") from exc
     except Exception as exc:
-        await db.rollback()
-        raise HTTPException(
-            status_code=503,
-            detail=SERVICE_UNAVAILABLE_DETAIL,
-        ) from exc
+        await _rollback_quietly(db)
+        raise _service_unavailable() from exc
 
 
 @router.post("/plans/{plan_id}/cancel", summary="取消预案")
@@ -408,29 +441,29 @@ async def cancel_plan(plan_id: int, db: AsyncSession = Depends(get_db)):
         plan = await _plan_service.cancel(db, plan_id)
         return plan
     except HTTPException:
+        await _rollback_quietly(db)
         raise
     except PlaybookNotFoundError as exc:
+        await _rollback_quietly(db)
         raise HTTPException(status_code=404, detail=NOT_FOUND_DETAIL) from exc
     except InvalidTransitionError as exc:
+        await _rollback_quietly(db)
         raise HTTPException(
             status_code=409,
             detail=STATE_CONFLICT_DETAIL,
         ) from exc
     except UpstreamUnavailableError as exc:
-        await db.rollback()
-        raise HTTPException(
-            status_code=503,
-            detail=SERVICE_UNAVAILABLE_DETAIL,
-        ) from exc
+        await _rollback_quietly(db)
+        raise _service_unavailable() from exc
     except IntegrityError as exc:
-        await db.rollback()
+        await _rollback_quietly(db)
         raise HTTPException(status_code=409, detail="Plan cancellation conflict") from exc
     except SQLAlchemyError as exc:
-        await db.rollback()
-        raise HTTPException(status_code=503, detail="Plan cancellation failed") from exc
-    except Exception:
-        await db.rollback()
-        raise
+        await _rollback_quietly(db)
+        raise _service_unavailable() from exc
+    except Exception as exc:
+        await _rollback_quietly(db)
+        raise _service_unavailable() from exc
 
 
 @router.get("/alerts", summary="查询独立交易预案提醒")
@@ -440,19 +473,26 @@ async def list_alerts(
     offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db),
 ):
-    statement = select(TradingAlertEvent)
-    if unread_only:
-        statement = statement.where(TradingAlertEvent.acknowledged_at.is_(None))
-    statement = statement.order_by(
-        TradingAlertEvent.triggered_at.desc(),
-        TradingAlertEvent.id.desc(),
-    ).offset(offset).limit(limit)
-    rows = list((await db.scalars(statement)).all())
-    return {
-        "items": [_serialize_alert(row) for row in rows],
-        "limit": limit,
-        "offset": offset,
-    }
+    try:
+        statement = select(TradingAlertEvent)
+        if unread_only:
+            statement = statement.where(
+                TradingAlertEvent.acknowledged_at.is_(None)
+            )
+        statement = statement.order_by(
+            TradingAlertEvent.triggered_at.desc(),
+            TradingAlertEvent.id.desc(),
+        ).offset(offset).limit(limit)
+        rows = list((await db.scalars(statement)).all())
+        return {
+            "items": [_serialize_alert(row) for row in rows],
+            "limit": limit,
+            "offset": offset,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise _service_unavailable() from exc
 
 
 @router.post("/alerts/{alert_id}/ack", summary="确认交易预案提醒已读")
@@ -461,26 +501,32 @@ async def acknowledge_alert(
     db: AsyncSession = Depends(get_db),
     now: datetime = Depends(get_trading_playbook_now),
 ):
-    alert = await db.get(TradingAlertEvent, alert_id)
-    if alert is None:
-        raise HTTPException(status_code=404, detail="Trading alert not found")
-    if alert.acknowledged_at is not None:
-        return _serialize_alert(alert)
-    if now.tzinfo is None or now.utcoffset() is None:
-        raise HTTPException(status_code=503, detail="Trading playbook clock is invalid")
-    alert.acknowledged_at = now.astimezone(CN_TZ)
     try:
+        alert = await db.get(TradingAlertEvent, alert_id)
+        if alert is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Trading alert not found",
+            )
+        if alert.acknowledged_at is not None:
+            return _serialize_alert(alert)
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise _service_unavailable()
+        alert.acknowledged_at = now.astimezone(CN_TZ)
         await db.commit()
         return _serialize_alert(alert)
+    except HTTPException:
+        await _rollback_quietly(db)
+        raise
     except IntegrityError as exc:
-        await db.rollback()
+        await _rollback_quietly(db)
         raise HTTPException(status_code=409, detail="Alert acknowledgement conflict") from exc
     except SQLAlchemyError as exc:
-        await db.rollback()
-        raise HTTPException(status_code=503, detail="Alert acknowledgement failed") from exc
-    except Exception:
-        await db.rollback()
-        raise
+        await _rollback_quietly(db)
+        raise _service_unavailable() from exc
+    except Exception as exc:
+        await _rollback_quietly(db)
+        raise _service_unavailable() from exc
 
 
 @router.put("/reviews/{trade_date}", summary="记录人工执行情况")
@@ -502,41 +548,35 @@ async def update_manual_execution(
         )
         return _serialize_review(review)
     except InvalidRequestError as exc:
-        await db.rollback()
+        await _rollback_quietly(db)
         raise HTTPException(
             status_code=422,
             detail=INVALID_REQUEST_DETAIL,
         ) from exc
     except PlaybookNotFoundError as exc:
-        await db.rollback()
+        await _rollback_quietly(db)
         raise HTTPException(status_code=404, detail=NOT_FOUND_DETAIL) from exc
     except InvalidTransitionError as exc:
-        await db.rollback()
+        await _rollback_quietly(db)
         raise HTTPException(
             status_code=409,
             detail=STATE_CONFLICT_DETAIL,
         ) from exc
     except UpstreamUnavailableError as exc:
-        await db.rollback()
-        raise HTTPException(
-            status_code=503,
-            detail=SERVICE_UNAVAILABLE_DETAIL,
-        ) from exc
+        await _rollback_quietly(db)
+        raise _service_unavailable() from exc
     except ValueError as exc:
-        await db.rollback()
-        raise HTTPException(
-            status_code=503,
-            detail=SERVICE_UNAVAILABLE_DETAIL,
-        ) from exc
+        await _rollback_quietly(db)
+        raise _service_unavailable() from exc
     except IntegrityError as exc:
-        await db.rollback()
+        await _rollback_quietly(db)
         raise HTTPException(status_code=409, detail="Review update conflict") from exc
     except SQLAlchemyError as exc:
-        await db.rollback()
-        raise HTTPException(status_code=503, detail="Review update failed") from exc
-    except Exception:
-        await db.rollback()
-        raise
+        await _rollback_quietly(db)
+        raise _service_unavailable() from exc
+    except Exception as exc:
+        await _rollback_quietly(db)
+        raise _service_unavailable() from exc
 
 
 @router.get("/settings", summary="查询交易预案设置")
@@ -547,10 +587,7 @@ async def get_settings(
     try:
         row = await _settings_row(db)
         if now.tzinfo is None or now.utcoffset() is None:
-            raise HTTPException(
-                status_code=503,
-                detail="Trading playbook clock is invalid",
-            )
+            raise _service_unavailable()
         if row.wechat_enabled is not False:
             row = await _plan_service.update_settings(
                 db,
@@ -561,26 +598,32 @@ async def get_settings(
             await db.commit()
         return _serialize_settings(row)
     except HTTPException:
-        await db.rollback()
+        await _rollback_quietly(db)
         raise
-    except IntegrityError:
-        await db.rollback()
-        row = await db.get(TradingPlaybookSettings, 1)
+    except IntegrityError as exc:
+        await _rollback_quietly(db)
+        try:
+            row = await db.get(TradingPlaybookSettings, 1)
+        except Exception as read_exc:
+            raise _service_unavailable() from read_exc
         if row is None:
-            raise HTTPException(status_code=409, detail="Settings creation conflict")
-        return _serialize_settings(row)
+            raise HTTPException(
+                status_code=409,
+                detail="Settings creation conflict",
+            ) from exc
+        try:
+            return _serialize_settings(row)
+        except Exception as serialize_exc:
+            raise _service_unavailable() from serialize_exc
     except SQLAlchemyError as exc:
-        await db.rollback()
-        raise HTTPException(status_code=503, detail="Settings are unavailable") from exc
+        await _rollback_quietly(db)
+        raise _service_unavailable() from exc
     except UpstreamUnavailableError as exc:
-        await db.rollback()
-        raise HTTPException(
-            status_code=503,
-            detail=SERVICE_UNAVAILABLE_DETAIL,
-        ) from exc
-    except Exception:
-        await db.rollback()
-        raise
+        await _rollback_quietly(db)
+        raise _service_unavailable() from exc
+    except Exception as exc:
+        await _rollback_quietly(db)
+        raise _service_unavailable() from exc
 
 
 @router.put("/settings", summary="修改交易预案设置")
@@ -594,29 +637,26 @@ async def update_settings(
         row = await _plan_service.update_settings(db, patch, now)
         return _serialize_settings(row)
     except HTTPException:
-        await db.rollback()
+        await _rollback_quietly(db)
         raise
     except InvalidRequestError as exc:
-        await db.rollback()
+        await _rollback_quietly(db)
         raise HTTPException(
             status_code=422,
             detail=INVALID_REQUEST_DETAIL,
         ) from exc
     except UpstreamUnavailableError as exc:
-        await db.rollback()
-        raise HTTPException(
-            status_code=503,
-            detail=SERVICE_UNAVAILABLE_DETAIL,
-        ) from exc
+        await _rollback_quietly(db)
+        raise _service_unavailable() from exc
     except IntegrityError as exc:
-        await db.rollback()
+        await _rollback_quietly(db)
         raise HTTPException(status_code=409, detail="Settings update conflict") from exc
     except SQLAlchemyError as exc:
-        await db.rollback()
-        raise HTTPException(status_code=503, detail="Settings update failed") from exc
-    except Exception:
-        await db.rollback()
-        raise
+        await _rollback_quietly(db)
+        raise _service_unavailable() from exc
+    except Exception as exc:
+        await _rollback_quietly(db)
+        raise _service_unavailable() from exc
 
 
 __all__ = [

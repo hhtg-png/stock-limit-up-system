@@ -8,7 +8,11 @@ from zoneinfo import ZoneInfo
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import (
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 from sqlalchemy.pool import StaticPool
 
 from app.api.v1 import trading_playbook as trading_playbook_api
@@ -862,6 +866,148 @@ class TradingPlaybookApiTests(unittest.TestCase):
             )
         self.assertEqual(generated.status_code, 503)
         self.assertEqual(reviewed.status_code, 503)
+        self.assertEqual(
+            generated.json()["detail"],
+            "Trading playbook service is unavailable",
+        )
+        self.assertEqual(
+            reviewed.json()["detail"],
+            "Trading playbook service is unavailable",
+        )
+
+    def test_all_endpoints_map_unexpected_failures_to_fixed_503(self):
+        async def fail(*_args, **_kwargs):
+            raise RuntimeError("unexpected provider secret")
+
+        cases = [
+            (
+                "rules",
+                "get",
+                "/trading-playbook/rules",
+                None,
+                lambda: patch.object(AsyncSession, "scalars", new=fail),
+            ),
+            (
+                "generate",
+                "post",
+                "/trading-playbook/plans/generate",
+                {"source_trade_date": "2026-07-10", "stage": "after_close"},
+                lambda: patch.object(
+                    self.orchestrator,
+                    "build_stage",
+                    new=fail,
+                ),
+            ),
+            (
+                "plans",
+                "get",
+                "/trading-playbook/plans?trade_date=2026-07-13",
+                None,
+                lambda: patch.object(AsyncSession, "scalars", new=fail),
+            ),
+            (
+                "plan-detail",
+                "get",
+                "/trading-playbook/plans/1",
+                None,
+                lambda: patch.object(
+                    trading_playbook_api._plan_service,
+                    "serialize",
+                    new=fail,
+                ),
+            ),
+            (
+                "revise",
+                "put",
+                "/trading-playbook/plans/1",
+                {"change_note": "failure contract"},
+                lambda: patch.object(
+                    trading_playbook_api._plan_service,
+                    "serialize",
+                    new=fail,
+                ),
+            ),
+            (
+                "confirm",
+                "post",
+                "/trading-playbook/plans/1/confirm",
+                {"confirmed_by": "contract-test"},
+                lambda: patch.object(
+                    trading_playbook_api._plan_service,
+                    "serialize",
+                    new=fail,
+                ),
+            ),
+            (
+                "cancel",
+                "post",
+                "/trading-playbook/plans/1/cancel",
+                None,
+                lambda: patch.object(
+                    trading_playbook_api._plan_service,
+                    "serialize",
+                    new=fail,
+                ),
+            ),
+            (
+                "alerts",
+                "get",
+                "/trading-playbook/alerts",
+                None,
+                lambda: patch.object(AsyncSession, "scalars", new=fail),
+            ),
+            (
+                "alert-ack",
+                "post",
+                "/trading-playbook/alerts/1/ack",
+                None,
+                lambda: patch.object(AsyncSession, "get", new=fail),
+            ),
+            (
+                "review",
+                "put",
+                "/trading-playbook/reviews/2026-07-10",
+                {"executions": {}},
+                lambda: patch.object(
+                    self.review_service,
+                    "update_manual_execution",
+                    new=fail,
+                ),
+            ),
+            (
+                "settings-get",
+                "get",
+                "/trading-playbook/settings",
+                None,
+                lambda: patch.object(
+                    trading_playbook_api,
+                    "_settings_row",
+                    new=fail,
+                ),
+            ),
+            (
+                "settings-put",
+                "put",
+                "/trading-playbook/settings",
+                {"enabled": False},
+                lambda: patch.object(
+                    trading_playbook_api._plan_service,
+                    "update_settings",
+                    new=fail,
+                ),
+            ),
+        ]
+
+        with TestClient(self.app, raise_server_exceptions=False) as client:
+            for name, method, path, body, patcher in cases:
+                with self.subTest(endpoint=name), patcher():
+                    response = client.request(method, path, json=body)
+                    self.assertEqual(response.status_code, 503, response.text)
+                    self.assertEqual(
+                        response.json()["detail"],
+                        "Trading playbook service is unavailable",
+                    )
+                    self.assertNotIn("secret", response.text)
 
     def test_real_application_resolves_registered_shared_runtime(self):
         from app.main import app as production_app
@@ -1222,8 +1368,14 @@ class TradingPlaybookApiTests(unittest.TestCase):
     def test_router_is_mounted_once_under_api_v1_prefix(self):
         from app.api.v1 import api_router
 
-        paths = [route.path for route in api_router.routes]
-        self.assertEqual(paths.count("/trading-playbook/rules"), 1)
+        operations = [
+            (route.path, method)
+            for route in api_router.routes
+            if route.path.startswith("/trading-playbook")
+            for method in route.methods
+        ]
+        self.assertEqual(len(operations), 12)
+        self.assertEqual(len(set(operations)), 12)
 
 
 if __name__ == "__main__":
