@@ -1,8 +1,10 @@
 import { ref, onUnmounted } from 'vue'
 import { useAlertStore } from '@/stores/alert'
 import { useLimitUpStore } from '@/stores/limit-up'
+import { useTradingPlaybookStore } from '@/stores/trading-playbook'
 import { useSpeech } from '@/composables/useSpeech'
 import type { TdxLimitUpEvent, TdxNewsItem } from '@/types/tdx-plugins'
+import type { TradingAlertEvent } from '@/types/trading-playbook'
 
 interface WebSocketMessage {
   type: string
@@ -125,6 +127,7 @@ export function useWebSocket() {
   
   const alertStore = useAlertStore()
   const limitUpStore = useLimitUpStore()
+  const tradingPlaybookStore = useTradingPlaybookStore()
 
   let reconnectTimer: number | null = null
   let pingTimer: number | null = null
@@ -290,6 +293,10 @@ export function useWebSocket() {
             { force: true }
           )
         }
+        break
+
+      case 'trading_plan_alert':
+        tradingPlaybookStore.receiveAlert(message.data as TradingAlertEvent)
         break
 
       case 'market_update':
