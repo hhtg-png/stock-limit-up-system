@@ -14,6 +14,7 @@ from app.config import settings
 from app.models.market_review import MarketReviewStockDaily
 from app.models.stock import Stock
 from app.models.trading_playbook import TradingPlanCandidate, TradingPlanVersion
+from app.services.realtime_limit_up_service import RealtimeLimitUpSnapshot
 from app.services.trading_playbook.domain import (
     CandidateSnapshot,
     DataQuality,
@@ -53,6 +54,7 @@ class _KlineBuildResult:
     features: Dict[str, Any]
     available_at: Optional[datetime]
     reason: Optional[str] = None
+    evidence_trade_date: Optional[date] = None
 
 
 class TradingPlaybookMarketDataProvider:
@@ -471,7 +473,11 @@ class TradingPlaybookMarketDataProvider:
                 and captured_time >= time(15, 0)
             )
         if stage == "auction":
-            return cls._is_auction_timestamp(local_captured, trade_date)
+            return (
+                cls._is_auction_timestamp(local_captured, trade_date)
+                and cls._age_seconds(local_as_of, local_captured)
+                <= settings.TRADING_PLAYBOOK_AUCTION_QUOTE_MAX_AGE_SECONDS
+            )
         return cls._age_seconds(local_as_of, local_captured) <= cls.STALE_AFTER_SECONDS
 
     @classmethod
@@ -590,6 +596,7 @@ class TradingPlaybookMarketDataProvider:
         local_as_of = self._china_datetime(as_of)
         accepted = []
         accepted_times = []
+        accepted_dates = []
         try:
             for point in points:
                 if not isinstance(point, Mapping):
@@ -619,6 +626,7 @@ class TradingPlaybookMarketDataProvider:
                     continue
                 accepted.append(point)
                 accepted_times.append(available_at)
+                accepted_dates.append(bar_date)
         except Exception as exc:
             return _KlineBuildResult(
                 missing,
@@ -635,6 +643,7 @@ class TradingPlaybookMarketDataProvider:
             features,
             self._evidence_datetime(available_at, as_of),
             reason,
+            max(accepted_dates) if accepted_dates else None,
         )
 
     async def build_market_snapshot(
@@ -741,20 +750,41 @@ class TradingPlaybookMarketDataProvider:
             warnings.append(context_warning)
 
         realtime_rows: List[Dict[str, Any]] = []
-        realtime_loaded = False
-        pool_trade_date = min(target_trade_date, local_as_of.date())
+        realtime_snapshot = RealtimeLimitUpSnapshot(
+            items=[],
+            authoritative=False,
+            complete=False,
+            evidence_trade_date=None,
+            warning="realtime limit-up pool unavailable",
+        )
+        pool_trade_date = (
+            evidence_trade_date
+            if stage == "overnight"
+            else min(target_trade_date, local_as_of.date())
+        )
+        expected_realtime_date = (
+            evidence_trade_date if stage == "overnight" else pool_trade_date
+        )
         try:
-            realtime_rows = await self._load_realtime_limit_up(pool_trade_date)
-            realtime_loaded = True
+            realtime_snapshot = await self._load_realtime_limit_up(pool_trade_date)
+            realtime_rows = list(realtime_snapshot.items)
+            if realtime_snapshot.warning:
+                warnings.append(realtime_snapshot.warning)
         except Exception as exc:
             warnings.append(f"realtime limit-up pool failed: {exc}")
         realtime_by_code: Dict[str, Dict[str, Any]] = {}
         realtime_provenance_by_code: Dict[str, datetime] = {}
         realtime_context_rows: List[Dict[str, Any]] = []
-        realtime_context_complete = realtime_loaded
-        expected_realtime_date = (
-            evidence_trade_date if stage == "overnight" else pool_trade_date
+        realtime_context_complete = (
+            realtime_snapshot.authoritative
+            and realtime_snapshot.complete
+            and realtime_snapshot.evidence_trade_date == expected_realtime_date
         )
+        if (
+            realtime_snapshot.evidence_trade_date is not None
+            and realtime_snapshot.evidence_trade_date != expected_realtime_date
+        ):
+            warnings.append("mismatched realtime snapshot evidence date")
         for row in realtime_rows or []:
             if not isinstance(row, dict):
                 warnings.append("invalid realtime limit-up row")
@@ -1002,6 +1032,8 @@ class TradingPlaybookMarketDataProvider:
                 quote_field_quality=quote_field_quality,
                 realtime_rows=realtime_context_rows,
                 realtime_complete=realtime_context_complete,
+                realtime_evidence_date=realtime_snapshot.evidence_trade_date,
+                kline_scope_codes=kline_load_order,
                 kline_by_code=kline_by_code,
                 review_history_by_code=review_history_by_code,
             )
@@ -1042,6 +1074,9 @@ class TradingPlaybookMarketDataProvider:
                     {
                         "source": "tencent",
                         "as_of": quote.captured_at,
+                        "evidence_trade_date": self._china_datetime(
+                            quote.captured_at
+                        ).date(),
                         "quality": self._quote_evidence_quality(
                             quote,
                             as_of,
@@ -1067,6 +1102,9 @@ class TradingPlaybookMarketDataProvider:
                 rank_evidence = {
                     "source": "full_market_quote_rank",
                     "as_of": quote.captured_at,
+                    "evidence_trade_date": self._china_datetime(
+                        quote.captured_at
+                    ).date(),
                     "quality": self._rank_timestamp_quality(
                         quote,
                         as_of,
@@ -1099,6 +1137,7 @@ class TradingPlaybookMarketDataProvider:
             kline_evidence = {
                 "source": "kline",
                 "as_of": kline_result.available_at,
+                "evidence_trade_date": kline_result.evidence_trade_date,
                 "quality": kline_quality,
             }
             if kline_quality != "ready":
@@ -1118,6 +1157,7 @@ class TradingPlaybookMarketDataProvider:
                     {
                         "source": "realtime_limit_up_pool",
                         "as_of": realtime_provenance_by_code[code],
+                        "evidence_trade_date": realtime_snapshot.evidence_trade_date,
                         "quality": "ready",
                     }
                 )
@@ -1317,6 +1357,8 @@ class TradingPlaybookMarketDataProvider:
         quote_field_quality: QuoteFieldQuality,
         realtime_rows: List[Dict[str, Any]],
         realtime_complete: bool,
+        realtime_evidence_date: Optional[date],
+        kline_scope_codes: List[str],
         kline_by_code: Mapping[str, _KlineBuildResult],
         review_history_by_code: Mapping[str, List[MarketReviewStockDaily]],
     ) -> Tuple[Dict[str, Any], List[Dict[str, Any]], Optional[str]]:
@@ -1368,12 +1410,8 @@ class TradingPlaybookMarketDataProvider:
             field_provenance[key] = provenance
             computed_fields[key] = provenance
 
-        if realtime_complete:
-            realtime_date = (
-                cls._parse_date_value(evidence[0].get("evidence_trade_date"))
-                if evidence
-                else None
-            ) or source_trade_date
+        if realtime_complete and realtime_evidence_date is not None:
+            realtime_date = realtime_evidence_date
             publish(
                 "limit_up_count",
                 len(realtime_rows),
@@ -1443,6 +1481,12 @@ class TradingPlaybookMarketDataProvider:
         )
         quote_complete = bool(universe_codes) and quote_coverage >= 0.9
         if quote_complete:
+            quote_evidence_date = max(
+                cls._china_datetime(
+                    quote_snapshot.quotes[code].captured_at
+                ).date()
+                for code in quote_ready_codes
+            )
             limit_down_count = sum(
                 cls._is_limit_down_quote(
                     code,
@@ -1454,7 +1498,7 @@ class TradingPlaybookMarketDataProvider:
                 "limit_down_count",
                 limit_down_count,
                 source="full_market_quote",
-                evidence_date=source_trade_date,
+                evidence_date=quote_evidence_date,
                 coverage=quote_coverage,
             )
             prior_limit_down = cls._optional_float(
@@ -1465,14 +1509,14 @@ class TradingPlaybookMarketDataProvider:
                     "sell_pressure_falling",
                     limit_down_count < prior_limit_down,
                     source="full_market_quote_vs_daily_metric",
-                    evidence_date=source_trade_date,
+                    evidence_date=quote_evidence_date,
                     coverage=quote_coverage,
                 )
                 publish(
                     "sell_pressure_rising",
                     limit_down_count > prior_limit_down,
                     source="full_market_quote_vs_daily_metric",
-                    evidence_date=source_trade_date,
+                    evidence_date=quote_evidence_date,
                     coverage=quote_coverage,
                 )
             prior_up = cls._optional_float(
@@ -1494,38 +1538,61 @@ class TradingPlaybookMarketDataProvider:
                     "breadth_recovered",
                     current_up > current_down and prior_up <= prior_down,
                     source="full_market_quote_vs_daily_metric",
-                    evidence_date=source_trade_date,
+                    evidence_date=quote_evidence_date,
                     coverage=quote_coverage,
                 )
 
         ready_klines = [
-            result
-            for result in kline_by_code.values()
-            if result.features.get("kline_quality") == "ready"
+            kline_by_code[code]
+            for code in kline_scope_codes
+            if code in kline_by_code
+            if kline_by_code[code].features.get("kline_quality") == "ready"
         ]
+        # The bounded union is useful evidence only under an explicit sample
+        # contract. It must never masquerade as a full-market aggregate.
+        sample_fields: Dict[str, Dict[str, Any]] = {}
         kline_coverage = (
-            len(ready_klines) / len(kline_by_code)
-            if kline_by_code
+            len(ready_klines) / len(kline_scope_codes)
+            if kline_scope_codes
             else 0.0
         )
-        if kline_by_code and kline_coverage >= 0.8:
-            publish(
-                "trend_new_high_count",
-                sum(bool(row.features.get("n_day_high")) for row in ready_klines),
-                source="bounded_kline_candidate_union",
-                evidence_date=source_trade_date,
-                coverage=kline_coverage,
+        if kline_scope_codes:
+            sample_evidence_date = max(
+                (
+                    row.evidence_trade_date
+                    for row in ready_klines
+                    if row.evidence_trade_date is not None
+                ),
+                default=None,
             )
-            publish(
-                "trend_new_high_count_prev",
+
+            def publish_sample(key: str, value: Any) -> None:
+                values[key] = value
+                provenance = {
+                    "source": "bounded_sample",
+                    "scope": "bounded_candidate_union",
+                    "trade_date": sample_evidence_date,
+                    "coverage": round(kline_coverage, 4),
+                }
+                sample_fields[key] = provenance
+
+            publish_sample(
+                "trend_new_high_sample_count",
+                sum(bool(row.features.get("n_day_high")) for row in ready_klines),
+            )
+            publish_sample(
+                "trend_new_high_sample_count_prev",
                 sum(
                     bool(row.features.get("prior_n_day_high"))
                     for row in ready_klines
                 ),
-                source="bounded_kline_candidate_union",
-                evidence_date=source_trade_date,
-                coverage=kline_coverage,
             )
+            publish_sample("trend_sample_size", len(kline_scope_codes))
+            publish_sample(
+                "trend_sample_ready_coverage",
+                round(kline_coverage, 4),
+            )
+            publish_sample("trend_scope", "bounded_candidate_union")
 
         if field_quality.get("negative_feedback") == "missing" and quote_complete:
             prior_rows = {}
@@ -1553,7 +1620,7 @@ class TradingPlaybookMarketDataProvider:
                         for code in popular_codes
                     ),
                     source="daily_analysis_popular_to_quote_limit_down",
-                    evidence_date=source_trade_date,
+                    evidence_date=quote_evidence_date,
                     coverage=quote_coverage,
                 )
 
@@ -1582,6 +1649,21 @@ class TradingPlaybookMarketDataProvider:
                         key: field_quality[key] for key in computed_fields
                     },
                     "field_provenance": computed_fields,
+                }
+            )
+        if sample_fields:
+            merged_evidence.append(
+                {
+                    "source": "bounded_sample",
+                    "scope": "bounded_candidate_union",
+                    "as_of": as_of,
+                    "quality": (
+                        "ready" if kline_coverage >= 0.8 else "degraded"
+                    ),
+                    "field_quality": {
+                        key: "computed" for key in sample_fields
+                    },
+                    "field_provenance": sample_fields,
                 }
             )
         missing = [
@@ -1764,12 +1846,30 @@ class TradingPlaybookMarketDataProvider:
     async def _load_realtime_limit_up(
         self,
         trade_date: date,
-    ) -> List[Dict[str, Any]]:
+    ) -> RealtimeLimitUpSnapshot:
         if self.realtime_limit_up_loader is not None:
-            return await self.realtime_limit_up_loader(trade_date)
+            loaded = await self.realtime_limit_up_loader(trade_date)
+            if isinstance(loaded, RealtimeLimitUpSnapshot):
+                return loaded
+            if isinstance(loaded, list):
+                # Legacy non-empty injection remains usable for candidates,
+                # but a plain empty list is not authoritative evidence of 0.
+                complete = bool(loaded)
+                return RealtimeLimitUpSnapshot(
+                    items=loaded,
+                    authoritative=complete,
+                    complete=complete,
+                    evidence_trade_date=trade_date if complete else None,
+                    warning=(
+                        None
+                        if complete
+                        else "unstructured empty realtime limit-up pool"
+                    ),
+                )
+            raise TypeError("invalid realtime limit-up snapshot")
         from app.services.realtime_limit_up_service import realtime_limit_up_service
 
-        return await realtime_limit_up_service.get_fast_limit_up_pool(trade_date)
+        return await realtime_limit_up_service.get_fast_limit_up_snapshot(trade_date)
 
     @classmethod
     def _normalize_realtime_row(
@@ -1860,6 +1960,7 @@ class TradingPlaybookMarketDataProvider:
             valid_timestamp = (
                 quote is not None
                 and field_quality.get("timestamp") == "ready"
+                and field_quality.get("_baseline_freshness") == "ready"
                 and self._is_auction_timestamp(
                     quote.captured_at,
                     target_trade_date,

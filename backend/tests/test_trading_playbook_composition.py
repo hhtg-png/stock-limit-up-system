@@ -111,6 +111,29 @@ class TradingPlaybookProductionCompositionTests(unittest.IsolatedAsyncioTestCase
             "000001", "SZ", "day", 60, stock_name="平安银行"
         )
 
+    async def test_realtime_adapter_returns_strict_snapshot_contract(self):
+        from app.services.realtime_limit_up_service import RealtimeLimitUpSnapshot
+        from app.services.trading_playbook.composition import (
+            load_production_realtime_limit_up,
+        )
+
+        trade_date = date(2026, 7, 13)
+        expected = RealtimeLimitUpSnapshot(
+            items=[],
+            authoritative=True,
+            complete=True,
+            evidence_trade_date=trade_date,
+        )
+        with patch(
+            "app.services.trading_playbook.composition."
+            "realtime_limit_up_service.get_fast_limit_up_snapshot",
+            AsyncMock(return_value=expected),
+        ) as loader:
+            result = await load_production_realtime_limit_up(trade_date)
+
+        self.assertEqual(result, expected)
+        loader.assert_awaited_once_with(trade_date)
+
     async def test_adapter_derives_point_in_time_fields_from_real_orm_rows(self):
         from app.services.trading_playbook.composition import (
             load_production_full_market_context,
@@ -157,8 +180,79 @@ class TradingPlaybookProductionCompositionTests(unittest.IsolatedAsyncioTestCase
         self.assertEqual(result["quality"], "degraded")
         self.assertEqual(result["field_quality"]["limit_up_count"], "missing")
         self.assertNotIn("limit_up_count", result)
-        self.assertEqual(result["prior_window"], "")
-        self.assertEqual(result["divergence_days"], 0)
+        self.assertNotIn("prior_window", result)
+        self.assertNotIn("divergence_days", result)
+        self.assertEqual(result["field_quality"]["prior_window"], "missing")
+        self.assertEqual(result["field_quality"]["divergence_days"], "missing")
+
+    async def test_same_day_plan_is_never_used_as_previous_session_state(self):
+        from app.services.trading_playbook.composition import (
+            load_production_full_market_context,
+        )
+
+        async with self.Session() as db:
+            db.add_all(
+                [
+                    self._metric(date(2026, 7, 13)),
+                    self._metric(date(2026, 7, 10)),
+                    TradingPlanVersion(
+                        source_trade_date=date(2026, 7, 13),
+                        target_trade_date=date(2026, 7, 14),
+                        stage="preclose",
+                        version_no=1,
+                        market_state_json={
+                            "window": "first_divergence",
+                            "divergence_days": 1,
+                        },
+                        input_hash="same-day",
+                        generated_at=datetime(2026, 7, 13, 14, 40),
+                    ),
+                ]
+            )
+            await db.commit()
+
+        result = await load_production_full_market_context(
+            date(2026, 7, 13),
+            "after_close",
+            CN_TZ.localize(datetime(2026, 7, 13, 15, 30)),
+            session_factory=self.Session,
+        )
+
+        self.assertNotIn("prior_window", result)
+        self.assertNotIn("divergence_days", result)
+
+    async def test_previous_session_after_close_plan_advances_divergence_once(self):
+        from app.services.trading_playbook.composition import (
+            load_production_full_market_context,
+        )
+
+        await self._seed_complete_persisted_context()
+        async with self.Session() as db:
+            db.add(
+                TradingPlanVersion(
+                    source_trade_date=date(2026, 7, 13),
+                    target_trade_date=date(2026, 7, 14),
+                    stage="preclose",
+                    version_no=1,
+                    market_state_json={
+                        "window": "first_divergence",
+                        "divergence_days": 99,
+                    },
+                    input_hash="same-day-newer",
+                    generated_at=datetime(2026, 7, 13, 14, 40),
+                )
+            )
+            await db.commit()
+
+        result = await load_production_full_market_context(
+            date(2026, 7, 13),
+            "after_close",
+            CN_TZ.localize(datetime(2026, 7, 13, 15, 30)),
+            session_factory=self.Session,
+        )
+
+        self.assertEqual(result["prior_window"], "first_divergence")
+        self.assertEqual(result["divergence_days"], 2)
 
     async def test_partial_previous_metric_cannot_supply_previous_comparisons(self):
         from app.services.trading_playbook.composition import (

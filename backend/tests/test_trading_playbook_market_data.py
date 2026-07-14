@@ -1006,6 +1006,257 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         await self.engine.dispose()
 
+    def test_bounded_kline_sample_never_populates_full_market_trend_fields(self):
+        from app.services.trading_playbook.domain import DataQuality, QuoteSnapshot
+        from app.services.trading_playbook.market_data import (
+            TradingPlaybookMarketDataProvider,
+            _KlineBuildResult,
+        )
+
+        trade_date = date(2026, 7, 13)
+        as_of = datetime(2026, 7, 13, 15, 30)
+        scope_codes = [f"{index:06d}" for index in range(100)]
+        ready = {
+            "n_day_high": True,
+            "prior_n_day_high": False,
+            "consolidation_days": 0,
+            "trend_established": True,
+            "kline_quality": "ready",
+        }
+        kline_by_code = {
+            code: _KlineBuildResult(
+                ready,
+                as_of,
+                evidence_trade_date=trade_date,
+            )
+            for code in scope_codes[:2]
+        }
+        values, evidence, _warning = (
+            TradingPlaybookMarketDataProvider._complete_market_context(
+                {},
+                [],
+                source_trade_date=trade_date,
+                stage="after_close",
+                as_of=as_of,
+                universe_codes=scope_codes,
+                quote_snapshot=QuoteSnapshot(
+                    trade_date=trade_date,
+                    quotes={},
+                    quality=DataQuality(
+                        status="degraded",
+                        as_of=as_of,
+                        source="test",
+                    ),
+                ),
+                quote_field_quality={},
+                realtime_rows=[],
+                realtime_complete=False,
+                realtime_evidence_date=None,
+                kline_scope_codes=scope_codes,
+                kline_by_code=kline_by_code,
+                review_history_by_code={},
+            )
+        )
+
+        self.assertNotIn("trend_new_high_count", values)
+        self.assertNotIn("trend_new_high_count_prev", values)
+        self.assertEqual(values["trend_new_high_sample_count"], 2)
+        self.assertEqual(values["trend_new_high_sample_count_prev"], 0)
+        self.assertEqual(values["trend_sample_size"], 100)
+        self.assertEqual(values["trend_sample_ready_coverage"], 0.02)
+        self.assertEqual(values["trend_scope"], "bounded_candidate_union")
+        self.assertEqual(
+            evidence[-1]["field_provenance"]["trend_new_high_sample_count"][
+                "source"
+            ],
+            "bounded_sample",
+        )
+
+    def test_realtime_empty_pool_requires_explicit_authoritative_snapshot(self):
+        from app.services.trading_playbook.domain import DataQuality, QuoteSnapshot
+        from app.services.trading_playbook.market_data import (
+            TradingPlaybookMarketDataProvider,
+        )
+
+        trade_date = date(2026, 7, 13)
+        as_of = datetime(2026, 7, 13, 15, 30)
+
+        def complete(authoritative: bool):
+            return TradingPlaybookMarketDataProvider._complete_market_context(
+                {},
+                [],
+                source_trade_date=trade_date,
+                stage="after_close",
+                as_of=as_of,
+                universe_codes=[],
+                quote_snapshot=QuoteSnapshot(
+                    trade_date=trade_date,
+                    quotes={},
+                    quality=DataQuality("ready", as_of, "test"),
+                ),
+                quote_field_quality={},
+                realtime_rows=[],
+                realtime_complete=authoritative,
+                realtime_evidence_date=trade_date if authoritative else None,
+                kline_scope_codes=[],
+                kline_by_code={},
+                review_history_by_code={},
+            )[0]
+
+        unavailable = complete(False)
+        authoritative_empty = complete(True)
+
+        self.assertNotIn("limit_up_count", unavailable)
+        self.assertNotIn("max_board_height", unavailable)
+        self.assertEqual(authoritative_empty["limit_up_count"], 0)
+        self.assertEqual(authoritative_empty["max_board_height"], 0)
+
+    async def test_auction_quote_age_is_strictly_bounded(self):
+        from app.services.trading_playbook.market_data import (
+            TradingPlaybookMarketDataProvider,
+        )
+
+        trade_date = date(2026, 7, 14)
+        as_of = datetime(2026, 7, 14, 9, 26)
+
+        self.assertFalse(
+            TradingPlaybookMarketDataProvider._quote_baseline_ready(
+                stage="auction",
+                trade_date=trade_date,
+                evidence_trade_date=trade_date,
+                captured_at=datetime(2026, 7, 14, 9, 15),
+                as_of=as_of,
+            )
+        )
+        self.assertTrue(
+            TradingPlaybookMarketDataProvider._quote_baseline_ready(
+                stage="auction",
+                trade_date=trade_date,
+                evidence_trade_date=trade_date,
+                captured_at=datetime(2026, 7, 14, 9, 25),
+                as_of=as_of,
+            )
+        )
+        self.assertFalse(
+            TradingPlaybookMarketDataProvider._quote_baseline_ready(
+                stage="auction",
+                trade_date=trade_date,
+                evidence_trade_date=trade_date,
+                captured_at=datetime(2026, 7, 14, 9, 27),
+                as_of=as_of,
+            )
+        )
+
+    async def test_kline_result_records_actual_latest_bar_trade_date(self):
+        from app.services.trading_playbook.market_data import (
+            TradingPlaybookMarketDataProvider,
+        )
+
+        async def loader(*args, **kwargs):
+            return [
+                {
+                    "date": date(2026, 7, 10) - timedelta(days=offset),
+                    "close": 10 + index,
+                }
+                for index, offset in enumerate(range(5, -1, -1))
+            ]
+
+        result = await TradingPlaybookMarketDataProvider(
+            quote_api=_FakeQuoteAPI(),
+            kline_loader=loader,
+        )._kline_features_as_of(
+            "000001",
+            "SZ",
+            "Weekend provenance",
+            date(2026, 7, 13),
+            datetime(2026, 7, 13, 8, 50),
+        )
+
+        self.assertEqual(result.evidence_trade_date, date(2026, 7, 10))
+
+    async def test_overnight_evidence_keeps_friday_quote_and_bar_dates(self):
+        from app.services.realtime_limit_up_service import RealtimeLimitUpSnapshot
+        from app.services.trading_playbook.market_data import (
+            TradingPlaybookMarketDataProvider,
+        )
+
+        monday = date(2026, 7, 13)
+        friday = date(2026, 7, 10)
+        as_of = datetime(2026, 7, 13, 8, 50)
+        async with self.session_factory() as db:
+            db.add(
+                Stock(
+                    stock_code="000001",
+                    stock_name="Weekend evidence",
+                    market="SZ",
+                    is_st=0,
+                )
+            )
+            await db.commit()
+
+            async def kline_loader(*args, **kwargs):
+                return [
+                    {
+                        "date": friday - timedelta(days=offset),
+                        "close": 10 + index,
+                    }
+                    for index, offset in enumerate(range(5, -1, -1))
+                ]
+
+            async def context_loader(trade_date, stage, captured_at):
+                return {
+                    "scope": "full_market",
+                    "trade_date": monday,
+                    "evidence_trade_date": friday,
+                    "as_of": datetime(2026, 7, 10, 15, 30),
+                    "quality": "degraded",
+                    "field_quality": {},
+                }
+
+            requested_pool_dates = []
+
+            async def realtime_loader(trade_date):
+                requested_pool_dates.append(trade_date)
+                return RealtimeLimitUpSnapshot(
+                    items=[],
+                    authoritative=True,
+                    complete=True,
+                    evidence_trade_date=trade_date,
+                )
+
+            snapshot = await TradingPlaybookMarketDataProvider(
+                quote_api=_FakeQuoteAPI(
+                    {
+                        "000001": _quote_payload(
+                            "000001",
+                            10.5,
+                            "20260710150100",
+                        )
+                    }
+                ),
+                kline_loader=kline_loader,
+                realtime_limit_up_loader=realtime_loader,
+                full_market_context_loader=context_loader,
+            ).build_market_snapshot(
+                db=db,
+                source_trade_date=monday,
+                target_trade_date=monday,
+                stage="overnight",
+                as_of=as_of,
+            )
+
+        candidate = snapshot.candidates[0]
+        quote_evidence = next(
+            item for item in candidate.evidence if item["source"] == "tencent"
+        )
+        kline_evidence = next(
+            item for item in candidate.evidence if item["source"] == "kline"
+        )
+        self.assertEqual(requested_pool_dates, [friday])
+        self.assertEqual(quote_evidence["evidence_trade_date"], friday)
+        self.assertEqual(kline_evidence["evidence_trade_date"], friday)
+        self.assertNotIn("speed_pct", candidate.features)
+
     async def test_full_market_context_loader_populates_point_in_time_features(self):
         from app.services.trading_playbook.market_data import (
             TradingPlaybookMarketDataProvider,
@@ -2153,8 +2404,8 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
             await db.commit()
 
             payload = {
-                "000001": _quote_payload("000001", 10.5, "20260713092000"),
-                "000002": _quote_payload("000002", 10.2, "20260713092100"),
+                "000001": _quote_payload("000001", 10.5, "20260713092400"),
+                "000002": _quote_payload("000002", 10.2, "20260713092430"),
                 "000003": _quote_payload("000003", 10.1, "20260713093000"),
             }
 
@@ -2265,31 +2516,31 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
             )
             await db.commit()
 
-            missing = _quote_payload("000010", 10, "20260713092000")
+            missing = _quote_payload("000010", 10, "20260713092400")
             for key in ("pre_close", "amount", "bid1_volume"):
                 missing.pop(key)
 
-            valid_zero = _quote_payload("000011", 10, "20260713092000")
+            valid_zero = _quote_payload("000011", 10, "20260713092400")
             valid_zero.pop("pre_close")
             valid_zero["change_pct"] = 0
             valid_zero["amount"] = 0
             valid_zero["bid1_volume"] = 0
 
-            partial = _quote_payload("000012", 10.5, "20260713092000")
+            partial = _quote_payload("000012", 10.5, "20260713092400")
             partial["amount"] = "bad"
             partial["bid1_volume"] = float("nan")
 
-            invalid_price = _quote_payload("000013", 10, "20260713092000")
+            invalid_price = _quote_payload("000013", 10, "20260713092400")
             invalid_price["price"] = "bad"
 
-            raw_change = _quote_payload("000014", 10.2, "20260713092000")
+            raw_change = _quote_payload("000014", 10.2, "20260713092400")
             raw_change.pop("pre_close")
             raw_change["change_pct"] = 2
 
             overflow_change = _quote_payload(
                 "000015",
                 1e308,
-                "20260713092000",
+                "20260713092400",
                 pre_close=1e-308,
             )
 
@@ -3210,10 +3461,10 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
                 quote_api=_FakeQuoteAPI(
                     {
                         "000001": _quote_payload(
-                            "000001", 10.5, "20260713092000"
+                            "000001", 10.5, "20260713092400"
                         ),
                         "000002": _quote_payload(
-                            "000002", 10.2, "20260713092000"
+                            "000002", 10.2, "20260713092400"
                         ),
                     }
                 ),

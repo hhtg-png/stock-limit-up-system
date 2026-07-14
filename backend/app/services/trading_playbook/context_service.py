@@ -81,7 +81,11 @@ class ProductionMarketContextService:
                 evidence_date,
                 database_as_of,
             )
-            prior_plan = await self._prior_plan(db, trade_date, database_as_of)
+            prior_plan = await self._prior_plan(
+                db,
+                previous.trade_date if previous is not None else None,
+                database_as_of,
+            )
 
         values: dict[str, Any] = {}
         quality = {key: "missing" for key in FULL_MARKET_CONTEXT_FIELDS}
@@ -148,15 +152,11 @@ class ProductionMarketContextService:
                     analysis.trade_date,
                 )
 
-        prior_window = ""
-        divergence_days = 0
-        prior_plan_date = trade_date
         if prior_plan is not None:
             state = prior_plan.market_state_json or {}
             candidate_window = state.get("window")
             if isinstance(candidate_window, str) and candidate_window != "unknown":
-                prior_window = candidate_window
-                prior_plan_date = prior_plan.source_trade_date
+                prior_window = candidate_window.strip()
                 previous_divergence = state.get("divergence_days")
                 if isinstance(previous_divergence, int) and previous_divergence >= 0:
                     divergence_days = (
@@ -169,18 +169,18 @@ class ProductionMarketContextService:
                         }
                         else 0
                     )
-        publish(
-            "prior_window",
-            prior_window,
-            "trading_plan_market_state",
-            prior_plan_date,
-        )
-        publish(
-            "divergence_days",
-            divergence_days,
-            "trading_plan_market_state",
-            prior_plan_date,
-        )
+                    publish(
+                        "prior_window",
+                        prior_window,
+                        "trading_plan_market_state",
+                        prior_plan.source_trade_date,
+                    )
+                    publish(
+                        "divergence_days",
+                        divergence_days,
+                        "trading_plan_market_state",
+                        prior_plan.source_trade_date,
+                    )
 
         captured_candidates = [
             self._china_datetime(metric.updated_at)
@@ -247,14 +247,23 @@ class ProductionMarketContextService:
         return result.scalar_one_or_none()
 
     @staticmethod
-    async def _prior_plan(db, trade_date: date, database_as_of: datetime):
+    async def _prior_plan(
+        db,
+        prior_trade_date: Optional[date],
+        database_as_of: datetime,
+    ):
+        if prior_trade_date is None:
+            return None
         result = await db.execute(
             select(TradingPlanVersion)
             .where(
-                TradingPlanVersion.source_trade_date <= trade_date,
+                TradingPlanVersion.source_trade_date == prior_trade_date,
+                TradingPlanVersion.stage == "after_close",
                 TradingPlanVersion.generated_at <= database_as_of,
+                TradingPlanVersion.status.in_(("active", "confirmed", "draft")),
             )
             .order_by(
+                desc(TradingPlanVersion.version_no),
                 desc(TradingPlanVersion.generated_at),
                 desc(TradingPlanVersion.id),
             )

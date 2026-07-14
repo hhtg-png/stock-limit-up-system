@@ -18,6 +18,61 @@ from app.services.trading_playbook.market_state import (
 
 
 class TestMarketStateClassifier:
+    def test_bounded_trend_sample_requires_material_ready_coverage(self):
+        classifier = MarketStateClassifier()
+        common = {
+            "limit_down_count": 1,
+            "seal_rate": 70,
+            "max_board_height": 3,
+            "limit_up_count": 30,
+            "limit_up_count_prev": 25,
+        }
+
+        tiny = classifier.classify(
+            {
+                **common,
+                "trend_new_high_sample_count": 2,
+                "trend_new_high_sample_count_prev": 1,
+                "trend_sample_size": 2,
+                "trend_sample_ready_coverage": 1.0,
+                "trend_scope": "bounded_candidate_union",
+            }
+        )
+        production_sized = classifier.classify(
+            {
+                **common,
+                "trend_new_high_sample_count": 24,
+                "trend_new_high_sample_count_prev": 12,
+                "trend_sample_size": 52,
+                "trend_sample_ready_coverage": 1.0,
+                "trend_scope": "bounded_candidate_union",
+            }
+        )
+
+        assert tiny["style"] == "unknown"
+        assert tiny["trend_evidence_source"] is None
+        assert production_sized["style"] == "trend_main_wave"
+        assert production_sized["trend_evidence_source"] == "bounded_sample"
+
+    def test_bounded_trend_sample_below_ready_coverage_is_unknown(self):
+        result = MarketStateClassifier().classify(
+            {
+                "limit_down_count": 1,
+                "seal_rate": 70,
+                "max_board_height": 3,
+                "limit_up_count": 30,
+                "limit_up_count_prev": 25,
+                "trend_new_high_sample_count": 24,
+                "trend_new_high_sample_count_prev": 12,
+                "trend_sample_size": 52,
+                "trend_sample_ready_coverage": 0.79,
+                "trend_scope": "bounded_candidate_union",
+            }
+        )
+
+        assert result["style"] == "unknown"
+        assert result["trend_evidence_source"] is None
+
     def test_style_and_window_publish_dependency_quality(self):
         complete = MarketStateClassifier().classify(
             {

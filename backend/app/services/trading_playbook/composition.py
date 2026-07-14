@@ -7,7 +7,10 @@ from functools import partial
 from typing import Any, Callable, Optional
 
 from app.data_collectors.tencent_api import tencent_api
-from app.services.realtime_limit_up_service import realtime_limit_up_service
+from app.services.realtime_limit_up_service import (
+    RealtimeLimitUpSnapshot,
+    realtime_limit_up_service,
+)
 
 from .context_service import ProductionMarketContextService
 from .orchestrator import (
@@ -40,9 +43,9 @@ async def load_production_kline(
 
 async def load_production_realtime_limit_up(
     trade_date: date,
-) -> list[dict[str, Any]]:
+) -> RealtimeLimitUpSnapshot:
     """Read the existing bounded real-time limit-up pool."""
-    return await realtime_limit_up_service.get_fast_limit_up_pool(trade_date)
+    return await realtime_limit_up_service.get_fast_limit_up_snapshot(trade_date)
 
 
 async def load_production_full_market_context(

@@ -57,6 +57,9 @@ def _strict_flag(value: Any) -> Optional[bool]:
 class MarketStateClassifier:
     """Classify the dominant market style and the ordered cycle window."""
 
+    _MIN_BOUNDED_TREND_SAMPLE_SIZE = 20
+    _MIN_BOUNDED_TREND_READY_COVERAGE = 0.8
+
     _PRIOR_WINDOWS = {
         "",
         "outbreak",
@@ -88,7 +91,11 @@ class MarketStateClassifier:
             return value
 
         limit_up_count = read_number("limit_up_count")
-        trend_new_high_count = read_number("trend_new_high_count")
+        (
+            trend_new_high_count,
+            trend_new_high_count_prev,
+            trend_evidence_source,
+        ) = self._trend_evidence(features, missing_fields)
         limit_up_growth = self._growth(
             features,
             explicit_key="limit_up_growth",
@@ -96,13 +103,20 @@ class MarketStateClassifier:
             previous_key="limit_up_count_prev",
             missing_fields=missing_fields,
         )
-        trend_growth = self._growth(
-            features,
-            explicit_key="trend_growth",
-            current_key="trend_new_high_count",
-            previous_key="trend_new_high_count_prev",
-            missing_fields=missing_fields,
-        )
+        explicit_trend_growth = _finite_number(features.get("trend_growth"))
+        if explicit_trend_growth is not None:
+            trend_growth = explicit_trend_growth
+        elif (
+            trend_new_high_count is not None
+            and trend_new_high_count_prev is not None
+            and trend_new_high_count_prev > 0
+        ):
+            trend_growth = (
+                trend_new_high_count - trend_new_high_count_prev
+            ) / trend_new_high_count_prev
+        else:
+            missing_fields.add("trend_growth")
+            trend_growth = None
 
         limit_down_count = read_number("limit_down_count")
         seal_rate = read_number("seal_rate", maximum=100)
@@ -224,6 +238,7 @@ class MarketStateClassifier:
             "window": window,
             "limit_up_growth": limit_up_growth,
             "trend_growth": trend_growth,
+            "trend_evidence_source": trend_evidence_source,
             "quality": "degraded" if missing_fields else "ready",
             "missing_fields": sorted(missing_fields),
             "_feature_quality": {
@@ -231,6 +246,57 @@ class MarketStateClassifier:
                 "window": "ready" if window != "unknown" else "missing",
             },
         }
+
+    @classmethod
+    def _trend_evidence(
+        cls,
+        features: Mapping[str, Any],
+        missing_fields: set,
+    ) -> Tuple[Optional[float], Optional[float], Optional[str]]:
+        current = _bounded_number(
+            features.get("trend_new_high_count"),
+            minimum=0,
+        )
+        previous = _bounded_number(
+            features.get("trend_new_high_count_prev"),
+            minimum=0,
+        )
+        if current is not None and previous is not None:
+            return current, previous, "full_market"
+
+        sample_size = _bounded_number(
+            features.get("trend_sample_size"),
+            minimum=cls._MIN_BOUNDED_TREND_SAMPLE_SIZE,
+        )
+        ready_coverage = _bounded_number(
+            features.get("trend_sample_ready_coverage"),
+            minimum=cls._MIN_BOUNDED_TREND_READY_COVERAGE,
+            maximum=1,
+        )
+        sample_current = _bounded_number(
+            features.get("trend_new_high_sample_count"),
+            minimum=0,
+        )
+        sample_previous = _bounded_number(
+            features.get("trend_new_high_sample_count_prev"),
+            minimum=0,
+        )
+        sample_ready = (
+            features.get("trend_scope") == "bounded_candidate_union"
+            and sample_size is not None
+            and ready_coverage is not None
+            and sample_current is not None
+            and sample_previous is not None
+            and sample_current <= sample_size
+            and sample_previous <= sample_size
+        )
+        if sample_ready:
+            return sample_current, sample_previous, "bounded_sample"
+
+        missing_fields.update(
+            {"trend_new_high_count", "trend_new_high_count_prev"}
+        )
+        return None, None, None
 
     @staticmethod
     def _growth(
