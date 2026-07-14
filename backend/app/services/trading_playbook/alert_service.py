@@ -1332,7 +1332,7 @@ class TradingPlaybookAlertService:
                 str(self._candidate_value(candidate, "id")),
                 str(self._candidate_value(candidate, "primary_mode_key") or ""),
                 event_type,
-                condition_version[:16],
+                condition_version,
                 str(occurrence_no),
             )
         )

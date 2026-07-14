@@ -1830,7 +1830,13 @@ class TradingPlaybookActionMonitorTests(unittest.IsolatedAsyncioTestCase):
             events[0].dedup_key,
             f"action:{self.today.isoformat()}:{plan_id}:{candidate_id}:"
             "leader_turn_two:entry_triggered:"
-            f"{state.condition_version[:16]}:1",
+            f"{state.condition_version}:1",
+        )
+        self.assertEqual(len(state.condition_version), 64)
+        self.assertEqual(TradingAlertEvent.dedup_key.type.length, 255)
+        self.assertLessEqual(
+            len(events[0].dedup_key),
+            TradingAlertEvent.dedup_key.type.length,
         )
 
     async def test_restart_delivers_committed_pending_occurrence(self):
