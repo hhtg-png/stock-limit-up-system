@@ -21,6 +21,7 @@ from app.models.trading_playbook import (
     TradingPlanVersion,
     TradingPlaybookSettings,
 )
+from app.services.realtime_limit_up_service import RealtimeLimitUpSnapshot
 from app.utils.time_utils import CN_TZ, now_cn
 
 from .channels import TradingPlanAlertChannel
@@ -60,6 +61,7 @@ class TradingPlaybookAlertService:
         *,
         session_factory=None,
         quote_api=None,
+        realtime_limit_up_loader=None,
         trading_calendar=None,
         quote_timeout_seconds: float = 5.0,
         quote_max_age_seconds: float | None = None,
@@ -84,6 +86,7 @@ class TradingPlaybookAlertService:
         self.owner = uuid.uuid4().hex
         self.session_factory = session_factory
         self.quote_api = quote_api
+        self.realtime_limit_up_loader = realtime_limit_up_loader
         self.trading_calendar = trading_calendar
         self.quote_timeout_seconds = max(float(quote_timeout_seconds), 0.01)
         max_age = (
@@ -278,15 +281,13 @@ class TradingPlaybookAlertService:
         # session factory keeps loaded rows usable with expire_on_commit=False.
         await db.commit()
         codes = sorted({candidate.stock_code for _plan, candidate in rows})
-        try:
-            response = await asyncio.wait_for(
-                self.quote_api.get_quotes_batch(codes),
-                timeout=self.quote_timeout_seconds,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.error("Trading playbook monitor quote batch failed: {}", exc)
+        needs_open_count = self._rows_need_open_count(rows)
+        response, open_count_snapshot = await self._load_monitor_market_data(
+            codes,
+            trade_date,
+            needs_open_count=needs_open_count,
+        )
+        if response is None:
             return []
         quotes = self._normalize_quotes(
             response,
@@ -295,6 +296,16 @@ class TradingPlaybookAlertService:
         )
         if not quotes:
             return []
+        if needs_open_count:
+            open_counts = self._normalize_open_counts(
+                open_count_snapshot,
+                requested_codes=set(codes),
+                as_of=current,
+            )
+            for code, open_count in open_counts.items():
+                quote = quotes.get(code)
+                if quote is not None:
+                    quote["open_count"] = open_count
 
         channel_enabled = await self._channel_enabled(db)
         persisted: list[TradingAlertEvent] = []
@@ -337,6 +348,117 @@ class TradingPlaybookAlertService:
             for event in persisted:
                 await self._deliver(db, event)
         return persisted
+
+    @classmethod
+    def _rows_need_open_count(cls, rows: list[tuple[Any, Any]]) -> bool:
+        for _plan, candidate in rows:
+            for name in (
+                "invalidation_json",
+                "exit_trigger_json",
+                "entry_trigger_json",
+            ):
+                condition = cls._candidate_value(candidate, name)
+                if isinstance(condition, Mapping) and "open_count_gte" in condition:
+                    return True
+        return False
+
+    async def _load_monitor_market_data(
+        self,
+        codes: list[str],
+        trade_date: date,
+        *,
+        needs_open_count: bool,
+    ) -> tuple[Any | None, Any | None]:
+        quote_task = asyncio.create_task(self.quote_api.get_quotes_batch(codes))
+        tasks = {quote_task}
+        pool_task = None
+        if needs_open_count and callable(self.realtime_limit_up_loader):
+            pool_task = asyncio.create_task(
+                self.realtime_limit_up_loader(trade_date)
+            )
+            tasks.add(pool_task)
+        try:
+            done, pending = await asyncio.wait(
+                tasks,
+                timeout=self.quote_timeout_seconds,
+            )
+        except asyncio.CancelledError:
+            await self._cancel_monitor_tasks(tasks)
+            raise
+
+        if pending:
+            await self._cancel_monitor_tasks(pending)
+        if quote_task not in done:
+            logger.error("Trading playbook monitor quote batch timed out")
+            return None, None
+        try:
+            response = quote_task.result()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("Trading playbook monitor quote batch failed: {}", exc)
+            return None, None
+
+        snapshot = None
+        if pool_task is not None:
+            if pool_task in done:
+                try:
+                    snapshot = pool_task.result()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning(
+                        "Trading playbook monitor open-count snapshot failed: {}",
+                        exc,
+                    )
+            else:
+                logger.warning(
+                    "Trading playbook monitor open-count snapshot timed out"
+                )
+        return response, snapshot
+
+    @staticmethod
+    async def _cancel_monitor_tasks(tasks) -> None:
+        pending = list(tasks)
+        for task in pending:
+            if not task.done():
+                task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    def _normalize_open_counts(
+        self,
+        snapshot: Any,
+        *,
+        requested_codes: set[str],
+        as_of: datetime,
+    ) -> dict[str, int]:
+        if not isinstance(snapshot, RealtimeLimitUpSnapshot):
+            return {}
+        if (
+            snapshot.authoritative is not True
+            or snapshot.complete is not True
+            or snapshot.evidence_trade_date != as_of.date()
+        ):
+            return {}
+        normalized: dict[str, int] = {}
+        for item in snapshot.items:
+            if not isinstance(item, Mapping):
+                continue
+            code = item.get("stock_code")
+            if type(code) is not str or code not in requested_codes:
+                continue
+            collected_at = self._parse_quote_datetime(item.get("_collected_at"))
+            if collected_at is None or collected_at.date() != as_of.date():
+                continue
+            age_seconds = (as_of - collected_at).total_seconds()
+            if age_seconds < 0 or age_seconds > self.quote_max_age_seconds:
+                continue
+            open_count = item.get("open_count")
+            if type(open_count) is not int or open_count < 0:
+                continue
+            normalized[code] = open_count
+        return normalized
 
     async def evaluate_candidate(
         self,
@@ -416,12 +538,23 @@ class TradingPlaybookAlertService:
         if not isinstance(condition, Mapping) or not isinstance(quote, Mapping):
             return False
         actionable = False
+        raw_missing_fields = quote.get("_missing_fields")
+        missing_fields = {
+            str(value)
+            for value in (
+                raw_missing_fields
+                if isinstance(raw_missing_fields, (list, tuple, set, frozenset))
+                else ()
+            )
+        }
         for key, expected in condition.items():
             if key in _CONDITION_METADATA:
                 continue
             actionable = True
             if key == "sealed":
                 if not isinstance(expected, bool):
+                    return False
+                if "sealed" in missing_fields:
                     return False
                 actual = quote.get("sealed")
                 if not isinstance(actual, bool) or actual is not expected:
@@ -431,9 +564,17 @@ class TradingPlaybookAlertService:
             if numeric is None:
                 return False
             quote_key, operation = numeric
+            if quote_key in missing_fields:
+                return False
+            if quote_key == "open_count":
+                open_count = quote.get(quote_key)
+                if type(open_count) is not int or open_count < 0:
+                    return False
             actual_number = cls._finite_number(quote.get(quote_key))
             expected_number = cls._finite_number(expected)
             if actual_number is None or expected_number is None:
+                return False
+            if quote_key == "price" and actual_number <= 0:
                 return False
             if operation == "gte" and actual_number < expected_number:
                 return False
@@ -504,6 +645,19 @@ class TradingPlaybookAlertService:
             if code not in requested_codes:
                 continue
             quote = dict(value)
+            raw_missing_fields = quote.get("_missing_fields")
+            missing_fields = {
+                str(item)
+                for item in (
+                    raw_missing_fields
+                    if isinstance(
+                        raw_missing_fields,
+                        (list, tuple, set, frozenset),
+                    )
+                    else ()
+                )
+            }
+            quote["_missing_fields"] = sorted(missing_fields)
             captured_at = self._parse_quote_datetime(
                 quote.get("datetime")
                 or quote.get("as_of")
@@ -520,14 +674,21 @@ class TradingPlaybookAlertService:
                 sealed = quote.get("is_sealed")
             if not isinstance(sealed, bool):
                 price = self._finite_number(quote.get("price"))
-                limit_up = self._finite_number(
-                    quote.get("limit_up", quote.get("limit_up_price"))
+                limit_up_key = (
+                    "limit_up" if "limit_up" in quote else "limit_up_price"
                 )
+                limit_up = self._finite_number(quote.get(limit_up_key))
                 bid_volume = self._finite_number(quote.get("bid1_volume"))
                 if (
-                    price is not None
+                    "price" not in missing_fields
+                    and limit_up_key not in missing_fields
+                    and "bid1_volume" not in missing_fields
+                    and price is not None
+                    and price > 0
                     and limit_up is not None
+                    and limit_up > 0
                     and bid_volume is not None
+                    and bid_volume >= 0
                 ):
                     sealed = price >= limit_up - 0.001 and bid_volume > 0
             if isinstance(sealed, bool):
@@ -661,7 +822,7 @@ class TradingPlaybookAlertService:
         if self.channel_name != "in_app":
             return True
         settings = await db.get(TradingPlaybookSettings, 1)
-        return settings is None or (
+        return settings is not None and (
             bool(settings.enabled) and bool(settings.in_app_enabled)
         )
 
@@ -798,9 +959,73 @@ class TradingPlaybookAlertService:
         event.channel_status_json = status
         return True
 
+    @staticmethod
+    def _settings_lock_statement(dialect_name: str):
+        if dialect_name == "sqlite":
+            return (
+                update(TradingPlaybookSettings)
+                .where(TradingPlaybookSettings.id == 1)
+                .values(
+                    enabled=TradingPlaybookSettings.enabled,
+                    updated_at=TradingPlaybookSettings.updated_at,
+                )
+                .execution_options(synchronize_session=False)
+            )
+        return (
+            select(TradingPlaybookSettings)
+            .where(TradingPlaybookSettings.id == 1)
+            .with_for_update()
+        )
+
+    async def _lock_delivery_settings(self, db):
+        dialect_name = db.get_bind().dialect.name
+        statement = self._settings_lock_statement(dialect_name)
+        if dialect_name == "sqlite":
+            result = await db.execute(statement)
+            if result.rowcount != 1:
+                return None
+            return await db.scalar(
+                select(TradingPlaybookSettings)
+                .where(TradingPlaybookSettings.id == 1)
+                .execution_options(populate_existing=True)
+            )
+        return await db.scalar(
+            statement.execution_options(populate_existing=True)
+        )
+
+    async def _skip_owned_delivery(
+        self,
+        db,
+        event_id: int,
+        *,
+        reason: str,
+    ) -> None:
+        await self._update_owned_sending(
+            db,
+            event_id,
+            final_status="skipped",
+            detail={"reason": reason},
+        )
+
     async def _deliver(self, db, event: TradingAlertEvent) -> None:
         if not await self._claim_pending(db, event):
             return
+        if self.channel_name == "in_app":
+            settings = await self._lock_delivery_settings(db)
+            if settings is None:
+                await self._skip_owned_delivery(
+                    db,
+                    event.id,
+                    reason="settings_missing",
+                )
+                return
+            if not bool(settings.enabled) or not bool(settings.in_app_enabled):
+                await self._skip_owned_delivery(
+                    db,
+                    event.id,
+                    reason="disabled",
+                )
+                return
         channel_status = event.channel_status_json[self.channel_name]
         idempotency_key = channel_status["idempotency_key"]
         payload = {

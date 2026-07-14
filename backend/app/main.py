@@ -17,6 +17,7 @@ from app.data_collectors.scheduler import data_scheduler
 from app.data_collectors.tencent_api import tencent_api
 from app.services.trading_playbook.composition import (
     build_production_trading_playbook_orchestrator,
+    load_production_realtime_limit_up,
 )
 from app.services.trading_playbook.alert_service import (
     TradingPlaybookAlertService,
@@ -66,6 +67,7 @@ async def lifespan(app: FastAPI):
                 InAppTradingPlanAlertChannel(),
                 session_factory=async_session_maker,
                 quote_api=tencent_api,
+                realtime_limit_up_loader=load_production_realtime_limit_up,
                 trading_calendar=calendar,
             )
             data_scheduler.install_trading_playbook_alert_service(alert_service)
@@ -97,6 +99,10 @@ async def lifespan(app: FastAPI):
                 await close()
         except Exception as exc:
             logger.error(f"Trading playbook provider cleanup failed: {exc}")
+        try:
+            await tencent_api.close()
+        except Exception as exc:
+            logger.error(f"Tencent quote cleanup failed: {exc}")
         try:
             _clear_trading_playbook_runtime(app)
         except Exception as exc:

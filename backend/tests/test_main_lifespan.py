@@ -262,6 +262,10 @@ class MainLifespanTests(unittest.IsolatedAsyncioTestCase):
                     scheduler.alert_service.trading_calendar,
                     scheduler.calendar,
                 )
+                self.assertIs(
+                    scheduler.alert_service.realtime_limit_up_loader,
+                    app_main.load_production_realtime_limit_up,
+                )
                 transport = httpx.ASGITransport(app=app_main.app)
                 async with httpx.AsyncClient(
                     transport=transport,
@@ -291,6 +295,36 @@ class MainLifespanTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(trading_playbook_runtime.get_orchestrator())
         self.assertFalse(
             hasattr(app_main.app.state, "trading_playbook_orchestrator")
+        )
+
+    async def test_shutdown_closes_shared_tencent_after_scheduler_and_isolates_failure(self):
+        scheduler = LifecycleScheduler()
+
+        async def fail_close():
+            self.assertEqual(scheduler.stop_calls, 1)
+            raise RuntimeError("quote close failed")
+
+        patches = self._lifecycle_patches(scheduler)
+        with patches[0], patches[1], patches[2] as close_db, patches[3], patches[4] as stop_bus, patches[5], patches[6], patches[7], patch.object(
+            app_main.settings,
+            "TRADING_PLAYBOOK_ENABLED",
+            False,
+        ), patch.object(
+            app_main.tencent_api,
+            "close",
+            AsyncMock(side_effect=fail_close),
+        ) as close_quote, patch.object(app_main.logger, "error") as log_error:
+            async with app_main.lifespan(app_main.app):
+                pass
+
+        close_quote.assert_awaited_once()
+        stop_bus.assert_awaited_once()
+        close_db.assert_awaited_once()
+        self.assertTrue(
+            any(
+                "Tencent quote cleanup failed" in str(call.args[0])
+                for call in log_error.call_args_list
+            )
         )
 
     async def test_disabled_startup_keeps_generate_endpoint_controlled_503(self):

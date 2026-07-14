@@ -1,12 +1,12 @@
 import asyncio
 import unittest
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from sqlalchemy import event, select
+from sqlalchemy import event, select, update
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -113,6 +113,14 @@ class TradingPlaybookDurableAlertTests(unittest.IsolatedAsyncioTestCase):
                 generated_at=datetime(2026, 7, 13, 15, 30),
             )
             db.add(plan)
+            db.add(
+                TradingPlaybookSettings(
+                    id=1,
+                    enabled=True,
+                    in_app_enabled=True,
+                    wechat_enabled=False,
+                )
+            )
             await db.commit()
             await db.refresh(plan)
             self.plan_id = plan.id
@@ -442,14 +450,8 @@ class TradingPlaybookDurableAlertTests(unittest.IsolatedAsyncioTestCase):
 
         channel = _RecordingInAppChannel()
         async with self.Session() as db:
-            db.add(
-                TradingPlaybookSettings(
-                    id=1,
-                    enabled=True,
-                    in_app_enabled=False,
-                    wechat_enabled=False,
-                )
-            )
+            settings = await db.get(TradingPlaybookSettings, 1)
+            settings.in_app_enabled = False
             await db.commit()
             await TradingPlaybookAlertService(channel).notify_plan_ready(
                 db,
@@ -491,6 +493,155 @@ class TradingPlaybookDurableAlertTests(unittest.IsolatedAsyncioTestCase):
                 for event in await self._events()
             )
         )
+
+    async def test_send_holds_sqlite_settings_lock_until_delivery_commit(self):
+        from app.services.trading_playbook.alert_service import (
+            TradingPlaybookAlertService,
+        )
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        class BlockingChannel(_RecordingInAppChannel):
+            async def send(self, event, *, idempotency_key):
+                started.set()
+                await release.wait()
+                return await super().send(
+                    event,
+                    idempotency_key=idempotency_key,
+                )
+
+        channel = BlockingChannel()
+        service = TradingPlaybookAlertService(channel)
+        async with self.Session() as db:
+            event_row = await service.emit_plan_event(
+                db,
+                self.plan,
+                event_type="plan_ready",
+                send=False,
+            )
+            event_id = event_row.id
+
+        async def deliver():
+            async with self.Session() as db:
+                row = await db.get(TradingAlertEvent, event_id)
+                await service._deliver(db, row)
+
+        async def disable():
+            async with self.SecondSession() as db:
+                await db.execute(
+                    update(TradingPlaybookSettings)
+                    .where(TradingPlaybookSettings.id == 1)
+                    .values(in_app_enabled=False)
+                )
+                await db.commit()
+
+        delivery_task = asyncio.create_task(deliver())
+        await asyncio.wait_for(started.wait(), timeout=1)
+        disable_task = asyncio.create_task(disable())
+        await asyncio.sleep(0.05)
+        try:
+            self.assertFalse(disable_task.done())
+        finally:
+            release.set()
+            await asyncio.gather(
+                delivery_task,
+                disable_task,
+                return_exceptions=True,
+            )
+
+        self.assertEqual(len(channel.sends), 1)
+        async with self.Session() as db:
+            settings = await db.get(TradingPlaybookSettings, 1)
+            persisted = await db.get(TradingAlertEvent, event_id)
+        self.assertFalse(settings.in_app_enabled)
+        self.assertEqual(
+            persisted.channel_status_json["in_app"]["status"],
+            "delivered",
+        )
+
+    async def test_disable_committed_first_skips_claimed_event_without_send(self):
+        from app.services.trading_playbook.alert_service import (
+            TradingPlaybookAlertService,
+        )
+
+        channel = _RecordingInAppChannel()
+        service = TradingPlaybookAlertService(channel)
+        async with self.Session() as db:
+            event_row = await service.emit_plan_event(
+                db,
+                self.plan,
+                event_type="plan_ready",
+                send=False,
+            )
+            event_id = event_row.id
+        async with self.SecondSession() as db:
+            await db.execute(
+                update(TradingPlaybookSettings)
+                .where(TradingPlaybookSettings.id == 1)
+                .values(in_app_enabled=False)
+            )
+            await db.commit()
+        async with self.Session() as db:
+            row = await db.get(TradingAlertEvent, event_id)
+            await service._deliver(db, row)
+
+        self.assertEqual(channel.sends, [])
+        event_row = (await self._events())[0]
+        self.assertEqual(event_row.channel_status_json["in_app"]["status"], "skipped")
+        self.assertEqual(event_row.channel_status_json["in_app"]["reason"], "disabled")
+
+    async def test_missing_settings_fails_closed_after_pending_claim(self):
+        from app.services.trading_playbook.alert_service import (
+            TradingPlaybookAlertService,
+        )
+
+        channel = _RecordingInAppChannel()
+        service = TradingPlaybookAlertService(channel)
+        async with self.Session() as db:
+            event_row = await service.emit_plan_event(
+                db,
+                self.plan,
+                event_type="plan_ready",
+                send=False,
+            )
+            event_id = event_row.id
+            settings = await db.get(TradingPlaybookSettings, 1)
+            await db.delete(settings)
+            await db.commit()
+        async with self.Session() as db:
+            row = await db.get(TradingAlertEvent, event_id)
+            await service._deliver(db, row)
+
+        self.assertEqual(channel.sends, [])
+        event_row = (await self._events())[0]
+        self.assertEqual(event_row.channel_status_json["in_app"]["status"], "skipped")
+        self.assertEqual(
+            event_row.channel_status_json["in_app"]["reason"],
+            "settings_missing",
+        )
+
+    def test_settings_delivery_lock_statements_compile_per_dialect(self):
+        from sqlalchemy.dialects import sqlite
+
+        from app.services.trading_playbook.alert_service import (
+            TradingPlaybookAlertService,
+        )
+
+        service = TradingPlaybookAlertService(_RecordingInAppChannel())
+        sqlite_sql = str(
+            service._settings_lock_statement("sqlite").compile(
+                dialect=sqlite.dialect()
+            )
+        )
+        postgres_sql = str(
+            service._settings_lock_statement("postgresql").compile(
+                dialect=postgresql.dialect()
+            )
+        )
+
+        self.assertIn("UPDATE trading_playbook_settings", sqlite_sql)
+        self.assertIn("FOR UPDATE", postgres_sql)
 
     async def test_in_app_channel_broadcast_carries_event_identity(self):
         from app.services.trading_playbook.channels import (
@@ -603,6 +754,16 @@ class TradingPlaybookActionMonitorTests(unittest.IsolatedAsyncioTestCase):
         )
         async with self.engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
+        async with self.Session() as db:
+            db.add(
+                TradingPlaybookSettings(
+                    id=1,
+                    enabled=True,
+                    in_app_enabled=True,
+                    wechat_enabled=False,
+                )
+            )
+            await db.commit()
         self.today = date(2026, 7, 14)
         self.now = CN_TZ.localize(datetime(2026, 7, 14, 10, 5))
         self.calendar = _TradingCalendar({self.today})
@@ -830,6 +991,193 @@ class TradingPlaybookActionMonitorTests(unittest.IsolatedAsyncioTestCase):
                     quote,
                 )
                 self.assertEqual(events, [])
+
+    async def test_real_tencent_missing_numeric_fields_never_trigger_terminal_actions(self):
+        from app.data_collectors.tencent_api import TencentStockAPI
+
+        def parsed_quote(
+            code,
+            *,
+            price="10",
+            change_pct="1",
+            bid1_volume="100",
+            limit_up="11",
+        ):
+            fields = ["0"] * 50
+            fields[1] = f"股票{code}"
+            fields[2] = code
+            fields[3] = price
+            fields[4] = "10"
+            fields[10] = bid1_volume
+            fields[30] = "20260714100500"
+            fields[32] = change_pct
+            fields[47] = limit_up
+            return TencentStockAPI()._parse_response(
+                f'v_test="{"~".join(fields)}";'
+            )
+
+        candidate_ids = []
+        for index, (code, invalidation) in enumerate(
+            (
+                ("000001", {"price_lte": 9}),
+                ("000002", {"change_pct_gte": -1}),
+                ("000003", {"sealed": True}),
+            )
+        ):
+            _plan_id, candidate_id = await self._create_candidate(
+                stock_code=code,
+                mode_key=f"quality-{code}",
+                entry={"price_gte": 999},
+                invalidation=invalidation,
+                target_trade_date=self.today + timedelta(days=index),
+            )
+            candidate_ids.append(candidate_id)
+
+        quote_api = _BatchQuoteAPI(
+            {
+                "000001": parsed_quote("000001", price=""),
+                "000002": parsed_quote("000002", change_pct="bad"),
+                "000003": parsed_quote(
+                    "000003",
+                    price="",
+                    limit_up="",
+                ),
+            }
+        )
+        async with self.Session() as db:
+            result = await self._monitor_service(
+                _RecordingInAppChannel(),
+                quote_api=quote_api,
+            ).monitor(db, self.now)
+        async with self.Session() as db:
+            candidate_statuses = [
+                (await db.get(TradingPlanCandidate, candidate_id)).status
+                for candidate_id in candidate_ids
+            ]
+
+        self.assertEqual(result, [])
+        self.assertEqual(await self._events(), [])
+        self.assertEqual(candidate_statuses, ["waiting", "waiting", "waiting"])
+
+    async def test_authoritative_fresh_open_count_snapshot_triggers_condition(self):
+        from app.services.realtime_limit_up_service import RealtimeLimitUpSnapshot
+
+        await self._create_candidate(entry={"open_count_gte": 2})
+        loader = AsyncMock(
+            return_value=RealtimeLimitUpSnapshot(
+                items=[
+                    {
+                        "stock_code": "000001",
+                        "open_count": 2,
+                        "_collected_at": self.now - timedelta(seconds=5),
+                    }
+                ],
+                authoritative=True,
+                complete=True,
+                evidence_trade_date=self.today,
+            )
+        )
+        async with self.Session() as db:
+            events = await self._monitor_service(
+                _RecordingInAppChannel(),
+                quote_api=_BatchQuoteAPI(
+                    {"000001": _fresh_quote("000001", 10.5)}
+                ),
+                realtime_limit_up_loader=loader,
+            ).monitor(db, self.now)
+
+        self.assertEqual([event.event_type for event in events], ["entry_triggered"])
+        loader.assert_awaited_once_with(self.today)
+        self.assertEqual(
+            events[0].market_snapshot_json["quote"]["open_count"],
+            2,
+        )
+
+    async def test_unusable_open_count_evidence_is_unknown_not_zero(self):
+        from app.services.realtime_limit_up_service import RealtimeLimitUpSnapshot
+
+        for index, code in enumerate(("000001", "000002", "000003")):
+            await self._create_candidate(
+                stock_code=code,
+                mode_key=f"open-quality-{code}",
+                entry={"open_count_gte": 0},
+                target_trade_date=self.today + timedelta(days=index),
+            )
+        loader = AsyncMock(
+            return_value=RealtimeLimitUpSnapshot(
+                items=[
+                    {
+                        "stock_code": "000002",
+                        "open_count": True,
+                        "_collected_at": self.now,
+                    },
+                    {
+                        "stock_code": "000003",
+                        "open_count": 3,
+                        "_collected_at": self.now - timedelta(minutes=5),
+                    },
+                ],
+                authoritative=True,
+                complete=True,
+                evidence_trade_date=self.today,
+            )
+        )
+        async with self.Session() as db:
+            events = await self._monitor_service(
+                _RecordingInAppChannel(),
+                quote_api=_BatchQuoteAPI(
+                    {
+                        code: _fresh_quote(code, 10.5)
+                        for code in ("000001", "000002", "000003")
+                    }
+                ),
+                realtime_limit_up_loader=loader,
+            ).monitor(db, self.now)
+
+        self.assertEqual(events, [])
+        self.assertEqual(await self._events(), [])
+
+    async def test_open_count_timeout_is_cancelled_without_blocking_price_condition(self):
+        await self._create_candidate(
+            entry={"price_gte": 10},
+            invalidation={"open_count_gte": 1},
+        )
+        cancelled = asyncio.Event()
+
+        async def slow_loader(_trade_date):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        async with self.Session() as db:
+            events = await self._monitor_service(
+                _RecordingInAppChannel(),
+                quote_api=_BatchQuoteAPI(
+                    {"000001": _fresh_quote("000001", 10.5)}
+                ),
+                realtime_limit_up_loader=slow_loader,
+                quote_timeout_seconds=0.03,
+            ).monitor(db, self.now)
+
+        self.assertTrue(cancelled.is_set())
+        self.assertEqual([event.event_type for event in events], ["entry_triggered"])
+
+    async def test_price_only_candidates_never_call_open_count_loader(self):
+        await self._create_candidate(entry={"price_gte": 10})
+        loader = AsyncMock(side_effect=AssertionError("must not load pool"))
+
+        async with self.Session() as db:
+            events = await self._monitor_service(
+                _RecordingInAppChannel(),
+                quote_api=_BatchQuoteAPI(
+                    {"000001": _fresh_quote("000001", 10.5)}
+                ),
+                realtime_limit_up_loader=loader,
+            ).monitor(db, self.now)
+
+        self.assertEqual([event.event_type for event in events], ["entry_triggered"])
+        loader.assert_not_awaited()
 
     async def test_monitor_persists_entry_and_restart_does_not_resend(self):
         from app.services.trading_playbook.alert_service import (
@@ -1301,14 +1649,8 @@ class TradingPlaybookActionMonitorTests(unittest.IsolatedAsyncioTestCase):
 
         await self._create_candidate()
         async with self.Session() as db:
-            db.add(
-                TradingPlaybookSettings(
-                    id=1,
-                    enabled=True,
-                    in_app_enabled=False,
-                    wechat_enabled=False,
-                )
-            )
+            settings = await db.get(TradingPlaybookSettings, 1)
+            settings.in_app_enabled = False
             await db.commit()
         quote_api = _BatchQuoteAPI(
             {"000001": _fresh_quote("000001", 10.5)}
@@ -1347,14 +1689,8 @@ class TradingPlaybookActionMonitorTests(unittest.IsolatedAsyncioTestCase):
             invalidation={"price_lte": 9},
         )
         async with self.Session() as db:
-            db.add(
-                TradingPlaybookSettings(
-                    id=1,
-                    enabled=True,
-                    in_app_enabled=False,
-                    wechat_enabled=False,
-                )
-            )
+            settings = await db.get(TradingPlaybookSettings, 1)
+            settings.in_app_enabled = False
             await db.commit()
         first_quotes = _BatchQuoteAPI(
             {"000001": _fresh_quote("000001", 8.0)}
