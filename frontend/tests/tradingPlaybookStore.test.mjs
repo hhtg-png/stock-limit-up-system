@@ -278,17 +278,18 @@ test('latest alert inbox load merges REST history with websocket arrivals', asyn
       return request.promise
     }
     const store = useTradingPlaybookStore(createPinia())
+    store.receiveAlert(alert(1, 'existing-ws'))
 
     const olderLoad = store.loadAlerts(true)
     const latestLoad = store.loadAlerts(false)
-    assert.deepEqual(store.alerts, [])
+    assert.deepEqual(store.alerts.map(item => item.id), [1])
     assert.equal(store.alertsLoading, true)
     assert.equal(store.alertsRequestedUnreadOnly, false)
     assert.equal(store.alertsLoadedUnreadOnly, null)
     assert.equal(store.alertsError, null)
     store.receiveAlert({ ...alert(3, 'ws-new'), triggered_at: '2026-07-14T15:10:00+08:00' })
     requests[1].request.resolve(axiosResponse(requests[1].config, {
-      items: [alert(2, 'rest-new'), alert(1, 'rest-old')],
+      items: [alert(2, 'rest-new')],
       limit: 50,
       offset: 0
     }))
@@ -305,6 +306,28 @@ test('latest alert inbox load merges REST history with websocket arrivals', asyn
       { unread_only: true },
       { unread_only: false }
     ])
+  })
+})
+
+test('failed latest alert load preserves existing and in-flight websocket reminders', async () => {
+  await withFrontendModules(async server => {
+    const api = await server.ssrLoadModule('/src/api/trading-playbook.ts')
+    const { useTradingPlaybookStore } = await server.ssrLoadModule('/src/stores/trading-playbook.ts')
+    const request = deferred()
+    api.tradingPlaybookApi.defaults.adapter = config => request.promise.then(data => axiosResponse(config, data))
+    const store = useTradingPlaybookStore(createPinia())
+    store.receiveAlert(alert(1, 'existing-ws'))
+
+    const load = store.loadAlerts(false)
+    store.receiveAlert({ ...alert(2, 'in-flight-ws'), triggered_at: '2026-07-14T15:10:00+08:00' })
+    request.reject(new Error('inbox unavailable'))
+    await assert.rejects(load, /inbox unavailable/)
+
+    assert.deepEqual(store.alerts.map(item => item.id), [2, 1])
+    assert.equal(store.alertsLoading, false)
+    assert.equal(store.alertsError, 'inbox unavailable')
+    assert.equal(store.alertsRequestedUnreadOnly, false)
+    assert.equal(store.alertsLoadedUnreadOnly, null)
   })
 })
 
