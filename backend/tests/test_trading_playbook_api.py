@@ -31,6 +31,8 @@ from app.models.trading_playbook import (
     TradingPlaybookSettings,
 )
 from app.services.trading_playbook.runtime import trading_playbook_runtime
+from app.services.trading_playbook import plan_service as plan_service_module
+from app.services.trading_playbook import serialization as serialization_module
 from app.services.trading_playbook.errors import (
     InvalidRequestError,
     InvalidTransitionError,
@@ -66,7 +68,10 @@ class _FakeOrchestrator:
             "candidates": [
                 {
                     "stock_code": "000001",
+                    "stock_name": "平安银行",
                     "action_trade_date": target_trade_date.isoformat(),
+                    "primary_mode_key": "a_mode",
+                    "rank": 1,
                     "position_reference": 10.0,
                     "risk_level": "trial",
                     "entry_trigger_json": {"reference_price": 10.0},
@@ -674,6 +679,34 @@ class TradingPlaybookApiTests(unittest.TestCase):
                 {"candidate": {"position_reference": -1.0}},
             ),
             (
+                "formal-risk-level-is-not-actionable",
+                {"candidate": {"risk_level": "watch"}},
+            ),
+            (
+                "position-does-not-match-risk-level",
+                {"candidate": {"position_reference": 100.0}},
+            ),
+            (
+                "missing-materialized-hard-stop",
+                {"candidate": {"invalidation_json": {"label": "missing"}}},
+            ),
+            (
+                "mismatched-materialized-hard-stop",
+                {"candidate": {"invalidation_json": {"price_lte": 9.4}}},
+            ),
+            (
+                "blank-stock-name",
+                {"candidate": {"stock_name": "   "}},
+            ),
+            (
+                "malformed-stock-code",
+                {"candidate": {"stock_code": "1"}},
+            ),
+            (
+                "blank-primary-mode",
+                {"candidate": {"primary_mode_key": "   "}},
+            ),
+            (
                 "trial-below-limit",
                 {
                     "risk": {
@@ -839,6 +872,83 @@ class TradingPlaybookApiTests(unittest.TestCase):
                     response.json()["detail"],
                     "Trading playbook service is unavailable",
                 )
+
+    def test_confirm_and_revise_reject_inconsistent_formal_candidates_without_writes(self):
+        cases = [
+            ("position", {"position_reference": 100.0}),
+            ("missing-stop", {"invalidation_json": {"label": "missing"}}),
+            ("wrong-stop", {"invalidation_json": {"price_lte": 9.4}}),
+            ("blank-identity", {"stock_name": "   "}),
+        ]
+
+        async def add_bad_plan(index: int, candidate_changes: dict):
+            target = date(2026, 9, 1) + timedelta(days=index)
+            async with self.Session() as db:
+                plan = TradingPlanVersion(
+                    source_trade_date=target - timedelta(days=1),
+                    target_trade_date=target,
+                    stage="after_close",
+                    version_no=1,
+                    status="draft",
+                    risk_settings_json={
+                        "trial": 10.0,
+                        "confirmed": 30.0,
+                        "hard_stop": 5.0,
+                        "max_candidates": 3,
+                    },
+                    input_hash=f"formal-risk-invalid-{index}",
+                    generated_at=datetime(2026, 7, 10, 15, 30),
+                )
+                db.add(plan)
+                await db.flush()
+                values = {
+                    "plan_version_id": plan.id,
+                    "stock_code": f"30{index:04d}",
+                    "stock_name": f"bad-formal-{index}",
+                    "action_trade_date": target,
+                    "theme_name": "history",
+                    "primary_mode_key": "a_mode",
+                    "role": "leader",
+                    "rank": 1,
+                    "entry_trigger_json": {"reference_price": 10.0},
+                    "invalidation_json": {"price_lte": 9.5},
+                    "exit_trigger_json": {"change_pct_lte": -5.0},
+                    "risk_level": "trial",
+                    "position_reference": 10.0,
+                    "status": "waiting",
+                }
+                values.update(candidate_changes)
+                db.add(TradingPlanCandidate(**values))
+                await db.commit()
+                return plan.id
+
+        async def state(plan_id: int):
+            async with self.Session() as db:
+                plan = await db.get(TradingPlanVersion, plan_id)
+                children = await db.scalar(
+                    text(
+                        "SELECT count(*) FROM trading_plan_versions "
+                        "WHERE parent_plan_version_id=:parent_id"
+                    ),
+                    {"parent_id": plan_id},
+                )
+                return plan.status, children
+
+        for index, (name, candidate_changes) in enumerate(cases, start=1):
+            plan_id = asyncio.run(add_bad_plan(index, candidate_changes))
+            with self.subTest(case=name, operation="confirm"):
+                confirmed = self.client.post(
+                    f"/trading-playbook/plans/{plan_id}/confirm",
+                    json={"confirmed_by": "local-user"},
+                )
+                self.assertEqual(confirmed.status_code, 503, confirmed.text)
+            with self.subTest(case=name, operation="revise"):
+                revised = self.client.put(
+                    f"/trading-playbook/plans/{plan_id}",
+                    json={"change_note": "must reject inconsistent history"},
+                )
+                self.assertEqual(revised.status_code, 503, revised.text)
+            self.assertEqual(asyncio.run(state(plan_id)), ("draft", 0))
 
     def test_generate_and_review_are_503_until_production_dependencies_exist(self):
         app = FastAPI()
@@ -1076,6 +1186,61 @@ class TradingPlaybookApiTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 503)
 
+    def test_generate_trusts_only_explicit_validated_plan_payload_marker(self):
+        marker_type = getattr(
+            serialization_module,
+            "ValidatedPlanPayload",
+            None,
+        )
+        self.assertIsNotNone(marker_type)
+
+        async def validated_result(db, source_trade_date, stage, as_of):
+            raw = await _FakeOrchestrator().build_stage(
+                db,
+                source_trade_date,
+                stage,
+                as_of,
+            )
+            return marker_type(raw)
+
+        self.orchestrator.build_stage = validated_result
+        with patch.object(
+            trading_playbook_api,
+            "_normalize_plan_payload",
+            side_effect=RuntimeError("must not normalize a trusted payload twice"),
+        ):
+            response = self.client.post(
+                "/trading-playbook/plans/generate",
+                json={
+                    "source_trade_date": "2026-07-10",
+                    "stage": "after_close",
+                },
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["id"], 901)
+
+    def test_generate_still_validates_arbitrary_mapping_results(self):
+        async def unsafe_mapping(db, source_trade_date, stage, as_of):
+            payload = await _FakeOrchestrator().build_stage(
+                db,
+                source_trade_date,
+                stage,
+                as_of,
+            )
+            payload["candidates"][0]["position_reference"] = 100.0
+            return payload
+
+        self.orchestrator.build_stage = unsafe_mapping
+        response = self.client.post(
+            "/trading-playbook/plans/generate",
+            json={"source_trade_date": "2026-07-10", "stage": "after_close"},
+        )
+        self.assertEqual(response.status_code, 503, response.text)
+        self.assertEqual(
+            response.json()["detail"],
+            "Trading playbook service is unavailable",
+        )
+
     def test_request_schemas_reject_extra_fields_bad_locators_and_nonfinite_numbers(self):
         invalid_requests = [
             (
@@ -1251,6 +1416,107 @@ class TradingPlaybookApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertFalse(response.json()["wechat_enabled"])
         self.assertFalse(asyncio.run(read_flag()))
+
+    def test_settings_put_serialization_failure_rolls_back_update(self):
+        async def seed_settings():
+            async with self.Session() as db:
+                db.add(
+                    TradingPlaybookSettings(
+                        id=1,
+                        trial_position_pct=10.0,
+                        confirmed_position_pct=30.0,
+                        wechat_enabled=False,
+                    )
+                )
+                await db.commit()
+
+        async def read_positions():
+            async with self.Session() as db:
+                row = await db.get(TradingPlaybookSettings, 1)
+                return row.trial_position_pct, row.confirmed_position_pct
+
+        asyncio.run(seed_settings())
+        with patch.object(
+            plan_service_module,
+            "normalize_settings_payload",
+            side_effect=RuntimeError("settings serializer failed"),
+            create=True,
+        ):
+            response = self.client.put(
+                "/trading-playbook/settings",
+                json={"trial_position_pct": 20.0},
+            )
+        self.assertEqual(response.status_code, 503, response.text)
+        self.assertEqual(asyncio.run(read_positions()), (10.0, 30.0))
+
+    def test_settings_get_creation_serialization_failure_does_not_commit(self):
+        async def settings_count():
+            async with self.Session() as db:
+                return await db.scalar(
+                    text("SELECT count(*) FROM trading_playbook_settings")
+                )
+
+        with patch.object(
+            trading_playbook_api,
+            "_serialize_settings",
+            side_effect=RuntimeError("settings serializer failed"),
+        ):
+            response = self.client.get("/trading-playbook/settings")
+        self.assertEqual(response.status_code, 503, response.text)
+        self.assertEqual(asyncio.run(settings_count()), 0)
+
+    def test_settings_get_repair_serialization_failure_does_not_commit(self):
+        async def seed_legacy_settings():
+            async with self.Session() as db:
+                await db.execute(text("PRAGMA ignore_check_constraints=ON"))
+                db.add(TradingPlaybookSettings(id=1, wechat_enabled=True))
+                await db.commit()
+                await db.execute(text("PRAGMA ignore_check_constraints=OFF"))
+
+        async def read_flag():
+            async with self.Session() as db:
+                row = await db.get(TradingPlaybookSettings, 1)
+                return row.wechat_enabled
+
+        asyncio.run(seed_legacy_settings())
+        with patch.object(
+            plan_service_module,
+            "normalize_settings_payload",
+            side_effect=RuntimeError("settings serializer failed"),
+            create=True,
+        ):
+            response = self.client.get("/trading-playbook/settings")
+        self.assertEqual(response.status_code, 503, response.text)
+        self.assertTrue(asyncio.run(read_flag()))
+
+    def test_settings_response_snapshot_matches_committed_database_fields(self):
+        response = self.client.put(
+            "/trading-playbook/settings",
+            json={
+                "trial_position_pct": 20.0,
+                "confirmed_position_pct": 30.0,
+                "hard_stop_pct": 6.0,
+                "max_action_candidates": 2,
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+        async def read_settings():
+            async with self.Session() as db:
+                row = await db.get(TradingPlaybookSettings, 1)
+                return {
+                    "id": row.id,
+                    "enabled": bool(row.enabled),
+                    "trial_position_pct": row.trial_position_pct,
+                    "confirmed_position_pct": row.confirmed_position_pct,
+                    "hard_stop_pct": row.hard_stop_pct,
+                    "max_action_candidates": row.max_action_candidates,
+                    "in_app_enabled": bool(row.in_app_enabled),
+                    "wechat_enabled": bool(row.wechat_enabled),
+                    "updated_at": row.updated_at.replace(tzinfo=CN).isoformat(),
+                }
+
+        self.assertEqual(response.json(), asyncio.run(read_settings()))
 
     def test_settings_upstream_failure_is_fixed_503_without_internal_detail(self):
         async def fail(*_args, **_kwargs):

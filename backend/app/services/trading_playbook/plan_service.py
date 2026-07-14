@@ -30,7 +30,13 @@ from .errors import (
     PlaybookNotFoundError,
     UpstreamUnavailableError,
 )
-from .serialization import json_value, normalize_plan_payload
+from .serialization import (
+    ValidatedSettingsPayload,
+    json_value,
+    materialize_candidate_risk,
+    normalize_plan_payload,
+    normalize_settings_payload,
+)
 
 
 CHINA_TZ = ZoneInfo("Asia/Shanghai")
@@ -274,7 +280,10 @@ class TradingPlanService:
                         ),
                     )
                     if existing is not None:
-                        return await self.serialize(db, existing)
+                        serialized = await self.serialize(db, existing)
+                        if serialized is None:
+                            raise RuntimeError("existing plan disappeared")
+                        return normalize_plan_payload(serialized)
                     if attempt == 2:
                         raise RuntimeError("could not allocate a unique plan version")
                 except Exception:
@@ -607,7 +616,7 @@ class TradingPlanService:
         db,
         changes: Mapping[str, Any],
         updated_at: datetime,
-    ) -> TradingPlaybookSettings:
+    ) -> ValidatedSettingsPayload:
         if not isinstance(changes, Mapping) or not changes:
             raise InvalidRequestError("settings patch is required")
         if (
@@ -682,8 +691,9 @@ class TradingPlanService:
             )
             if updated_row is None:
                 raise RuntimeError("updated settings row disappeared")
+            payload = normalize_settings_payload(updated_row)
             await db.commit()
-            return updated_row
+            return payload
         except InvalidRequestError:
             raise
         except IntegrityError as exc:
@@ -1017,11 +1027,13 @@ class TradingPlanService:
             for key, value in features.items()
             if key in recognition_keys
         }
-        invalidation = copy.deepcopy(row["invalidation"])
-        invalidation["price_lte"] = round(
-            reference_price * (1 - float(risk_settings["hard_stop"]) / 100),
-            2,
+        position_reference, hard_stop_price = materialize_candidate_risk(
+            reference_price,
+            risk_level,
+            risk_settings,
         )
+        invalidation = copy.deepcopy(row["invalidation"])
+        invalidation["price_lte"] = hard_stop_price
         stock_name = stock_names.get(row["stock_code"]) or str(
             source.get("stock_name") or row["stock_code"]
         )
@@ -1040,7 +1052,7 @@ class TradingPlanService:
             invalidation_json=invalidation,
             exit_trigger_json=copy.deepcopy(row["exit_trigger"]),
             risk_level=risk_level,
-            position_reference=float(risk_settings[risk_level]),
+            position_reference=position_reference,
             evidence_json=copy.deepcopy(row["evidence"]),
             manual_overrides_json={},
             status="waiting",
@@ -1300,12 +1312,14 @@ class TradingPlanService:
                             db,
                             existing.id,
                         )
-                        return normalize_plan_payload(
+                        payload = normalize_plan_payload(
                             self._serialize_loaded(
                                 existing,
                                 existing_candidates,
                             )
                         )
+                        await db.commit()
+                        return payload
                     current_parent = await db.get(TradingPlanVersion, plan_id)
                     if current_parent is None:
                         raise InvalidTransitionError("plan cannot be revised")
@@ -1728,10 +1742,12 @@ class TradingPlanService:
         hard_stop = _finite_number(risk_settings.get("hard_stop"))
         if reference_price is None or hard_stop is None or not 0 < hard_stop <= 20:
             raise ValueError("revised candidate must retain valid risk prices")
-        values["invalidation_json"]["price_lte"] = round(
-            reference_price * (1 - hard_stop / 100),
-            2,
+        position_reference, hard_stop_price = materialize_candidate_risk(
+            reference_price,
+            parent.risk_level,
+            risk_settings,
         )
+        values["invalidation_json"]["price_lte"] = hard_stop_price
         for key in (
             "entry_trigger_json",
             "invalidation_json",
@@ -1773,7 +1789,7 @@ class TradingPlanService:
             invalidation_json=values["invalidation_json"],
             exit_trigger_json=values["exit_trigger_json"],
             risk_level=parent.risk_level,
-            position_reference=parent.position_reference,
+            position_reference=position_reference,
             evidence_json=copy.deepcopy(parent.evidence_json or []),
             manual_overrides_json=values["manual_overrides_json"],
             status=parent.status,

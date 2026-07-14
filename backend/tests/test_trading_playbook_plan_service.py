@@ -27,6 +27,7 @@ from app.services.trading_playbook.domain import (
     ModeEvaluation,
 )
 from app.services.trading_playbook.plan_service import TradingPlanService
+from app.services.trading_playbook import serialization as serialization_module
 from app.services.trading_playbook.errors import (
     InvalidRequestError,
     InvalidTransitionError,
@@ -1725,6 +1726,133 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
                 await first_engine.dispose()
                 await second_engine.dispose()
 
+    async def test_reused_revision_commits_lock_before_returning_detached_payload(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            database_path = Path(directory) / "revision-lock-release.db"
+            url = f"sqlite+aiosqlite:///{database_path.as_posix()}"
+            first_engine = create_async_engine(url, connect_args={"timeout": 1})
+            second_engine = create_async_engine(url, connect_args={"timeout": 1})
+            FirstSession = async_sessionmaker(first_engine, expire_on_commit=False)
+            SecondSession = async_sessionmaker(second_engine, expire_on_commit=False)
+            try:
+                async with first_engine.begin() as connection:
+                    await connection.run_sync(Base.metadata.create_all)
+                async with FirstSession() as setup:
+                    parent = await TradingPlanService().generate(
+                        setup,
+                        _snapshot(),
+                        [_evaluation("leader", "000001")],
+                        stock_names={"000001": "股票1"},
+                        rule_snapshot=_rule_snapshot("leader"),
+                    )
+                parent_id = parent["id"]
+                first_changes = {"change_note": "first child"}
+                async with FirstSession() as setup:
+                    child = await TradingPlanService().revise(
+                        setup,
+                        parent_id,
+                        first_changes,
+                    )
+                    parent_row = await setup.get(TradingPlanVersion, parent_id)
+                    parent_audit = (
+                        parent_row.status,
+                        parent_row.input_hash,
+                        parent_row.generated_at,
+                        parent_row.confirmed_at,
+                        parent_row.confirmed_by,
+                    )
+                    await setup.rollback()
+
+                async with FirstSession() as held_open:
+                    reused = await TradingPlanService().revise(
+                        held_open,
+                        parent_id,
+                        first_changes,
+                    )
+                    self.assertFalse(held_open.in_transaction())
+                    self.assertEqual(reused["id"], child["id"])
+                    self.assertEqual(reused["status"], child["status"])
+
+                    async def create_different_revision():
+                        async with SecondSession() as second:
+                            return await TradingPlanService().revise(
+                                second,
+                                parent_id,
+                                {"change_note": "different child"},
+                            )
+
+                    different = await asyncio.wait_for(
+                        create_different_revision(),
+                        timeout=2,
+                    )
+                    self.assertNotEqual(different["id"], child["id"])
+
+                async with SecondSession() as verify:
+                    parent_row = await verify.get(TradingPlanVersion, parent_id)
+                    self.assertEqual(
+                        (
+                            parent_row.status,
+                            parent_row.input_hash,
+                            parent_row.generated_at,
+                            parent_row.confirmed_at,
+                            parent_row.confirmed_by,
+                        ),
+                        parent_audit,
+                    )
+            finally:
+                await first_engine.dispose()
+                await second_engine.dispose()
+
+    async def test_reused_revision_commit_failure_rolls_back_without_returning(self):
+        async with self.Session() as setup:
+            parent = await self.service.generate(
+                setup,
+                _snapshot(),
+                [_evaluation("leader", "000001")],
+                stock_names={"000001": "股票1"},
+                rule_snapshot=_rule_snapshot("leader"),
+            )
+            changes = {"change_note": "existing revision"}
+            child = await self.service.revise(setup, parent["id"], changes)
+
+        async with self.Session() as db:
+            rollback = AsyncMock(wraps=db.rollback)
+            with patch.object(
+                db,
+                "commit",
+                new=AsyncMock(side_effect=RuntimeError("commit failed")),
+            ), patch.object(db, "rollback", new=rollback):
+                with self.assertRaisesRegex(RuntimeError, "commit failed"):
+                    await self.service.revise(db, parent["id"], changes)
+            rollback.assert_awaited_once()
+
+        async with self.Session() as verify:
+            children = (
+                await verify.scalars(
+                    select(TradingPlanVersion).where(
+                        TradingPlanVersion.parent_plan_version_id == parent["id"]
+                    )
+                )
+            ).all()
+            self.assertEqual([row.id for row in children], [child["id"]])
+
+    async def test_generate_returns_explicit_validated_payload_marker(self):
+        marker_type = getattr(
+            serialization_module,
+            "ValidatedPlanPayload",
+            None,
+        )
+        self.assertIsNotNone(marker_type)
+        async with self.Session() as db:
+            payload = await self.service.generate(
+                db,
+                _snapshot(),
+                [_evaluation("leader", "000001")],
+                stock_names={"000001": "股票1"},
+                rule_snapshot=_rule_snapshot("leader"),
+            )
+        self.assertIsInstance(payload, marker_type)
+
     async def test_sqlite_compat_migration_repairs_duplicate_active_before_index(self):
         async with self.engine.begin() as connection:
             await connection.exec_driver_sql(
@@ -1817,8 +1945,8 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
                 AS_OF.replace(tzinfo=ZoneInfo("Asia/Shanghai")),
             )
 
-        self.assertEqual(row.trial_position_pct, 50.0)
-        self.assertEqual(row.confirmed_position_pct, 60.0)
+        self.assertEqual(row["trial_position_pct"], 50.0)
+        self.assertEqual(row["confirmed_position_pct"], 60.0)
 
     async def test_update_settings_does_not_query_after_successful_commit(self):
         async with self.Session() as db:
@@ -1858,7 +1986,7 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
                     AS_OF.replace(tzinfo=ZoneInfo("Asia/Shanghai")),
                 )
 
-        self.assertEqual(row.trial_position_pct, 20.0)
+        self.assertEqual(row["trial_position_pct"], 20.0)
 
     async def test_settings_can_lower_both_position_limits_atomically(self):
         async with self.Session() as db:
@@ -1880,8 +2008,8 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
                 AS_OF.replace(tzinfo=ZoneInfo("Asia/Shanghai")),
             )
 
-        self.assertEqual(row.trial_position_pct, 10.0)
-        self.assertEqual(row.confirmed_position_pct, 20.0)
+        self.assertEqual(row["trial_position_pct"], 10.0)
+        self.assertEqual(row["confirmed_position_pct"], 20.0)
 
     async def test_file_sqlite_concurrent_settings_updates_preserve_position_order(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:

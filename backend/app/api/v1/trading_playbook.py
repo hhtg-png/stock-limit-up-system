@@ -38,8 +38,11 @@ from app.services.trading_playbook.errors import (
 from app.services.trading_playbook.plan_service import TradingPlanService
 from app.services.trading_playbook.runtime import trading_playbook_runtime
 from app.services.trading_playbook.serialization import (
+    ValidatedPlanPayload,
+    ValidatedSettingsPayload,
     json_value as _json_value,
     normalize_plan_payload as _normalize_plan_payload,
+    normalize_settings_payload as _normalize_settings_payload,
 )
 
 
@@ -131,6 +134,8 @@ async def _serialize_plan_response(
         payload = await _plan_service.serialize(db, plan_or_id)
         if payload is None:
             return None
+        if isinstance(payload, ValidatedPlanPayload):
+            return payload
         return _normalize_plan_payload(payload)
     except HTTPException:
         raise
@@ -194,18 +199,10 @@ def _serialize_alert(alert: TradingAlertEvent) -> dict[str, Any]:
     }
 
 
-def _serialize_settings(row: TradingPlaybookSettings) -> dict[str, Any]:
-    return {
-        "id": row.id,
-        "enabled": bool(row.enabled),
-        "trial_position_pct": row.trial_position_pct,
-        "confirmed_position_pct": row.confirmed_position_pct,
-        "hard_stop_pct": row.hard_stop_pct,
-        "max_action_candidates": row.max_action_candidates,
-        "in_app_enabled": bool(row.in_app_enabled),
-        "wechat_enabled": bool(row.wechat_enabled),
-        "updated_at": _china_iso(row.updated_at),
-    }
+def _serialize_settings(row: Any) -> ValidatedSettingsPayload:
+    if isinstance(row, ValidatedSettingsPayload):
+        return row
+    return _normalize_settings_payload(row)
 
 
 def _serialize_review(review: Any) -> dict[str, Any]:
@@ -278,6 +275,8 @@ async def generate_plan(
         )
         if isinstance(result, TradingPlanVersion):
             return await _serialize_plan_response(db, result)
+        if isinstance(result, ValidatedPlanPayload):
+            return result
         if isinstance(result, Mapping):
             return _normalize_plan_payload(result)
         raise _service_unavailable()
@@ -589,14 +588,15 @@ async def get_settings(
         if now.tzinfo is None or now.utcoffset() is None:
             raise _service_unavailable()
         if row.wechat_enabled is not False:
-            row = await _plan_service.update_settings(
+            payload = await _plan_service.update_settings(
                 db,
                 {"wechat_enabled": False},
                 now,
             )
         else:
+            payload = _serialize_settings(row)
             await db.commit()
-        return _serialize_settings(row)
+        return payload
     except HTTPException:
         await _rollback_quietly(db)
         raise
