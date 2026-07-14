@@ -191,13 +191,15 @@ def _priority(rule: TradingModeRule) -> tuple[int, float]:
     if not isinstance(prerequisites, Mapping):
         return (1, 0)
     value = prerequisites.get("priority")
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, (int, float))
-        or not math.isfinite(float(value))
-    ):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return (1, 0)
-    return (0, float(value))
+    try:
+        priority = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return (1, 0)
+    if not math.isfinite(priority):
+        return (1, 0)
+    return (0, -priority)
 
 
 def _serialize_rule(rule: TradingModeRule) -> dict[str, Any]:

@@ -220,8 +220,8 @@ class TradingPlaybookApiTests(unittest.TestCase):
         response = self.client.get("/trading-playbook/rules")
         self.assertEqual(response.status_code, 200, response.text)
         items = response.json()["items"]
-        self.assertEqual([item["mode_key"] for item in items], ["a_mode", "z_mode"])
-        self.assertEqual(items[0]["source_refs_json"], "malformed-but-preserved")
+        self.assertEqual([item["mode_key"] for item in items], ["z_mode", "a_mode"])
+        self.assertEqual(items[1]["source_refs_json"], "malformed-but-preserved")
         for key in (
             "version",
             "content_hash",
@@ -233,7 +233,41 @@ class TradingPlaybookApiTests(unittest.TestCase):
             "risk_guidance_json",
             "source_refs_json",
         ):
-            self.assertIn(key, items[0])
+            self.assertIn(key, items[1])
+
+    def test_rules_put_unrepresentable_priority_after_valid_priorities(self):
+        async def add_rule():
+            async with self.Session() as db:
+                db.add(
+                    TradingModeRule(
+                        mode_key="overflow_priority",
+                        version=1,
+                        name="overflow",
+                        family="outbreak",
+                        style="board_flow",
+                        window="outbreak",
+                        automation_level="manual_only",
+                        description="historical malformed priority",
+                        prerequisites_json={"priority": 10**400},
+                        candidate_filters_json=[],
+                        entry_trigger_json={},
+                        invalidation_json={},
+                        exit_trigger_json={},
+                        risk_guidance_json={},
+                        source_refs_json=[],
+                        enabled=True,
+                        content_hash="d" * 64,
+                    )
+                )
+                await db.commit()
+
+        asyncio.run(add_rule())
+        response = self.client.get("/trading-playbook/rules")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            [item["mode_key"] for item in response.json()["items"]],
+            ["z_mode", "a_mode", "overflow_priority"],
+        )
 
     def test_plan_list_detail_revision_and_confirmation_are_serialized(self):
         listed = self.client.get(
