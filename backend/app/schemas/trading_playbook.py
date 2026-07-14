@@ -17,6 +17,8 @@ from pydantic import (
     model_validator,
 )
 
+from app.utils.time_utils import CN_TZ, is_trading_time
+
 
 PlanStage = Literal["preclose", "after_close", "overnight", "auction"]
 PlanStatus = Literal["draft", "confirmed", "active", "superseded", "expired"]
@@ -197,6 +199,10 @@ class ManualExecutionEntry(StrictRequest):
             or self.executed_at.utcoffset() is None
         ):
             raise ValueError("executed_at must be timezone-aware")
+        if self.executed_at is not None and not is_trading_time(
+            self.executed_at.astimezone(CN_TZ)
+        ):
+            raise ValueError("executed_at must be in a continuous trading session")
         if not self.executed and any(
             value is not None
             for value in (

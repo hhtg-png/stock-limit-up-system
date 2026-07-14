@@ -1823,6 +1823,58 @@ class TradingPlaybookApiTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 422, response.text)
 
+    def test_review_execution_contract_enforces_continuous_cn_sessions(self):
+        for endpoint in ("09:30:00", "11:30:00", "13:00:00", "15:00:00"):
+            with self.subTest(endpoint=endpoint):
+                response = self.client.put(
+                    "/trading-playbook/reviews/2026-07-10",
+                    json={
+                        "executions": {
+                            "1": {
+                                "executed": True,
+                                "executed_at": f"2026-07-10T{endpoint}+08:00",
+                            }
+                        }
+                    },
+                )
+                self.assertEqual(response.status_code, 200, response.text)
+
+        accepted_call_count = len(self.review_service.calls)
+        for executed_at in (
+            "2026-07-10T08:00:00+08:00",
+            "2026-07-10T12:00:00+08:00",
+            "2026-07-10T23:59:00+08:00",
+        ):
+            for scope in ("planned", "unplanned"):
+                with self.subTest(scope=scope, executed_at=executed_at):
+                    payload = (
+                        {
+                            "executions": {
+                                "1": {
+                                    "executed": True,
+                                    "executed_at": executed_at,
+                                }
+                            }
+                        }
+                        if scope == "planned"
+                        else {
+                            "unplanned_executions": [
+                                {
+                                    "executed": True,
+                                    "stock_code": "600000",
+                                    "stock_name": "浦发银行",
+                                    "executed_at": executed_at,
+                                }
+                            ]
+                        }
+                    )
+                    response = self.client.put(
+                        "/trading-playbook/reviews/2026-07-10",
+                        json=payload,
+                    )
+                    self.assertEqual(response.status_code, 422, response.text)
+        self.assertEqual(len(self.review_service.calls), accepted_call_count)
+
     def test_review_put_forwards_strict_explicit_plan_selection(self):
         response = self.client.put(
             "/trading-playbook/reviews/2026-07-10",

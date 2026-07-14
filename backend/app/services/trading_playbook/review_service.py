@@ -24,7 +24,7 @@ from app.models.trading_playbook import (
     TradingPlanCandidate,
     TradingPlanVersion,
 )
-from app.utils.time_utils import CN_TZ, now_cn
+from app.utils.time_utils import CN_TZ, is_trading_time, now_cn
 
 from .errors import (
     InvalidRequestError,
@@ -117,6 +117,97 @@ def _event_price(event: Any) -> Optional[float]:
     return price if price is not None and price > 0 else None
 
 
+def _sanitize_event_json(
+    value: Any,
+    *,
+    path: str,
+    issues: list[tuple[str, str]],
+) -> Any:
+    """Make persisted event JSON strict while retaining audit paths."""
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if math.isfinite(value):
+            return value
+        issues.append((path, "nonfinite_event_json"))
+        return None
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, Mapping):
+        sanitized: dict[str, Any] = {}
+        for key, child in value.items():
+            if not isinstance(key, str):
+                issues.append((f"{path}.{key}", "invalid_event_json"))
+                continue
+            sanitized[key] = _sanitize_event_json(
+                child,
+                path=f"{path}.{key}",
+                issues=issues,
+            )
+        return sanitized
+    if isinstance(value, (list, tuple)):
+        return [
+            _sanitize_event_json(
+                child,
+                path=f"{path}[{index}]",
+                issues=issues,
+            )
+            for index, child in enumerate(value)
+        ]
+    issues.append((path, "invalid_event_json"))
+    return None
+
+
+def _sanitize_event(event: Any) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    event_id = _value(event, "id")
+    event_type = _value(event, "event_type")
+    inherited_paths = list(_value(event, "_invalid_numeric_paths", []) or [])
+    inherited_warnings = list(_value(event, "_event_json_warnings", []) or [])
+    issues: list[tuple[str, str]] = []
+    snapshot = _sanitize_event_json(
+        _value(event, "market_snapshot_json", {}) or {},
+        path="market_snapshot_json",
+        issues=issues,
+    )
+    channel_status = _sanitize_event_json(
+        _value(event, "channel_status_json", {}) or {},
+        path="channel_status_json",
+        issues=issues,
+    )
+    warnings = inherited_warnings + [
+        {
+            "event_id": event_id,
+            "event_type": event_type,
+            "reason": reason,
+            "path": path,
+        }
+        for path, reason in issues
+    ]
+    invalid_paths = sorted(
+        set(inherited_paths).union(
+            path for path, reason in issues if reason == "nonfinite_event_json"
+        )
+    )
+    return (
+        {
+            "id": event_id,
+            "candidate_id": _value(event, "candidate_id"),
+            "event_type": event_type,
+            "triggered_at": _value(event, "triggered_at"),
+            "acknowledged_at": _value(event, "acknowledged_at"),
+            "channel_status_json": channel_status,
+            "market_snapshot_json": snapshot,
+            "message": _value(event, "message"),
+            "dedup_key": _value(event, "dedup_key"),
+            "_invalid_numeric_paths": invalid_paths,
+            "_event_json_warnings": warnings,
+        },
+        warnings,
+    )
+
+
 class TradingPlaybookReviewService:
     """Build immutable-plan execution reviews without inferring account P&L."""
 
@@ -141,7 +232,12 @@ class TradingPlaybookReviewService:
     ) -> dict[str, Any]:
         """Classify signal and manual execution state using plan-local facts."""
         candidate_rows = list(candidates or [])
-        event_rows = list(events or [])
+        event_rows: list[dict[str, Any]] = []
+        event_json_warnings: list[dict[str, Any]] = []
+        for raw_event in events or []:
+            safe_event, warnings = _sanitize_event(raw_event)
+            event_rows.append(safe_event)
+            event_json_warnings.extend(warnings)
         manual = manual_execution if isinstance(manual_execution, Mapping) else {}
         outcome_by_code = outcomes if isinstance(outcomes, Mapping) else {}
 
@@ -341,6 +437,11 @@ class TradingPlaybookReviewService:
             invalid_entry_price = (
                 raw_entry_price is not None and entry_price is None
             )
+            invalid_entry_price = invalid_entry_price or bool(
+                _value(entry_event, "_invalid_numeric_paths", [])
+                if entry_event is not None
+                else []
+            )
             invalid_close_price = raw_close_price is not None and (
                 close_price is None or close_price <= 0
             )
@@ -404,7 +505,7 @@ class TradingPlaybookReviewService:
             if isinstance(raw_unplanned, list)
             else []
         )
-        return {
+        result = {
             "not_triggered": not_triggered,
             "invalidated": invalidated,
             "triggered_executed": triggered_executed,
@@ -419,6 +520,9 @@ class TradingPlaybookReviewService:
             "signal_outcomes": signal_outcomes,
             "unplanned_executions": unplanned_executions,
         }
+        if event_json_warnings:
+            result["event_warnings"] = event_json_warnings
+        return result
 
     async def build(
         self,
@@ -558,7 +662,7 @@ class TradingPlaybookReviewService:
             raise InvalidRequestError("plan_version_id must be positive")
         manual = self._normalize_manual_execution(executions, trade_date)
         unplanned = self._normalize_unplanned_executions(
-            unplanned_executions or [],
+            [] if unplanned_executions is None else unplanned_executions,
             trade_date,
         )
         if unplanned:
@@ -1068,8 +1172,8 @@ class TradingPlaybookReviewService:
         trade_date: date,
         *,
         build_now: datetime,
-    ) -> tuple[list[TradingAlertEvent], list[dict[str, Any]]]:
-        events: list[TradingAlertEvent] = []
+    ) -> tuple[list[Any], list[dict[str, Any]]]:
+        events: list[Any] = []
         warnings: list[dict[str, Any]] = []
         expected = trade_date.isoformat()
         normalized_now = _cn_datetime(build_now)
@@ -1130,13 +1234,17 @@ class TradingPlaybookReviewService:
                         reason = "invalid_triggered_at"
                     elif triggered_at.date() != trade_date:
                         reason = "triggered_at_trade_date_mismatch"
+                    elif not is_trading_time(triggered_at):
+                        reason = "outside_continuous_session"
                     elif (
                         normalized_now.date() == trade_date
                         and triggered_at > normalized_now
                     ):
                         reason = "future_triggered_at"
             if reason is None:
-                events.append(event)
+                safe_event, event_warnings = _sanitize_event(event)
+                events.append(safe_event)
+                warnings.extend(event_warnings)
                 continue
             warnings.append(
                 {
@@ -1433,7 +1541,7 @@ class TradingPlaybookReviewService:
         executions: Sequence[Mapping[str, Any]],
         trade_date: date,
     ) -> list[dict[str, Any]]:
-        if isinstance(executions, (str, bytes)) or not isinstance(
+        if isinstance(executions, (str, bytes, Mapping)) or not isinstance(
             executions,
             Sequence,
         ):
@@ -1505,6 +1613,10 @@ class TradingPlaybookReviewService:
         if normalized.date() != trade_date:
             raise InvalidRequestError(
                 f"{path} must belong to the review trade date"
+            )
+        if not is_trading_time(normalized):
+            raise InvalidRequestError(
+                f"{path} must belong to a continuous trading session"
             )
         item["executed_at"] = normalized.isoformat()
 
