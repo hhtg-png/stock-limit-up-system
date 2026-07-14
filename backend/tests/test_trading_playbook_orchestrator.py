@@ -37,6 +37,7 @@ from app.services.trading_playbook.mode_features import ModeFeatureBuilder
 from app.services.trading_playbook.mode_matcher import ModeMatcher
 from app.services.trading_playbook.plan_service import TradingPlanService
 from app.services.trading_playbook.rule_catalog import RuleCatalog
+from app.services.trading_playbook.serialization import ValidatedPlanPayload
 
 
 CN_TZ = ZoneInfo("Asia/Shanghai")
@@ -341,6 +342,7 @@ class TradingPlaybookOrchestratorTests(unittest.IsolatedAsyncioTestCase):
             db, SOURCE_DATE, "preclose", AS_OF, degraded=True
         )
 
+        self.assertIsInstance(result, ValidatedPlanPayload)
         self.assertEqual(result["stage"], "preclose")
         self.assertEqual(resolver_calls, [SOURCE_DATE])
         self.assertEqual(

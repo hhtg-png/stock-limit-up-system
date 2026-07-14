@@ -1853,6 +1853,32 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertIsInstance(payload, marker_type)
 
+    async def test_zero_trial_position_remains_a_valid_formal_candidate(self):
+        async with self.Session() as db:
+            db.add(
+                TradingPlaybookSettings(
+                    id=1,
+                    trial_position_pct=0.0,
+                    confirmed_position_pct=30.0,
+                    hard_stop_pct=5.0,
+                    max_action_candidates=3,
+                )
+            )
+            await db.commit()
+            payload = await self.service.generate(
+                db,
+                _snapshot(),
+                [_evaluation("leader", "000001", risk_level="trial")],
+                stock_names={"000001": "股票1"},
+                rule_snapshot=_rule_snapshot("leader"),
+            )
+
+        self.assertEqual(payload["candidates"][0]["position_reference"], 0.0)
+        self.assertEqual(
+            payload["candidates"][0]["invalidation_json"]["price_lte"],
+            9.5,
+        )
+
     async def test_sqlite_compat_migration_repairs_duplicate_active_before_index(self):
         async with self.engine.begin() as connection:
             await connection.exec_driver_sql(
