@@ -342,7 +342,6 @@ class TradingPlaybookOrchestratorTests(unittest.IsolatedAsyncioTestCase):
             db, SOURCE_DATE, "preclose", AS_OF, degraded=True
         )
 
-        self.assertIsInstance(result, ValidatedPlanPayload)
         self.assertEqual(result["stage"], "preclose")
         self.assertEqual(resolver_calls, [SOURCE_DATE])
         self.assertEqual(
@@ -1035,6 +1034,7 @@ class TradingPlaybookOrchestratorIntegrationTests(
                 select(func.count()).select_from(TradingPlanVersion)
             )
 
+        self.assertIsInstance(result, ValidatedPlanPayload)
         self.assertEqual(result["stage"], "preclose")
         self.assertEqual(persisted, 1)
         self.assertEqual(len(result["mode_radar_json"]), 38)

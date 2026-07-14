@@ -1359,26 +1359,14 @@ class TradingPlanService:
                     return payload
                 except IntegrityError:
                     await db.rollback()
-                    existing = await self._find_revision_by_hash(
-                        db,
-                        plan_id,
-                        revision_hash,
-                    )
-                    if existing is not None:
-                        existing_candidates = await self._load_candidates(
-                            db,
-                            existing.id,
-                        )
-                        return normalize_plan_payload(
-                            self._serialize_loaded(
-                                existing,
-                                existing_candidates,
-                            )
-                        )
                     if attempt == 2:
                         raise InvalidTransitionError(
                             "could not allocate a unique revision version"
                         )
+                    # Retry from the parent claim. If a concurrent worker won,
+                    # the normal existing-child branch builds the detached
+                    # payload and commits before returning it.
+                    continue
                 except Exception:
                     await db.rollback()
                     raise

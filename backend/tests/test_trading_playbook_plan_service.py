@@ -1836,6 +1836,56 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
             ).all()
             self.assertEqual([row.id for row in children], [child["id"]])
 
+    async def test_revision_integrity_recovery_retries_through_claimed_commit_path(self):
+        async with self.Session() as setup:
+            parent = await self.service.generate(
+                setup,
+                _snapshot(),
+                [_evaluation("leader", "000001")],
+                stock_names={"000001": "股票1"},
+                rule_snapshot=_rule_snapshot("leader"),
+            )
+            changes = {"change_note": "concurrent winning revision"}
+            child = await self.service.revise(setup, parent["id"], changes)
+
+        find_calls = 0
+
+        async with self.Session() as db:
+            async def find_after_retry(
+                session,
+                parent_plan_id,
+                input_hash,
+            ):
+                nonlocal find_calls
+                find_calls += 1
+                if find_calls == 1:
+                    return None
+                return await session.get(TradingPlanVersion, child["id"])
+
+            forced_conflict = IntegrityError(
+                "forced concurrent insert",
+                {},
+                RuntimeError("duplicate revision"),
+            )
+            with patch.object(
+                self.service,
+                "_find_revision_by_hash",
+                new=find_after_retry,
+            ), patch.object(
+                db,
+                "flush",
+                new=AsyncMock(side_effect=forced_conflict),
+            ):
+                recovered = await self.service.revise(
+                    db,
+                    parent["id"],
+                    changes,
+                )
+
+            self.assertEqual(find_calls, 2)
+            self.assertEqual(recovered["id"], child["id"])
+            self.assertFalse(db.in_transaction())
+
     async def test_generate_returns_explicit_validated_payload_marker(self):
         marker_type = getattr(
             serialization_module,
