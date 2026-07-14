@@ -47,7 +47,36 @@ test('trading playbook types preserve backend snake_case contracts', () => {
     source,
     /type\s+TradingAlertEventType[\s\S]*?['"]review_ready['"]/
   )
+  assert.match(
+    source,
+    /interface\s+TradingRuleSnapshot[\s\S]*?mode_key:\s*string[\s\S]*?version:\s*number[\s\S]*?content_hash:\s*string/
+  )
+  assert.match(source, /interface\s+TradingRuleSnapshot[\s\S]*?\[key:\s*string\]:\s*unknown/)
+  assert.match(source, /rule_snapshot_json:\s*TradingRuleSnapshot\[\]/)
   assert.match(source, /wechat_enabled:\s*false/)
+})
+
+test('trading plan API preserves object rule snapshots from the backend', async () => {
+  await withFrontendModules(async server => {
+    const client = await server.ssrLoadModule('/src/api/trading-playbook.ts')
+    const ruleSnapshot = {
+      mode_key: 'leader_turn_two',
+      version: 3,
+      content_hash: 'a'.repeat(64),
+      name: '龙头弱转强'
+    }
+    client.tradingPlaybookApi.defaults.adapter = async config => ({
+      data: { id: 7, rule_snapshot_json: [ruleSnapshot] },
+      status: 200,
+      statusText: 'OK',
+      headers: {},
+      config
+    })
+
+    const plan = await client.getTradingPlan(7)
+
+    assert.deepEqual(plan.rule_snapshot_json, [ruleSnapshot])
+  })
 })
 
 test('trading playbook API sends exact backend routes, params, and payloads', async () => {

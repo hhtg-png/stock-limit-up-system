@@ -11,6 +11,13 @@ export type TradingAlertEventType =
   | 'exit_triggered'
   | 'review_ready'
 
+export interface TradingRuleSnapshot {
+  mode_key: string
+  version: number
+  content_hash: string
+  [key: string]: unknown
+}
+
 export interface TradingPlanCandidate {
   id: number
   stock_code: string
@@ -43,7 +50,7 @@ export interface TradingPlanVersion {
   market_state_json: Record<string, unknown>
   theme_ranking_json: Array<Record<string, unknown>>
   mode_radar_json: Array<Record<string, unknown>>
-  rule_snapshot_json: string[]
+  rule_snapshot_json: TradingRuleSnapshot[]
   risk_settings_json: Record<string, unknown>
   data_quality_json: { status: string; stale?: boolean; warnings?: string[] }
   change_summary_json: Record<string, unknown>
