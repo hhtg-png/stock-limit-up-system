@@ -18,15 +18,20 @@ export function discoverDirectTests(frontendRoot) {
     .sort()
 }
 
+export function normalizeSpawnExitCode(result) {
+  return result.status ?? 1
+}
+
 export function runSteps(steps, options = {}) {
+  const cwd = options.cwd
   const stdio = options.stdio ?? 'inherit'
   const report = options.report ?? true
   let exitCode = 0
 
   for (const step of steps) {
     if (report) console.log(`\n[frontend:test] ${step.label}`)
-    const result = spawnSync(step.command, step.args, { stdio })
-    const stepExitCode = result.status ?? 1
+    const result = spawnSync(step.command, step.args, { cwd, stdio })
+    const stepExitCode = normalizeSpawnExitCode(result)
 
     if (report && result.error) {
       console.error(`[frontend:test] 无法启动 ${step.label}: ${result.error.message}`)
@@ -42,7 +47,7 @@ export function runSteps(steps, options = {}) {
   return exitCode
 }
 
-function main() {
+export function main(run = runSteps) {
   const frontendRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
   const directTests = discoverDirectTests(frontendRoot)
   const steps = [
@@ -63,7 +68,9 @@ function main() {
     }
   ]
 
-  process.exitCode = runSteps(steps)
+  const exitCode = run(steps, { cwd: frontendRoot })
+  process.exitCode = exitCode
+  return exitCode
 }
 
 const invokedPath = process.argv[1] ? resolve(process.argv[1]) : ''
