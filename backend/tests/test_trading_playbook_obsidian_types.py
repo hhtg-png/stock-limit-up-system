@@ -344,13 +344,27 @@ class ObsidianContractTests(unittest.TestCase):
             )
 
     def test_sync_batch_result_rejects_non_json_safe_git_status_values(self) -> None:
+        class DictSubclass(dict[str, object]):
+            pass
+
+        class ListSubclass(list[object]):
+            pass
+
         invalid_statuses = (
             {"bad": object()},
             {"nested": {"bad": object()}},
+            {"nested": date(2026, 7, 15)},
+            {"nested": datetime(2026, 7, 15, 1, 30, tzinfo=timezone.utc)},
+            {"nested": Decimal("1.25")},
+            {"nested": (1, 2)},
             {"nested": [1, {"bad"}]},
             {"nested": {1: "non-string key"}},
+            {"nested": DictSubclass(value=1)},
+            {"nested": ListSubclass([1])},
             {"bad": b"bytes"},
             {"bad": float("nan")},
+            {"bad": float("inf")},
+            {"bad": float("-inf")},
         )
 
         for git_status in invalid_statuses:
@@ -365,6 +379,32 @@ class ObsidianContractTests(unittest.TestCase):
                         failed_files=(),
                         git_status=git_status,  # type: ignore[arg-type]
                     )
+
+    def test_sync_batch_result_retains_only_strict_json_values(self) -> None:
+        git_status = {
+            "branch": "main",
+            "clean": True,
+            "ahead": 2,
+            "coverage": 0.875,
+            "upstream": None,
+            "files": [
+                {"path": "plan.md", "staged": False},
+                ["nested", 1, 0.5, None],
+            ],
+        }
+
+        result = ObsidianSyncBatchResult(
+            trade_date=date(2026, 7, 15),
+            phase="reconcile",
+            written_files=(),
+            skipped_files=(),
+            pending_files=(),
+            failed_files=(),
+            git_status=git_status,
+        )
+
+        self.assertIs(result.git_status, git_status)
+        self.assertEqual(result.git_status, git_status)
 
     def test_sync_batch_result_git_status_must_be_a_real_dict(self) -> None:
         invalid_statuses = (

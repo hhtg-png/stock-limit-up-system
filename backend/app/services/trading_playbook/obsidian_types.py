@@ -90,6 +90,26 @@ def _canonical_value(value: object) -> JSONValue:
     )
 
 
+def _validate_json_value(value: object) -> None:
+    if value is None or isinstance(value, (str, bool, int)):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("JSON float values must be finite")
+        return
+    if type(value) is dict:
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError("JSON dict keys must be strings")
+            _validate_json_value(item)
+        return
+    if type(value) is list:
+        for item in value:
+            _validate_json_value(item)
+        return
+    raise TypeError(f"unsupported JSON value type: {type(value).__name__}")
+
+
 def canonical_json_bytes(value: CanonicalValue) -> bytes:
     """Return stable UTF-8 JSON bytes for a strict canonical input value."""
 
@@ -157,7 +177,7 @@ class ObsidianSyncBatchResult:
             raise ValueError(f"phase must be one of {OBSIDIAN_PHASES}")
         if type(self.git_status) is not dict:
             raise TypeError("git_status must be a dict")
-        canonical_json_bytes(self.git_status)
+        _validate_json_value(self.git_status)
 
 
 __all__ = (
