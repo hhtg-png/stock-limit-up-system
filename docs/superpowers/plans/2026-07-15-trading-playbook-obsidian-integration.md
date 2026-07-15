@@ -135,7 +135,7 @@ Run:
 
 ```powershell
 Set-Location backend
-python -m unittest tests.test_obsidian_vault_writer -v
+python -m unittest discover -s tests -p 'test_obsidian_vault_writer.py' -v
 ```
 
 Expected: `ModuleNotFoundError: No module named 'app.services.obsidian_vault_writer'`。
@@ -271,7 +271,7 @@ Run:
 
 ```powershell
 Set-Location backend
-python -m unittest tests.test_obsidian_vault_writer tests.test_obsidian_knowledge_service -v
+python -m unittest discover -s tests -p 'test_obsidian*.py' -v
 ```
 
 Expected: 全部通过，测试输出包含 `OK`。
@@ -298,7 +298,7 @@ git commit -m "refactor: extract safe Obsidian vault writer"
 
 ```powershell
 Set-Location backend
-python -m unittest tests.test_trading_playbook_models.TradingPlaybookModelTests -v
+python -m unittest discover -s tests -p 'test_trading_playbook_models.py' -v
 ```
 
 Expected: 因 `TradingPlaybookObsidianExport` 尚不存在而失败。
@@ -360,7 +360,7 @@ class TradingPlaybookObsidianExport(Base):
 
 ```powershell
 Set-Location backend
-python -m unittest tests.test_trading_playbook_models -v
+python -m unittest discover -s tests -p 'test_trading_playbook_models.py' -v
 ```
 
 Expected: 全部通过，旧库初始化测试证明缺失表由 `Base.metadata.create_all` 补齐，不需要重复手写 DDL。
@@ -386,7 +386,7 @@ git commit -m "feat: persist Obsidian export snapshots"
 
 ```powershell
 Set-Location backend
-python -m unittest tests.test_trading_playbook_obsidian_types -v
+python -m unittest discover -s tests -p 'test_trading_playbook_obsidian_types.py' -v
 ```
 
 Expected: 新模块不存在。
@@ -442,7 +442,7 @@ json.dumps(
 
 ```powershell
 Set-Location backend
-python -m unittest tests.test_trading_playbook_obsidian_types -v
+python -m unittest discover -s tests -p 'test_trading_playbook_obsidian_types.py' -v
 ```
 
 Expected: 全部通过。
@@ -472,7 +472,7 @@ git commit -m "feat: define canonical Obsidian artifacts"
 
 ```powershell
 Set-Location backend
-python -m unittest tests.test_trading_playbook_obsidian_snapshot_builder -v
+python -m unittest discover -s tests -p 'test_trading_playbook_obsidian_snapshot_builder.py' -v
 ```
 
 Expected: 新模块不存在。
@@ -532,7 +532,7 @@ payload = {
 
 ```powershell
 Set-Location backend
-python -m unittest tests.test_trading_playbook_obsidian_snapshot_builder -v
+python -m unittest discover -s tests -p 'test_trading_playbook_obsidian_snapshot_builder.py' -v
 ```
 
 Expected: 规则和预案测试全部通过。
@@ -564,7 +564,7 @@ Dashboard 快照只包含 Dataview 查询和固定导航事实；Notes 链接为
 
 ```powershell
 Set-Location backend
-python -m unittest tests.test_trading_playbook_obsidian_snapshot_builder -v
+python -m unittest discover -s tests -p 'test_trading_playbook_obsidian_snapshot_builder.py' -v
 ```
 
 Expected: 缺失 review/alerts/index/dashboard 构建方法而失败。
@@ -602,7 +602,7 @@ async def build_stage_artifacts(
 
 ```powershell
 Set-Location backend
-python -m unittest tests.test_trading_playbook_obsidian_snapshot_builder -v
+python -m unittest discover -s tests -p 'test_trading_playbook_obsidian_snapshot_builder.py' -v
 ```
 
 Expected: 全部通过，测试明确证明没有 `entity_type == "notes"` 或 Notes 目标路径。
@@ -636,7 +636,7 @@ auto_execute: false
 
 ```powershell
 Set-Location backend
-python -m unittest tests.test_trading_playbook_obsidian_exporter -v
+python -m unittest discover -s tests -p 'test_trading_playbook_obsidian_exporter.py' -v
 ```
 
 Expected: 新 exporter 模块不存在。
@@ -674,7 +674,7 @@ Frontmatter `source_hash` 来自 artifact，而 `generated_at` 来自协调器�
 
 ```powershell
 Set-Location backend
-python -m unittest tests.test_trading_playbook_obsidian_exporter -v
+python -m unittest discover -s tests -p 'test_trading_playbook_obsidian_exporter.py' -v
 ```
 
 Expected: 全部通过，稳定性测试比较完整字符串相等。
@@ -700,7 +700,7 @@ git commit -m "feat: render trading playbook Obsidian pages"
 
 ```powershell
 Set-Location backend
-python -m unittest tests.test_trading_playbook_obsidian_sync -v
+python -m unittest discover -s tests -p 'test_trading_playbook_obsidian_sync.py' -v
 ```
 
 Expected: 协调器模块不存在。
@@ -754,7 +754,7 @@ class TradingPlaybookObsidianSyncCoordinator:
 
 ```powershell
 Set-Location backend
-python -m unittest tests.test_trading_playbook_obsidian_sync -v
+python -m unittest discover -s tests -p 'test_trading_playbook_obsidian_sync.py' -v
 ```
 
 Expected: 入队与竞争测试全部通过。
@@ -825,7 +825,7 @@ async def process_due(self, *, limit: int = 100) -> ObsidianSyncBatchResult:
 
 ```powershell
 Set-Location backend
-python -m unittest tests.test_trading_playbook_obsidian_sync -v
+python -m unittest discover -s tests -p 'test_trading_playbook_obsidian_sync.py' -v
 ```
 
 Expected: 全部通过，重试时间使用注入 clock 做精确断言，不 sleep。
@@ -891,7 +891,7 @@ def reset_trading_playbook_services(self) -> None:
 
 ```powershell
 Set-Location backend
-python -m unittest tests.test_trading_playbook_scheduler -v
+python -m unittest discover -s tests -p 'test_trading_playbook_scheduler.py' -v
 ```
 
 Expected: 全部通过。
@@ -906,7 +906,7 @@ Expected: 全部通过。
 
 ```powershell
 Set-Location backend
-python -m unittest tests.test_main_lifespan -v
+python -m unittest discover -s tests -p 'test_main_lifespan.py' -v
 ```
 
 Expected: 全部通过。
@@ -944,7 +944,7 @@ git commit -m "feat: schedule Obsidian trading playbook sync"
 
 ```powershell
 Set-Location backend
-python -m unittest tests.test_trading_playbook_api -v
+python -m unittest discover -s tests -p 'test_trading_playbook_api.py' -v
 ```
 
 Expected: 新路由返回 404 或 schema 不存在。
@@ -985,7 +985,7 @@ class TradingPlaybookObsidianStatusResponse(BaseModel):
 
 ```powershell
 Set-Location backend
-python -m unittest tests.test_trading_playbook_api -v
+python -m unittest discover -s tests -p 'test_trading_playbook_api.py' -v
 ```
 
 Expected: 全部通过。
@@ -1179,7 +1179,8 @@ git commit -m "feat: add Obsidian controls to trading playbook"
 
 ```powershell
 Set-Location backend
-python -m unittest tests.test_obsidian_vault_writer tests.test_obsidian_knowledge_service tests.test_trading_playbook_obsidian_types tests.test_trading_playbook_obsidian_snapshot_builder tests.test_trading_playbook_obsidian_exporter tests.test_trading_playbook_obsidian_sync -v
+python -m unittest discover -s tests -p 'test_obsidian*.py' -v
+python -m unittest discover -s tests -p 'test_trading_playbook_obsidian_*.py' -v
 ```
 
 Expected: 全部通过。
