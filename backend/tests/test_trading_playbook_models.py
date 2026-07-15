@@ -1,4 +1,5 @@
 import unittest
+from datetime import date, datetime
 
 from sqlalchemy import (
     Boolean,
@@ -168,6 +169,27 @@ TABLE_COLUMNS = {
         "channel_config_json",
         "updated_at",
     },
+    "trading_playbook_obsidian_exports": {
+        "id",
+        "snapshot_key",
+        "snapshot_version",
+        "trade_date",
+        "entity_type",
+        "entity_id",
+        "phase",
+        "target_path",
+        "source_hash",
+        "snapshot_json",
+        "immutable",
+        "status",
+        "attempt_no",
+        "next_attempt_at",
+        "last_error",
+        "git_status_json",
+        "exported_at",
+        "created_at",
+        "updated_at",
+    },
 }
 
 COLUMN_TYPES = {
@@ -309,6 +331,27 @@ COLUMN_TYPES = {
         "channel_config_json": (JSON, None),
         "updated_at": (DateTime, None),
     },
+    "trading_playbook_obsidian_exports": {
+        "id": (Integer, None),
+        "snapshot_key": (String, 255),
+        "snapshot_version": (Integer, None),
+        "trade_date": (Date, None),
+        "entity_type": (String, 32),
+        "entity_id": (Integer, None),
+        "phase": (String, 32),
+        "target_path": (String, 1024),
+        "source_hash": (String, 64),
+        "snapshot_json": (JSON, None),
+        "immutable": (Boolean, None),
+        "status": (String, 32),
+        "attempt_no": (Integer, None),
+        "next_attempt_at": (DateTime, None),
+        "last_error": (Text, None),
+        "git_status_json": (JSON, None),
+        "exported_at": (DateTime, None),
+        "created_at": (DateTime, None),
+        "updated_at": (DateTime, None),
+    },
 }
 
 NULLABLE_COLUMNS = {
@@ -328,6 +371,11 @@ NULLABLE_COLUMNS = {
     ("trading_playbook_job_claims", "lease_expires_at"),
     ("trading_playbook_job_claims", "completed_at"),
     ("trading_playbook_job_claims", "last_error"),
+    ("trading_playbook_obsidian_exports", "entity_id"),
+    ("trading_playbook_obsidian_exports", "next_attempt_at"),
+    ("trading_playbook_obsidian_exports", "last_error"),
+    ("trading_playbook_obsidian_exports", "git_status_json"),
+    ("trading_playbook_obsidian_exports", "exported_at"),
 }
 
 SCALAR_DEFAULTS = {
@@ -350,6 +398,9 @@ SCALAR_DEFAULTS = {
     ("trading_playbook_settings", "max_action_candidates"): 3,
     ("trading_playbook_settings", "in_app_enabled"): True,
     ("trading_playbook_settings", "wechat_enabled"): False,
+    ("trading_playbook_obsidian_exports", "immutable"): False,
+    ("trading_playbook_obsidian_exports", "status"): "pending",
+    ("trading_playbook_obsidian_exports", "attempt_no"): 0,
 }
 
 DATETIME_DEFAULTS = {
@@ -362,6 +413,8 @@ DATETIME_DEFAULTS = {
     ("trading_playbook_job_claims", "created_at"),
     ("trading_playbook_job_claims", "updated_at"),
     ("trading_playbook_settings", "updated_at"),
+    ("trading_playbook_obsidian_exports", "created_at"),
+    ("trading_playbook_obsidian_exports", "updated_at"),
 }
 
 JSON_DEFAULTS = {
@@ -406,6 +459,10 @@ JSON_DEFAULTS = {
     "trading_playbook_settings": {"channel_config_json": dict},
 }
 
+JSON_COLUMNS_WITHOUT_DEFAULTS = {
+    "trading_playbook_obsidian_exports": {"snapshot_json", "git_status_json"},
+}
+
 UNIQUE_CONSTRAINTS = {
     "trading_rule_sources": {
         ("uq_trading_rule_source_hash", ("source_key", "content_hash")),
@@ -441,6 +498,12 @@ UNIQUE_CONSTRAINTS = {
         ("uq_trading_playbook_job_claim_key", ("job_key",)),
     },
     "trading_playbook_settings": set(),
+    "trading_playbook_obsidian_exports": {
+        (
+            "uq_trading_playbook_obsidian_snapshot_version",
+            ("snapshot_key", "snapshot_version"),
+        ),
+    },
 }
 
 FOREIGN_KEYS = {
@@ -481,21 +544,35 @@ COMPOSITE_INDEXES = {
             ("candidate_id", "event_type", "active"),
         ),
     },
+    "trading_playbook_obsidian_exports": {
+        (
+            "ix_trading_playbook_obsidian_due",
+            ("status", "next_attempt_at"),
+        ),
+        (
+            "ix_trading_playbook_obsidian_trade_date",
+            ("trade_date", "phase"),
+        ),
+    },
 }
 
 
 class TradingPlaybookModelTests(unittest.TestCase):
+    def _table(self, table_name):
+        self.assertIn(table_name, Base.metadata.tables)
+        return Base.metadata.tables[table_name]
+
     def test_tables_have_exact_column_sets(self):
         for table_name, expected_columns in TABLE_COLUMNS.items():
             with self.subTest(table=table_name):
-                table = Base.metadata.tables[table_name]
+                table = self._table(table_name)
                 self.assertEqual(set(table.c.keys()), expected_columns)
 
     def test_column_types_and_string_lengths_match_contract(self):
         for table_name, expected_columns in TABLE_COLUMNS.items():
             with self.subTest(table=table_name, coverage="type map"):
                 self.assertEqual(set(COLUMN_TYPES[table_name]), expected_columns)
-            table = Base.metadata.tables[table_name]
+            table = self._table(table_name)
             for column_name, (expected_type, expected_length) in COLUMN_TYPES[
                 table_name
             ].items():
@@ -514,7 +591,7 @@ class TradingPlaybookModelTests(unittest.TestCase):
         callable_defaults = DATETIME_DEFAULTS | json_default_columns
 
         for table_name, expected_columns in TABLE_COLUMNS.items():
-            table = Base.metadata.tables[table_name]
+            table = self._table(table_name)
             for column_name in expected_columns:
                 key = (table_name, column_name)
                 column = table.c[column_name]
@@ -535,13 +612,22 @@ class TradingPlaybookModelTests(unittest.TestCase):
                         self.assertIsNone(column.default)
 
     def test_json_defaults_are_callable_with_the_correct_shape(self):
-        for table_name, expected_defaults in JSON_DEFAULTS.items():
-            table = Base.metadata.tables[table_name]
+        json_tables = set(JSON_DEFAULTS) | set(JSON_COLUMNS_WITHOUT_DEFAULTS)
+        for table_name in json_tables:
+            expected_defaults = JSON_DEFAULTS.get(table_name, {})
+            expected_without_defaults = JSON_COLUMNS_WITHOUT_DEFAULTS.get(
+                table_name,
+                set(),
+            )
+            table = self._table(table_name)
             actual_json_columns = {
                 column.name for column in table.c if isinstance(column.type, JSON)
             }
             with self.subTest(table=table_name, coverage="JSON columns"):
-                self.assertEqual(actual_json_columns, set(expected_defaults))
+                self.assertEqual(
+                    actual_json_columns,
+                    set(expected_defaults) | expected_without_defaults,
+                )
             for column_name, expected_factory in expected_defaults.items():
                 with self.subTest(table=table_name, column=column_name):
                     default_callable = table.c[column_name].default.arg
@@ -553,9 +639,13 @@ class TradingPlaybookModelTests(unittest.TestCase):
                     )
                     self.assertIsInstance(factory(), expected_factory)
 
+            for column_name in expected_without_defaults:
+                with self.subTest(table=table_name, column=column_name):
+                    self.assertIsNone(table.c[column_name].default)
+
     def test_named_unique_constraints_match_contract(self):
         for table_name, expected_constraints in UNIQUE_CONSTRAINTS.items():
-            table = Base.metadata.tables[table_name]
+            table = self._table(table_name)
             actual_constraints = {
                 (
                     constraint.name,
@@ -578,7 +668,7 @@ class TradingPlaybookModelTests(unittest.TestCase):
 
     def test_required_single_column_indexes_are_registered(self):
         for table_name, expected_columns in INDEXED_COLUMNS.items():
-            table = Base.metadata.tables[table_name]
+            table = self._table(table_name)
             indexed_columns = {
                 tuple(column.name for column in index.columns)
                 for index in table.indexes
@@ -589,7 +679,7 @@ class TradingPlaybookModelTests(unittest.TestCase):
 
     def test_required_composite_indexes_are_registered(self):
         for table_name, expected_indexes in COMPOSITE_INDEXES.items():
-            table = Base.metadata.tables[table_name]
+            table = self._table(table_name)
             actual_indexes = {
                 (index.name, tuple(column.name for column in index.columns))
                 for index in table.indexes
@@ -600,7 +690,7 @@ class TradingPlaybookModelTests(unittest.TestCase):
     def test_primary_keys_and_autoincrement_match_contract(self):
         autoincrement_tables = set(TABLE_COLUMNS) - {"trading_playbook_settings"}
         for table_name in TABLE_COLUMNS:
-            table = Base.metadata.tables[table_name]
+            table = self._table(table_name)
             with self.subTest(table=table_name):
                 self.assertEqual(tuple(table.primary_key.columns.keys()), ("id",))
                 if table_name in autoincrement_tables:
@@ -617,6 +707,20 @@ class TradingPlaybookModelTests(unittest.TestCase):
         ].c.updated_at
         self.assertIsNotNone(updated_at.onupdate)
         self.assertTrue(callable(updated_at.onupdate.arg))
+
+    def test_obsidian_export_updated_at_has_callable_onupdate(self):
+        table_name = "trading_playbook_obsidian_exports"
+        self.assertIn(table_name, Base.metadata.tables)
+        updated_at = Base.metadata.tables[table_name].c.updated_at
+        self.assertIsNotNone(updated_at.onupdate)
+        self.assertTrue(callable(updated_at.onupdate.arg))
+
+    def test_obsidian_export_model_is_exported(self):
+        self.assertTrue(
+            hasattr(app.models, "TradingPlaybookObsidianExport"),
+            "TradingPlaybookObsidianExport must be exported from app.models",
+        )
+        self.assertIn("TradingPlaybookObsidianExport", app.models.__all__)
 
 
 class TradingPlaybookPersistenceTests(unittest.IsolatedAsyncioTestCase):
@@ -673,6 +777,87 @@ class TradingPlaybookPersistenceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(first.candidate_filters_json, ["liquid"])
                 self.assertEqual(second.prerequisites_json, {})
                 self.assertEqual(second.candidate_filters_json, [])
+        finally:
+            await engine.dispose()
+
+    async def test_obsidian_export_persists_snapshot_round_trip(self):
+        self.assertTrue(
+            hasattr(app.models, "TradingPlaybookObsidianExport"),
+            "TradingPlaybookObsidianExport must exist before it can persist",
+        )
+        export_model = app.models.TradingPlaybookObsidianExport
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:", future=True)
+        try:
+            async with engine.begin() as connection:
+                await connection.run_sync(Base.metadata.create_all)
+
+            session_factory = async_sessionmaker(engine, expire_on_commit=False)
+            async with session_factory() as session:
+                snapshot = export_model(
+                    snapshot_key="2026-07-15/plan/42",
+                    snapshot_version=3,
+                    trade_date=date(2026, 7, 15),
+                    entity_type="plan",
+                    entity_id=42,
+                    phase="pre_market",
+                    target_path="Trading/2026-07-15/plan-42.md",
+                    source_hash="c" * 64,
+                    snapshot_json={"candidate_ids": [7, 11]},
+                    immutable=True,
+                    status="exported",
+                    attempt_no=2,
+                    next_attempt_at=datetime(2026, 7, 15, 8, 45),
+                    last_error="previous attempt failed",
+                    git_status_json={"commit": "abc123"},
+                    exported_at=datetime(2026, 7, 15, 9, 0),
+                )
+                session.add(snapshot)
+                await session.commit()
+                await session.refresh(snapshot)
+
+                self.assertIsNotNone(snapshot.id)
+                self.assertEqual(snapshot.snapshot_version, 3)
+                self.assertEqual(snapshot.trade_date, date(2026, 7, 15))
+                self.assertEqual(snapshot.snapshot_json, {"candidate_ids": [7, 11]})
+                self.assertEqual(snapshot.git_status_json, {"commit": "abc123"})
+                self.assertEqual(snapshot.next_attempt_at, datetime(2026, 7, 15, 8, 45))
+                self.assertEqual(snapshot.exported_at, datetime(2026, 7, 15, 9, 0))
+                self.assertIsNotNone(snapshot.created_at)
+                self.assertIsNotNone(snapshot.updated_at)
+        finally:
+            await engine.dispose()
+
+    async def test_create_all_adds_obsidian_export_table_to_existing_schema(self):
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:", future=True)
+        try:
+            async with engine.begin() as connection:
+                await connection.exec_driver_sql(
+                    "CREATE TABLE preexisting_rows ("
+                    "id INTEGER PRIMARY KEY, value VARCHAR(32) NOT NULL)"
+                )
+                await connection.exec_driver_sql(
+                    "INSERT INTO preexisting_rows (id, value) "
+                    "VALUES (1, 'preserved')"
+                )
+                before = await connection.exec_driver_sql(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND "
+                    "name='trading_playbook_obsidian_exports'"
+                )
+                self.assertIsNone(before.scalar_one_or_none())
+
+                await connection.run_sync(Base.metadata.create_all)
+
+                tables = await connection.exec_driver_sql(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+                self.assertIn(
+                    "trading_playbook_obsidian_exports",
+                    set(tables.scalars()),
+                )
+                preserved = await connection.exec_driver_sql(
+                    "SELECT value FROM preexisting_rows WHERE id=1"
+                )
+                self.assertEqual(preserved.scalar_one(), "preserved")
         finally:
             await engine.dispose()
 

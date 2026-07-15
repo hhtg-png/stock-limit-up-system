@@ -295,6 +295,54 @@ class TradingPlaybookJobClaim(Base):
     )
 
 
+class TradingPlaybookObsidianExport(Base):
+    """Immutable snapshot queued for export to an Obsidian vault."""
+
+    __tablename__ = "trading_playbook_obsidian_exports"
+    __table_args__ = (
+        UniqueConstraint(
+            "snapshot_key",
+            "snapshot_version",
+            name="uq_trading_playbook_obsidian_snapshot_version",
+        ),
+        Index(
+            "ix_trading_playbook_obsidian_due",
+            "status",
+            "next_attempt_at",
+        ),
+        Index(
+            "ix_trading_playbook_obsidian_trade_date",
+            "trade_date",
+            "phase",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    snapshot_key = Column(String(255), nullable=False)
+    snapshot_version = Column(Integer, nullable=False)
+    trade_date = Column(Date, nullable=False)
+    entity_type = Column(String(32), nullable=False)
+    entity_id = Column(Integer, nullable=True)
+    phase = Column(String(32), nullable=False)
+    target_path = Column(String(1024), nullable=False)
+    source_hash = Column(String(64), nullable=False)
+    snapshot_json = Column(JSON, nullable=False)
+    immutable = Column(Boolean, default=False, nullable=False)
+    status = Column(String(32), default="pending", nullable=False)
+    attempt_no = Column(Integer, default=0, nullable=False)
+    next_attempt_at = Column(DateTime, nullable=True)
+    last_error = Column(Text, nullable=True)
+    git_status_json = Column(JSON, nullable=True)
+    exported_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.now, nullable=False)
+    updated_at = Column(
+        DateTime,
+        default=datetime.now,
+        onupdate=datetime.now,
+        nullable=False,
+    )
+
+
 class TradingPlaybookSettings(Base):
     """Singleton configuration for playbook sizing and alert channels."""
 

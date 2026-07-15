@@ -31,8 +31,9 @@ from .trading_playbook import (  # noqa: F401
     TradingModeRule,
     TradingPlanCandidate,
     TradingPlanVersion,
-    TradingPlaybookSettings,
     TradingPlaybookJobClaim,
+    TradingPlaybookObsidianExport,
+    TradingPlaybookSettings,
     TradingRuleSource,
 )
 
@@ -63,8 +64,9 @@ __all__ = [
     "TradingModeRule",
     "TradingPlanCandidate",
     "TradingPlanVersion",
-    "TradingPlaybookSettings",
     "TradingPlaybookJobClaim",
+    "TradingPlaybookObsidianExport",
+    "TradingPlaybookSettings",
     "TradingRuleSource",
     "UserConfig",
 ]
