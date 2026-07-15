@@ -15,7 +15,7 @@ async def import_rules(source_root: Path) -> dict[str, int]:
     catalog_path = (
         Path(__file__).resolve().parents[1]
         / "data"
-        / "trading_playbook_rules_v1.json"
+        / "trading_playbook_rules_v2.json"
     )
     async with async_session_maker() as session:
         return await RuleCatalog(catalog_path).seed(session, source_root)

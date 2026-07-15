@@ -777,7 +777,7 @@ class TradingPlaybookOrchestratorTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_each_candidate_must_have_exact_catalog_mode_coverage(self):
         catalog = RuleCatalog(
-            Path("app/data/trading_playbook_rules_v1.json")
+            Path("app/data/trading_playbook_rules_v2.json")
         ).load()
         real_matcher = ModeMatcher(
             catalog["rules"], catalog_version=catalog["catalog_version"]
@@ -825,7 +825,7 @@ class TradingPlaybookOrchestratorTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_second_candidate_mode_gap_stops_the_whole_plan(self):
         catalog = RuleCatalog(
-            Path("app/data/trading_playbook_rules_v1.json")
+            Path("app/data/trading_playbook_rules_v2.json")
         ).load()
         missing_mode = catalog["rules"][0]["mode_key"]
         matcher = _DroppingEvaluationMatcher(
@@ -995,7 +995,7 @@ class TradingPlaybookOrchestratorIntegrationTests(
             }
 
         catalog = RuleCatalog(
-            Path("app/data/trading_playbook_rules_v1.json")
+            Path("app/data/trading_playbook_rules_v2.json")
         ).load()
         orchestrator = TradingPlaybookOrchestrator(
             market_data=TradingPlaybookMarketDataProvider(
@@ -1051,7 +1051,7 @@ class TradingPlaybookOrchestratorIntegrationTests(
 
     async def test_candidate_missing_one_catalog_mode_is_rejected_before_plan_write(self):
         catalog = RuleCatalog(
-            Path("app/data/trading_playbook_rules_v1.json")
+            Path("app/data/trading_playbook_rules_v2.json")
         ).load()
         missing_mode = catalog["rules"][0]["mode_key"]
         matcher = _DroppingEvaluationMatcher(
@@ -1085,7 +1085,7 @@ class TradingPlaybookOrchestratorIntegrationTests(
 
     async def test_empty_candidate_snapshot_persists_zero_radar_with_full_rules(self):
         catalog = RuleCatalog(
-            Path("app/data/trading_playbook_rules_v1.json")
+            Path("app/data/trading_playbook_rules_v2.json")
         ).load()
         orchestrator = TradingPlaybookOrchestrator(
             market_data=_EchoMarketData(),
@@ -1112,7 +1112,7 @@ class TradingPlaybookOrchestratorIntegrationTests(
 
     async def test_first_non_preclose_stage_propagates_missing_lineage(self):
         catalog = RuleCatalog(
-            Path("app/data/trading_playbook_rules_v1.json")
+            Path("app/data/trading_playbook_rules_v2.json")
         ).load()
         as_of = datetime(2026, 7, 10, 15, 30, tzinfo=CN_TZ)
         orchestrator = TradingPlaybookOrchestrator(

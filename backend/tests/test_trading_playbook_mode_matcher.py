@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import math
 from datetime import date, datetime, timedelta, timezone
@@ -26,7 +27,7 @@ from app.services.trading_playbook.mode_matcher import ModeMatcher
 from app.services.trading_playbook import rule_catalog as rule_catalog_module
 
 
-CATALOG_PATH = Path("app/data/trading_playbook_rules_v1.json")
+CATALOG_PATH = Path("app/data/trading_playbook_rules_v2.json")
 AS_OF = datetime(2026, 7, 10, 14, 40)
 
 
@@ -1361,6 +1362,7 @@ def _rule(
     window: str = "outbreak",
     style: str = "dual_active",
 ) -> dict:
+    source_content_hash = hashlib.sha256(b"test transcript").hexdigest()
     return {
         "mode_key": mode_key,
         "name": mode_key,
@@ -1375,7 +1377,13 @@ def _rule(
         "entry": {"label": "进入"},
         "invalidation": {"label": "失效"},
         "exit": {"label": "退出"},
-        "source_refs": [{"source_key": "test", "excerpt": "evidence"}],
+        "source_refs": [
+            {
+                "source_key": "test",
+                "excerpt": "evidence",
+                "source_content_hash": source_content_hash,
+            }
+        ],
     }
 
 
@@ -1674,9 +1682,37 @@ class TestModeMatcherContract:
                 "mode_key": "example",
                 "version": 7,
                 "content_hash": first.rules[0]["content_hash"],
+                "source_hashes": [
+                    {
+                        "source_key": "test",
+                        "content_hash": original["source_refs"][0][
+                            "source_content_hash"
+                        ],
+                    }
+                ],
+                "source_refs": original["source_refs"],
             }
         ]
         assert len(first.rules[0]["content_hash"]) == 64
+
+    def test_rule_hash_and_snapshot_bind_the_referenced_transcript_hash(self):
+        original = _rule()
+        changed = copy.deepcopy(original)
+        changed["source_refs"][0]["source_content_hash"] = "f" * 64
+
+        first = ModeMatcher([original])
+        second = ModeMatcher([changed])
+
+        assert first.rules[0]["content_hash"] != second.rules[0]["content_hash"]
+        assert first.rule_snapshot()[0]["source_hashes"] == [
+            {
+                "source_key": "test",
+                "content_hash": original["source_refs"][0][
+                    "source_content_hash"
+                ],
+            }
+        ]
+        assert second.rule_snapshot()[0]["source_refs"] == changed["source_refs"]
 
     def test_uses_the_shared_catalog_hash_and_rejects_noncanonical_hashes(self):
         helper = getattr(
@@ -1994,5 +2030,19 @@ class TestRealCatalogCoverage:
         )
         assert len({item["mode_key"] for item in snapshot}) == 19
         assert len({item["content_hash"] for item in snapshot}) == 19
-        assert all(item["version"] == 1 for item in snapshot)
+        assert all(item["version"] == 2 for item in snapshot)
         assert all(len(item["content_hash"]) == 64 for item in snapshot)
+        assert all(item["source_hashes"] for item in snapshot)
+        assert all(item["source_refs"] for item in snapshot)
+        for item in snapshot:
+            assert item["source_hashes"] == sorted(
+                item["source_hashes"],
+                key=lambda source: source["source_key"],
+            )
+            assert item["source_refs"] == sorted(
+                item["source_refs"],
+                key=lambda source: (
+                    source["source_key"],
+                    source["excerpt"],
+                ),
+            )

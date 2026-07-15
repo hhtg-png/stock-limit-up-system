@@ -8,7 +8,11 @@ import re
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from .domain import CandidateSnapshot, ModeEvaluation
-from .rule_catalog import canonical_rule_content_hash
+from .rule_catalog import (
+    canonical_rule_content_hash,
+    canonical_rule_source_hashes,
+    canonical_rule_source_refs,
+)
 
 
 _SUPPORTED_OPERATORS = {"eq", "in", "lte", "gte"}
@@ -83,6 +87,7 @@ class ModeMatcher:
                     operator,
                     requirement.get("value"),
                 )
+            rule["source_refs"] = canonical_rule_source_refs(rule)
             canonical_hash = canonical_rule_content_hash(rule)
             supplied_hash = rule.get("content_hash")
             if "content_hash" in rule:
@@ -95,6 +100,7 @@ class ModeMatcher:
             rule["mode_key"] = mode_key
             rule["version"] = int(version)
             rule["content_hash"] = canonical_hash
+            rule["source_hashes"] = canonical_rule_source_hashes(rule)
             normalized.append(rule)
         self.rules = tuple(
             sorted(
@@ -162,6 +168,8 @@ class ModeMatcher:
                 "mode_key": rule["mode_key"],
                 "version": rule["version"],
                 "content_hash": rule["content_hash"],
+                "source_hashes": copy.deepcopy(rule["source_hashes"]),
+                "source_refs": copy.deepcopy(rule["source_refs"]),
             }
             for rule in sorted(self.rules, key=lambda item: item["mode_key"])
         ]

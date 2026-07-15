@@ -242,6 +242,16 @@ async def list_rules(db: AsyncSession = Depends(get_db)):
                 )
             ).all()
         )
+        latest_by_mode: dict[str, TradingModeRule] = {}
+        for row in rows:
+            mode_key = str(row.mode_key or "")
+            previous = latest_by_mode.get(mode_key)
+            if previous is None or (row.version, row.id) > (
+                previous.version,
+                previous.id,
+            ):
+                latest_by_mode[mode_key] = row
+        rows = list(latest_by_mode.values())
         rows.sort(
             key=lambda row: (
                 str(row.family or ""),

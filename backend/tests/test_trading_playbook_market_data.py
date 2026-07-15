@@ -1074,6 +1074,172 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
             "bounded_sample",
         )
 
+    def test_valid_bounded_trend_sample_does_not_block_market_context(self):
+        from app.services.trading_playbook.context_service import (
+            FULL_MARKET_CONTEXT_FIELDS,
+        )
+        from app.services.trading_playbook.domain import DataQuality, QuoteSnapshot
+        from app.services.trading_playbook.market_data import (
+            TradingPlaybookMarketDataProvider,
+            _KlineBuildResult,
+        )
+
+        trade_date = date(2026, 7, 13)
+        as_of = datetime(2026, 7, 13, 15, 30)
+        context = {
+            "limit_up_count": 30,
+            "limit_up_count_prev": 25,
+            "limit_down_count": 1,
+            "max_board_height": 3,
+            "seal_rate": 70,
+            "negative_feedback": False,
+            "divergence_days": 1,
+            "sell_pressure_falling": False,
+            "breadth_recovered": False,
+            "prior_window": "",
+            "sell_pressure_rising": False,
+        }
+        scope_codes = [f"{index:06d}" for index in range(20)]
+        ready_kline = {
+            "n_day_high": True,
+            "prior_n_day_high": True,
+            "kline_quality": "ready",
+        }
+
+        values, evidence, warning = (
+            TradingPlaybookMarketDataProvider._complete_market_context(
+                context,
+                [
+                    {
+                        "field_quality": {
+                            key: "ready" if key in context else "missing"
+                            for key in FULL_MARKET_CONTEXT_FIELDS
+                        }
+                    }
+                ],
+                source_trade_date=trade_date,
+                stage="after_close",
+                as_of=as_of,
+                universe_codes=[],
+                quote_snapshot=QuoteSnapshot(
+                    trade_date=trade_date,
+                    quotes={},
+                    quality=DataQuality("ready", as_of, "test"),
+                ),
+                quote_field_quality={},
+                realtime_rows=[],
+                realtime_complete=False,
+                realtime_evidence_date=None,
+                kline_scope_codes=scope_codes,
+                kline_by_code={
+                    code: _KlineBuildResult(
+                        ready_kline,
+                        as_of,
+                        evidence_trade_date=trade_date,
+                    )
+                    for code in scope_codes
+                },
+                review_history_by_code={},
+            )
+        )
+
+        self.assertIsNone(warning)
+        self.assertEqual(evidence[0]["quality"], "ready")
+        self.assertNotIn("trend_new_high_count", values)
+        self.assertNotIn("trend_new_high_count_prev", values)
+        self.assertEqual(
+            evidence[0]["field_quality"]["trend_new_high_count"],
+            "missing",
+        )
+        self.assertEqual(
+            evidence[0]["field_quality"]["trend_new_high_count_prev"],
+            "missing",
+        )
+
+    def test_invalid_bounded_trend_samples_still_block_market_context(self):
+        from app.services.trading_playbook.context_service import (
+            FULL_MARKET_CONTEXT_FIELDS,
+        )
+        from app.services.trading_playbook.domain import DataQuality, QuoteSnapshot
+        from app.services.trading_playbook.market_data import (
+            TradingPlaybookMarketDataProvider,
+        )
+
+        trade_date = date(2026, 7, 13)
+        as_of = datetime(2026, 7, 13, 15, 30)
+        complete_context = {
+            "limit_up_count": 30,
+            "limit_up_count_prev": 25,
+            "limit_down_count": 1,
+            "max_board_height": 3,
+            "seal_rate": 70,
+            "negative_feedback": False,
+            "divergence_days": 1,
+            "sell_pressure_falling": False,
+            "breadth_recovered": False,
+            "prior_window": "",
+            "sell_pressure_rising": False,
+        }
+        common_sample = {
+            "trend_new_high_sample_count": 10,
+            "trend_new_high_sample_count_prev": 5,
+            "trend_sample_size": 20,
+            "trend_sample_ready_coverage": 0.8,
+            "trend_scope": "bounded_candidate_union",
+        }
+        cases = {
+            "low_sample": {"trend_sample_size": 19},
+            "low_coverage": {"trend_sample_ready_coverage": 0.79},
+            "count_exceeds_sample": {"trend_new_high_sample_count": 21},
+        }
+
+        for name, invalid_sample in cases.items():
+            with self.subTest(case=name):
+                _values, evidence, warning = (
+                    TradingPlaybookMarketDataProvider._complete_market_context(
+                        {
+                            **complete_context,
+                            **common_sample,
+                            **invalid_sample,
+                        },
+                        [
+                            {
+                                "field_quality": {
+                                    key: (
+                                        "ready"
+                                        if key in complete_context
+                                        else "missing"
+                                    )
+                                    for key in FULL_MARKET_CONTEXT_FIELDS
+                                }
+                            }
+                        ],
+                        source_trade_date=trade_date,
+                        stage="after_close",
+                        as_of=as_of,
+                        universe_codes=[],
+                        quote_snapshot=QuoteSnapshot(
+                            trade_date=trade_date,
+                            quotes={},
+                            quality=DataQuality("ready", as_of, "test"),
+                        ),
+                        quote_field_quality={},
+                        realtime_rows=[],
+                        realtime_complete=False,
+                        realtime_evidence_date=None,
+                        kline_scope_codes=[],
+                        kline_by_code={},
+                        review_history_by_code={},
+                    )
+                )
+
+                self.assertEqual(evidence[0]["quality"], "degraded")
+                self.assertEqual(
+                    warning,
+                    "incomplete full-market context: "
+                    "trend_new_high_count,trend_new_high_count_prev",
+                )
+
     def test_realtime_empty_pool_requires_explicit_authoritative_snapshot(self):
         from app.services.trading_playbook.domain import DataQuality, QuoteSnapshot
         from app.services.trading_playbook.market_data import (
@@ -1449,7 +1615,7 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
             evidence=copy.deepcopy(analyzed.evidence),
         )
         catalog = json.loads(
-            Path("app/data/trading_playbook_rules_v1.json").read_text(
+            Path("app/data/trading_playbook_rules_v2.json").read_text(
                 encoding="utf-8"
             )
         )
@@ -1557,7 +1723,7 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
             },
         }
         catalog = json.loads(
-            Path("app/data/trading_playbook_rules_v1.json").read_text(
+            Path("app/data/trading_playbook_rules_v2.json").read_text(
                 encoding="utf-8"
             )
         )
@@ -3190,7 +3356,7 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
             evidence=copy.deepcopy(analyzed.evidence),
         )
         catalog = json.loads(
-            Path("app/data/trading_playbook_rules_v1.json").read_text(
+            Path("app/data/trading_playbook_rules_v2.json").read_text(
                 encoding="utf-8"
             )
         )

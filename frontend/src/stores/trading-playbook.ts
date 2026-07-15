@@ -163,8 +163,8 @@ export const useTradingPlaybookStore = defineStore('trading-playbook', () => {
     alertsLoadedUnreadOnly.value = null
     try {
       const response = await getTradingAlerts(unreadOnly)
-      if (requestId !== alertsRequestId.value) return
       for (const alert of response.items) receiveAlert(alert)
+      if (requestId !== alertsRequestId.value) return
       alertsLoadedUnreadOnly.value = unreadOnly
       alertsLoading.value = false
     } catch (error) {

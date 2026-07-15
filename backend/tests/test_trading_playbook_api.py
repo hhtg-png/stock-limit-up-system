@@ -176,6 +176,25 @@ class TradingPlaybookApiTests(unittest.TestCase):
                 enabled=True,
                 content_hash="a" * 64,
             )
+            historical_enabled_rule = TradingModeRule(
+                mode_key="z_mode",
+                version=1,
+                name="Historical Z",
+                family="outbreak",
+                style="board_flow",
+                window="outbreak",
+                automation_level="assisted",
+                description="historical-rule-z",
+                prerequisites_json={"priority": 99},
+                candidate_filters_json=[],
+                entry_trigger_json={},
+                invalidation_json={},
+                exit_trigger_json={},
+                risk_guidance_json={},
+                source_refs_json=[],
+                enabled=True,
+                content_hash="e" * 64,
+            )
             first_rule = TradingModeRule(
                 mode_key="a_mode",
                 version=1,
@@ -214,7 +233,14 @@ class TradingPlaybookApiTests(unittest.TestCase):
                 enabled=False,
                 content_hash="c" * 64,
             )
-            db.add_all([enabled_rule, first_rule, disabled_rule])
+            db.add_all(
+                [
+                    enabled_rule,
+                    historical_enabled_rule,
+                    first_rule,
+                    disabled_rule,
+                ]
+            )
             plan = TradingPlanVersion(
                 source_trade_date=date(2026, 7, 10),
                 target_trade_date=date(2026, 7, 13),
@@ -300,6 +326,7 @@ class TradingPlaybookApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         items = response.json()["items"]
         self.assertEqual([item["mode_key"] for item in items], ["z_mode", "a_mode"])
+        self.assertEqual(items[0]["version"], 2)
         self.assertEqual(items[1]["source_refs_json"], "malformed-but-preserved")
         for key in (
             "version",

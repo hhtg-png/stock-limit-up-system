@@ -28,7 +28,7 @@ from app.services.trading_playbook.rule_catalog import (
 DEFAULT_CATALOG_PATH = (
     Path(__file__).resolve().parents[1]
     / "data"
-    / "trading_playbook_rules_v1.json"
+    / "trading_playbook_rules_v2.json"
 )
 DEFAULT_FIXTURE_PATH = (
     Path(__file__).resolve().parents[2]

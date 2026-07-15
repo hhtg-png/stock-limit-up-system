@@ -25,6 +25,7 @@ from app.services.trading_playbook.domain import (
 from app.services.trading_playbook.context_service import (
     FULL_MARKET_CONTEXT_FIELDS,
 )
+from app.services.trading_playbook.market_state import MarketStateClassifier
 from app.utils.market_data_sanitizer import normalize_change_pct
 
 QuoteFieldQuality = Dict[str, Dict[str, str]]
@@ -1687,10 +1688,25 @@ class TradingPlaybookMarketDataProvider:
                     coverage=quote_coverage,
                 )
 
-        complete = all(
-            field_quality[key] in {"ready", "computed"}
+        missing = [
+            key
             for key in _FULL_MARKET_CONTEXT_FIELDS
+            if field_quality[key] not in {"ready", "computed"}
+        ]
+        bounded_trend_ready = (
+            MarketStateClassifier()
+            .classify(values)
+            .get("trend_evidence_source")
+            == "bounded_sample"
         )
+        if bounded_trend_ready:
+            missing = [
+                key
+                for key in missing
+                if key
+                not in {"trend_new_high_count", "trend_new_high_count_prev"}
+            ]
+        complete = not missing
         aggregate = dict(evidence[0]) if evidence else {
             "source": "full_market_context",
             "scope": "full_market",
@@ -1729,11 +1745,6 @@ class TradingPlaybookMarketDataProvider:
                     "field_provenance": sample_fields,
                 }
             )
-        missing = [
-            key
-            for key in _FULL_MARKET_CONTEXT_FIELDS
-            if field_quality[key] not in {"ready", "computed"}
-        ]
         warning = (
             "incomplete full-market context: " + ",".join(missing)
             if missing

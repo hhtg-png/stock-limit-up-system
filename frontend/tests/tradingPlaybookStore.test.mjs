@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { createPinia } from 'pinia'
+import { createPinia, setActivePinia } from 'pinia'
 import { createServer } from 'vite'
 
 const root = resolve(import.meta.dirname, '..')
@@ -309,6 +309,59 @@ test('latest alert inbox load merges REST history with websocket arrivals', asyn
   })
 })
 
+test('concurrent full and unread alert loads merge every successful response in either completion order', async () => {
+  await withFrontendModules(async server => {
+    const api = await server.ssrLoadModule('/src/api/trading-playbook.ts')
+    const { useTradingPlaybookStore } = await server.ssrLoadModule('/src/stores/trading-playbook.ts')
+
+    for (const completionOrder of ['full-first', 'unread-first']) {
+      const requests = []
+      api.tradingPlaybookApi.defaults.adapter = config => {
+        const request = deferred()
+        requests.push({ config, request })
+        return request.promise
+      }
+      const store = useTradingPlaybookStore(createPinia())
+
+      const fullLoad = store.loadAlerts(false)
+      const unreadLoad = store.loadAlerts(true)
+      assert.deepEqual(requests.map(item => item.config.params), [
+        { unread_only: false },
+        { unread_only: true }
+      ])
+
+      const fullResponse = axiosResponse(requests[0].config, {
+        items: [alert(1, 'acknowledged-history', '2026-07-14T15:00:00+08:00')],
+        limit: 50,
+        offset: 0
+      })
+      const unreadResponse = axiosResponse(requests[1].config, {
+        items: [{ ...alert(2, 'unread-latest'), triggered_at: '2026-07-14T15:10:00+08:00' }],
+        limit: 50,
+        offset: 0
+      })
+
+      if (completionOrder === 'full-first') {
+        requests[0].request.resolve(fullResponse)
+        await fullLoad
+        requests[1].request.resolve(unreadResponse)
+        await unreadLoad
+      } else {
+        requests[1].request.resolve(unreadResponse)
+        await unreadLoad
+        requests[0].request.resolve(fullResponse)
+        await fullLoad
+      }
+
+      assert.deepEqual(store.alerts.map(item => item.id), [2, 1], completionOrder)
+      assert.equal(store.alertsLoading, false, completionOrder)
+      assert.equal(store.alertsError, null, completionOrder)
+      assert.equal(store.alertsRequestedUnreadOnly, true, completionOrder)
+      assert.equal(store.alertsLoadedUnreadOnly, true, completionOrder)
+    }
+  })
+})
+
 test('failed latest alert load preserves existing and in-flight websocket reminders', async () => {
   await withFrontendModules(async server => {
     const api = await server.ssrLoadModule('/src/api/trading-playbook.ts')
@@ -360,6 +413,221 @@ test('trading_plan_alert websocket routing stays outside global alerts speech an
   assert.ok(match, 'trading_plan_alert case should exist')
   assert.match(match[1], /tradingPlaybookStore\.receiveAlert\(message\.data as TradingAlertEvent\)/)
   assert.doesNotMatch(match[1], /alertStore|useSpeech|Notification|Audio/)
+})
+
+async function withWebSocketHarness(run) {
+  await withFrontendModules(async server => {
+    const originalWindow = Object.getOwnPropertyDescriptor(globalThis, 'window')
+    const originalWebSocket = Object.getOwnPropertyDescriptor(globalThis, 'WebSocket')
+    const originalWarn = console.warn
+    const originalError = console.error
+    const sockets = []
+    const loadCalls = []
+    const unhandledRejections = []
+    const reconnectCallbacks = []
+    const errors = []
+    let pingStarts = 0
+
+    class FakeWebSocket {
+      static CONNECTING = 0
+      static OPEN = 1
+      static CLOSED = 3
+
+      get [Symbol.toStringTag]() {
+        return 'WebSocket'
+      }
+
+      constructor(url) {
+        this.url = url
+        this.readyState = FakeWebSocket.CONNECTING
+        sockets.push(this)
+      }
+
+      send() {}
+      close() {
+        this.readyState = FakeWebSocket.CLOSED
+        setImmediate(() => this.onclose?.())
+      }
+    }
+
+    const onUnhandledRejection = reason => unhandledRejections.push(reason)
+    process.on('unhandledRejection', onUnhandledRejection)
+    Object.defineProperty(globalThis, 'window', {
+      configurable: true,
+      value: {
+        location: { protocol: 'http:', host: 'example.test' },
+        setInterval: () => {
+          pingStarts += 1
+          return 100 + pingStarts
+        },
+        setTimeout: callback => {
+          reconnectCallbacks.push(callback)
+          return reconnectCallbacks.length
+        }
+      }
+    })
+    Object.defineProperty(globalThis, 'WebSocket', {
+      configurable: true,
+      value: FakeWebSocket
+    })
+
+    try {
+      setActivePinia(createPinia())
+      const { useTradingPlaybookStore } = await server.ssrLoadModule('/src/stores/trading-playbook.ts')
+      const tradingPlaybookStore = useTradingPlaybookStore()
+      tradingPlaybookStore.loadAlerts = unreadOnly => {
+        loadCalls.push(unreadOnly)
+        return Promise.reject(new Error('inbox temporarily unavailable'))
+      }
+      const { useWebSocket } = await server.ssrLoadModule('/src/composables/useWebSocket.ts')
+      console.warn = () => {}
+      const client = useWebSocket()
+      console.warn = originalWarn
+      console.error = (...args) => errors.push(args)
+
+      await run({
+        client,
+        errors,
+        FakeWebSocket,
+        loadCalls,
+        reconnectCallbacks,
+        sockets,
+        tradingPlaybookStore,
+        unhandledRejections,
+        pingStarts: () => pingStarts
+      })
+    } finally {
+      console.warn = originalWarn
+      console.error = originalError
+      process.off('unhandledRejection', onUnhandledRejection)
+      if (originalWindow) Object.defineProperty(globalThis, 'window', originalWindow)
+      else delete globalThis.window
+      if (originalWebSocket) Object.defineProperty(globalThis, 'WebSocket', originalWebSocket)
+      else delete globalThis.WebSocket
+    }
+  })
+}
+
+test('websocket reconnect reloads unread playbook alerts and contains rejection', async () => {
+  await withWebSocketHarness(async ({
+    client,
+    FakeWebSocket,
+    loadCalls,
+    reconnectCallbacks,
+    sockets,
+    unhandledRejections,
+    pingStarts
+  }) => {
+    client.connect()
+    sockets[0].readyState = FakeWebSocket.OPEN
+    sockets[0].onopen()
+    await new Promise(resolvePromise => setImmediate(resolvePromise))
+
+    assert.deepEqual(loadCalls, [])
+    assert.equal(client.isConnected.value, true)
+    assert.equal(pingStarts(), 1)
+
+    sockets[0].readyState = FakeWebSocket.CLOSED
+    sockets[0].onclose()
+    assert.equal(client.isConnected.value, false)
+    assert.equal(reconnectCallbacks.length, 1)
+    reconnectCallbacks[0]()
+    assert.equal(sockets.length, 2)
+    sockets[1].readyState = FakeWebSocket.OPEN
+    sockets[1].onopen()
+    await new Promise(resolvePromise => setImmediate(resolvePromise))
+
+    assert.deepEqual(loadCalls, [true])
+    assert.deepEqual(unhandledRejections, [])
+    assert.equal(client.isConnected.value, true)
+    assert.equal(pingStarts(), 2)
+  })
+})
+
+test('manual websocket disconnect ignores asynchronous close and allows a later explicit reconnect', async () => {
+  await withWebSocketHarness(async ({
+    client,
+    FakeWebSocket,
+    loadCalls,
+    reconnectCallbacks,
+    sockets
+  }) => {
+    client.connect()
+    sockets[0].readyState = FakeWebSocket.OPEN
+    sockets[0].onopen()
+
+    client.disconnect()
+    await new Promise(resolvePromise => setImmediate(resolvePromise))
+
+    assert.equal(client.ws.value, null)
+    assert.equal(client.isConnected.value, false)
+    assert.deepEqual(loadCalls, [])
+    assert.deepEqual(reconnectCallbacks, [])
+
+    client.connect()
+    assert.equal(sockets.length, 2)
+    sockets[1].readyState = FakeWebSocket.OPEN
+    sockets[1].onopen()
+    await new Promise(resolvePromise => setImmediate(resolvePromise))
+    assert.deepEqual(loadCalls, [])
+
+    sockets[1].readyState = FakeWebSocket.CLOSED
+    sockets[1].onclose()
+    assert.equal(reconnectCallbacks.length, 1)
+  })
+})
+
+test('repeated connect while websocket is connecting creates only one socket', async () => {
+  await withWebSocketHarness(async ({ client, FakeWebSocket, sockets }) => {
+    client.connect()
+    assert.equal(sockets[0].readyState, FakeWebSocket.CONNECTING)
+
+    client.connect()
+
+    assert.equal(sockets.length, 1)
+    assert.equal(client.ws.value, sockets[0])
+  })
+})
+
+test('late callbacks from an obsolete websocket cannot mutate current connection state', async () => {
+  await withWebSocketHarness(async ({
+    client,
+    errors,
+    FakeWebSocket,
+    loadCalls,
+    reconnectCallbacks,
+    sockets,
+    tradingPlaybookStore,
+    pingStarts
+  }) => {
+    client.connect()
+    const obsoleteSocket = sockets[0]
+    obsoleteSocket.readyState = FakeWebSocket.CLOSED
+    client.connect()
+    const currentSocket = sockets[1]
+    currentSocket.readyState = FakeWebSocket.OPEN
+    currentSocket.onopen()
+
+    obsoleteSocket.onopen()
+    obsoleteSocket.onmessage({
+      data: JSON.stringify({
+        type: 'trading_plan_alert',
+        data: alert(99, 'obsolete-socket-alert'),
+        timestamp: '2026-07-14T15:20:00+08:00'
+      })
+    })
+    obsoleteSocket.onerror(new Error('obsolete socket error'))
+    obsoleteSocket.onclose()
+    await new Promise(resolvePromise => setImmediate(resolvePromise))
+
+    assert.equal(client.ws.value, currentSocket)
+    assert.equal(client.isConnected.value, true)
+    assert.equal(pingStarts(), 1)
+    assert.deepEqual(loadCalls, [])
+    assert.deepEqual(tradingPlaybookStore.alerts, [])
+    assert.deepEqual(reconnectCallbacks, [])
+    assert.deepEqual(errors, [])
+  })
 })
 
 test('trading playbook store never imports the global alert store', () => {

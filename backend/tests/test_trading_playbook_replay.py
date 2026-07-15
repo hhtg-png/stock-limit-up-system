@@ -24,7 +24,7 @@ REPLAY_MODULE = BACKEND_ROOT / "app" / "scripts" / "replay_trading_playbook.py"
 SCENARIO_FIXTURE = (
     BACKEND_ROOT / "tests" / "fixtures" / "trading_playbook_scenarios.json"
 )
-CATALOG_PATH = BACKEND_ROOT / "app" / "data" / "trading_playbook_rules_v1.json"
+CATALOG_PATH = BACKEND_ROOT / "app" / "data" / "trading_playbook_rules_v2.json"
 
 EXPECTED_SCENARIOS = {
     "new_theme_high_volatility": (
@@ -805,7 +805,7 @@ class ScenarioLoaderTest(unittest.TestCase):
             "app.scripts.replay_trading_playbook"
         )
         payload = json.loads(SCENARIO_FIXTURE.read_text(encoding="utf-8"))
-        payload["catalog_version"] = 2
+        payload["catalog_version"] = 1
 
         with tempfile.TemporaryDirectory() as directory:
             fixture_path = Path(directory) / "wrong-version.json"

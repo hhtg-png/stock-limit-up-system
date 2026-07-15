@@ -54,7 +54,19 @@ def _rule_snapshot(*mode_keys: str) -> list[dict]:
             "mode_key": mode_key,
             "version": 1,
             "content_hash": _rule_hash(mode_key),
-            "source_refs": [{"source_key": "test", "excerpt": mode_key}],
+            "source_hashes": [
+                {
+                    "source_key": "test",
+                    "content_hash": _rule_hash(f"source:{mode_key}"),
+                }
+            ],
+            "source_refs": [
+                {
+                    "source_key": "test",
+                    "excerpt": mode_key,
+                    "source_content_hash": _rule_hash(f"source:{mode_key}"),
+                }
+            ],
         }
         for mode_key in reversed(sorted(set(mode_keys)))
     ]
@@ -652,6 +664,43 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
             [row["mode_key"] for row in first["rule_snapshot"]],
             ["alpha", "beta"],
         )
+
+    async def test_rule_snapshot_source_binding_is_immutable_and_in_input_hash(self):
+        evaluation = _evaluation("leader", "000001")
+        first_rules = _rule_snapshot("leader")
+        changed_rules = copy.deepcopy(first_rules)
+        changed_source_hash = hashlib.sha256(b"changed transcript").hexdigest()
+        changed_rules[0]["source_hashes"][0]["content_hash"] = changed_source_hash
+        changed_rules[0]["source_refs"][0][
+            "source_content_hash"
+        ] = changed_source_hash
+
+        async with self.Session() as db:
+            first = await self._generate(
+                db,
+                [evaluation],
+                rule_snapshot=first_rules,
+            )
+            second = await self._generate(
+                db,
+                [evaluation],
+                rule_snapshot=changed_rules,
+            )
+            stored = (
+                await db.scalars(
+                    select(TradingPlanVersion).order_by(
+                        TradingPlanVersion.version_no
+                    )
+                )
+            ).all()
+
+        self.assertNotEqual(first["id"], second["id"])
+        self.assertNotEqual(first["input_hash"], second["input_hash"])
+        self.assertEqual(first["rule_snapshot"], first_rules)
+        self.assertEqual(second["rule_snapshot"], changed_rules)
+        self.assertEqual(stored[0].rule_snapshot_json, first_rules)
+        self.assertEqual(stored[1].rule_snapshot_json, changed_rules)
+        self.assertNotEqual(stored[0].input_hash, stored[1].input_hash)
 
     async def test_invalid_prices_remain_in_radar_but_never_become_candidates(self):
         evaluations = [

@@ -338,7 +338,7 @@ def build_default_orchestrator(
     catalog_path = (
         Path(__file__).resolve().parents[2]
         / "data"
-        / "trading_playbook_rules_v1.json"
+        / "trading_playbook_rules_v2.json"
     )
     catalog = RuleCatalog(catalog_path).load()
     market_data = TradingPlaybookMarketDataProvider(

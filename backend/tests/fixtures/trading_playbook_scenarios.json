@@ -1,15 +1,15 @@
 {
-  "catalog_version": 1,
+  "catalog_version": 2,
   "scenarios": [
     {
       "scenario_id": "new-theme-high-volatility-golden",
       "mode_key": "new_theme_high_volatility",
-      "rule_hash": "e543acbf5798dfa9231d60b23d47540859ed6a6cd35c23994f4712fdd911dab6",
+      "rule_hash": "558bb0e7a22001fb80aab245e2e06faa86b42c7a91a39d4b2bd517e515ca7cc6",
       "as_of": "2026-07-10T14:40:00+08:00",
       "expected": "matched",
       "source_refs": [
-        {"source_key": "05-new-theme", "excerpt": "爆发当日高波动优先于高身位，优先于同身位换手"},
-        {"source_key": "01-specialize", "excerpt": "重大题材起爆当日先选择高波动套利"}
+        {"source_key": "05-new-theme", "excerpt": "爆发当日高波动优先于高身位，优先于同身位换手", "source_content_hash": "c12c086950b9d47d59ec5c776fd98329fcc6a003f98af246b9f64b072312be68"},
+        {"source_key": "01-specialize", "excerpt": "重大题材起爆当日先选择高波动套利", "source_content_hash": "f40100a84e366be52c3f41ad1e79cd316a0059abd9b51856059341ffe7cdacdf"}
       ],
       "market_features": {"style": "dual_active", "window": "outbreak", "quality": "ready"},
       "candidate": {
@@ -21,10 +21,10 @@
     {
       "scenario_id": "new-theme-high-position-golden",
       "mode_key": "new_theme_high_position",
-      "rule_hash": "d51e4142f023581130766c4c044263f1911b7df0dbfd6e7e9d63202d94e7411a",
+      "rule_hash": "44e704d3a207f03ddca8058a261bdcf7636ecd83c49e1657c53fbbb782f3b1c3",
       "as_of": "2026-07-10T14:40:00+08:00",
       "expected": "matched",
-      "source_refs": [{"source_key": "05-new-theme", "excerpt": "高波动优先于高身位，高身位优先于同身位换手"}],
+      "source_refs": [{"source_key": "05-new-theme", "excerpt": "高波动优先于高身位，高身位优先于同身位换手", "source_content_hash": "c12c086950b9d47d59ec5c776fd98329fcc6a003f98af246b9f64b072312be68"}],
       "market_features": {"style": "board_flow", "window": "outbreak", "quality": "ready"},
       "candidate": {
         "stock_code": "600002", "stock_name": "场景二", "theme_name": "新题材",
@@ -35,10 +35,10 @@
     {
       "scenario_id": "new-theme-same-level-turnover-golden",
       "mode_key": "new_theme_same_level_turnover",
-      "rule_hash": "0077fbbd690e357485938070f04ddcab8b938e19fc38dacb680bf0adc1a22459",
+      "rule_hash": "f15871eacdc2f129d0c002595420dad58ab0a7178a34079236d6bc7408907d2a",
       "as_of": "2026-07-10T14:40:00+08:00",
       "expected": "matched",
-      "source_refs": [{"source_key": "05-new-theme", "excerpt": "同身位换手不是不好，而是选择更难"}],
+      "source_refs": [{"source_key": "05-new-theme", "excerpt": "同身位换手不是不好，而是选择更难", "source_content_hash": "c12c086950b9d47d59ec5c776fd98329fcc6a003f98af246b9f64b072312be68"}],
       "market_features": {"style": "board_flow", "window": "outbreak", "quality": "ready"},
       "candidate": {
         "stock_code": "600003", "stock_name": "场景三", "theme_name": "新题材",
@@ -49,12 +49,12 @@
     {
       "scenario_id": "big-middle-army-transition-golden",
       "mode_key": "big_middle_army_transition",
-      "rule_hash": "a996996eca053eb438aabd6691efa908e9163eeb4a85bd1c3842b803d438f138",
+      "rule_hash": "2d98e9b357d919169d1fcfb1a526712ea9212e8b4d15aeb078d716fd6543bec9",
       "as_of": "2026-07-10T14:40:00+08:00",
       "expected": "matched",
       "source_refs": [
-        {"source_key": "05-new-theme", "excerpt": "第一波高波动做完，再做一次大中军套利"},
-        {"source_key": "01-specialize", "excerpt": "首次分歧可以选择流动性好的中军"}
+        {"source_key": "05-new-theme", "excerpt": "第一波高波动做完，再做一次大中军套利", "source_content_hash": "c12c086950b9d47d59ec5c776fd98329fcc6a003f98af246b9f64b072312be68"},
+        {"source_key": "01-specialize", "excerpt": "首次分歧可以选择流动性好的中军", "source_content_hash": "f40100a84e366be52c3f41ad1e79cd316a0059abd9b51856059341ffe7cdacdf"}
       ],
       "market_features": {"style": "trend_main_wave", "window": "first_divergence", "quality": "ready"},
       "candidate": {
@@ -66,12 +66,12 @@
     {
       "scenario_id": "first-mover-leader-golden",
       "mode_key": "first_mover_leader",
-      "rule_hash": "34278d5b32f77abbc665aa35527b549a09941459ce546142c9047a10054ffd13",
+      "rule_hash": "40ee236b390bd6786758d07892f6ba1fd893e63dcb1317b641007330f95b62f6",
       "as_of": "2026-07-10T14:40:00+08:00",
       "expected": "matched",
       "source_refs": [
-        {"source_key": "02-window-recognition", "excerpt": "通过窗口寻找方向和核心辨识度"},
-        {"source_key": "06-short-term-terms", "excerpt": "先于板块启动并完成个股分歧转一致"}
+        {"source_key": "02-window-recognition", "excerpt": "通过窗口寻找方向和核心辨识度", "source_content_hash": "168ca42c4a35fc66a70bf0c0bbf610c16ed6652570fb545209a8dea85cce63e6"},
+        {"source_key": "06-short-term-terms", "excerpt": "先于板块启动并完成个股分歧转一致", "source_content_hash": "2a317a65b9cc8483aa6fa376695ef293316dd41c5c157c1187bb983e0ccb099b"}
       ],
       "market_features": {"style": "board_flow", "window": "first_divergence", "quality": "ready"},
       "candidate": {
@@ -83,12 +83,12 @@
     {
       "scenario_id": "unique-survivor-trial-golden",
       "mode_key": "unique_survivor_trial",
-      "rule_hash": "e0074486eba6af809573aa333287fc2193787aeb71d069e2067624c648024cfd",
+      "rule_hash": "db248ef8f0034ea2b3b88ac14b039a5592fcd2eebb9f34204c60c5cf36bfa872",
       "as_of": "2026-07-10T14:40:00+08:00",
       "expected": "matched",
       "source_refs": [
-        {"source_key": "05-new-theme", "excerpt": "全面分歧后等待杀出唯一活口"},
-        {"source_key": "06-short-term-terms", "excerpt": "都死了而它还在，这种叫活口"}
+        {"source_key": "05-new-theme", "excerpt": "全面分歧后等待杀出唯一活口", "source_content_hash": "c12c086950b9d47d59ec5c776fd98329fcc6a003f98af246b9f64b072312be68"},
+        {"source_key": "06-short-term-terms", "excerpt": "都死了而它还在，这种叫活口", "source_content_hash": "2a317a65b9cc8483aa6fa376695ef293316dd41c5c157c1187bb983e0ccb099b"}
       ],
       "market_features": {"style": "dual_active", "window": "divergence_exhaustion", "quality": "ready"},
       "candidate": {
@@ -100,12 +100,12 @@
     {
       "scenario_id": "leader-turn-two-golden",
       "mode_key": "leader_turn_two",
-      "rule_hash": "59f7a3132e09cbc8fb321c0c72d3de009ad56aebad4a82e17d5dc4cedfa4c01e",
+      "rule_hash": "55da31972286cf1cd4f9976dc5709ca89e9d09175eee8c083c9c258c2e7c31a1",
       "as_of": "2026-07-10T14:40:00+08:00",
       "expected": "matched",
       "source_refs": [
-        {"source_key": "00-art-1123", "excerpt": "启动之后超预期，再打开第二浪"},
-        {"source_key": "06-short-term-terms", "excerpt": "转点确认之后才是推仓位的关键窗口"}
+        {"source_key": "00-art-1123", "excerpt": "启动之后超预期，再打开第二浪", "source_content_hash": "3606c1599ad4aab942fb7c9936e9b178dca154d2eeed049e0982f77469c457db"},
+        {"source_key": "06-short-term-terms", "excerpt": "转点确认之后才是推仓位的关键窗口", "source_content_hash": "2a317a65b9cc8483aa6fa376695ef293316dd41c5c157c1187bb983e0ccb099b"}
       ],
       "market_features": {"style": "board_flow", "window": "divergence_to_consensus", "quality": "ready"},
       "candidate": {
@@ -117,10 +117,10 @@
     {
       "scenario_id": "leader-stronger-confirmation-golden",
       "mode_key": "leader_stronger_confirmation",
-      "rule_hash": "1f244dffcb1af4e49ab7adb0f0d7e29df3de19254b7c4317b08c6c494ac6cc36",
+      "rule_hash": "a993d1943745c7b4d16a386443c3a7885e2567943d6916590066169d64b1511f",
       "as_of": "2026-07-10T14:40:00+08:00",
       "expected": "matched",
-      "source_refs": [{"source_key": "06-short-term-terms", "excerpt": "转二之后隔日强更强，才能确认龙头"}],
+      "source_refs": [{"source_key": "06-short-term-terms", "excerpt": "转二之后隔日强更强，才能确认龙头", "source_content_hash": "2a317a65b9cc8483aa6fa376695ef293316dd41c5c157c1187bb983e0ccb099b"}],
       "market_features": {"style": "board_flow", "window": "stronger_confirmation", "quality": "ready"},
       "candidate": {
         "stock_code": "600008", "stock_name": "场景八", "theme_name": "主线题材",
@@ -131,10 +131,10 @@
     {
       "scenario_id": "leader-acceleration-to-divergence-golden",
       "mode_key": "leader_acceleration_to_divergence",
-      "rule_hash": "50d95d74b99d60efe8c4a984a07f5cbe6beb1fbc6cbc5cba8daa53907e66ab16",
+      "rule_hash": "b0f98422cb808b96e669ddb61c8e9bb7c373fafe553cc4e2f6bc8b5a1c2c3e60",
       "as_of": "2026-07-10T14:40:00+08:00",
       "expected": "matched",
-      "source_refs": [{"source_key": "06-short-term-terms", "excerpt": "龙头三个买点包括加速转分歧"}],
+      "source_refs": [{"source_key": "06-short-term-terms", "excerpt": "龙头三个买点包括加速转分歧", "source_content_hash": "2a317a65b9cc8483aa6fa376695ef293316dd41c5c157c1187bb983e0ccb099b"}],
       "market_features": {"style": "board_flow", "window": "second_divergence", "quality": "ready"},
       "candidate": {
         "stock_code": "600009", "stock_name": "场景九", "theme_name": "主线题材",
@@ -145,12 +145,12 @@
     {
       "scenario_id": "stage-three-high-low-switch-golden",
       "mode_key": "stage_three_high_low_switch",
-      "rule_hash": "6200f22fef95f88c6a45e98cbcff5c71051c86d170c4b3a584ed1935bbccb851",
+      "rule_hash": "0f2a9771bdf7b124b2397c245ef275f5a5ac18517a3a2b29a1ea2168843977e3",
       "as_of": "2026-07-10T14:40:00+08:00",
       "expected": "matched",
       "source_refs": [
-        {"source_key": "01-specialize", "excerpt": "一致再一致时同时考虑高低切"},
-        {"source_key": "06-short-term-terms", "excerpt": "关键转点低位启动形成高低切"}
+        {"source_key": "01-specialize", "excerpt": "一致再一致时同时考虑高低切", "source_content_hash": "f40100a84e366be52c3f41ad1e79cd316a0059abd9b51856059341ffe7cdacdf"},
+        {"source_key": "06-short-term-terms", "excerpt": "关键转点低位启动形成高低切", "source_content_hash": "2a317a65b9cc8483aa6fa376695ef293316dd41c5c157c1187bb983e0ccb099b"}
       ],
       "market_features": {"style": "board_flow", "window": "stage_three", "quality": "ready"},
       "candidate": {
@@ -162,10 +162,10 @@
     {
       "scenario_id": "stage-transition-supplement-golden",
       "mode_key": "stage_transition_supplement",
-      "rule_hash": "7fc1894fbe128c9bbe2de81ac3ff6fce7fe5cc64b7e30e6dc3a4a1bf6561e55b",
+      "rule_hash": "169a1e4248229dc62d1168825b72e961e61eced88d2ec69fe5102b89c87a6bf1",
       "as_of": "2026-07-10T14:40:00+08:00",
       "expected": "matched",
-      "source_refs": [{"source_key": "06-short-term-terms", "excerpt": "转点补涨卡在关键窗口"}],
+      "source_refs": [{"source_key": "06-short-term-terms", "excerpt": "转点补涨卡在关键窗口", "source_content_hash": "2a317a65b9cc8483aa6fa376695ef293316dd41c5c157c1187bb983e0ccb099b"}],
       "market_features": {"style": "board_flow", "window": "stage_three", "quality": "ready"},
       "candidate": {
         "stock_code": "600011", "stock_name": "场景十一", "theme_name": "轮动题材",
@@ -176,10 +176,10 @@
     {
       "scenario_id": "leader-first-bearish-rebound-golden",
       "mode_key": "leader_first_bearish_rebound",
-      "rule_hash": "f11b55e1f256c2f989f8249efb3249ee2e3bec3e775ff2e2178381f9a6722161",
+      "rule_hash": "75dbe497c1be65ce235346d59ba446e94cb653cde159d21fcdeaf1ffbe44134f",
       "as_of": "2026-07-10T14:40:00+08:00",
       "expected": "manual_review",
-      "source_refs": [{"source_key": "06-short-term-terms", "excerpt": "龙头首阴低吸只适用于已确认龙头"}],
+      "source_refs": [{"source_key": "06-short-term-terms", "excerpt": "龙头首阴低吸只适用于已确认龙头", "source_content_hash": "2a317a65b9cc8483aa6fa376695ef293316dd41c5c157c1187bb983e0ccb099b"}],
       "market_features": {"style": "board_flow", "window": "stage_three", "quality": "ready"},
       "candidate": {
         "stock_code": "600012", "stock_name": "场景十二", "theme_name": "主线题材",
@@ -190,12 +190,12 @@
     {
       "scenario_id": "trend-core-pullback-golden",
       "mode_key": "trend_core_pullback",
-      "rule_hash": "a347f3da87c51bfa2238f74c6c2c4aa244a20f9e05681296ab80f9366c7d0ca3",
+      "rule_hash": "91b4d64a974a97cde502645aa01bc24b065b91009dd93d4d33bcff156590b3d8",
       "as_of": "2026-07-10T14:40:00+08:00",
       "expected": "matched",
       "source_refs": [
-        {"source_key": "00-art-1130", "excerpt": "向上主升方向在分歧衰竭买核心辨识度"},
-        {"source_key": "02-window-recognition", "excerpt": "在正确窗口寻找相对最强的辨识度"}
+        {"source_key": "00-art-1130", "excerpt": "向上主升方向在分歧衰竭买核心辨识度", "source_content_hash": "c8058034ba23a4ae53564280ca38559a3e8d6e6dc842aec74f3c5a6ecc70c06e"},
+        {"source_key": "02-window-recognition", "excerpt": "在正确窗口寻找相对最强的辨识度", "source_content_hash": "168ca42c4a35fc66a70bf0c0bbf610c16ed6652570fb545209a8dea85cce63e6"}
       ],
       "market_features": {"style": "trend_main_wave", "window": "first_divergence", "quality": "ready"},
       "candidate": {
@@ -207,12 +207,12 @@
     {
       "scenario_id": "trend-consolidation-rebreak-golden",
       "mode_key": "trend_consolidation_rebreak",
-      "rule_hash": "971b5b73a6984488603840c3bffe23f4fb91e60a382421ce3c61cfe6a7b9fa4e",
+      "rule_hash": "cb1f05a0e3ddea764f0664e332042af9ddd26acb4781bdd973bb5c2cf62d559f",
       "as_of": "2026-07-10T14:40:00+08:00",
       "expected": "matched",
       "source_refs": [
-        {"source_key": "00-art-1123", "excerpt": "一波拉升横盘三到五天后的再突破"},
-        {"source_key": "00-art-1130", "excerpt": "个股突破需要板块联动交叉验证"}
+        {"source_key": "00-art-1123", "excerpt": "一波拉升横盘三到五天后的再突破", "source_content_hash": "3606c1599ad4aab942fb7c9936e9b178dca154d2eeed049e0982f77469c457db"},
+        {"source_key": "00-art-1130", "excerpt": "个股突破需要板块联动交叉验证", "source_content_hash": "c8058034ba23a4ae53564280ca38559a3e8d6e6dc842aec74f3c5a6ecc70c06e"}
       ],
       "market_features": {"style": "trend_main_wave", "window": "divergence_to_consensus", "quality": "ready"},
       "candidate": {
@@ -224,12 +224,12 @@
     {
       "scenario_id": "trend-turn-two-golden",
       "mode_key": "trend_turn_two",
-      "rule_hash": "c84a84fbdf47618e987459261849d69b6ea7da03aac70ad656a6a6b2cb1ba763",
+      "rule_hash": "cea2dfac863dc45177a6b5dac21e285a5ca576c1b85a31dba9da58a9613b24ab",
       "as_of": "2026-07-10T14:40:00+08:00",
       "expected": "matched",
       "source_refs": [
-        {"source_key": "00-art-1123", "excerpt": "趋势主升浪转二，横盘后再破新高"},
-        {"source_key": "00-art-1130", "excerpt": "二浪必须由中军和板块共振确认"}
+        {"source_key": "00-art-1123", "excerpt": "趋势主升浪转二，横盘后再破新高", "source_content_hash": "3606c1599ad4aab942fb7c9936e9b178dca154d2eeed049e0982f77469c457db"},
+        {"source_key": "00-art-1130", "excerpt": "二浪必须由中军和板块共振确认", "source_content_hash": "c8058034ba23a4ae53564280ca38559a3e8d6e6dc842aec74f3c5a6ecc70c06e"}
       ],
       "market_features": {"style": "trend_main_wave", "window": "divergence_to_consensus", "quality": "ready"},
       "candidate": {
@@ -241,10 +241,10 @@
     {
       "scenario_id": "resilient-core-exhaustion-golden",
       "mode_key": "resilient_core_exhaustion",
-      "rule_hash": "be9673836003465236e01d376fb08f5335fe3d679fd40253b7bd9b3b5472cb89",
+      "rule_hash": "9f4a9eae51a6e5c9c85ca78143af7ef0985f5a9e0622dfb86a630d842edb020e",
       "as_of": "2026-07-10T14:40:00+08:00",
       "expected": "matched",
-      "source_refs": [{"source_key": "04-trading-plan", "excerpt": "低吸是弱中选强，不是买分时最弱"}],
+      "source_refs": [{"source_key": "04-trading-plan", "excerpt": "低吸是弱中选强，不是买分时最弱", "source_content_hash": "03827eacc2922c003725862d27fe9619f7739b67e6578a85192a0a48044c1edd"}],
       "market_features": {"style": "dual_active", "window": "divergence_exhaustion", "quality": "ready"},
       "candidate": {
         "stock_code": "600016", "stock_name": "场景十六", "theme_name": "趋势题材",
@@ -255,10 +255,10 @@
     {
       "scenario_id": "alive-theme-snake-arbitrage-golden",
       "mode_key": "alive_theme_snake_arbitrage",
-      "rule_hash": "1f08760d54ca608f351a6eaa6936db33a824e271c4157875609418c25d09d3e1",
+      "rule_hash": "4d3c71ec8b1a4e780d4eff6805f687c54d233d10d532011f24fcdb572864b9ac",
       "as_of": "2026-07-10T14:40:00+08:00",
       "expected": "manual_review",
-      "source_refs": [{"source_key": "04-trading-plan", "excerpt": "板块没走完，行为本质是套利"}],
+      "source_refs": [{"source_key": "04-trading-plan", "excerpt": "板块没走完，行为本质是套利", "source_content_hash": "03827eacc2922c003725862d27fe9619f7739b67e6578a85192a0a48044c1edd"}],
       "market_features": {"style": "dual_active", "window": "divergence_exhaustion", "quality": "ready"},
       "candidate": {
         "stock_code": "600017", "stock_name": "场景十七", "theme_name": "趋势题材",
@@ -269,10 +269,10 @@
     {
       "scenario_id": "dead-pile-right-confirmation-golden",
       "mode_key": "dead_pile_right_confirmation",
-      "rule_hash": "f3a339db191e7bfd84be530edd1b949e94ea5599ffa95ec87d50a98f25d25eb8",
+      "rule_hash": "3b6c4974e6f1d4214cc5fe28ca60cc4049461e339575d89ac28984cafa5f5b4b",
       "as_of": "2026-07-10T14:40:00+08:00",
       "expected": "manual_review",
-      "source_refs": [{"source_key": "04-trading-plan", "excerpt": "死人堆爬出来的只能右侧确认"}],
+      "source_refs": [{"source_key": "04-trading-plan", "excerpt": "死人堆爬出来的只能右侧确认", "source_content_hash": "03827eacc2922c003725862d27fe9619f7739b67e6578a85192a0a48044c1edd"}],
       "market_features": {"style": "dual_active", "window": "divergence_to_consensus", "quality": "ready"},
       "candidate": {
         "stock_code": "600018", "stock_name": "场景十八", "theme_name": "趋势题材",
@@ -283,12 +283,12 @@
     {
       "scenario_id": "external-high-low-switch-golden",
       "mode_key": "external_high_low_switch",
-      "rule_hash": "bbb65fd0212a0b6578d29e606ce10116b7263c745e045d0804bc9c93a3dd67b8",
+      "rule_hash": "2acfee6f3a0d1ff848e9f7ed8cb306fa208a480d9b2fc9b812399bc57de03804",
       "as_of": "2026-07-10T14:40:00+08:00",
       "expected": "manual_review",
       "source_refs": [
-        {"source_key": "01-specialize", "excerpt": "高位分歧时题材外高低切夺权"},
-        {"source_key": "06-short-term-terms", "excerpt": "题材外新方向必须形成扩散和卡位"}
+        {"source_key": "01-specialize", "excerpt": "高位分歧时题材外高低切夺权", "source_content_hash": "f40100a84e366be52c3f41ad1e79cd316a0059abd9b51856059341ffe7cdacdf"},
+        {"source_key": "06-short-term-terms", "excerpt": "题材外新方向必须形成扩散和卡位", "source_content_hash": "2a317a65b9cc8483aa6fa376695ef293316dd41c5c157c1187bb983e0ccb099b"}
       ],
       "market_features": {"style": "dual_active", "window": "stage_three", "quality": "ready"},
       "candidate": {
