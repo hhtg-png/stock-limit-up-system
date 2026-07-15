@@ -17,6 +17,7 @@ _WINDOWS_RESERVED_BASENAMES = frozenset(
     | {f"LPT{number}" for number in range(1, 10)}
 )
 _WINDOWS_DRIVE_PATH = re.compile(r"^[A-Za-z]:")
+_GIT_COMMAND_TIMEOUT_SECONDS = 10
 
 
 @dataclass(frozen=True)
@@ -107,7 +108,10 @@ class ObsidianVaultWriter:
             os.replace(temporary_path, target)
         except Exception:
             if temporary_path is not None:
-                temporary_path.unlink(missing_ok=True)
+                try:
+                    temporary_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
             raise
 
         return VaultWriteResult(relative_path=relative_path, absolute_path=target, changed=True)
@@ -133,26 +137,34 @@ class ObsidianVaultWriter:
             return {"enabled": True, "committed": False, "reason": "vault_is_not_git_repo"}
 
         prefix = ["git", "--literal-pathspecs", "-C", str(vault)]
+        git_environment = os.environ.copy()
+        git_environment.update({"GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": ""})
+        run_options = {
+            "capture_output": True,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+            "timeout": _GIT_COMMAND_TIMEOUT_SECONDS,
+            "stdin": subprocess.DEVNULL,
+            "env": git_environment,
+        }
         try:
             status = self.command_runner(
                 prefix + ["status", "--porcelain", "--", *paths],
                 check=True,
-                capture_output=True,
-                text=True,
+                **run_options,
             )
             if not status.stdout.strip():
                 return {"enabled": True, "committed": False, "reason": "no_changes"}
             self.command_runner(
                 prefix + ["add", "--", *paths],
                 check=True,
-                capture_output=True,
-                text=True,
+                **run_options,
             )
             diff = self.command_runner(
                 prefix + ["diff", "--cached", "--quiet", "--", *paths],
                 check=False,
-                capture_output=True,
-                text=True,
+                **run_options,
             )
             if diff.returncode == 0:
                 return {"enabled": True, "committed": False, "reason": "no_changes"}
@@ -166,8 +178,7 @@ class ObsidianVaultWriter:
             self.command_runner(
                 prefix + ["commit", "-m", message, "--", *paths],
                 check=True,
-                capture_output=True,
-                text=True,
+                **run_options,
             )
             return {"enabled": True, "committed": True}
         except Exception as exc:

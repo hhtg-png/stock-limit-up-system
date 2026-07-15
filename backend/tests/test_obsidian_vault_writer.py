@@ -46,6 +46,14 @@ class ObsidianVaultWriterTests(unittest.TestCase):
         subprocess.run(["git", "init", str(self.vault)], check=True, capture_output=True)
         subprocess.run(["git", "-C", str(self.vault), "config", "user.email", "test@example.com"], check=True)
         subprocess.run(["git", "-C", str(self.vault), "config", "user.name", "Test User"], check=True)
+        subprocess.run(["git", "-C", str(self.vault), "config", "commit.gpgSign", "false"], check=True)
+        subprocess.run(["git", "-C", str(self.vault), "config", "tag.gpgSign", "false"], check=True)
+        disabled_hooks = self.vault / ".git" / "disabled-hooks"
+        disabled_hooks.mkdir()
+        subprocess.run(
+            ["git", "-C", str(self.vault), "config", "core.hooksPath", str(disabled_hooks)],
+            check=True,
+        )
         readme = self.vault / "README.md"
         readme.write_text("baseline\n", encoding="utf-8")
         subprocess.run(["git", "-C", str(self.vault), "add", "README.md"], check=True)
@@ -171,6 +179,18 @@ class ObsidianVaultWriterTests(unittest.TestCase):
         self.assertEqual(target.read_text(encoding="utf-8"), "old\n")
         self.assertEqual(set(target.parent.iterdir()), files_before)
 
+    def test_write_text_cleanup_failure_does_not_mask_replace_failure(self):
+        writer = self._writer()
+        writer.write_text("50_Daily/note.md", "old\n", allowed_roots=ALLOWED_ROOTS)
+        replace_failure = OSError("replace failed")
+
+        with patch("app.services.obsidian_vault_writer.os.replace", side_effect=replace_failure):
+            with patch("app.services.obsidian_vault_writer.Path.unlink", side_effect=OSError("cleanup failed")):
+                with self.assertRaises(OSError) as raised:
+                    writer.write_text("50_Daily/note.md", "new\n", allowed_roots=ALLOWED_ROOTS)
+
+        self.assertIs(raised.exception, replace_failure)
+
     def test_commit_paths_is_a_no_op_when_git_is_disabled(self):
         def unexpected_runner(*args, **kwargs):
             self.fail("Git runner must not be called while auto Git is disabled")
@@ -246,6 +266,14 @@ class ObsidianVaultWriterTests(unittest.TestCase):
                 prefix + ["commit", "-m", "test commit", "--", "50_Daily/note.md"],
             ],
         )
+        for _, kwargs in commands:
+            self.assertEqual(kwargs.get("encoding"), "utf-8")
+            self.assertEqual(kwargs.get("errors"), "replace")
+            self.assertEqual(kwargs.get("stdin"), subprocess.DEVNULL)
+            self.assertIsInstance(kwargs.get("timeout"), (int, float))
+            self.assertGreater(kwargs["timeout"], 0)
+            self.assertEqual(kwargs.get("env", {}).get("GIT_TERMINAL_PROMPT"), "0")
+            self.assertEqual(kwargs.get("env", {}).get("GIT_ASKPASS"), "")
         self.assertEqual(result, {"enabled": True, "committed": True})
 
     def test_commit_paths_reports_missing_git_repository(self):
@@ -291,15 +319,29 @@ class ObsidianVaultWriterTests(unittest.TestCase):
         self.assertIn("fatal: test failure", result["error"])
         json.dumps(result)
 
-    def test_commit_paths_leaves_unrelated_staged_content_out_of_the_commit(self):
+    def test_commit_paths_reports_timeout_without_raising(self):
         self.vault.mkdir()
-        subprocess.run(["git", "init", str(self.vault)], check=True, capture_output=True)
-        subprocess.run(["git", "-C", str(self.vault), "config", "user.email", "test@example.com"], check=True)
-        subprocess.run(["git", "-C", str(self.vault), "config", "user.name", "Test User"], check=True)
+        (self.vault / ".git").mkdir()
+
+        def timing_out_runner(command, **kwargs):
+            if "status" in command:
+                return SimpleNamespace(returncode=0, stdout="?? 50_Daily/note.md\n", stderr="")
+            raise subprocess.TimeoutExpired(command, timeout=kwargs["timeout"])
+
+        result = self._writer(auto_git_enabled=True, command_runner=timing_out_runner).commit_paths(
+            ["50_Daily/note.md"],
+            allowed_roots=ALLOWED_ROOTS,
+            message="test commit",
+        )
+
+        self.assertTrue(result["enabled"])
+        self.assertFalse(result["committed"])
+        self.assertIn("timed out", result["error"])
+        json.dumps(result)
+
+    def test_commit_paths_leaves_unrelated_staged_content_out_of_the_commit(self):
+        self._initialize_git_repository()
         readme = self.vault / "README.md"
-        readme.write_text("baseline\n", encoding="utf-8")
-        subprocess.run(["git", "-C", str(self.vault), "add", "README.md"], check=True)
-        subprocess.run(["git", "-C", str(self.vault), "commit", "-m", "baseline"], check=True, capture_output=True)
         readme.write_text("unrelated staged change\n", encoding="utf-8")
         subprocess.run(["git", "-C", str(self.vault), "add", "README.md"], check=True)
         target = self.vault / "50_Daily" / "note.md"
@@ -380,6 +422,29 @@ class ObsidianVaultWriterTests(unittest.TestCase):
         self.assertEqual(present_result, {"enabled": True, "committed": True})
         self.assertEqual(committed, ["50_Daily/[ab].md"])
         self.assertEqual(untracked, ["50_Daily/a.md", "50_Daily/b.md"])
+
+    def test_commit_paths_decodes_chinese_git_output_as_utf8(self):
+        self._initialize_git_repository()
+        subprocess.run(["git", "-C", str(self.vault), "config", "core.quotePath", "false"], check=True)
+        dashboard = self.vault / "Dashboards"
+        dashboard.mkdir()
+        (dashboard / "交易预案.md").write_text("# 交易预案\n", encoding="utf-8")
+
+        result = self._writer(auto_git_enabled=True).commit_paths(
+            ["Dashboards/交易预案.md"],
+            allowed_roots=ALLOWED_ROOTS,
+            message="Chinese path commit",
+        )
+
+        committed = subprocess.run(
+            ["git", "-C", str(self.vault), "show", "--pretty=", "--name-only", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        ).stdout.splitlines()
+        self.assertEqual(result, {"enabled": True, "committed": True})
+        self.assertEqual(committed, ["Dashboards/交易预案.md"])
 
 
 if __name__ == "__main__":
