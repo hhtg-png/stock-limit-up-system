@@ -1,5 +1,9 @@
+import inspect
+import tempfile
 import unittest
 from datetime import date, datetime
+from pathlib import Path
+from unittest.mock import patch
 
 from sqlalchemy import (
     Boolean,
@@ -12,9 +16,11 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     CheckConstraint,
+    inspect as sqlalchemy_inspect,
 )
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from app import database
 from app.database import Base
 import app.models  # noqa: F401
 from app.models import TradingModeRule
@@ -714,11 +720,11 @@ class TradingPlaybookModelTests(unittest.TestCase):
         created_at = table.c.created_at
         updated_at = table.c.updated_at
 
-        self.assertEqual(created_at.default.arg.__wrapped__, datetime.now)
-        self.assertEqual(updated_at.default.arg.__wrapped__, datetime.now)
+        self.assertEqual(inspect.unwrap(created_at.default.arg), datetime.now)
+        self.assertEqual(inspect.unwrap(updated_at.default.arg), datetime.now)
         self.assertIsNotNone(updated_at.onupdate)
         self.assertTrue(callable(updated_at.onupdate.arg))
-        self.assertEqual(updated_at.onupdate.arg.__wrapped__, datetime.now)
+        self.assertEqual(inspect.unwrap(updated_at.onupdate.arg), datetime.now)
 
         for column in table.c:
             if column.name != "updated_at":
@@ -854,12 +860,14 @@ class TradingPlaybookPersistenceTests(unittest.IsolatedAsyncioTestCase):
                     trade_date=date(2026, 7, 15),
                     entity_type="plan",
                     entity_id=42,
-                    phase="pre_market",
-                    target_path="Trading/2026-07-15/plan-42.md",
+                    phase="preclose",
+                    target_path=(
+                        "TradingPlaybook Auto/2026-07-15/preclose/plan-42.md"
+                    ),
                     source_hash="c" * 64,
                     snapshot_json={"candidate_ids": [7, 11]},
                     immutable=True,
-                    status="exported",
+                    status="written",
                     attempt_no=2,
                     next_attempt_at=datetime(2026, 7, 15, 8, 45),
                     last_error="previous attempt failed",
@@ -873,6 +881,12 @@ class TradingPlaybookPersistenceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNotNone(snapshot.id)
                 self.assertEqual(snapshot.snapshot_version, 3)
                 self.assertEqual(snapshot.trade_date, date(2026, 7, 15))
+                self.assertEqual(snapshot.phase, "preclose")
+                self.assertEqual(snapshot.status, "written")
+                self.assertEqual(
+                    snapshot.target_path,
+                    "TradingPlaybook Auto/2026-07-15/preclose/plan-42.md",
+                )
                 self.assertEqual(snapshot.snapshot_json, {"candidate_ids": [7, 11]})
                 self.assertEqual(snapshot.git_status_json, {"commit": "abc123"})
                 self.assertEqual(snapshot.next_attempt_at, datetime(2026, 7, 15, 8, 45))
@@ -882,39 +896,76 @@ class TradingPlaybookPersistenceTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await engine.dispose()
 
-    async def test_create_all_adds_obsidian_export_table_to_existing_schema(self):
-        engine = create_async_engine("sqlite+aiosqlite:///:memory:", future=True)
-        try:
-            async with engine.begin() as connection:
-                await connection.exec_driver_sql(
-                    "CREATE TABLE preexisting_rows ("
-                    "id INTEGER PRIMARY KEY, value VARCHAR(32) NOT NULL)"
-                )
-                await connection.exec_driver_sql(
-                    "INSERT INTO preexisting_rows (id, value) "
-                    "VALUES (1, 'preserved')"
-                )
-                before = await connection.exec_driver_sql(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND "
-                    "name='trading_playbook_obsidian_exports'"
-                )
-                self.assertIsNone(before.scalar_one_or_none())
+    async def test_init_db_adds_obsidian_export_table_to_existing_schema(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "existing-playbook.db"
+            database_url = (
+                f"sqlite+aiosqlite:///{database_path.as_posix()}"
+            )
+            engine = create_async_engine(database_url, future=True)
+            session_factory = async_sessionmaker(engine, expire_on_commit=False)
+            try:
+                async with engine.begin() as connection:
+                    await connection.run_sync(
+                        TradingPlaybookSettings.__table__.create
+                    )
 
-                await connection.run_sync(Base.metadata.create_all)
+                async with session_factory() as session:
+                    session.add(
+                        TradingPlaybookSettings(
+                            id=1,
+                            enabled=True,
+                            trial_position_pct=12,
+                            confirmed_position_pct=28,
+                            hard_stop_pct=4.5,
+                            max_action_candidates=2,
+                            in_app_enabled=True,
+                            wechat_enabled=False,
+                            channel_config_json={"priority": "high"},
+                        )
+                    )
+                    await session.commit()
 
-                tables = await connection.exec_driver_sql(
-                    "SELECT name FROM sqlite_master WHERE type='table'"
-                )
-                self.assertIn(
-                    "trading_playbook_obsidian_exports",
-                    set(tables.scalars()),
-                )
-                preserved = await connection.exec_driver_sql(
-                    "SELECT value FROM preexisting_rows WHERE id=1"
-                )
-                self.assertEqual(preserved.scalar_one(), "preserved")
-        finally:
-            await engine.dispose()
+                async with engine.begin() as connection:
+                    export_table_exists = await connection.run_sync(
+                        lambda sync_connection: sqlalchemy_inspect(
+                            sync_connection
+                        ).has_table("trading_playbook_obsidian_exports")
+                    )
+                    self.assertFalse(export_table_exists)
+
+                with patch.object(database, "engine", engine), patch.object(
+                    database.settings,
+                    "DATABASE_URL",
+                    database_url,
+                ):
+                    await database.init_db()
+
+                async with engine.begin() as connection:
+                    export_table_exists = await connection.run_sync(
+                        lambda sync_connection: sqlalchemy_inspect(
+                            sync_connection
+                        ).has_table("trading_playbook_obsidian_exports")
+                    )
+                    self.assertTrue(export_table_exists)
+
+                async with session_factory() as session:
+                    settings_row = await session.get(TradingPlaybookSettings, 1)
+                    self.assertIsNotNone(settings_row)
+                    self.assertEqual(settings_row.id, 1)
+                    self.assertTrue(settings_row.enabled)
+                    self.assertEqual(settings_row.trial_position_pct, 12)
+                    self.assertEqual(settings_row.confirmed_position_pct, 28)
+                    self.assertEqual(settings_row.hard_stop_pct, 4.5)
+                    self.assertEqual(settings_row.max_action_candidates, 2)
+                    self.assertTrue(settings_row.in_app_enabled)
+                    self.assertFalse(settings_row.wechat_enabled)
+                    self.assertEqual(
+                        settings_row.channel_config_json,
+                        {"priority": "high"},
+                    )
+            finally:
+                await engine.dispose()
 
 
 if __name__ == "__main__":
