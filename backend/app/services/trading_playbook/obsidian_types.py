@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal
@@ -38,11 +37,11 @@ TRADING_PLAYBOOK_ALLOWED_ROOTS = (
 CanonicalScalar: TypeAlias = str | bool | int | float | Decimal | date | datetime | None
 CanonicalValue: TypeAlias = (
     CanonicalScalar
-    | Mapping[str, "CanonicalValue"]
+    | dict[str, "CanonicalValue"]
     | list["CanonicalValue"]
     | tuple["CanonicalValue", ...]
 )
-CanonicalMapping: TypeAlias = Mapping[str, CanonicalValue]
+CanonicalMapping: TypeAlias = dict[str, CanonicalValue]
 
 JSONScalar: TypeAlias = str | bool | int | float | None
 JSONValue: TypeAlias = (
@@ -77,14 +76,14 @@ def _canonical_value(value: object) -> JSONValue:
         return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
     if isinstance(value, date):
         return value.isoformat()
-    if isinstance(value, Mapping):
+    if type(value) is dict:
         normalized: dict[str, JSONValue] = {}
         for key, item in value.items():
             if not isinstance(key, str):
                 raise TypeError("canonical JSON dict keys must be strings")
             normalized[key] = _canonical_value(item)
         return normalized
-    if isinstance(value, (list, tuple)):
+    if type(value) in (list, tuple):
         return [_canonical_value(item) for item in value]
     raise TypeError(
         f"unsupported canonical JSON type: {type(value).__name__}"
@@ -134,6 +133,8 @@ class ObsidianArtifact:
             raise ValueError(f"entity_type must be one of {OBSIDIAN_ENTITY_TYPES}")
         if self.phase not in OBSIDIAN_PHASES:
             raise ValueError(f"phase must be one of {OBSIDIAN_PHASES}")
+        if type(self.payload) is not dict:
+            raise TypeError("payload must be a dict")
         canonical_json_bytes(self.payload)
 
     @property
@@ -154,6 +155,9 @@ class ObsidianSyncBatchResult:
     def __post_init__(self) -> None:
         if self.phase not in OBSIDIAN_PHASES:
             raise ValueError(f"phase must be one of {OBSIDIAN_PHASES}")
+        if type(self.git_status) is not dict:
+            raise TypeError("git_status must be a dict")
+        canonical_json_bytes(self.git_status)
 
 
 __all__ = (

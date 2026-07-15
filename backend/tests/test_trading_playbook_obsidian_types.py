@@ -4,10 +4,11 @@ import hashlib
 import json
 import re
 import unittest
-from collections import OrderedDict
+from collections import UserDict
 from dataclasses import FrozenInstanceError
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, localcontext
+from types import MappingProxyType
 
 from app.services.trading_playbook.obsidian_types import (
     OBSIDIAN_ENTITY_TYPES,
@@ -24,9 +25,7 @@ from app.services.trading_playbook.obsidian_types import (
 class CanonicalJsonBytesTests(unittest.TestCase):
     def test_dict_insertion_order_does_not_change_bytes_or_hash(self) -> None:
         first = {"z": 1, "nested": {"b": 2, "a": 3}, "a": "value"}
-        second = OrderedDict(
-            (("a", "value"), ("nested", OrderedDict((("a", 3), ("b", 2)))), ("z", 1))
-        )
+        second = {"a": "value", "nested": {"a": 3, "b": 2}, "z": 1}
 
         first_bytes = canonical_json_bytes(first)
         second_bytes = canonical_json_bytes(second)
@@ -141,6 +140,30 @@ class CanonicalJsonBytesTests(unittest.TestCase):
             with self.subTest(value_type=type(value).__name__):
                 with self.assertRaisesRegex(TypeError, "unsupported canonical JSON type"):
                     canonical_json_bytes(value)
+
+    def test_arbitrary_mappings_and_container_subclasses_are_rejected(self) -> None:
+        class DictSubclass(dict[str, object]):
+            pass
+
+        class ListSubclass(list[object]):
+            pass
+
+        class TupleSubclass(tuple[object, ...]):
+            pass
+
+        rejected = (
+            UserDict({"value": 1}),
+            MappingProxyType({"value": 1}),
+            DictSubclass(value=1),
+            ListSubclass([1]),
+            TupleSubclass((1,)),
+        )
+        for value in rejected:
+            with self.subTest(value_type=type(value).__name__):
+                with self.assertRaisesRegex(TypeError, "unsupported canonical JSON type"):
+                    canonical_json_bytes(value)  # type: ignore[arg-type]
+                with self.assertRaisesRegex(TypeError, "unsupported canonical JSON type"):
+                    canonical_json_bytes({"nested": value})  # type: ignore[dict-item]
 
     def test_non_string_dict_keys_are_rejected(self) -> None:
         with self.assertRaisesRegex(TypeError, "dict keys must be strings"):
@@ -271,6 +294,28 @@ class ObsidianContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "timezone-aware"):
             ObsidianArtifact(**invalid_payload)  # type: ignore[arg-type]
 
+    def test_artifact_payload_must_be_a_real_dict(self) -> None:
+        base = {
+            "snapshot_key": "rule:1",
+            "trade_date": date(2026, 7, 15),
+            "entity_type": "rule",
+            "entity_id": 1,
+            "phase": "catalog",
+            "target_path": "30_TradingPlaybook/Modes/Auto/rule-1.md",
+            "immutable": True,
+        }
+        invalid_payloads = (
+            7,
+            [],
+            UserDict({"rule_id": 1}),
+            MappingProxyType({"rule_id": 1}),
+        )
+
+        for payload in invalid_payloads:
+            with self.subTest(payload_type=type(payload).__name__):
+                with self.assertRaisesRegex(TypeError, "payload must be a dict"):
+                    ObsidianArtifact(**base, payload=payload)  # type: ignore[arg-type]
+
     def test_sync_batch_result_is_frozen_and_validates_phase(self) -> None:
         result = ObsidianSyncBatchResult(
             trade_date=date(2026, 7, 15),
@@ -297,6 +342,49 @@ class ObsidianContractTests(unittest.TestCase):
                 failed_files=(),
                 git_status={},
             )
+
+    def test_sync_batch_result_rejects_non_json_safe_git_status_values(self) -> None:
+        invalid_statuses = (
+            {"bad": object()},
+            {"nested": {"bad": object()}},
+            {"nested": [1, {"bad"}]},
+            {"nested": {1: "non-string key"}},
+            {"bad": b"bytes"},
+            {"bad": float("nan")},
+        )
+
+        for git_status in invalid_statuses:
+            with self.subTest(git_status=git_status):
+                with self.assertRaises((TypeError, ValueError)):
+                    ObsidianSyncBatchResult(
+                        trade_date=date(2026, 7, 15),
+                        phase="reconcile",
+                        written_files=(),
+                        skipped_files=(),
+                        pending_files=(),
+                        failed_files=(),
+                        git_status=git_status,  # type: ignore[arg-type]
+                    )
+
+    def test_sync_batch_result_git_status_must_be_a_real_dict(self) -> None:
+        invalid_statuses = (
+            [],
+            UserDict({"branch": "main"}),
+            MappingProxyType({"branch": "main"}),
+        )
+
+        for git_status in invalid_statuses:
+            with self.subTest(git_status_type=type(git_status).__name__):
+                with self.assertRaisesRegex(TypeError, "git_status must be a dict"):
+                    ObsidianSyncBatchResult(
+                        trade_date=date(2026, 7, 15),
+                        phase="reconcile",
+                        written_files=(),
+                        skipped_files=(),
+                        pending_files=(),
+                        failed_files=(),
+                        git_status=git_status,  # type: ignore[arg-type]
+                    )
 
 
 if __name__ == "__main__":
