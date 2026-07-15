@@ -710,10 +710,65 @@ class TradingPlaybookModelTests(unittest.TestCase):
 
     def test_obsidian_export_updated_at_has_callable_onupdate(self):
         table_name = "trading_playbook_obsidian_exports"
-        self.assertIn(table_name, Base.metadata.tables)
-        updated_at = Base.metadata.tables[table_name].c.updated_at
+        table = self._table(table_name)
+        created_at = table.c.created_at
+        updated_at = table.c.updated_at
+
+        self.assertEqual(created_at.default.arg.__wrapped__, datetime.now)
+        self.assertEqual(updated_at.default.arg.__wrapped__, datetime.now)
         self.assertIsNotNone(updated_at.onupdate)
         self.assertTrue(callable(updated_at.onupdate.arg))
+        self.assertEqual(updated_at.onupdate.arg.__wrapped__, datetime.now)
+
+        for column in table.c:
+            if column.name != "updated_at":
+                with self.subTest(column=column.name):
+                    self.assertIsNone(column.onupdate)
+
+    def test_obsidian_export_datetimes_are_naive(self):
+        table = self._table("trading_playbook_obsidian_exports")
+        datetime_columns = {
+            "next_attempt_at",
+            "exported_at",
+            "created_at",
+            "updated_at",
+        }
+        actual_datetime_columns = {
+            column.name
+            for column in table.c
+            if isinstance(column.type, DateTime)
+        }
+        self.assertEqual(actual_datetime_columns, datetime_columns)
+        for column_name in datetime_columns:
+            with self.subTest(column=column_name):
+                self.assertIs(table.c[column_name].type.timezone, False)
+
+    def test_obsidian_export_indexes_match_exact_contract(self):
+        table = self._table("trading_playbook_obsidian_exports")
+        actual_indexes = {
+            (
+                index.name,
+                tuple(column.name for column in index.columns),
+                index.unique,
+            )
+            for index in table.indexes
+            if len(index.columns) > 1
+        }
+        self.assertEqual(
+            actual_indexes,
+            {
+                (
+                    "ix_trading_playbook_obsidian_due",
+                    ("status", "next_attempt_at"),
+                    False,
+                ),
+                (
+                    "ix_trading_playbook_obsidian_trade_date",
+                    ("trade_date", "phase"),
+                    False,
+                ),
+            },
+        )
 
     def test_obsidian_export_model_is_exported(self):
         self.assertTrue(
