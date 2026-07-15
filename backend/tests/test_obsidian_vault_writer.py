@@ -29,6 +29,28 @@ class ObsidianVaultWriterTests(unittest.TestCase):
             command_runner=command_runner,
         )
 
+    def _create_directory_link(self, link: Path, target: Path) -> None:
+        try:
+            link.symlink_to(target, target_is_directory=True)
+        except OSError as exc:
+            junction = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+                capture_output=True,
+                text=True,
+            )
+            if junction.returncode != 0:
+                self.skipTest(f"directory symlinks and junctions are unavailable: {exc}")
+
+    def _initialize_git_repository(self) -> None:
+        self.vault.mkdir()
+        subprocess.run(["git", "init", str(self.vault)], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(self.vault), "config", "user.email", "test@example.com"], check=True)
+        subprocess.run(["git", "-C", str(self.vault), "config", "user.name", "Test User"], check=True)
+        readme = self.vault / "README.md"
+        readme.write_text("baseline\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.vault), "add", "README.md"], check=True)
+        subprocess.run(["git", "-C", str(self.vault), "commit", "-m", "baseline"], check=True, capture_output=True)
+
     def test_configured_vault_resolves_path_without_creating_it(self):
         writer = self._writer()
 
@@ -97,16 +119,7 @@ class ObsidianVaultWriterTests(unittest.TestCase):
         outside = Path(self.temp_dir.name) / "outside"
         outside.mkdir()
         link = daily_root / "escape"
-        try:
-            link.symlink_to(outside, target_is_directory=True)
-        except OSError as exc:
-            junction = subprocess.run(
-                ["cmd", "/c", "mklink", "/J", str(link), str(outside)],
-                capture_output=True,
-                text=True,
-            )
-            if junction.returncode != 0:
-                self.skipTest(f"directory symlinks and junctions are unavailable: {exc}")
+        self._create_directory_link(link, outside)
 
         with self.assertRaises(ValueError):
             writer.resolve_target("50_Daily/escape/note.md", allowed_roots=ALLOWED_ROOTS)
@@ -117,16 +130,7 @@ class ObsidianVaultWriterTests(unittest.TestCase):
         notes = self.vault / "Notes"
         notes.mkdir()
         allowed_link = self.vault / "50_Daily"
-        try:
-            allowed_link.symlink_to(notes, target_is_directory=True)
-        except OSError as exc:
-            junction = subprocess.run(
-                ["cmd", "/c", "mklink", "/J", str(allowed_link), str(notes)],
-                capture_output=True,
-                text=True,
-            )
-            if junction.returncode != 0:
-                self.skipTest(f"directory symlinks and junctions are unavailable: {exc}")
+        self._create_directory_link(allowed_link, notes)
 
         with self.assertRaises(ValueError):
             writer.write_text("50_Daily/private.md", "must not escape\n", allowed_roots=ALLOWED_ROOTS)
@@ -180,6 +184,20 @@ class ObsidianVaultWriterTests(unittest.TestCase):
         self.assertEqual(result, {"enabled": False})
         json.dumps(result)
 
+    def test_commit_paths_validates_junction_escape_when_git_is_disabled(self):
+        writer = self._writer()
+        writer.ensure_vault()
+        notes = self.vault / "Notes"
+        notes.mkdir()
+        self._create_directory_link(self.vault / "50_Daily", notes)
+
+        with self.assertRaises(ValueError):
+            writer.commit_paths(
+                ["50_Daily/private.md"],
+                allowed_roots=ALLOWED_ROOTS,
+                message="test commit",
+            )
+
     def test_commit_paths_is_a_no_op_when_no_paths_changed(self):
         def unexpected_runner(*args, **kwargs):
             self.fail("Git runner must not be called without paths")
@@ -207,6 +225,8 @@ class ObsidianVaultWriterTests(unittest.TestCase):
 
         def runner(command, **kwargs):
             commands.append((command, kwargs))
+            if "status" in command:
+                return SimpleNamespace(returncode=0, stdout="?? 50_Daily/note.md\n", stderr="")
             returncode = 1 if "--quiet" in command else 0
             return SimpleNamespace(returncode=returncode, stdout="", stderr="")
 
@@ -216,10 +236,11 @@ class ObsidianVaultWriterTests(unittest.TestCase):
             message="test commit",
         )
 
-        prefix = ["git", "-C", str(self.vault.resolve())]
+        prefix = ["git", "--literal-pathspecs", "-C", str(self.vault.resolve())]
         self.assertEqual(
             [command for command, _ in commands],
             [
+                prefix + ["status", "--porcelain", "--", "50_Daily/note.md"],
                 prefix + ["add", "--", "50_Daily/note.md"],
                 prefix + ["diff", "--cached", "--quiet", "--", "50_Daily/note.md"],
                 prefix + ["commit", "-m", "test commit", "--", "50_Daily/note.md"],
@@ -237,6 +258,20 @@ class ObsidianVaultWriterTests(unittest.TestCase):
         )
 
         self.assertEqual(result, {"enabled": True, "committed": False, "reason": "vault_is_not_git_repo"})
+
+    def test_commit_paths_validates_junction_escape_when_git_repository_is_missing(self):
+        writer = self._writer(auto_git_enabled=True)
+        writer.ensure_vault()
+        notes = self.vault / "Notes"
+        notes.mkdir()
+        self._create_directory_link(self.vault / "50_Daily", notes)
+
+        with self.assertRaises(ValueError):
+            writer.commit_paths(
+                ["50_Daily/private.md"],
+                allowed_roots=ALLOWED_ROOTS,
+                message="test commit",
+            )
 
     def test_commit_paths_reports_git_failure_without_raising(self):
         self.vault.mkdir()
@@ -292,6 +327,59 @@ class ObsidianVaultWriterTests(unittest.TestCase):
         self.assertEqual(result, {"enabled": True, "committed": True})
         self.assertEqual(committed, ["50_Daily/note.md"])
         self.assertEqual(staged, ["README.md"])
+
+    def test_commit_paths_treats_git_metacharacters_as_a_literal_filename(self):
+        self._initialize_git_repository()
+        daily_root = self.vault / "50_Daily"
+        daily_root.mkdir()
+        for filename in ("a.md", "b.md"):
+            (daily_root / filename).write_text(f"{filename}\n", encoding="utf-8")
+
+        writer = self._writer(auto_git_enabled=True)
+        absent_result = writer.commit_paths(
+            ["50_Daily/[ab].md"],
+            allowed_roots=ALLOWED_ROOTS,
+            message="literal path commit",
+        )
+
+        commit_count = subprocess.run(
+            ["git", "-C", str(self.vault), "rev-list", "--count", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        untracked_before = subprocess.run(
+            ["git", "-C", str(self.vault), "ls-files", "--others", "--exclude-standard"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.splitlines()
+        self.assertEqual(absent_result, {"enabled": True, "committed": False, "reason": "no_changes"})
+        self.assertEqual(commit_count, "1")
+        self.assertEqual(untracked_before, ["50_Daily/a.md", "50_Daily/b.md"])
+
+        (daily_root / "[ab].md").write_text("literal file\n", encoding="utf-8")
+        present_result = writer.commit_paths(
+            ["50_Daily/[ab].md"],
+            allowed_roots=ALLOWED_ROOTS,
+            message="literal path commit",
+        )
+
+        committed = subprocess.run(
+            ["git", "-C", str(self.vault), "show", "--pretty=", "--name-only", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.splitlines()
+        untracked = subprocess.run(
+            ["git", "-C", str(self.vault), "ls-files", "--others", "--exclude-standard"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.splitlines()
+        self.assertEqual(present_result, {"enabled": True, "committed": True})
+        self.assertEqual(committed, ["50_Daily/[ab].md"])
+        self.assertEqual(untracked, ["50_Daily/a.md", "50_Daily/b.md"])
 
 
 if __name__ == "__main__":

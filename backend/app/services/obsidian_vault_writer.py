@@ -121,7 +121,7 @@ class ObsidianVaultWriter:
     ) -> dict[str, object]:
         paths = list(dict.fromkeys(relative_paths))
         for relative_path in paths:
-            self._validate_relative_path(relative_path, allowed_roots=allowed_roots)
+            self.resolve_target(relative_path, allowed_roots=allowed_roots)
 
         if not self.auto_git_enabled:
             return {"enabled": False}
@@ -132,11 +132,16 @@ class ObsidianVaultWriter:
         if vault is None or not (vault / ".git").exists():
             return {"enabled": True, "committed": False, "reason": "vault_is_not_git_repo"}
 
-        for relative_path in paths:
-            self.resolve_target(relative_path, allowed_roots=allowed_roots)
-
-        prefix = ["git", "-C", str(vault)]
+        prefix = ["git", "--literal-pathspecs", "-C", str(vault)]
         try:
+            status = self.command_runner(
+                prefix + ["status", "--porcelain", "--", *paths],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            if not status.stdout.strip():
+                return {"enabled": True, "committed": False, "reason": "no_changes"}
             self.command_runner(
                 prefix + ["add", "--", *paths],
                 check=True,
