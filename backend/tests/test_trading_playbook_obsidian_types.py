@@ -20,6 +20,18 @@ from app.services.trading_playbook.obsidian_types import (
     canonical_json_bytes,
     database_datetime_to_cn,
 )
+from app.utils.time_utils import CN_TZ
+
+
+MAX_TEST_NESTING_DEPTH = 64
+
+
+def _nested_dict(depth: int) -> dict[str, object]:
+    value: object = 0
+    for _ in range(depth):
+        value = {"child": value}
+    assert isinstance(value, dict)
+    return value
 
 
 class CanonicalJsonBytesTests(unittest.TestCase):
@@ -130,6 +142,45 @@ class CanonicalJsonBytesTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "finite"):
                     canonical_json_bytes(value)
 
+    def test_negative_float_zero_has_the_same_canonical_bytes_and_hash_as_zero(self) -> None:
+        negative = canonical_json_bytes({"value": -0.0})
+        positive = canonical_json_bytes({"value": 0.0})
+
+        self.assertEqual(negative, positive)
+        self.assertEqual(
+            hashlib.sha256(negative).hexdigest(),
+            hashlib.sha256(positive).hexdigest(),
+        )
+
+    def test_cycles_are_rejected_with_clear_value_errors(self) -> None:
+        dict_cycle: dict[str, object] = {}
+        dict_cycle["self"] = dict_cycle
+        list_cycle: list[object] = []
+        list_cycle.append(list_cycle)
+
+        for value in (dict_cycle, list_cycle):
+            with self.subTest(value_type=type(value).__name__):
+                with self.assertRaisesRegex(ValueError, "cycle detected"):
+                    canonical_json_bytes(value)  # type: ignore[arg-type]
+
+    def test_maximum_nesting_depth_has_an_explicit_boundary(self) -> None:
+        canonical_json_bytes(_nested_dict(MAX_TEST_NESTING_DEPTH))
+
+        with self.assertRaisesRegex(
+            ValueError,
+            f"maximum nesting depth {MAX_TEST_NESTING_DEPTH} exceeded",
+        ):
+            canonical_json_bytes(_nested_dict(MAX_TEST_NESTING_DEPTH + 1))
+
+    def test_repeated_shared_references_are_not_treated_as_cycles(self) -> None:
+        shared = {"values": [1, 2]}
+        value = {"left": shared, "right": shared}
+
+        self.assertEqual(
+            json.loads(canonical_json_bytes(value)),
+            {"left": {"values": [1, 2]}, "right": {"values": [1, 2]}},
+        )
+
     def test_naive_datetime_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "timezone-aware"):
             canonical_json_bytes(datetime(2026, 7, 15, 9, 30))
@@ -205,6 +256,18 @@ class DatabaseDatetimeToCnTests(unittest.TestCase):
         self.assertEqual(converted.isoformat(), "2026-07-15T09:30:00+08:00")
         self.assertEqual(getattr(converted.tzinfo, "zone", None), "Asia/Shanghai")
 
+    def test_direct_pytz_tzinfo_assignment_is_normalized_via_utc(self) -> None:
+        source = datetime(2026, 7, 15, 9, 30, tzinfo=CN_TZ)
+        self.assertEqual(source.utcoffset(), timedelta(hours=8, minutes=6))
+
+        converted = database_datetime_to_cn(source)
+
+        self.assertIsNotNone(converted)
+        assert converted is not None
+        self.assertEqual(converted.utcoffset(), timedelta(hours=8))
+        self.assertEqual(converted.astimezone(timezone.utc), source.astimezone(timezone.utc))
+        self.assertEqual(converted.replace(tzinfo=None), datetime(2026, 7, 15, 9, 24))
+
 
 class ObsidianContractTests(unittest.TestCase):
     def test_constants_are_exact_and_notes_is_not_an_allowed_root(self) -> None:
@@ -264,6 +327,53 @@ class ObsidianContractTests(unittest.TestCase):
         self.assertRegex(artifact.source_hash, re.compile(r"^[0-9a-f]{64}$"))
         with self.assertRaises(FrozenInstanceError):
             artifact.phase = "after_close"  # type: ignore[misc]
+
+    def test_artifact_deeply_owns_payload_and_precomputes_a_stable_hash(self) -> None:
+        payload = {
+            "trade_date": date(2026, 7, 15),
+            "captured_at": datetime(2026, 7, 15, 1, 30, tzinfo=timezone.utc),
+            "nested": {"levels": [Decimal("10.500"), 11]},
+        }
+        expected_bytes = canonical_json_bytes(payload)
+        artifact = ObsidianArtifact(
+            snapshot_key="plan:42:2026-07-15",
+            trade_date=date(2026, 7, 15),
+            entity_type="plan",
+            entity_id=42,
+            phase="preclose",
+            target_path="30_TradingPlaybook/Daily/Auto/2026-07-15.md",
+            immutable=True,
+            payload=payload,
+        )
+        expected_hash = artifact.source_hash
+
+        payload["nested"]["levels"].append(12)  # type: ignore[index,union-attr]
+        payload["new"] = "caller mutation"
+
+        self.assertEqual(artifact.source_hash, expected_hash)
+        self.assertEqual(canonical_json_bytes(artifact.payload), expected_bytes)  # type: ignore[arg-type]
+        with self.assertRaises(TypeError):
+            artifact.payload["new"] = "direct mutation"  # type: ignore[index]
+        frozen_nested = artifact.payload["nested"]
+        with self.assertRaises(TypeError):
+            frozen_nested["new"] = 1  # type: ignore[index]
+        frozen_levels = frozen_nested["levels"]  # type: ignore[index]
+        with self.assertRaises(TypeError):
+            frozen_levels[0] = 99  # type: ignore[index]
+
+        plain = artifact.payload_json()
+        self.assertEqual(canonical_json_bytes(plain), expected_bytes)
+        self.assertEqual(
+            plain,
+            {
+                "trade_date": "2026-07-15",
+                "captured_at": "2026-07-15T01:30:00Z",
+                "nested": {"levels": ["10.5", 11]},
+            },
+        )
+        plain["nested"]["levels"].append("copy mutation")  # type: ignore[index,union-attr]
+        self.assertEqual(artifact.source_hash, expected_hash)
+        self.assertEqual(canonical_json_bytes(artifact.payload), expected_bytes)  # type: ignore[arg-type]
 
     def test_artifact_validates_identity_phase_path_and_payload(self) -> None:
         base = {
@@ -343,6 +453,32 @@ class ObsidianContractTests(unittest.TestCase):
                 git_status={},
             )
 
+    def test_sync_batch_file_fields_require_exact_tuples_of_strings(self) -> None:
+        base = {
+            "trade_date": date(2026, 7, 15),
+            "phase": "reconcile",
+            "written_files": (),
+            "skipped_files": (),
+            "pending_files": (),
+            "failed_files": (),
+            "git_status": {},
+        }
+        for field_name in (
+            "written_files",
+            "skipped_files",
+            "pending_files",
+            "failed_files",
+        ):
+            for invalid_value in (["mutable.md"], ("valid.md", 7)):
+                with self.subTest(field_name=field_name, value=invalid_value):
+                    kwargs = dict(base)
+                    kwargs[field_name] = invalid_value
+                    with self.assertRaisesRegex(
+                        TypeError,
+                        f"{field_name} must be a tuple of strings",
+                    ):
+                        ObsidianSyncBatchResult(**kwargs)  # type: ignore[arg-type]
+
     def test_sync_batch_result_rejects_non_json_safe_git_status_values(self) -> None:
         class DictSubclass(dict[str, object]):
             pass
@@ -403,8 +539,80 @@ class ObsidianContractTests(unittest.TestCase):
             git_status=git_status,
         )
 
-        self.assertIs(result.git_status, git_status)
-        self.assertEqual(result.git_status, git_status)
+        expected = {
+            "branch": "main",
+            "clean": True,
+            "ahead": 2,
+            "coverage": 0.875,
+            "upstream": None,
+            "files": [
+                {"path": "plan.md", "staged": False},
+                ["nested", 1, 0.5, None],
+            ],
+        }
+        self.assertIsNot(result.git_status, git_status)
+        self.assertEqual(result.git_status_json(), expected)
+
+        git_status["branch"] = "caller-mutated"
+        git_status["files"][0]["path"] = "caller-mutated.md"  # type: ignore[index]
+        git_status["files"].append("caller-mutated")  # type: ignore[union-attr]
+        self.assertEqual(result.git_status_json(), expected)
+
+        with self.assertRaises(TypeError):
+            result.git_status["branch"] = "direct mutation"  # type: ignore[index]
+        frozen_files = result.git_status["files"]
+        with self.assertRaises(TypeError):
+            frozen_files[0] = "direct mutation"  # type: ignore[index]
+        frozen_first_file = frozen_files[0]  # type: ignore[index]
+        with self.assertRaises(TypeError):
+            frozen_first_file["path"] = "direct mutation.md"  # type: ignore[index]
+
+        plain = result.git_status_json()
+        self.assertIsNot(plain, result.git_status_json())
+        plain["files"][0]["path"] = "copy-mutated.md"  # type: ignore[index]
+        self.assertEqual(result.git_status_json(), expected)
+
+    def test_sync_batch_json_freeze_rejects_cycles_and_excess_depth(self) -> None:
+        cycle: list[object] = []
+        cycle.append(cycle)
+        invalid_statuses = (
+            ({"cycle": cycle}, "cycle detected"),
+            (
+                _nested_dict(MAX_TEST_NESTING_DEPTH + 1),
+                f"maximum nesting depth {MAX_TEST_NESTING_DEPTH} exceeded",
+            ),
+        )
+
+        for git_status, message in invalid_statuses:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValueError, message):
+                    ObsidianSyncBatchResult(
+                        trade_date=date(2026, 7, 15),
+                        phase="reconcile",
+                        written_files=(),
+                        skipped_files=(),
+                        pending_files=(),
+                        failed_files=(),
+                        git_status=git_status,
+                    )
+
+    def test_sync_batch_json_freeze_allows_boundary_and_shared_references(self) -> None:
+        shared = {"values": [1, 2]}
+        boundary = _nested_dict(MAX_TEST_NESTING_DEPTH)
+        boundary["shared_left"] = shared
+        boundary["shared_right"] = shared
+
+        result = ObsidianSyncBatchResult(
+            trade_date=date(2026, 7, 15),
+            phase="reconcile",
+            written_files=(),
+            skipped_files=(),
+            pending_files=(),
+            failed_files=(),
+            git_status=boundary,
+        )
+
+        self.assertEqual(result.git_status_json(), boundary)
 
     def test_sync_batch_result_git_status_must_be_a_real_dict(self) -> None:
         invalid_statuses = (

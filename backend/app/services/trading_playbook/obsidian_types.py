@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal
@@ -50,6 +51,40 @@ JSONValue: TypeAlias = (
 JSONMapping: TypeAlias = dict[str, JSONValue]
 
 
+_MAX_NESTING_DEPTH = 64
+
+
+class _FrozenDict(Mapping[str, object]):
+    """A small immutable mapping backed only by immutable tuples."""
+
+    __slots__ = ("__items",)
+
+    def __init__(self, items: tuple[tuple[str, object], ...]) -> None:
+        object.__setattr__(
+            self,
+            "_FrozenDict__items",
+            tuple((key, value) for key, value in items),
+        )
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("_FrozenDict is immutable")
+
+    def __getitem__(self, key: str) -> object:
+        for item_key, value in self.__items:
+            if item_key == key:
+                return value
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return (key for key, _ in self.__items)
+
+    def __len__(self) -> int:
+        return len(self.__items)
+
+    def _items(self) -> tuple[tuple[str, object], ...]:
+        return self.__items
+
+
 def _decimal_string(value: Decimal) -> str:
     if not value.is_finite():
         raise ValueError("canonical JSON decimal values must be finite")
@@ -61,12 +96,30 @@ def _decimal_string(value: Decimal) -> str:
     return fixed_point
 
 
-def _canonical_value(value: object) -> JSONValue:
+def _container_depth(depth: int) -> int:
+    next_depth = depth + 1
+    if next_depth > _MAX_NESTING_DEPTH:
+        raise ValueError(
+            f"maximum nesting depth {_MAX_NESTING_DEPTH} exceeded"
+        )
+    return next_depth
+
+
+def _canonical_value(
+    value: object,
+    *,
+    depth: int = 0,
+    active_ids: set[int] | None = None,
+) -> JSONValue:
+    if active_ids is None:
+        active_ids = set()
     if value is None or isinstance(value, (str, bool, int)):
         return value
     if isinstance(value, float):
         if not math.isfinite(value):
             raise ValueError("canonical JSON float values must be finite")
+        if value == 0.0:
+            return 0.0
         return value
     if isinstance(value, Decimal):
         return _decimal_string(value)
@@ -76,38 +129,184 @@ def _canonical_value(value: object) -> JSONValue:
         return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
     if isinstance(value, date):
         return value.isoformat()
-    if type(value) is dict:
-        normalized: dict[str, JSONValue] = {}
-        for key, item in value.items():
-            if not isinstance(key, str):
-                raise TypeError("canonical JSON dict keys must be strings")
-            normalized[key] = _canonical_value(item)
-        return normalized
+    if type(value) is dict or type(value) is _FrozenDict:
+        container_depth = _container_depth(depth)
+        identity = id(value)
+        if identity in active_ids:
+            raise ValueError("canonical JSON cycle detected")
+        active_ids.add(identity)
+        try:
+            items = value.items() if type(value) is dict else value._items()
+            normalized: dict[str, JSONValue] = {}
+            for key, item in items:
+                if not isinstance(key, str):
+                    raise TypeError("canonical JSON dict keys must be strings")
+                normalized[key] = _canonical_value(
+                    item,
+                    depth=container_depth,
+                    active_ids=active_ids,
+                )
+            return normalized
+        finally:
+            active_ids.remove(identity)
     if type(value) in (list, tuple):
-        return [_canonical_value(item) for item in value]
+        container_depth = _container_depth(depth)
+        identity = id(value)
+        if identity in active_ids:
+            raise ValueError("canonical JSON cycle detected")
+        active_ids.add(identity)
+        try:
+            return [
+                _canonical_value(
+                    item,
+                    depth=container_depth,
+                    active_ids=active_ids,
+                )
+                for item in value
+            ]
+        finally:
+            active_ids.remove(identity)
     raise TypeError(
         f"unsupported canonical JSON type: {type(value).__name__}"
     )
 
 
-def _validate_json_value(value: object) -> None:
+def _freeze_canonical_value(
+    value: object,
+    *,
+    depth: int = 0,
+    active_ids: set[int] | None = None,
+) -> object:
+    if active_ids is None:
+        active_ids = set()
     if value is None or isinstance(value, (str, bool, int)):
-        return
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("canonical JSON float values must be finite")
+        return value
+    if isinstance(value, Decimal):
+        _decimal_string(value)
+        return value
+    if isinstance(value, datetime):
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("canonical JSON datetime values must be timezone-aware")
+        return value
+    if isinstance(value, date):
+        return value
+    if type(value) is dict or type(value) is _FrozenDict:
+        container_depth = _container_depth(depth)
+        identity = id(value)
+        if identity in active_ids:
+            raise ValueError("canonical JSON cycle detected")
+        active_ids.add(identity)
+        try:
+            items = value.items() if type(value) is dict else value._items()
+            frozen_items: list[tuple[str, object]] = []
+            for key, item in items:
+                if not isinstance(key, str):
+                    raise TypeError("canonical JSON dict keys must be strings")
+                frozen_items.append(
+                    (
+                        key,
+                        _freeze_canonical_value(
+                            item,
+                            depth=container_depth,
+                            active_ids=active_ids,
+                        ),
+                    )
+                )
+            return _FrozenDict(tuple(frozen_items))
+        finally:
+            active_ids.remove(identity)
+    if type(value) in (list, tuple):
+        container_depth = _container_depth(depth)
+        identity = id(value)
+        if identity in active_ids:
+            raise ValueError("canonical JSON cycle detected")
+        active_ids.add(identity)
+        try:
+            return tuple(
+                _freeze_canonical_value(
+                    item,
+                    depth=container_depth,
+                    active_ids=active_ids,
+                )
+                for item in value
+            )
+        finally:
+            active_ids.remove(identity)
+    raise TypeError(
+        f"unsupported canonical JSON type: {type(value).__name__}"
+    )
+
+
+def _freeze_json_value(
+    value: object,
+    *,
+    depth: int = 0,
+    active_ids: set[int] | None = None,
+) -> object:
+    if active_ids is None:
+        active_ids = set()
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
     if isinstance(value, float):
         if not math.isfinite(value):
             raise ValueError("JSON float values must be finite")
-        return
+        return value
     if type(value) is dict:
-        for key, item in value.items():
-            if not isinstance(key, str):
-                raise TypeError("JSON dict keys must be strings")
-            _validate_json_value(item)
-        return
+        container_depth = _container_depth(depth)
+        identity = id(value)
+        if identity in active_ids:
+            raise ValueError("JSON cycle detected")
+        active_ids.add(identity)
+        try:
+            frozen_items: list[tuple[str, object]] = []
+            for key, item in value.items():
+                if not isinstance(key, str):
+                    raise TypeError("JSON dict keys must be strings")
+                frozen_items.append(
+                    (
+                        key,
+                        _freeze_json_value(
+                            item,
+                            depth=container_depth,
+                            active_ids=active_ids,
+                        ),
+                    )
+                )
+            return _FrozenDict(tuple(frozen_items))
+        finally:
+            active_ids.remove(identity)
     if type(value) is list:
-        for item in value:
-            _validate_json_value(item)
-        return
+        container_depth = _container_depth(depth)
+        identity = id(value)
+        if identity in active_ids:
+            raise ValueError("JSON cycle detected")
+        active_ids.add(identity)
+        try:
+            return tuple(
+                _freeze_json_value(
+                    item,
+                    depth=container_depth,
+                    active_ids=active_ids,
+                )
+                for item in value
+            )
+        finally:
+            active_ids.remove(identity)
     raise TypeError(f"unsupported JSON value type: {type(value).__name__}")
+
+
+def _plain_json_value(value: object) -> JSONValue:
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    if type(value) is _FrozenDict:
+        return {key: _plain_json_value(item) for key, item in value._items()}
+    if type(value) is tuple:
+        return [_plain_json_value(item) for item in value]
+    raise TypeError(f"unsupported frozen JSON value type: {type(value).__name__}")
 
 
 def canonical_json_bytes(value: CanonicalValue) -> bytes:
@@ -130,7 +329,7 @@ def database_datetime_to_cn(value: datetime | None) -> datetime | None:
         return None
     if value.tzinfo is None or value.utcoffset() is None:
         return CN_TZ.localize(value)
-    return value.astimezone(CN_TZ)
+    return value.astimezone(timezone.utc).astimezone(CN_TZ)
 
 
 @dataclass(frozen=True)
@@ -155,11 +354,22 @@ class ObsidianArtifact:
             raise ValueError(f"phase must be one of {OBSIDIAN_PHASES}")
         if type(self.payload) is not dict:
             raise TypeError("payload must be a dict")
-        canonical_json_bytes(self.payload)
+        frozen_payload = _freeze_canonical_value(self.payload)
+        object.__setattr__(self, "payload", frozen_payload)
+        object.__setattr__(
+            self,
+            "_source_hash",
+            hashlib.sha256(canonical_json_bytes(frozen_payload)).hexdigest(),
+        )
 
     @property
     def source_hash(self) -> str:
-        return hashlib.sha256(canonical_json_bytes(self.payload)).hexdigest()
+        return self._source_hash  # type: ignore[attr-defined,no-any-return]
+
+    def payload_json(self) -> JSONMapping:
+        plain = _canonical_value(self.payload)
+        assert type(plain) is dict
+        return plain
 
 
 @dataclass(frozen=True)
@@ -175,9 +385,29 @@ class ObsidianSyncBatchResult:
     def __post_init__(self) -> None:
         if self.phase not in OBSIDIAN_PHASES:
             raise ValueError(f"phase must be one of {OBSIDIAN_PHASES}")
+        for field_name in (
+            "written_files",
+            "skipped_files",
+            "pending_files",
+            "failed_files",
+        ):
+            value = getattr(self, field_name)
+            if type(value) is not tuple or not all(
+                type(item) is str for item in value
+            ):
+                raise TypeError(f"{field_name} must be a tuple of strings")
         if type(self.git_status) is not dict:
             raise TypeError("git_status must be a dict")
-        _validate_json_value(self.git_status)
+        object.__setattr__(
+            self,
+            "git_status",
+            _freeze_json_value(self.git_status),
+        )
+
+    def git_status_json(self) -> JSONMapping:
+        plain = _plain_json_value(self.git_status)
+        assert type(plain) is dict
+        return plain
 
 
 __all__ = (
