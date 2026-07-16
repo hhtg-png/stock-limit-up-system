@@ -6,6 +6,7 @@ import re
 import unittest
 from collections import UserDict
 from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import FrozenInstanceError, asdict, replace
 from datetime import date, datetime, timedelta, timezone, tzinfo
 from decimal import Decimal, localcontext
@@ -417,6 +418,46 @@ class ObsidianContractTests(unittest.TestCase):
             hashlib.sha256(canonical_json_bytes(artifact.payload)).hexdigest(),  # type: ignore[arg-type]
         )
 
+    def test_artifact_detaches_mutable_date_and_decimal_subclasses(self) -> None:
+        class MutableDate(date):
+            rendered = "2026-07-15"
+
+            def isoformat(self) -> str:
+                return type(self).rendered
+
+        class MutableDecimal(Decimal):
+            rendered = "10.5"
+
+            def __format__(self, format_spec: str) -> str:
+                return type(self).rendered
+
+        mutable_date = MutableDate(2026, 7, 15)
+        mutable_decimal = MutableDecimal("10.500")
+        payload = {
+            "trade_date": mutable_date,
+            "amount": mutable_decimal,
+        }
+        expected_bytes = canonical_json_bytes(payload)
+        artifact = ObsidianArtifact(
+            snapshot_key="plan:42:2026-07-15",
+            trade_date=date(2026, 7, 15),
+            entity_type="plan",
+            entity_id=42,
+            phase="preclose",
+            target_path="30_TradingPlaybook/Daily/Auto/2026-07-15.md",
+            immutable=True,
+            payload=payload,
+        )
+        expected_hash = hashlib.sha256(expected_bytes).hexdigest()
+
+        MutableDate.rendered = "2099-01-01"
+        MutableDecimal.rendered = "999"
+
+        self.assertEqual(canonical_json_bytes(artifact.payload), expected_bytes)  # type: ignore[arg-type]
+        self.assertIs(type(artifact.payload["trade_date"]), date)
+        self.assertIs(type(artifact.payload["amount"]), Decimal)
+        self.assertEqual(artifact.source_hash, expected_hash)
+
     def test_artifact_asdict_exports_a_fresh_plain_canonical_payload(self) -> None:
         artifact = ObsidianArtifact(
             snapshot_key="plan:42:2026-07-15",
@@ -438,6 +479,25 @@ class ObsidianContractTests(unittest.TestCase):
         self.assertEqual(exported["payload"], artifact.payload_json())
         exported["payload"]["levels"].append(12)  # type: ignore[index,union-attr]
         self.assertEqual(artifact.payload_json()["levels"], ["10.5", 11])
+
+    def test_artifact_deepcopy_preserves_the_deeply_frozen_snapshot(self) -> None:
+        artifact = ObsidianArtifact(
+            snapshot_key="plan:42:2026-07-15",
+            trade_date=date(2026, 7, 15),
+            entity_type="plan",
+            entity_id=42,
+            phase="preclose",
+            target_path="30_TradingPlaybook/Daily/Auto/2026-07-15.md",
+            immutable=True,
+            payload={"nested": {"levels": [Decimal("10.500"), 11]}},
+        )
+
+        copied = deepcopy(artifact)
+
+        self.assertIs(copied, artifact)
+        self.assertEqual(copied.source_hash, artifact.source_hash)
+        with self.assertRaises(TypeError):
+            copied.payload["new"] = "mutation"  # type: ignore[index]
 
     def test_artifact_replace_reconstructs_from_the_frozen_payload(self) -> None:
         artifact = ObsidianArtifact(
@@ -673,6 +733,23 @@ class ObsidianContractTests(unittest.TestCase):
         self.assertEqual(exported["git_status"], result.git_status_json())
         exported["git_status"]["files"][0]["path"] = "mutated.md"  # type: ignore[index]
         self.assertEqual(result.git_status_json()["files"][0]["path"], "plan.md")  # type: ignore[index]
+
+    def test_sync_batch_deepcopy_preserves_the_deeply_frozen_snapshot(self) -> None:
+        result = ObsidianSyncBatchResult(
+            trade_date=date(2026, 7, 15),
+            phase="reconcile",
+            written_files=("written.md",),
+            skipped_files=(),
+            pending_files=(),
+            failed_files=(),
+            git_status={"branch": "main", "files": [{"path": "plan.md"}]},
+        )
+
+        copied = deepcopy(result)
+
+        self.assertIs(copied, result)
+        with self.assertRaises(TypeError):
+            copied.git_status["branch"] = "mutation"  # type: ignore[index]
 
     def test_sync_batch_replace_reconstructs_from_frozen_git_status(self) -> None:
         result = ObsidianSyncBatchResult(

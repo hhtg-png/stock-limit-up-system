@@ -218,8 +218,9 @@ def _freeze_canonical_value(
             raise ValueError("canonical JSON float values must be finite")
         return value
     if isinstance(value, Decimal):
-        _decimal_string(value)
-        return value
+        normalized_decimal = value if type(value) is Decimal else Decimal(value)
+        _decimal_string(normalized_decimal)
+        return normalized_decimal
     if isinstance(value, datetime):
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("canonical JSON datetime values must be timezone-aware")
@@ -236,7 +237,9 @@ def _freeze_canonical_value(
             fold=normalized.fold,
         )
     if isinstance(value, date):
-        return value
+        if type(value) is date:
+            return value
+        return date.fromordinal(date.toordinal(value))
     if type(value) is dict:
         container_depth = _container_depth(depth)
         identity = id(value)
@@ -438,6 +441,10 @@ class ObsidianArtifact:
         assert type(plain) is dict
         return plain
 
+    def __deepcopy__(self, memo: dict[int, object]) -> ObsidianArtifact:
+        memo[id(self)] = self
+        return self
+
 
 @dataclass(frozen=True, init=False)
 class ObsidianSyncBatchResult:
@@ -496,6 +503,10 @@ class ObsidianSyncBatchResult:
         plain = _plain_json_value(self.git_status)
         assert type(plain) is dict
         return plain
+
+    def __deepcopy__(self, memo: dict[int, object]) -> ObsidianSyncBatchResult:
+        memo[id(self)] = self
+        return self
 
 
 __all__ = (
