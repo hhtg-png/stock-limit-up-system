@@ -8,6 +8,7 @@ from app.services.trading_playbook.obsidian_exporter import (
     TradingPlaybookObsidianExporter,
 )
 from app.services.trading_playbook.obsidian_types import ObsidianArtifact
+from app.services.trading_playbook.rule_catalog import canonical_rule_source_refs
 
 
 UTC_CREATED = datetime(2026, 7, 15, 6, 0, tzinfo=timezone.utc)
@@ -24,31 +25,42 @@ class TradingPlaybookObsidianExporterContractTests(unittest.TestCase):
     @staticmethod
     def _rule_artifact(
         *,
-        mode_key: str = "safe\n---\nstatus: hacked #: 2026-01-01",
+        mode_key: str = "mode_01",
         payload_type: str = "trading_mode_rule",
+        catalog_version: str = "v2",
+        rule_id: int = 1,
+        rule_version: int = 2,
+        content_hash: str = "b" * 64,
+        source_refs: list[dict[str, object]] | None = None,
     ) -> ObsidianArtifact:
         target_mode = (
             mode_key
-            if re.fullmatch(r"[a-z0-9][a-z0-9_-]*", mode_key)
+            if re.fullmatch(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)*", mode_key)
             else "trend_core_pullback"
         )
+        target_catalog = (
+            catalog_version
+            if re.fullmatch(r"v[1-9][0-9]*", catalog_version)
+            else "v2"
+        )
         return ObsidianArtifact(
-            snapshot_key=f"rule:v2:{mode_key}",
+            snapshot_key=f"rule:{catalog_version}:{mode_key}",
             trade_date=date(2026, 7, 15),
             entity_type="rule",
             entity_id=1,
             phase="catalog",
             target_path=(
-                f"30_TradingPlaybook/Modes/Auto/v2/{target_mode}.md"
+                "30_TradingPlaybook/Modes/Auto/"
+                f"{target_catalog}/{target_mode}.md"
             ),
             immutable=True,
             payload={
                 "type": payload_type,
-                "catalog_version": "v2",
-                "rule_id": 1,
+                "catalog_version": catalog_version,
+                "rule_id": rule_id,
                 "mode_key": mode_key,
-                "rule_version": 2,
-                "name": "趋势 `核心` [[诱导链接]]",
+                "rule_version": rule_version,
+                "name": "趋势 `核心` [[诱导链接]]\n---\nstatus: hacked",
                 "family": "趋势",
                 "style": "回踩",
                 "window": "盘中",
@@ -64,14 +76,16 @@ class TradingPlaybookObsidianExporterContractTests(unittest.TestCase):
                 "invalidation": {"any": ["跌破支撑"]},
                 "exit_trigger": {"any": ["趋势破坏"]},
                 "risk_guidance": {"position": "试仓"},
-                "source_refs": [
+                "source_refs": source_refs
+                if source_refs is not None
+                else [
                     {
                         "source_key": "01-trend",
+                        "excerpt": "短引文 #1: [[不应成为链接]]",
                         "source_content_hash": "a" * 64,
-                        "quote": "短引文 #1: [[不应成为链接]]",
                     }
                 ],
-                "content_hash": "b" * 64,
+                "content_hash": content_hash,
                 "enabled": True,
                 "created_at": UTC_CREATED,
                 "manual_required": True,
@@ -116,6 +130,9 @@ class TradingPlaybookObsidianExporterContractTests(unittest.TestCase):
         stage: str = "preclose",
         version_no: int = 1,
         modes: tuple[str, ...] = MODE_KEYS,
+        source_trade_date: date = date(2026, 7, 15),
+        target_trade_date: date = date(2026, 7, 16),
+        action_trade_dates: tuple[date, date, date] | None = None,
     ) -> ObsidianArtifact:
         distributed = (list(modes[1:7]), list(modes[8:13]), list(modes[14:]))
         candidates = [
@@ -125,14 +142,22 @@ class TradingPlaybookObsidianExporterContractTests(unittest.TestCase):
         ]
         for candidate in candidates:
             candidate["plan_version_id"] = plan_id
+        if action_trade_dates is not None:
+            for candidate, action_trade_date in zip(
+                candidates,
+                action_trade_dates,
+                strict=True,
+            ):
+                candidate["action_trade_date"] = action_trade_date
         return ObsidianArtifact(
             snapshot_key=f"plan:{plan_id}",
-            trade_date=date(2026, 7, 16),
+            trade_date=target_trade_date,
             entity_type="plan",
             entity_id=plan_id,
             phase=stage,
             target_path=(
-                "30_TradingPlaybook/Daily/Auto/2026/2026-07-16/"
+                "30_TradingPlaybook/Daily/Auto/"
+                f"{target_trade_date.year}/{target_trade_date.isoformat()}/"
                 f"{stage}-v{version_no}.md"
             ),
             immutable=True,
@@ -142,8 +167,8 @@ class TradingPlaybookObsidianExporterContractTests(unittest.TestCase):
                 "version_no": version_no,
                 "stage": stage,
                 "status": "confirmed",
-                "source_trade_date": date(2026, 7, 15),
-                "target_trade_date": date(2026, 7, 16),
+                "source_trade_date": source_trade_date,
+                "target_trade_date": target_trade_date,
                 "parent_plan_version_id": plan_id - 1 if version_no > 1 else None,
                 "market_state": {"cycle": "divergence"},
                 "theme_ranking": [
@@ -168,7 +193,7 @@ class TradingPlaybookObsidianExporterContractTests(unittest.TestCase):
                             {
                                 "source_key": "01-trend",
                                 "source_content_hash": "a" * 64,
-                                "quote": "短引文",
+                                "excerpt": "短引文",
                             }
                         ],
                     }
@@ -202,18 +227,28 @@ class TradingPlaybookObsidianExporterContractTests(unittest.TestCase):
 
     @staticmethod
     def _review_artifact(
-        *, plan_id: int = 101, phase: str = "initial_review", stage: str = "preclose", version_no: int = 1
+        *,
+        plan_id: int = 101,
+        phase: str = "initial_review",
+        stage: str = "preclose",
+        version_no: int = 1,
+        review_trade_date: date = date(2026, 7, 16),
+        source_trade_date: date = date(2026, 7, 15),
+        target_trade_date: date = date(2026, 7, 16),
+        review_id: int | None = None,
     ) -> ObsidianArtifact:
         kind = "initial" if phase == "initial_review" else "final"
-        review_id = plan_id * 10 + (1 if kind == "initial" else 2)
+        if review_id is None:
+            review_id = plan_id * 10 + (1 if kind == "initial" else 2)
         return ObsidianArtifact(
             snapshot_key=f"review:{review_id}:{kind}",
-            trade_date=date(2026, 7, 16),
+            trade_date=review_trade_date,
             entity_type="review",
             entity_id=review_id,
             phase=phase,
             target_path=(
-                "30_TradingPlaybook/Reviews/Auto/2026/2026-07-16/"
+                "30_TradingPlaybook/Reviews/Auto/"
+                f"{review_trade_date.year}/{review_trade_date.isoformat()}/"
                 f"{kind}-review-{plan_id}.md"
             ),
             immutable=True,
@@ -221,14 +256,14 @@ class TradingPlaybookObsidianExporterContractTests(unittest.TestCase):
                 "type": "trading_execution_review",
                 "review_id": review_id,
                 "phase": phase,
-                "trade_date": date(2026, 7, 16),
+                "trade_date": review_trade_date,
                 "plan_version_id": plan_id,
                 "plan_version": {
                     "version_no": version_no,
                     "stage": stage,
                     "status": "confirmed",
-                    "source_trade_date": date(2026, 7, 15),
-                    "target_trade_date": date(2026, 7, 16),
+                    "source_trade_date": source_trade_date,
+                    "target_trade_date": target_trade_date,
                 },
                 "signal_review": {
                     "triggered": True,
@@ -308,7 +343,39 @@ class TradingPlaybookObsidianExporterContractTests(unittest.TestCase):
         )
 
     @staticmethod
-    def _daily_index_artifact(plans: list[dict[str, object]]) -> ObsidianArtifact:
+    def _daily_index_artifact(
+        plans: list[dict[str, object]],
+        *,
+        stage_schedule: list[dict[str, object]] | None = None,
+    ) -> ObsidianArtifact:
+        if stage_schedule is None:
+            stage_schedule = [
+                {
+                    "phases": ["preclose"],
+                    "time_cn": "14:40",
+                    "label": "提前预案",
+                },
+                {
+                    "phases": ["initial_review"],
+                    "time_cn": "15:10",
+                    "label": "初步复盘",
+                },
+                {
+                    "phases": ["after_close", "final_review"],
+                    "time_cn": "15:30",
+                    "label": "正式预案与最终复盘",
+                },
+                {
+                    "phases": ["overnight"],
+                    "time_cn": "08:50",
+                    "label": "隔夜刷新",
+                },
+                {
+                    "phases": ["auction"],
+                    "time_cn": "09:26",
+                    "label": "竞价最终版本",
+                },
+            ]
         return ObsidianArtifact(
             snapshot_key="daily-index:2026-07-16",
             trade_date=date(2026, 7, 16),
@@ -324,13 +391,7 @@ class TradingPlaybookObsidianExporterContractTests(unittest.TestCase):
                 "trade_date": date(2026, 7, 16),
                 "current_effective_plan_version_id": 104,
                 "plan_versions": list(reversed(plans)),
-                "stage_schedule": [
-                    {"phases": ["preclose"], "time_cn": "14:40", "label": "提前预案"},
-                    {"phases": ["initial_review"], "time_cn": "15:10", "label": "初步复盘"},
-                    {"phases": ["after_close", "final_review"], "time_cn": "15:30", "label": "正式预案与最终复盘"},
-                    {"phases": ["overnight"], "time_cn": "08:50", "label": "隔夜刷新"},
-                    {"phases": ["auction"], "time_cn": "09:26", "label": "竞价最终版本"},
-                ],
+                "stage_schedule": stage_schedule,
                 "manual_required": True,
                 "auto_execute": False,
             },
@@ -381,7 +442,7 @@ class TradingPlaybookObsidianExporterContractTests(unittest.TestCase):
                 'status: "enabled"',
                 "manual_required: true",
                 "auto_execute: false",
-                'mode_key: "safe\\n---\\nstatus: hacked #: 2026-01-01"',
+                'mode_key: "mode_01"',
                 'rule_version: 2',
                 "---",
                 "",
@@ -393,6 +454,80 @@ class TradingPlaybookObsidianExporterContractTests(unittest.TestCase):
         self.assertEqual(first.count("```dataview"), 1)
         self.assertIn('FROM "30_TradingPlaybook/Daily/Auto"', first)
         self.assertNotIn('FROM "Notes"', first)
+
+    def test_rule_renders_exact_canonical_builder_source_refs(self) -> None:
+        source_refs = canonical_rule_source_refs(
+            {
+                "source_refs": [
+                    {
+                        "source_key": "02-breakout",
+                        "excerpt": "确认后再行动",
+                        "source_content_hash": "2" * 64,
+                    },
+                    {
+                        "source_key": "01-trend",
+                        "excerpt": "短引文 [[不是链接]] `不成代码`",
+                        "source_content_hash": "1" * 64,
+                    },
+                ]
+            }
+        )
+        rendered = self.exporter.render(
+            self._rule_artifact(source_refs=source_refs),
+            generated_at=self.generated_at,
+        )
+
+        self.assertLess(rendered.index("01-trend"), rendered.index("02-breakout"))
+        self.assertIn("1" * 64, rendered)
+        self.assertIn("2" * 64, rendered)
+        self.assertIn(
+            "短引文 &#91;&#91;不是链接&#93;&#93; &#96;不成代码&#96;",
+            rendered,
+        )
+        self.assertNotIn("[[不是链接]]", rendered)
+
+    def test_rule_rejects_noncanonical_or_malformed_source_refs(self) -> None:
+        first = {
+            "source_key": "01-trend",
+            "excerpt": "证据一",
+            "source_content_hash": "1" * 64,
+        }
+        second = {
+            "source_key": "02-breakout",
+            "excerpt": "证据二",
+            "source_content_hash": "2" * 64,
+        }
+        cases = (
+            [],
+            [{**first, "quote": "legacy"}],
+            [{**first, "source_content_hash": "not-sha256"}],
+            [second, first],
+        )
+
+        for source_refs in cases:
+            with self.subTest(source_refs=source_refs):
+                with self.assertRaisesRegex(ValueError, "source_refs"):
+                    self.exporter.render(
+                        self._rule_artifact(source_refs=source_refs),
+                        generated_at=self.generated_at,
+                    )
+
+    def test_rule_path_driving_identity_and_hashes_fail_closed(self) -> None:
+        cases = (
+            ({"mode_key": "../unsafe"}, "mode_key"),
+            ({"rule_id": 0}, "rule_id"),
+            ({"rule_version": 0}, "rule_version"),
+            ({"catalog_version": "v02"}, "catalog_version"),
+            ({"content_hash": "not-sha256"}, "content_hash"),
+        )
+
+        for overrides, message in cases:
+            with self.subTest(overrides=overrides):
+                with self.assertRaisesRegex(ValueError, message):
+                    self.exporter.render(
+                        self._rule_artifact(**overrides),
+                        generated_at=self.generated_at,
+                    )
 
     def test_generated_at_must_be_timezone_aware(self) -> None:
         with self.assertRaisesRegex(ValueError, "generated_at must be timezone-aware"):
@@ -443,6 +578,57 @@ class TradingPlaybookObsidianExporterContractTests(unittest.TestCase):
         self.assertIn("[[30_TradingPlaybook/Reviews/Auto/2026/2026-07-16/final-review-101", rendered)
         self.assertIn("[[30_TradingPlaybook/Notes/2026/2026-07-16", rendered)
         self.assertNotIn("[[伪链接]]", rendered)
+
+    def test_plan_links_reviews_for_action_dates_and_target_date(self) -> None:
+        source_trade_date = date(2026, 7, 15)
+        action_trade_date = date(2026, 7, 16)
+        target_trade_date = date(2026, 7, 17)
+        plan = self._plan_artifact(
+            source_trade_date=source_trade_date,
+            target_trade_date=target_trade_date,
+            action_trade_dates=(
+                action_trade_date,
+                target_trade_date,
+                action_trade_date,
+            ),
+        )
+        reviews = [
+            self._review_artifact(
+                phase=phase,
+                review_trade_date=review_date,
+                source_trade_date=source_trade_date,
+                target_trade_date=target_trade_date,
+                review_id=2000 + offset,
+            )
+            for offset, (review_date, phase) in enumerate(
+                (
+                    (action_trade_date, "initial_review"),
+                    (action_trade_date, "final_review"),
+                    (target_trade_date, "initial_review"),
+                    (target_trade_date, "final_review"),
+                ),
+                start=1,
+            )
+        ]
+
+        rendered = self.exporter.render(plan, generated_at=self.generated_at)
+        review_links = {
+            match.group(1)
+            for match in re.finditer(
+                r"\[\[(30_TradingPlaybook/Reviews/Auto/[^\]|#]+)",
+                rendered,
+            )
+        }
+        review_paths = {
+            review.target_path.removesuffix(".md") for review in reviews
+        }
+
+        self.assertEqual(review_links, review_paths)
+        self.assertIn("2026-07-16 15:10 初步复盘", rendered)
+        self.assertIn("2026-07-16 15:30 最终复盘", rendered)
+        self.assertIn("2026-07-17 15:10 初步复盘", rendered)
+        self.assertIn("2026-07-17 15:30 最终复盘", rendered)
+        self.assertNotIn("Reviews/Auto/2026/2026-07-15", rendered)
 
     def test_review_page_contains_full_review_sections_and_plan_link(self) -> None:
         rendered = self.exporter.render(
@@ -550,6 +736,37 @@ class TradingPlaybookObsidianExporterContractTests(unittest.TestCase):
             self.assertIn(f"{stage}-v{version_no}", rendered)
             self.assertIn(f"计划 #{plan_id}", rendered)
 
+    def test_daily_index_rejects_missing_extra_arbitrary_or_duplicate_schedule(self) -> None:
+        valid_schedule = self._daily_index_artifact([]).payload_json()[
+            "stage_schedule"
+        ]
+        if not isinstance(valid_schedule, list):
+            self.fail("stage_schedule fixture must be a list")
+        cases = (
+            [],
+            [{"phases": ["preclose"], "time_cn": "12:00", "label": "任意"}],
+            [valid_schedule[0] for _ in range(5)],
+            [
+                *valid_schedule,
+                {
+                    "phases": ["auction"],
+                    "time_cn": "09:27",
+                    "label": "额外",
+                },
+            ],
+        )
+
+        for stage_schedule in cases:
+            with self.subTest(stage_schedule=stage_schedule):
+                with self.assertRaisesRegex(ValueError, "stage_schedule"):
+                    self.exporter.render(
+                        self._daily_index_artifact(
+                            [],
+                            stage_schedule=stage_schedule,
+                        ),
+                        generated_at=self.generated_at,
+                    )
+
     def test_dashboard_uses_fixed_navigation_and_auto_only_dataview_sources(self) -> None:
         rendered = self.exporter.render(
             self._dashboard_artifact(), generated_at=self.generated_at
@@ -584,6 +801,11 @@ class TradingPlaybookObsidianExporterContractTests(unittest.TestCase):
                 plan_id=plan_id,
                 stage=stage,
                 version_no=version_no,
+                action_trade_dates=(
+                    date(2026, 7, 15),
+                    date(2026, 7, 16),
+                    date(2026, 7, 15),
+                ),
             )
             for plan_id, stage, version_no in plan_specs
         ]
@@ -593,8 +815,15 @@ class TradingPlaybookObsidianExporterContractTests(unittest.TestCase):
                 phase=phase,
                 stage=stage,
                 version_no=version_no,
+                review_trade_date=review_trade_date,
+                review_id=(
+                    plan_id * 1000
+                    + review_trade_date.day * 10
+                    + (1 if phase == "initial_review" else 2)
+                ),
             )
             for plan_id, stage, version_no in plan_specs
+            for review_trade_date in (date(2026, 7, 15), date(2026, 7, 16))
             for phase in ("initial_review", "final_review")
         ]
         daily_plans = [

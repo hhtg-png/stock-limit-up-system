@@ -9,6 +9,7 @@ from datetime import date, datetime, timezone
 from typing import Callable
 
 from app.services.trading_playbook.obsidian_types import ObsidianArtifact
+from app.services.trading_playbook.rule_catalog import canonical_rule_source_refs
 
 
 _PAYLOAD_TYPES = {
@@ -20,9 +21,17 @@ _PAYLOAD_TYPES = {
     "dashboard": "trading_playbook_dashboard",
 }
 
-_SAFE_MODE_KEY = re.compile(r"[a-z0-9][a-z0-9_-]*")
+_SAFE_MODE_KEY = re.compile(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)*")
 _SAFE_STAGE = re.compile(r"[a-z][a-z0-9_]*")
 _SAFE_CATALOG_VERSION = re.compile(r"v[1-9][0-9]*")
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+_EXPECTED_STAGE_SCHEDULE = (
+    ("14:40", ("preclose",)),
+    ("15:10", ("initial_review",)),
+    ("15:30", ("after_close", "final_review")),
+    ("08:50", ("overnight",)),
+    ("09:26", ("auction",)),
+)
 _IN_APP_STATUS_FIELDS = (
     "status",
     "attempts",
@@ -384,37 +393,56 @@ class TradingPlaybookObsidianExporter:
             "catalog_version",
             _SAFE_CATALOG_VERSION,
         )
+        rule_id = self._positive_int(payload.get("rule_id"), "rule_id")
+        mode_key = self._safe_identifier(
+            payload.get("mode_key"),
+            "mode_key",
+            _SAFE_MODE_KEY,
+        )
+        rule_version = self._positive_int(
+            payload.get("rule_version"), "rule_version"
+        )
+        if catalog_version != f"v{rule_version}":
+            raise ValueError("catalog_version must match rule_version")
+        content_hash = payload.get("content_hash")
+        if (
+            not isinstance(content_hash, str)
+            or _SHA256.fullmatch(content_hash) is None
+        ):
+            raise ValueError("content_hash must be sha256")
         prerequisites = self._require_dict(
             payload.get("prerequisites"), "rule prerequisites"
         )
-        source_refs = self._require_list(payload.get("source_refs"), "source_refs")
-        source_rows: list[str] = []
-        sortable_refs: list[dict[str, object]] = []
-        for value in source_refs:
-            sortable_refs.append(self._require_dict(value, "source reference"))
-        sortable_refs.sort(
-            key=lambda item: (
-                str(item.get("source_key", "")),
-                str(item.get("source_content_hash", "")),
-            )
+        raw_source_refs = self._require_list(
+            payload.get("source_refs"), "source_refs"
         )
-        for source_ref in sortable_refs:
+        try:
+            source_refs = canonical_rule_source_refs(
+                {"source_refs": raw_source_refs}
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"source_refs are malformed: {exc}") from exc
+        if source_refs != raw_source_refs:
+            raise ValueError("source_refs must be stored in canonical order")
+        source_rows: list[str] = []
+        for source_ref in source_refs:
             source_rows.extend(
                 (
                     f"- source_key: {self._safe_text(source_ref.get('source_key'))}",
                     "  - source_content_hash: "
                     f"{self._safe_text(source_ref.get('source_content_hash'))}",
-                    f"  - 短引用: {self._safe_text(source_ref.get('quote'))}",
+                    f"  - 短引用: {self._safe_text(source_ref.get('excerpt'))}",
                 )
             )
         mode_literal = json.dumps(
-            str(payload.get("mode_key", "")), ensure_ascii=False
+            mode_key, ensure_ascii=False
         ).replace("`", "\\u0060")
         return "\n".join(
             (
                 f"# 交易模式：{self._safe_text(payload.get('name'))}",
                 "",
-                f"- 模式键：{self._safe_text(payload.get('mode_key'))}",
+                f"- 规则 ID：{rule_id}",
+                f"- 模式键：{mode_key}",
                 f"- 规则目录：{catalog_version}",
                 f"- 家族：{self._safe_text(payload.get('family'))}",
                 f"- 风格：{self._safe_text(payload.get('style'))}",
@@ -569,10 +597,16 @@ class TradingPlaybookObsidianExporter:
         )
         if not candidates:
             lines.append("- 无")
+        review_dates = {target_date}
         for candidate in candidates:
             candidate_id = self._positive_int(
                 candidate.get("candidate_id"), "candidate_id"
             )
+            action_trade_date = self._iso_date(
+                candidate.get("action_trade_date"),
+                "candidate action_trade_date",
+            )
+            review_dates.add(action_trade_date)
             primary_mode = self._safe_identifier(
                 candidate.get("primary_mode_key"),
                 "primary_mode_key",
@@ -617,7 +651,7 @@ class TradingPlaybookObsidianExporter:
                     f"### {candidate['rank']}. {self._safe_text(candidate.get('stock_name'))}（{self._safe_text(candidate.get('stock_code'))}）",
                     "",
                     f"- 候选 ID：{candidate_id}",
-                    f"- 行动交易日：{self._safe_text(candidate.get('action_trade_date'))}",
+                    f"- 行动交易日：{action_trade_date}",
                     f"- 题材：{self._safe_text(candidate.get('theme_name'))}",
                     f"- 主模式：{primary_link}",
                     f"- 辅助模式：{supporting_links}",
@@ -667,19 +701,32 @@ class TradingPlaybookObsidianExporter:
             (
                 f"- 日期索引：{self._wiki_link(date_links['index'], target_date)}",
                 f"- 提醒时间线：{self._wiki_link(date_links['alerts'], '项目内提醒')}",
-                "- 初步复盘："
-                + self._wiki_link(
-                    "30_TradingPlaybook/Reviews/Auto/"
-                    f"{target_date[:4]}/{target_date}/initial-review-{plan_id}",
-                    "15:10 初步复盘",
-                ),
-                "- 最终复盘："
-                + self._wiki_link(
-                    "30_TradingPlaybook/Reviews/Auto/"
-                    f"{target_date[:4]}/{target_date}/final-review-{plan_id}",
-                    "15:30 最终复盘",
-                ),
-                f"- 个人手记：{self._wiki_link(date_links['notes'], target_date + ' Notes')}",
+            )
+        )
+        for review_date in sorted(review_dates):
+            review_root = (
+                "30_TradingPlaybook/Reviews/Auto/"
+                f"{review_date[:4]}/{review_date}"
+            )
+            lines.extend(
+                (
+                    "- 初步复盘："
+                    + self._wiki_link(
+                        f"{review_root}/initial-review-{plan_id}",
+                        f"{review_date} 15:10 初步复盘",
+                    ),
+                    "- 最终复盘："
+                    + self._wiki_link(
+                        f"{review_root}/final-review-{plan_id}",
+                        f"{review_date} 15:30 最终复盘",
+                    ),
+                )
+            )
+        lines.append(
+            "- 个人手记："
+            + self._wiki_link(
+                date_links["notes"],
+                target_date + " Notes",
             )
         )
         return "\n".join(lines)
@@ -814,18 +861,41 @@ class TradingPlaybookObsidianExporter:
                 payload.get("stage_schedule"), "stage_schedule"
             )
         ]
+        actual_schedule: list[tuple[str, tuple[str, ...]]] = []
+        for row in schedule:
+            if set(row) != {"phases", "time_cn", "label"}:
+                raise ValueError("stage_schedule rows have unexpected fields")
+            time_cn = row.get("time_cn")
+            phases = row.get("phases")
+            label = row.get("label")
+            if (
+                not isinstance(time_cn, str)
+                or not isinstance(phases, list)
+                or not all(isinstance(phase, str) for phase in phases)
+                or not isinstance(label, str)
+                or not label.strip()
+            ):
+                raise ValueError("stage_schedule rows are malformed")
+            actual_schedule.append((time_cn, tuple(phases)))
+        if (
+            len(actual_schedule) != len(_EXPECTED_STAGE_SCHEDULE)
+            or len(set(actual_schedule)) != len(actual_schedule)
+            or set(actual_schedule) != set(_EXPECTED_STAGE_SCHEDULE)
+        ):
+            raise ValueError(
+                "stage_schedule must contain exactly the five prescribed stages"
+            )
         schedule_order = {
-            "14:40": 0,
-            "15:10": 1,
-            "15:30": 2,
-            "08:50": 3,
-            "09:26": 4,
+            contract: index
+            for index, contract in enumerate(_EXPECTED_STAGE_SCHEDULE)
         }
         schedule.sort(
-            key=lambda row: (
-                schedule_order.get(str(row.get("time_cn")), 99),
-                str(row.get("time_cn", "")),
-            )
+            key=lambda row: schedule_order[
+                (
+                    str(row.get("time_cn")),
+                    tuple(str(phase) for phase in row.get("phases", [])),
+                )
+            ]
         )
         plans = [
             self._require_dict(value, "plan version row")
