@@ -128,6 +128,37 @@ def _decimal_string(value: Decimal) -> str:
     return fixed_point
 
 
+def _base_date(value: date) -> date:
+    if type(value) is date:
+        return value
+    return date.fromordinal(date.toordinal(value))
+
+
+def _base_decimal(value: Decimal) -> Decimal:
+    if type(value) is Decimal:
+        return value
+    return Decimal(Decimal.as_tuple(value))
+
+
+def _base_utc_datetime(value: datetime) -> datetime:
+    if datetime.utcoffset(value) is None:
+        raise ValueError("canonical JSON datetime values must be timezone-aware")
+    normalized = datetime.astimezone(value, timezone.utc)
+    normalized_date = date.fromordinal(date.toordinal(normalized))
+    normalized_time = datetime.time(normalized)
+    return datetime(
+        normalized_date.year,
+        normalized_date.month,
+        normalized_date.day,
+        normalized_time.hour,
+        normalized_time.minute,
+        normalized_time.second,
+        normalized_time.microsecond,
+        tzinfo=timezone.utc,
+        fold=normalized_time.fold,
+    )
+
+
 def _container_depth(depth: int) -> int:
     next_depth = depth + 1
     if next_depth > _MAX_NESTING_DEPTH:
@@ -154,13 +185,11 @@ def _canonical_value(
             return 0.0
         return value
     if isinstance(value, Decimal):
-        return _decimal_string(value)
+        return _decimal_string(_base_decimal(value))
     if isinstance(value, datetime):
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError("canonical JSON datetime values must be timezone-aware")
-        return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        return _base_utc_datetime(value).isoformat().replace("+00:00", "Z")
     if isinstance(value, date):
-        return value.isoformat()
+        return _base_date(value).isoformat()
     if type(value) is dict or type(value) is _FrozenCanonicalDict:
         container_depth = _container_depth(depth)
         identity = id(value)
@@ -218,28 +247,13 @@ def _freeze_canonical_value(
             raise ValueError("canonical JSON float values must be finite")
         return value
     if isinstance(value, Decimal):
-        normalized_decimal = value if type(value) is Decimal else Decimal(value)
+        normalized_decimal = _base_decimal(value)
         _decimal_string(normalized_decimal)
         return normalized_decimal
     if isinstance(value, datetime):
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError("canonical JSON datetime values must be timezone-aware")
-        normalized = value.astimezone(timezone.utc)
-        return datetime(
-            normalized.year,
-            normalized.month,
-            normalized.day,
-            normalized.hour,
-            normalized.minute,
-            normalized.second,
-            normalized.microsecond,
-            tzinfo=timezone.utc,
-            fold=normalized.fold,
-        )
+        return _base_utc_datetime(value)
     if isinstance(value, date):
-        if type(value) is date:
-            return value
-        return date.fromordinal(date.toordinal(value))
+        return _base_date(value)
     if type(value) is dict:
         container_depth = _container_depth(depth)
         identity = id(value)

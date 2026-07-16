@@ -233,6 +233,69 @@ class CanonicalJsonBytesTests(unittest.TestCase):
 
         self.assertEqual(len(set(results)), 1)
 
+    def test_mutable_scalar_subclasses_cannot_change_canonical_bytes(self) -> None:
+        class MutableDate(date):
+            rendered = "2026-07-15"
+
+            def isoformat(self) -> str:
+                return type(self).rendered
+
+        class MutableDecimal(Decimal):
+            rendered = "10.5"
+
+            def __format__(self, format_spec: str) -> str:
+                return type(self).rendered
+
+            def as_tuple(self):  # type: ignore[no-untyped-def]
+                return Decimal("999").as_tuple()
+
+        class MutableDatetime(datetime):
+            shift = timedelta(0)
+
+            def astimezone(self, tz=None):  # type: ignore[no-untyped-def]
+                return datetime.astimezone(self, tz) + type(self).shift
+
+        payload = {
+            "trade_date": MutableDate(2026, 7, 15),
+            "amount": MutableDecimal("10.500"),
+            "captured_at": MutableDatetime(
+                2026,
+                7,
+                15,
+                9,
+                30,
+                tzinfo=timezone(timedelta(hours=8)),
+            ),
+        }
+        expected = (
+            b'{"amount":"10.5","captured_at":"2026-07-15T01:30:00Z",'
+            b'"trade_date":"2026-07-15"}'
+        )
+        first = canonical_json_bytes(payload)
+        artifact = ObsidianArtifact(
+            snapshot_key="plan:42:2026-07-15",
+            trade_date=date(2026, 7, 15),
+            entity_type="plan",
+            entity_id=42,
+            phase="preclose",
+            target_path="30_TradingPlaybook/Daily/Auto/2026-07-15.md",
+            immutable=True,
+            payload=payload,
+        )
+
+        MutableDate.rendered = "2099-01-01"
+        MutableDecimal.rendered = "999"
+        MutableDatetime.shift = timedelta(hours=5)
+        second = canonical_json_bytes(payload)
+
+        self.assertEqual(first, expected)
+        self.assertEqual(second, first)
+        self.assertEqual(canonical_json_bytes(artifact.payload), second)  # type: ignore[arg-type]
+        self.assertEqual(
+            artifact.source_hash,
+            hashlib.sha256(second).hexdigest(),
+        )
+
 
 class DatabaseDatetimeToCnTests(unittest.TestCase):
     def test_none_remains_none(self) -> None:
