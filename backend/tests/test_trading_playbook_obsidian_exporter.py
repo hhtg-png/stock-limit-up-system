@@ -742,10 +742,13 @@ class TradingPlaybookObsidianExporterContractTests(unittest.TestCase):
         ]
         if not isinstance(valid_schedule, list):
             self.fail("stage_schedule fixture must be a list")
+        altered_label_schedule = [dict(row) for row in valid_schedule]
+        altered_label_schedule[0]["label"] = "被篡改的标签"
         cases = (
             [],
             [{"phases": ["preclose"], "time_cn": "12:00", "label": "任意"}],
             [valid_schedule[0] for _ in range(5)],
+            altered_label_schedule,
             [
                 *valid_schedule,
                 {

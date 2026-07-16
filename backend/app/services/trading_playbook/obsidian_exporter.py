@@ -26,11 +26,11 @@ _SAFE_STAGE = re.compile(r"[a-z][a-z0-9_]*")
 _SAFE_CATALOG_VERSION = re.compile(r"v[1-9][0-9]*")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _EXPECTED_STAGE_SCHEDULE = (
-    ("14:40", ("preclose",)),
-    ("15:10", ("initial_review",)),
-    ("15:30", ("after_close", "final_review")),
-    ("08:50", ("overnight",)),
-    ("09:26", ("auction",)),
+    ("14:40", ("preclose",), "提前预案"),
+    ("15:10", ("initial_review",), "初步复盘"),
+    ("15:30", ("after_close", "final_review"), "正式预案与最终复盘"),
+    ("08:50", ("overnight",), "隔夜刷新"),
+    ("09:26", ("auction",), "竞价最终版本"),
 )
 _IN_APP_STATUS_FIELDS = (
     "status",
@@ -861,7 +861,7 @@ class TradingPlaybookObsidianExporter:
                 payload.get("stage_schedule"), "stage_schedule"
             )
         ]
-        actual_schedule: list[tuple[str, tuple[str, ...]]] = []
+        actual_schedule: list[tuple[str, tuple[str, ...], str]] = []
         for row in schedule:
             if set(row) != {"phases", "time_cn", "label"}:
                 raise ValueError("stage_schedule rows have unexpected fields")
@@ -876,7 +876,7 @@ class TradingPlaybookObsidianExporter:
                 or not label.strip()
             ):
                 raise ValueError("stage_schedule rows are malformed")
-            actual_schedule.append((time_cn, tuple(phases)))
+            actual_schedule.append((time_cn, tuple(phases), label))
         if (
             len(actual_schedule) != len(_EXPECTED_STAGE_SCHEDULE)
             or len(set(actual_schedule)) != len(actual_schedule)
@@ -894,6 +894,7 @@ class TradingPlaybookObsidianExporter:
                 (
                     str(row.get("time_cn")),
                     tuple(str(phase) for phase in row.get("phases", [])),
+                    str(row.get("label")),
                 )
             ]
         )
