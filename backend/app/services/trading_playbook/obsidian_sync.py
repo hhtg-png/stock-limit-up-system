@@ -5,12 +5,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import os
-import tempfile
 from collections.abc import Callable, Sequence
 from datetime import date, datetime, timedelta
 from functools import partial
-from pathlib import Path
 from typing import Any
 
 from sqlalchemy import case, desc, exists, func, or_, select, text, update
@@ -41,21 +40,50 @@ from app.utils.time_utils import CN_TZ
 
 _IMMUTABLE_CONFLICT = "immutable_snapshot_hash_conflict"
 _MAX_ERROR_LENGTH = 2000
+_MAX_GIT_JSON_DEPTH = 4
+_MAX_GIT_JSON_ITEMS = 16
+_MAX_GIT_JSON_STRING = 512
+_LOCK_ROOT = "30_TradingPlaybook/Daily/Auto/.sync-locks"
 
 
 class _TargetFileLock:
-    """A crash-released, cross-process lock for one Vault target path."""
+    """A crash-released lock stored inside the shared Vault.
+
+    This coordinates processes and hosts only when the shared filesystem
+    honors POSIX/Windows advisory byte-range locks (for example a correctly
+    configured SMB share).  It does not claim correctness for filesystems
+    that ignore network advisory locks.
+    """
 
     def __init__(self, handle) -> None:
         self._handle = handle
 
     @classmethod
-    def acquire(cls, vault: Path, target_path: str) -> _TargetFileLock:
-        identity = f"{vault.resolve(strict=False)}\0{target_path}".encode("utf-8")
-        digest = hashlib.sha256(identity).hexdigest()
-        lock_root = Path(tempfile.gettempdir()) / "stock-limit-up-obsidian-locks"
-        lock_root.mkdir(parents=True, exist_ok=True)
-        handle = (lock_root / f"{digest}.lock").open("a+b")
+    def acquire(
+        cls,
+        writer: ObsidianVaultWriter,
+        relative_path: str,
+    ) -> _TargetFileLock:
+        target = writer.resolve_target(
+            relative_path,
+            allowed_roots=TRADING_PLAYBOOK_ALLOWED_ROOTS,
+        )
+        target.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        target = writer.resolve_target(
+            relative_path,
+            allowed_roots=TRADING_PLAYBOOK_ALLOWED_ROOTS,
+        )
+        if target.is_symlink():
+            raise ValueError("Obsidian sync lock cannot be a symlink")
+        flags = os.O_RDWR | os.O_CREAT
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(target, flags, 0o600)
+        try:
+            handle = os.fdopen(descriptor, "r+b", buffering=0)
+        except BaseException:
+            os.close(descriptor)
+            raise
         try:
             if os.name == "nt":
                 import msvcrt
@@ -330,6 +358,68 @@ class TradingPlaybookObsidianSyncCoordinator:
                 by_id[row_id] for row_id in claimed_ids if row_id in by_id
             )
 
+    async def _claim_selected(
+        self,
+        row_ids: Sequence[int],
+    ) -> tuple[TradingPlaybookObsidianExport, ...]:
+        normalized_ids = tuple(dict.fromkeys(int(row_id) for row_id in row_ids))
+        if not normalized_ids:
+            return ()
+        now = self._database_datetime(self._aware_now())
+        lease_until = now + self.CLAIM_LEASE
+        claimed_ids: list[int] = []
+        async with self.session_factory() as session:
+            for row_id in normalized_ids:
+                claimed = await session.execute(
+                    self._claim_statement(
+                        row_id=row_id,
+                        now=now,
+                        lease_until=lease_until,
+                    )
+                )
+                if claimed.rowcount == 1:
+                    claimed_ids.append(row_id)
+            await session.commit()
+        if not claimed_ids:
+            return ()
+        reload_now = self._database_datetime(self._aware_now())
+        async with self.session_factory() as session:
+            rows = list(
+                (
+                    await session.execute(
+                        select(TradingPlaybookObsidianExport).where(
+                            TradingPlaybookObsidianExport.id.in_(claimed_ids),
+                            *self._active_lease_predicates(
+                                now=reload_now,
+                                lease_until=lease_until,
+                            ),
+                        )
+                    )
+                ).scalars()
+            )
+        by_id = {int(row.id): row for row in rows}
+        return tuple(by_id[row_id] for row_id in claimed_ids if row_id in by_id)
+
+    async def _load_selected_rows(
+        self,
+        row_ids: Sequence[int],
+    ) -> tuple[TradingPlaybookObsidianExport, ...]:
+        normalized_ids = tuple(dict.fromkeys(int(row_id) for row_id in row_ids))
+        if not normalized_ids:
+            return ()
+        async with self.session_factory() as session:
+            rows = list(
+                (
+                    await session.execute(
+                        select(TradingPlaybookObsidianExport).where(
+                            TradingPlaybookObsidianExport.id.in_(normalized_ids)
+                        )
+                    )
+                ).scalars()
+            )
+        by_id = {int(row.id): row for row in rows}
+        return tuple(by_id[row_id] for row_id in normalized_ids if row_id in by_id)
+
     @classmethod
     def _due_select_statement(cls, *, now: datetime, limit: int):
         return (
@@ -442,6 +532,7 @@ class TradingPlaybookObsidianSyncCoordinator:
 
         if limit <= 0:
             return self._empty_result()
+        await self._ensure_persistent_git_intents()
         if not await self._writer_available():
             paused = await self._pause_due(limit=limit)
             return self._result_for_rows(
@@ -459,7 +550,6 @@ class TradingPlaybookObsidianSyncCoordinator:
         skipped: list[str] = []
         pending: list[str] = []
         failed: list[str] = []
-        changed_row_ids: list[int] = []
         for row in claimed:
             lease_until = row.next_attempt_at
             if not isinstance(lease_until, datetime):
@@ -505,7 +595,6 @@ class TradingPlaybookObsidianSyncCoordinator:
                 continue
             if outcome == "written":
                 written.append(row.target_path)
-                changed_row_ids.append(int(row.id))
             elif outcome == "skipped":
                 skipped.append(row.target_path)
             elif outcome == "failed":
@@ -513,23 +602,178 @@ class TradingPlaybookObsidianSyncCoordinator:
             else:
                 pending.append(row.target_path)
 
-        changed_paths = tuple(dict.fromkeys(written))
-        if changed_paths:
-            trade_date, phase = self._batch_context(claimed)
-            git_status = await self._commit_paths(
-                changed_paths,
-                trade_date=trade_date,
-                phase=phase,
-            )
-            await self._store_git_status(changed_row_ids, git_status)
-        else:
-            git_status = self._no_git_status()
+        _, git_status = await self._commit_git_intents(
+            row_ids=[int(row.id) for row in claimed],
+            allowed_paths=None,
+            limit=limit,
+        )
         return self._result_for_rows(
             claimed,
             written_files=tuple(written),
             skipped_files=tuple(skipped),
             pending_files=tuple(pending),
             failed_files=tuple(failed),
+            git_status=git_status,
+        )
+
+    async def _process_selected(
+        self,
+        row_ids: Sequence[int],
+        *,
+        trade_date: date,
+        phase: str = "reconcile",
+    ) -> ObsidianSyncBatchResult:
+        normalized_ids = tuple(dict.fromkeys(int(row_id) for row_id in row_ids))
+        await self._ensure_persistent_git_intents()
+        if not await self._writer_available():
+            await self._pause_selected_due(normalized_ids)
+            rows = await self._load_selected_rows(normalized_ids)
+            pending = tuple(
+                row.target_path
+                for row in rows
+                if row.status not in {"written", "superseded"}
+            )
+            return self._selected_result(
+                trade_date=trade_date,
+                phase=phase,
+                pending_files=pending,
+                git_status=self._no_git_status(),
+            )
+
+        await self._resume_selected_paused(normalized_ids)
+        claimed = await self._claim_selected(normalized_ids)
+        written: list[str] = []
+        skipped: list[str] = []
+        failed: list[str] = []
+        pending: list[str] = []
+        handled_ids: set[int] = set()
+        for row in claimed:
+            row_id = int(row.id)
+            handled_ids.add(row_id)
+            lease_until = row.next_attempt_at
+            if not isinstance(lease_until, datetime):
+                pending.append(row.target_path)
+                continue
+            try:
+                artifact, generated_at = self._artifact_from_row(row)
+                content = self.exporter.render(
+                    artifact,
+                    generated_at=generated_at,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                marked = await self._mark_failed(
+                    row_id=row_id,
+                    lease_until=lease_until,
+                    attempt_no=int(row.attempt_no),
+                    error=exc,
+                )
+                (failed if marked else pending).append(row.target_path)
+                continue
+            if not await self._lease_is_active(row_id, lease_until):
+                pending.append(row.target_path)
+                continue
+            try:
+                outcome = await self._write_with_fence(
+                    row=row,
+                    lease_until=lease_until,
+                    content=content,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                marked = await self._mark_failed(
+                    row_id=row_id,
+                    lease_until=lease_until,
+                    attempt_no=int(row.attempt_no),
+                    error=exc,
+                )
+                (failed if marked else pending).append(row.target_path)
+                continue
+            if outcome == "written":
+                written.append(row.target_path)
+            elif outcome == "skipped":
+                skipped.append(row.target_path)
+            elif outcome == "failed":
+                failed.append(row.target_path)
+            else:
+                pending.append(row.target_path)
+
+        selected_rows = await self._load_selected_rows(normalized_ids)
+        for row in selected_rows:
+            if int(row.id) in handled_ids:
+                continue
+            if row.status not in {"written", "superseded"}:
+                pending.append(row.target_path)
+        _, git_status = await self._commit_git_intents(
+            row_ids=normalized_ids,
+            allowed_paths=None,
+            limit=max(100, len(normalized_ids)),
+        )
+        return self._selected_result(
+            trade_date=trade_date,
+            phase=phase,
+            written_files=tuple(dict.fromkeys(written)),
+            skipped_files=tuple(dict.fromkeys(skipped)),
+            pending_files=tuple(dict.fromkeys(pending)),
+            failed_files=tuple(dict.fromkeys(failed)),
+            git_status=git_status,
+        )
+
+    async def _pause_selected_due(self, row_ids: Sequence[int]) -> None:
+        if not row_ids:
+            return
+        now = self._database_datetime(self._aware_now())
+        async with self.session_factory() as session:
+            for row_id in row_ids:
+                await session.execute(
+                    update(TradingPlaybookObsidianExport)
+                    .where(
+                        TradingPlaybookObsidianExport.id == int(row_id),
+                        *self._claim_predicates(now=now),
+                    )
+                    .values(
+                        status="paused",
+                        next_attempt_at=None,
+                        updated_at=now,
+                    )
+                )
+            await session.commit()
+
+    async def _resume_selected_paused(self, row_ids: Sequence[int]) -> None:
+        if not row_ids:
+            return
+        now = self._database_datetime(self._aware_now())
+        async with self.session_factory() as session:
+            await session.execute(
+                update(TradingPlaybookObsidianExport)
+                .where(
+                    TradingPlaybookObsidianExport.id.in_(tuple(row_ids)),
+                    TradingPlaybookObsidianExport.status == "paused",
+                )
+                .values(status="pending", next_attempt_at=None, updated_at=now)
+            )
+            await session.commit()
+
+    @staticmethod
+    def _selected_result(
+        *,
+        trade_date: date,
+        phase: str,
+        written_files: tuple[str, ...] = (),
+        skipped_files: tuple[str, ...] = (),
+        pending_files: tuple[str, ...] = (),
+        failed_files: tuple[str, ...] = (),
+        git_status: dict[str, Any],
+    ) -> ObsidianSyncBatchResult:
+        return ObsidianSyncBatchResult(
+            trade_date=trade_date,
+            phase=phase,
+            written_files=written_files,
+            skipped_files=skipped_files,
+            pending_files=pending_files,
+            failed_files=failed_files,
             git_status=git_status,
         )
 
@@ -587,8 +831,6 @@ class TradingPlaybookObsidianSyncCoordinator:
             raise ValueError("trade_date must be a date")
         if type(include_rules) is not bool or type(force) is not bool:
             raise ValueError("include_rules and force must be booleans")
-        if force:
-            await self._reset_forced_exports(trade_date)
 
         plan_ids, reviews = await self._fact_references_for_date(trade_date)
         artifacts: list[ObsidianArtifact] = []
@@ -604,13 +846,19 @@ class TradingPlaybookObsidianSyncCoordinator:
                 )
             )
         artifacts.extend(await self._build_mutable_artifacts(trade_date))
-        await self.enqueue_artifacts(artifacts)
-        return await self.process_due(limit=max(100, len(artifacts)))
+        rows = await self.enqueue_artifacts(artifacts)
+        row_ids = tuple(int(row.id) for row in rows)
+        if force:
+            await self._reset_forced_exports(row_ids)
+        return await self._process_selected(
+            row_ids,
+            trade_date=trade_date,
+            phase="reconcile",
+        )
 
     async def startup_reconcile(self) -> ObsidianSyncBatchResult:
         """Resume immutable work and refresh only the two latest date axes."""
 
-        await self._resume_unfinished_immutable()
         dates = await self._latest_plan_dates()
         artifact_count = 0
         for trade_date in dates:
@@ -752,12 +1000,13 @@ class TradingPlaybookObsidianSyncCoordinator:
 
         target_lock = await self._acquire_target_lock(row.target_path)
         try:
-            renewed_until = await self._renew_lease(
+            renewed = await self._renew_lease(
                 row_id=int(row.id),
                 lease_until=lease_until,
             )
-            if renewed_until is None:
+            if renewed is None:
                 return "pending"
+            renewed_until, previous_git_status = renewed
             try:
                 result = await self._to_thread_fenced(
                     self.writer.write_text,
@@ -782,6 +1031,8 @@ class TradingPlaybookObsidianSyncCoordinator:
             completed = await self._mark_written(
                 row_id=int(row.id),
                 lease_until=renewed_until,
+                changed=changed,
+                previous_git_status=previous_git_status,
             )
             if not completed:
                 return "pending"
@@ -801,10 +1052,28 @@ class TradingPlaybookObsidianSyncCoordinator:
         *,
         row_id: int,
         lease_until: datetime,
-    ) -> datetime | None:
+    ) -> tuple[datetime, dict[str, Any] | None] | None:
         now = self._database_datetime(self._aware_now())
         renewed_until = now + self.CLAIM_LEASE
         async with self.session_factory() as session:
+            selected = (
+                await session.execute(
+                    select(
+                        TradingPlaybookObsidianExport.id,
+                        TradingPlaybookObsidianExport.git_status_json,
+                    ).where(
+                        TradingPlaybookObsidianExport.id == row_id,
+                        *self._active_lease_predicates(
+                            now=now,
+                            lease_until=lease_until,
+                        ),
+                    )
+                )
+            ).first()
+            if selected is None:
+                return None
+            previous_git_status = self._bounded_git_mapping(selected[1])
+            lease_token = self._canonical_datetime(CN_TZ.localize(renewed_until))
             renewed = await session.execute(
                 update(TradingPlaybookObsidianExport)
                 .where(
@@ -814,18 +1083,34 @@ class TradingPlaybookObsidianSyncCoordinator:
                         lease_until=lease_until,
                     ),
                 )
-                .values(next_attempt_at=renewed_until, updated_at=now)
+                .values(
+                    next_attempt_at=renewed_until,
+                    git_status_json={
+                        "state": "write_in_progress",
+                        "lease_token": lease_token,
+                        "previous": previous_git_status,
+                    },
+                    updated_at=now,
+                )
             )
             await session.commit()
-            return renewed_until if renewed.rowcount == 1 else None
+            if renewed.rowcount != 1:
+                return None
+            return renewed_until, previous_git_status
 
     async def _mark_written(
         self,
         *,
         row_id: int,
         lease_until: datetime,
+        changed: bool,
+        previous_git_status: dict[str, Any] | None,
     ) -> bool:
         completed_at = self._database_datetime(self._aware_now())
+        git_intent = self._written_git_intent(
+            changed=changed,
+            previous_git_status=previous_git_status,
+        )
         async with self.session_factory() as session:
             completed = await session.execute(
                 update(TradingPlaybookObsidianExport)
@@ -840,6 +1125,7 @@ class TradingPlaybookObsidianSyncCoordinator:
                     status="written",
                     next_attempt_at=None,
                     last_error=None,
+                    git_status_json=git_intent,
                     exported_at=completed_at,
                     updated_at=completed_at,
                 )
@@ -848,11 +1134,16 @@ class TradingPlaybookObsidianSyncCoordinator:
             return completed.rowcount == 1
 
     async def _acquire_target_lock(self, target_path: str) -> _TargetFileLock:
-        vault = await self._to_thread_fenced(self.writer.configured_vault)
-        if vault is None:
-            raise ValueError("Obsidian Vault path is not configured")
+        return await self._acquire_named_lock(f"target:{target_path}")
+
+    async def _acquire_named_lock(self, identity: str) -> _TargetFileLock:
+        relative_path = self._lock_relative_path(identity)
         task = asyncio.create_task(
-            asyncio.to_thread(_TargetFileLock.acquire, vault, target_path)
+            asyncio.to_thread(
+                _TargetFileLock.acquire,
+                self.writer,
+                relative_path,
+            )
         )
         try:
             return await asyncio.shield(task)
@@ -867,6 +1158,12 @@ class TradingPlaybookObsidianSyncCoordinator:
                 await self._to_thread_fenced(lock.release)
             finally:
                 raise cancelled
+
+    @staticmethod
+    def _lock_relative_path(identity: str) -> str:
+        normalized = identity.replace("\\", "/").casefold().encode("utf-8")
+        digest = hashlib.sha256(normalized).hexdigest()
+        return f"{_LOCK_ROOT}/{digest}.lock"
 
     async def _mark_failed(
         self,
@@ -932,15 +1229,19 @@ class TradingPlaybookObsidianSyncCoordinator:
                 allowed_roots=TRADING_PLAYBOOK_ALLOWED_ROOTS,
                 message=f"obsidian: export trading playbook {trade_date} {phase}",
             )
-            return self._json_git_status(raw_status)
+            return self._normalize_git_result(raw_status)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            return {
-                "enabled": bool(getattr(self.writer, "auto_git_enabled", False)),
-                "committed": False,
-                "error": self._safe_error(exc),
-            }
+            return self._normalize_git_result(
+                {
+                    "enabled": bool(
+                        getattr(self.writer, "auto_git_enabled", False)
+                    ),
+                    "committed": False,
+                    "error": self._safe_error(exc),
+                }
+            )
 
     async def _store_git_status(
         self,
@@ -962,41 +1263,139 @@ class TradingPlaybookObsidianSyncCoordinator:
             )
             await session.commit()
 
-    async def _retry_failed_git(self, *, limit: int) -> ObsidianSyncBatchResult:
+    async def _ensure_persistent_git_intents(self) -> None:
+        now = self._database_datetime(self._aware_now())
         async with self.session_factory() as session:
-            candidates = list(
-                (
-                    await session.execute(
-                        select(TradingPlaybookObsidianExport)
-                        .where(
-                            TradingPlaybookObsidianExport.status == "written",
-                            TradingPlaybookObsidianExport.git_status_json.is_not(None),
-                        )
-                        .order_by(
-                            TradingPlaybookObsidianExport.trade_date,
-                            TradingPlaybookObsidianExport.id,
-                        )
-                    )
-                ).scalars()
+            await session.execute(
+                update(TradingPlaybookObsidianExport)
+                .where(
+                    TradingPlaybookObsidianExport.status == "written",
+                    TradingPlaybookObsidianExport.git_status_json.is_(None),
+                )
+                .values(
+                    git_status_json={
+                        "state": "git_pending",
+                        "reason": "legacy_write_uncertain",
+                    },
+                    updated_at=now,
+                )
             )
-        retry_rows = tuple(
+            await session.commit()
+
+    async def _load_git_intent_rows(
+        self,
+        *,
+        row_ids: Sequence[int] | None,
+        allowed_paths: tuple[str, ...] | None,
+        limit: int,
+    ) -> tuple[TradingPlaybookObsidianExport, ...]:
+        async with self.session_factory() as session:
+            statement = (
+                select(TradingPlaybookObsidianExport)
+                .where(TradingPlaybookObsidianExport.status == "written")
+                .order_by(
+                    TradingPlaybookObsidianExport.trade_date,
+                    TradingPlaybookObsidianExport.id,
+                )
+            )
+            if row_ids is not None:
+                normalized_ids = tuple(dict.fromkeys(int(item) for item in row_ids))
+                if not normalized_ids:
+                    return ()
+                statement = statement.where(
+                    TradingPlaybookObsidianExport.id.in_(normalized_ids)
+                )
+            rows = list((await session.execute(statement)).scalars())
+        allowed = set(allowed_paths) if allowed_paths is not None else None
+        selected = [
             row
-            for row in candidates
-            if self._git_failed(row.git_status_json)
-        )[:limit]
+            for row in rows
+            if self._git_needs_retry(row.git_status_json)
+            and (allowed is None or row.target_path in allowed)
+        ]
+        return tuple(selected[:limit])
+
+    async def _commit_git_intents(
+        self,
+        *,
+        row_ids: Sequence[int] | None,
+        allowed_paths: tuple[str, ...] | None,
+        limit: int,
+    ) -> tuple[tuple[TradingPlaybookObsidianExport, ...], dict[str, Any]]:
+        target_lock: _TargetFileLock | None = None
+        try:
+            target_lock = await self._acquire_named_lock("git:vault")
+            rows = await self._load_git_intent_rows(
+                row_ids=row_ids,
+                allowed_paths=allowed_paths,
+                limit=limit,
+            )
+            if not rows:
+                return (), self._no_git_status()
+            paths = tuple(dict.fromkeys(row.target_path for row in rows))
+            trade_date, phase = self._batch_context(rows)
+            status = await self._commit_paths(
+                paths,
+                trade_date=trade_date,
+                phase=phase,
+            )
+            try:
+                await self._store_git_status(
+                    [int(row.id) for row in rows],
+                    status,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                return rows, {
+                    "state": "git_store_pending",
+                    "error": self._safe_error(exc),
+                    "result": status,
+                }
+            return rows, status
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            rows = await self._load_git_intent_rows(
+                row_ids=row_ids,
+                allowed_paths=allowed_paths,
+                limit=limit,
+            )
+            status = self._normalize_git_result(
+                {
+                    "enabled": bool(
+                        getattr(self.writer, "auto_git_enabled", False)
+                    ),
+                    "committed": False,
+                    "error": self._safe_error(exc),
+                }
+            )
+            if rows:
+                try:
+                    await self._store_git_status(
+                        [int(row.id) for row in rows],
+                        status,
+                    )
+                except Exception:
+                    pass
+            return rows, status
+        finally:
+            if target_lock is not None:
+                try:
+                    await self._to_thread_fenced(target_lock.release)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    pass
+
+    async def _retry_failed_git(self, *, limit: int) -> ObsidianSyncBatchResult:
+        retry_rows, status = await self._commit_git_intents(
+            row_ids=None,
+            allowed_paths=None,
+            limit=limit,
+        )
         if not retry_rows:
             return self._empty_result()
-        paths = tuple(dict.fromkeys(row.target_path for row in retry_rows))
-        trade_date, phase = self._batch_context(retry_rows)
-        status = await self._commit_paths(
-            paths,
-            trade_date=trade_date,
-            phase=phase,
-        )
-        await self._store_git_status(
-            [int(row.id) for row in retry_rows],
-            status,
-        )
         return self._result_for_rows(retry_rows, git_status=status)
 
     async def _fact_references_for_date(
@@ -1044,58 +1443,57 @@ class TradingPlaybookObsidianSyncCoordinator:
             await self.builder.build_dashboard_artifact(trade_date),
         )
 
-    async def _reset_forced_exports(self, trade_date: date) -> None:
+    async def _reset_forced_exports(self, row_ids: Sequence[int]) -> None:
         now = self._database_datetime(self._aware_now())
-        relevant = or_(
-            TradingPlaybookObsidianExport.trade_date == trade_date,
-            TradingPlaybookObsidianExport.snapshot_key
-            == "dashboard:trading-playbook",
-        )
+        rows = await self._load_selected_rows(row_ids)
         async with self.session_factory() as session:
-            await session.execute(
-                update(TradingPlaybookObsidianExport)
-                .where(
-                    relevant,
-                    TradingPlaybookObsidianExport.status.in_(("failed", "paused")),
-                    or_(
-                        TradingPlaybookObsidianExport.last_error.is_(None),
-                        TradingPlaybookObsidianExport.last_error
-                        != _IMMUTABLE_CONFLICT,
-                    ),
+            for row in rows:
+                status = row.status
+                git_state = (
+                    row.git_status_json.get("state")
+                    if type(row.git_status_json) is dict
+                    else None
                 )
-                .values(
-                    status="pending",
-                    attempt_no=0,
-                    next_attempt_at=None,
-                    last_error=None,
-                    updated_at=now,
+                has_future_token = (
+                    isinstance(row.next_attempt_at, datetime)
+                    and row.next_attempt_at > now
                 )
-            )
-            await session.execute(
-                update(TradingPlaybookObsidianExport)
-                .where(relevant)
-                .values(git_status_json=None, updated_at=now)
-            )
-            await session.commit()
-
-    async def _resume_unfinished_immutable(self) -> None:
-        now = self._database_datetime(self._aware_now())
-        async with self.session_factory() as session:
-            await session.execute(
-                update(TradingPlaybookObsidianExport)
-                .where(
-                    TradingPlaybookObsidianExport.immutable.is_(True),
-                    TradingPlaybookObsidianExport.status.in_(
-                        ("pending", "failed", "paused")
-                    ),
-                    or_(
-                        TradingPlaybookObsidianExport.last_error.is_(None),
-                        TradingPlaybookObsidianExport.last_error
-                        != _IMMUTABLE_CONFLICT,
-                    ),
+                is_active = has_future_token and (
+                    status == "pending" or git_state == "write_in_progress"
                 )
-                .values(status="pending", next_attempt_at=None, updated_at=now)
-            )
+                if is_active or status == "superseded":
+                    continue
+                if row.last_error == _IMMUTABLE_CONFLICT:
+                    continue
+                token_predicate = (
+                    TradingPlaybookObsidianExport.next_attempt_at.is_(None)
+                    if row.next_attempt_at is None
+                    else TradingPlaybookObsidianExport.next_attempt_at
+                    == row.next_attempt_at
+                )
+                values: dict[str, Any] = {
+                    "git_status_json": {
+                        "state": "git_pending",
+                        "reason": "force_requested",
+                    },
+                    "updated_at": now,
+                }
+                if status in {"failed", "paused"}:
+                    values.update(
+                        status="pending",
+                        attempt_no=0,
+                        next_attempt_at=None,
+                        last_error=None,
+                    )
+                await session.execute(
+                    update(TradingPlaybookObsidianExport)
+                    .where(
+                        TradingPlaybookObsidianExport.id == int(row.id),
+                        TradingPlaybookObsidianExport.status == status,
+                        token_predicate,
+                    )
+                    .values(**values)
+                )
             await session.commit()
 
     async def _latest_plan_dates(self) -> tuple[date, ...]:
@@ -1175,6 +1573,7 @@ class TradingPlaybookObsidianSyncCoordinator:
 
     def _no_git_status(self) -> dict[str, Any]:
         return {
+            "state": "not_attempted",
             "enabled": bool(getattr(self.writer, "auto_git_enabled", False)),
             "committed": False,
             "reason": "no_written_files",
@@ -1186,36 +1585,129 @@ class TradingPlaybookObsidianSyncCoordinator:
             text_value = str(error)
         except Exception:
             text_value = type(error).__name__
+        return TradingPlaybookObsidianSyncCoordinator._safe_text(
+            text_value,
+            limit=_MAX_ERROR_LENGTH,
+        )
+
+    @staticmethod
+    def _safe_text(value: str, *, limit: int) -> str:
         safe_text = "".join(
             " " if character in "\r\n\t" else character
             if ord(character) >= 32
             else "�"
-            for character in text_value
+            for character in value
         )
-        return safe_text[:_MAX_ERROR_LENGTH]
-
-    @staticmethod
-    def _git_failed(status: object) -> bool:
-        return type(status) is dict and bool(status.get("error"))
+        return safe_text[:limit]
 
     @classmethod
-    def _json_git_status(cls, status: object) -> dict[str, Any]:
+    def _bounded_git_mapping(
+        cls,
+        status: object,
+    ) -> dict[str, Any] | None:
+        if status is None:
+            return None
         if type(status) is not dict:
-            raise TypeError("Git status must be a JSON object")
-        try:
-            encoded = json.dumps(
-                status,
-                ensure_ascii=False,
-                allow_nan=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            decoded = json.loads(encoded)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("Git status must contain strict JSON values") from exc
-        if type(decoded) is not dict:
-            raise TypeError("Git status must be a JSON object")
-        return decoded
+            return {
+                "state": "git_error",
+                "error": "invalid stored Git status",
+            }
+        bounded = cls._bounded_json_value(status, depth=0)
+        assert type(bounded) is dict
+        return bounded
+
+    @classmethod
+    def _bounded_json_value(cls, value: object, *, depth: int) -> Any:
+        if value is None or type(value) is bool:
+            return value
+        if type(value) is int:
+            return value if value.bit_length() <= 63 else "integer_out_of_range"
+        if type(value) is float:
+            if not math.isfinite(value):
+                return "nonfinite_number"
+            return value
+        if type(value) is str:
+            return cls._safe_text(value, limit=_MAX_GIT_JSON_STRING)
+        if depth >= _MAX_GIT_JSON_DEPTH:
+            return "truncated_depth"
+        if type(value) is dict:
+            bounded: dict[str, Any] = {}
+            for index, (key, item) in enumerate(value.items()):
+                if index >= _MAX_GIT_JSON_ITEMS:
+                    bounded["_truncated_items"] = True
+                    break
+                raw_key = key if type(key) is str else type(key).__name__
+                safe_key = cls._safe_text(raw_key, limit=128)
+                bounded[safe_key] = cls._bounded_json_value(
+                    item,
+                    depth=depth + 1,
+                )
+            return bounded
+        if type(value) in (list, tuple):
+            items = [
+                cls._bounded_json_value(item, depth=depth + 1)
+                for item in value[:_MAX_GIT_JSON_ITEMS]
+            ]
+            if len(value) > _MAX_GIT_JSON_ITEMS:
+                items.append("truncated_items")
+            return items
+        return cls._safe_text(type(value).__name__, limit=128)
+
+    @classmethod
+    def _normalize_git_result(cls, status: object) -> dict[str, Any]:
+        bounded = cls._bounded_git_mapping(status)
+        if bounded is None:
+            bounded = {"error": "empty Git status"}
+        raw_error = bounded.get("error")
+        if raw_error:
+            return {
+                "state": "git_error",
+                "enabled": bool(bounded.get("enabled", True)),
+                "committed": False,
+                "error": cls._safe_text(
+                    str(raw_error),
+                    limit=_MAX_ERROR_LENGTH,
+                ),
+                "result": bounded,
+            }
+        return {
+            "state": "git_complete",
+            "enabled": bool(bounded.get("enabled", False)),
+            "committed": bool(bounded.get("committed", False)),
+            "result": bounded,
+        }
+
+    @staticmethod
+    def _git_needs_retry(status: object) -> bool:
+        if status is None:
+            return True
+        if type(status) is not dict:
+            return True
+        return status.get("state") in {
+            "git_pending",
+            "git_error",
+            "write_in_progress",
+        } or bool(status.get("error"))
+
+    @classmethod
+    def _written_git_intent(
+        cls,
+        *,
+        changed: bool,
+        previous_git_status: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        if changed:
+            return {"state": "git_pending", "reason": "content_changed"}
+        if previous_git_status is None:
+            return {"state": "not_needed", "reason": "content_identical"}
+        if cls._git_needs_retry(previous_git_status):
+            return {
+                "state": "git_pending",
+                "reason": "previous_write_uncertain",
+            }
+        if previous_git_status is not None:
+            return previous_git_status
+        raise AssertionError("unreachable Git intent state")
 
     def _aware_now(self) -> datetime:
         now = self.clock()

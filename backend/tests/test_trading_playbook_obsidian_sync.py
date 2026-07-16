@@ -1,4 +1,5 @@
 import asyncio
+import json
 import tempfile
 import threading
 import unittest
@@ -62,6 +63,15 @@ class FakeWriter:
     def configured_vault(self):
         raw = str(self.vault_path or "").strip()
         return Path(raw) if raw else None
+
+    def resolve_target(self, relative_path, *, allowed_roots):
+        normalized = relative_path.replace("\\", "/")
+        if not any(
+            normalized == root or normalized.startswith(f"{root}/")
+            for root in allowed_roots
+        ):
+            raise ValueError("outside fake writer allowlist")
+        return Path(self.vault_path).joinpath(*normalized.split("/"))
 
     def write_text(self, relative_path, content, *, allowed_roots):
         self.write_calls.append(
@@ -803,6 +813,15 @@ class TradingPlaybookObsidianSyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             all(call[2] == event_loop_thread for call in exporter.calls)
         )
+        stored_by_key = {row.snapshot_key: row for row in await self._rows()}
+        self.assertEqual(
+            stored_by_key[unchanged.snapshot_key].git_status_json["state"],
+            "not_needed",
+        )
+        self.assertEqual(
+            stored_by_key[changed.snapshot_key].git_status_json["state"],
+            "git_complete",
+        )
 
     async def test_real_exporter_and_writer_restore_the_frozen_snapshot(self):
         vault = Path(self.temporary_directory.name) / "vault"
@@ -842,6 +861,39 @@ class TradingPlaybookObsidianSyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(f'source_hash: "{item.source_hash}"', content)
         self.assertIn('generated_at: "2026-07-16T06:40:00.000000Z"', content)
         self.assertEqual((await self._rows(item.snapshot_key))[0].status, "written")
+        lock_root = (
+            vault
+            / "30_TradingPlaybook"
+            / "Daily"
+            / "Auto"
+            / ".sync-locks"
+        )
+        lock_files = list(lock_root.glob("*.lock"))
+        self.assertGreaterEqual(len(lock_files), 2)
+        self.assertTrue(all(path.suffix == ".lock" for path in lock_files))
+        self.assertEqual(list(lock_root.glob("*.md")), [])
+
+    async def test_lock_identity_is_case_normalized_inside_the_vault(self):
+        coordinator = self._coordinator(
+            self.session_factory,
+            exporter=FakeExporter(),
+            writer=FakeWriter(self.temporary_directory.name),
+        )
+
+        upper = coordinator._lock_relative_path(
+            "TARGET:30_TradingPlaybook/Alerts/Auto/2026/CASE.md"
+        )
+        lower = coordinator._lock_relative_path(
+            "target:30_tradingplaybook/alerts/auto/2026/case.md"
+        )
+
+        self.assertEqual(upper, lower)
+        self.assertTrue(
+            upper.startswith(
+                "30_TradingPlaybook/Daily/Auto/.sync-locks/"
+            )
+        )
+        self.assertTrue(upper.endswith(".lock"))
 
     async def test_mixed_due_batch_context_is_stable(self):
         earlier = artifact(
@@ -1007,6 +1059,31 @@ class TradingPlaybookObsidianSyncTests(unittest.IsolatedAsyncioTestCase):
         rows = await self._rows(old.snapshot_key)
         self.assertEqual([row.status for row in rows], ["superseded", "pending"])
 
+    async def test_legacy_written_null_git_status_is_recovered_without_rewrite(self):
+        item = artifact("legacy-git", snapshot_key="alerts:legacy-git")
+        row = (await self.coordinator.enqueue_artifacts([item]))[0]
+        async with self.session_factory() as session:
+            await session.execute(
+                update(TradingPlaybookObsidianExport)
+                .where(TradingPlaybookObsidianExport.id == row.id)
+                .values(status="written", git_status_json=None)
+            )
+            await session.commit()
+        writer = FakeWriter(self.temporary_directory.name)
+        coordinator = self._coordinator(
+            self.session_factory,
+            exporter=FakeExporter(),
+            writer=writer,
+        )
+
+        result = await coordinator.process_due()
+
+        self.assertEqual(writer.write_calls, [])
+        self.assertEqual(writer.commit_calls[0][0], (item.target_path,))
+        self.assertEqual(result.git_status_json()["state"], "git_complete")
+        stored = (await self._rows(item.snapshot_key))[0]
+        self.assertEqual(stored.git_status_json["state"], "git_complete")
+
     async def test_git_failure_does_not_rollback_files_and_retries_without_rewrite(self):
         first = artifact("git-one", snapshot_key="alerts:git-one")
         second = artifact(
@@ -1036,7 +1113,13 @@ class TradingPlaybookObsidianSyncTests(unittest.IsolatedAsyncioTestCase):
         )
         rows = await self._rows()
         self.assertEqual([row.status for row in rows], ["written", "written"])
-        self.assertTrue(all(row.git_status_json == failed_git.git_status_json() for row in rows))
+        self.assertEqual(failed_git.git_status_json()["state"], "git_error")
+        self.assertTrue(
+            all(
+                row.git_status_json == failed_git.git_status_json()
+                for row in rows
+            )
+        )
         write_count = len(writer.write_calls)
 
         writer.commit_result = {"enabled": True, "committed": True}
@@ -1045,9 +1128,230 @@ class TradingPlaybookObsidianSyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(writer.write_calls), write_count)
         self.assertEqual(len(writer.commit_calls), 2)
         self.assertEqual(retried.written_files, ())
-        self.assertEqual(retried.git_status_json(), writer.commit_result)
+        self.assertEqual(retried.git_status_json()["state"], "git_complete")
         rows = await self._rows()
-        self.assertTrue(all(row.git_status_json == writer.commit_result for row in rows))
+        self.assertTrue(
+            all(row.git_status_json["state"] == "git_complete" for row in rows)
+        )
+
+    async def test_lost_mark_written_recovers_physical_change_and_git_intent(self):
+        item = artifact("lost-mark", snapshot_key="alerts:lost-mark")
+        await self.coordinator.enqueue_artifacts([item])
+        writer = FakeWriter(self.temporary_directory.name)
+
+        class LoseFirstCompletionCoordinator(
+            TradingPlaybookObsidianSyncCoordinator
+        ):
+            lose_once = True
+
+            async def _mark_written(inner_self, *args, **kwargs):
+                if inner_self.lose_once:
+                    inner_self.lose_once = False
+                    return False
+                return await super()._mark_written(*args, **kwargs)
+
+        coordinator = self._coordinator(
+            self.session_factory,
+            exporter=FakeExporter(),
+            writer=writer,
+            coordinator_class=LoseFirstCompletionCoordinator,
+        )
+
+        first = await coordinator.process_due()
+
+        self.assertEqual(first.pending_files, (item.target_path,))
+        stored = (await self._rows(item.snapshot_key))[0]
+        self.assertEqual(stored.status, "pending")
+        self.assertEqual(stored.git_status_json["state"], "write_in_progress")
+        self.assertEqual(writer.commit_calls, [])
+
+        self.clock.value += timedelta(seconds=61)
+        writer.changed = False
+        second = await coordinator.process_due()
+
+        self.assertEqual(second.skipped_files, (item.target_path,))
+        self.assertEqual(len(writer.commit_calls), 1)
+        self.assertEqual(writer.commit_calls[0][0], (item.target_path,))
+        stored = (await self._rows(item.snapshot_key))[0]
+        self.assertEqual(stored.status, "written")
+        self.assertEqual(stored.git_status_json["state"], "git_complete")
+
+    async def test_git_cancellation_leaves_pending_intent_for_git_only_retry(self):
+        item = artifact("git-cancel", snapshot_key="alerts:git-cancel")
+        await self.coordinator.enqueue_artifacts([item])
+        writer = FakeWriter(self.temporary_directory.name)
+        writer.commit_result = asyncio.CancelledError()
+        coordinator = self._coordinator(
+            self.session_factory,
+            exporter=FakeExporter(),
+            writer=writer,
+        )
+
+        with self.assertRaises(asyncio.CancelledError):
+            await coordinator.process_due()
+
+        stored = (await self._rows(item.snapshot_key))[0]
+        self.assertEqual(stored.status, "written")
+        self.assertEqual(stored.git_status_json["state"], "git_pending")
+        write_count = len(writer.write_calls)
+
+        writer.commit_result = {"enabled": True, "committed": True}
+        retried = await coordinator.process_due()
+
+        self.assertEqual(len(writer.write_calls), write_count)
+        self.assertEqual(retried.git_status_json()["state"], "git_complete")
+        stored = (await self._rows(item.snapshot_key))[0]
+        self.assertEqual(stored.git_status_json["state"], "git_complete")
+
+    async def test_git_status_store_failure_keeps_pending_intent_for_retry(self):
+        item = artifact("git-store", snapshot_key="alerts:git-store")
+        await self.coordinator.enqueue_artifacts([item])
+        writer = FakeWriter(self.temporary_directory.name)
+
+        class StoreFailureCoordinator(TradingPlaybookObsidianSyncCoordinator):
+            fail_once = True
+
+            async def _store_git_status(inner_self, *args, **kwargs):
+                if inner_self.fail_once:
+                    inner_self.fail_once = False
+                    raise RuntimeError("status store unavailable")
+                return await super()._store_git_status(*args, **kwargs)
+
+        coordinator = self._coordinator(
+            self.session_factory,
+            exporter=FakeExporter(),
+            writer=writer,
+            coordinator_class=StoreFailureCoordinator,
+        )
+
+        first = await coordinator.process_due()
+
+        stored = (await self._rows(item.snapshot_key))[0]
+        self.assertEqual(first.git_status_json()["state"], "git_store_pending")
+        self.assertEqual(stored.status, "written")
+        self.assertEqual(stored.git_status_json["state"], "git_pending")
+        write_count = len(writer.write_calls)
+
+        await coordinator.process_due()
+
+        self.assertEqual(len(writer.write_calls), write_count)
+        self.assertEqual(len(writer.commit_calls), 2)
+        stored = (await self._rows(item.snapshot_key))[0]
+        self.assertEqual(stored.git_status_json["state"], "git_complete")
+
+    async def test_git_retry_uses_shared_lock_and_rechecks_after_acquiring_it(self):
+        first = artifact("git-lock-a", snapshot_key="alerts:git-lock-a")
+        second = artifact(
+            "git-lock-b",
+            snapshot_key="alerts:git-lock-b",
+            target_path="30_TradingPlaybook/Alerts/Auto/2026/git-lock-b.md",
+        )
+        rows = await self.coordinator.enqueue_artifacts([first, second])
+        async with self.session_factory() as session:
+            await session.execute(
+                update(TradingPlaybookObsidianExport)
+                .where(
+                    TradingPlaybookObsidianExport.id.in_(
+                        [int(row.id) for row in rows]
+                    )
+                )
+                .values(
+                    status="written",
+                    git_status_json={
+                        "state": "git_error",
+                        "error": "retry",
+                    },
+                )
+            )
+            await session.commit()
+        writer = FakeWriter(self.temporary_directory.name)
+        first_entered = threading.Event()
+        second_entered = threading.Event()
+        release = threading.Event()
+        counter_lock = threading.Lock()
+        active = 0
+        maximum_active = 0
+        call_count = 0
+
+        def blocking_commit(relative_paths, *, allowed_roots, message):
+            nonlocal active, maximum_active, call_count
+            with counter_lock:
+                call_count += 1
+                call_number = call_count
+                active += 1
+                maximum_active = max(maximum_active, active)
+            try:
+                if call_number == 1:
+                    first_entered.set()
+                    if not release.wait(timeout=5):
+                        raise RuntimeError("Git lock release timed out")
+                else:
+                    second_entered.set()
+                return {"enabled": True, "committed": True}
+            finally:
+                with counter_lock:
+                    active -= 1
+
+        writer.commit_paths = blocking_commit
+        coordinators = [
+            self._coordinator(
+                self.session_factory,
+                exporter=FakeExporter(),
+                writer=writer,
+            )
+            for _ in range(2)
+        ]
+        tasks = [
+            asyncio.create_task(coordinator.process_due())
+            for coordinator in coordinators
+        ]
+        await asyncio.to_thread(first_entered.wait, 5)
+        second_was_concurrent = await asyncio.to_thread(
+            second_entered.wait,
+            1,
+        )
+        release.set()
+        await asyncio.gather(*tasks)
+
+        self.assertFalse(second_was_concurrent)
+        self.assertEqual(maximum_active, 1)
+        self.assertEqual(call_count, 1)
+        stored = await self._rows()
+        self.assertTrue(
+            all(row.git_status_json["state"] == "git_complete" for row in stored)
+        )
+
+    async def test_git_error_status_is_recursively_bounded_and_control_safe(self):
+        item = artifact("git-bounds", snapshot_key="alerts:git-bounds")
+        await self.coordinator.enqueue_artifacts([item])
+        writer = FakeWriter(self.temporary_directory.name)
+        writer.commit_result = {
+            "enabled": True,
+            "committed": False,
+            "error": "bad\n\t\x00" + ("x" * 10_000),
+            "stderr": [
+                {"line": "secret\r" + ("y" * 2_000)}
+                for _ in range(100)
+            ],
+        }
+        coordinator = self._coordinator(
+            self.session_factory,
+            exporter=FakeExporter(),
+            writer=writer,
+        )
+
+        result = await coordinator.process_due()
+
+        status = result.git_status_json()
+        encoded = json.dumps(status, ensure_ascii=False)
+        self.assertEqual(status["state"], "git_error")
+        self.assertLessEqual(len(status["error"]), 2000)
+        self.assertNotIn("\n", status["error"])
+        self.assertNotIn("\t", status["error"])
+        self.assertNotIn("\x00", status["error"])
+        self.assertLess(len(encoded), 12_000)
+        stored = (await self._rows(item.snapshot_key))[0]
+        self.assertEqual(stored.git_status_json, status)
 
     async def test_corrupt_snapshot_envelope_or_hash_fails_before_file_io(self):
         cases = (
@@ -1344,6 +1648,204 @@ class TradingPlaybookObsidianSyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(result.written_files), 6)
         self.assertEqual(len(await self._rows()), 6)
 
+    async def test_export_trade_date_processes_only_its_selected_rows_under_backlog(self):
+        backlog = [
+            artifact(
+                f"backlog-{number}",
+                trade_date=date(2026, 7, 1),
+                snapshot_key=f"alerts:backlog:{number:03d}",
+                entity_type="alerts",
+                target_path=(
+                    "30_TradingPlaybook/Alerts/Auto/2026/"
+                    f"backlog-{number:03d}.md"
+                ),
+            )
+            for number in range(100)
+        ]
+        await self.coordinator.enqueue_artifacts(backlog)
+        selected = {
+            "alerts": artifact(
+                "selected-alerts",
+                snapshot_key="alerts:2026-07-16",
+                entity_type="alerts",
+                target_path=(
+                    "30_TradingPlaybook/Alerts/Auto/2026/2026-07-16.md"
+                ),
+            ),
+            "index": artifact("selected-index"),
+            "dashboard": artifact(
+                "selected-dashboard",
+                snapshot_key="dashboard:trading-playbook",
+                entity_type="dashboard",
+                target_path="Dashboards/交易预案.md",
+            ),
+        }
+        builder = FakeBuilder(
+            by_date={
+                ("alerts", TRADE_DATE): selected["alerts"],
+                ("index", TRADE_DATE): selected["index"],
+                ("dashboard", TRADE_DATE): selected["dashboard"],
+            }
+        )
+        writer = FakeWriter(self.temporary_directory.name)
+        coordinator = self._coordinator(
+            self.session_factory,
+            builder=builder,
+            exporter=FakeExporter(),
+            writer=writer,
+        )
+
+        result = await coordinator.export_trade_date(
+            TRADE_DATE,
+            include_rules=False,
+            force=False,
+        )
+
+        expected_paths = {item.target_path for item in selected.values()}
+        self.assertEqual(set(result.written_files), expected_paths)
+        self.assertEqual(result.skipped_files, ())
+        self.assertEqual(result.pending_files, ())
+        self.assertEqual(result.failed_files, ())
+        self.assertEqual(
+            {call[0] for call in writer.write_calls},
+            expected_paths,
+        )
+        stored = await self._rows()
+        self.assertTrue(
+            all(
+                row.status == "pending"
+                for row in stored
+                if row.snapshot_key.startswith("alerts:backlog:")
+            )
+        )
+
+    async def test_force_uses_actual_artifact_rows_and_preserves_active_lease(self):
+        target_date = date(2026, 7, 17)
+        async with self.session_factory() as session:
+            plan = plan_row(target_trade_date=target_date)
+            session.add(plan)
+            await session.commit()
+            plan_id = int(plan.id)
+        plan_artifact = artifact(
+            "force-plan",
+            trade_date=target_date,
+            snapshot_key=f"plan:{plan_id}",
+            immutable=True,
+            entity_type="plan",
+            entity_id=plan_id,
+            phase="preclose",
+            target_path=(
+                "30_TradingPlaybook/Daily/Auto/2026/2026-07-17/"
+                "preclose-v1.md"
+            ),
+        )
+        alerts = artifact(
+            "force-active-alerts",
+            snapshot_key="alerts:2026-07-16",
+            entity_type="alerts",
+            target_path="30_TradingPlaybook/Alerts/Auto/2026/2026-07-16.md",
+        )
+        index = artifact("force-index")
+        dashboard = artifact(
+            "force-dashboard",
+            snapshot_key="dashboard:trading-playbook",
+            entity_type="dashboard",
+            target_path="Dashboards/交易预案.md",
+        )
+        rows = await self.coordinator.enqueue_artifacts(
+            [plan_artifact, alerts, index, dashboard]
+        )
+        by_key = {row.snapshot_key: row for row in rows}
+        live_until = datetime(2026, 7, 16, 14, 41)
+        async with self.session_factory() as session:
+            await session.execute(
+                update(TradingPlaybookObsidianExport)
+                .where(
+                    TradingPlaybookObsidianExport.id
+                    == by_key[plan_artifact.snapshot_key].id
+                )
+                .values(
+                    status="failed",
+                    attempt_no=3,
+                    next_attempt_at=datetime(2030, 1, 1),
+                    last_error="backoff",
+                    git_status_json={"state": "git_error", "error": "old"},
+                )
+            )
+            await session.execute(
+                update(TradingPlaybookObsidianExport)
+                .where(
+                    TradingPlaybookObsidianExport.id
+                    == by_key[alerts.snapshot_key].id
+                )
+                .values(
+                    status="pending",
+                    next_attempt_at=live_until,
+                    git_status_json={
+                        "state": "write_in_progress",
+                        "lease_token": "active-token",
+                    },
+                )
+            )
+            await session.execute(
+                update(TradingPlaybookObsidianExport)
+                .where(
+                    TradingPlaybookObsidianExport.id
+                    == by_key[dashboard.snapshot_key].id
+                )
+                .values(status="written", git_status_json=None)
+            )
+            await session.commit()
+        builder = FakeBuilder(
+            by_date={
+                ("plan", plan_id): plan_artifact,
+                ("alerts", TRADE_DATE): alerts,
+                ("index", TRADE_DATE): index,
+                ("dashboard", TRADE_DATE): dashboard,
+            }
+        )
+        writer = FakeWriter(self.temporary_directory.name)
+        coordinator = self._coordinator(
+            self.session_factory,
+            builder=builder,
+            exporter=FakeExporter(),
+            writer=writer,
+        )
+
+        result = await coordinator.export_trade_date(
+            TRADE_DATE,
+            include_rules=False,
+            force=True,
+        )
+
+        self.assertEqual(
+            set(result.written_files),
+            {plan_artifact.target_path, index.target_path},
+        )
+        self.assertEqual(result.pending_files, (alerts.target_path,))
+        self.assertEqual(len(writer.commit_calls), 1)
+        self.assertEqual(
+            set(writer.commit_calls[0][0]),
+            {
+                plan_artifact.target_path,
+                index.target_path,
+                dashboard.target_path,
+            },
+        )
+        stored = {row.snapshot_key: row for row in await self._rows()}
+        self.assertEqual(stored[plan_artifact.snapshot_key].status, "written")
+        self.assertEqual(stored[alerts.snapshot_key].status, "pending")
+        self.assertEqual(stored[alerts.snapshot_key].next_attempt_at, live_until)
+        self.assertEqual(
+            stored[alerts.snapshot_key].git_status_json["state"],
+            "write_in_progress",
+        )
+        self.assertEqual(stored[dashboard.snapshot_key].status, "written")
+        self.assertEqual(
+            stored[dashboard.snapshot_key].git_status_json["state"],
+            "git_complete",
+        )
+
     async def test_force_reset_is_scoped_to_date_and_dashboard_export_state(self):
         requested_failed = artifact(
             "requested-failed",
@@ -1408,7 +1910,13 @@ class TradingPlaybookObsidianSyncTests(unittest.IsolatedAsyncioTestCase):
             writer=FakeWriter(self.temporary_directory.name),
         )
 
-        await coordinator._reset_forced_exports(TRADE_DATE)
+        await coordinator._reset_forced_exports(
+            [
+                row_by_key[requested_failed.snapshot_key].id,
+                row_by_key[dashboard_paused.snapshot_key].id,
+                row_by_key[requested_written.snapshot_key].id,
+            ]
+        )
 
         stored = {row.snapshot_key: row for row in await self._rows()}
         self.assertEqual(stored[requested_failed.snapshot_key].status, "pending")
@@ -1418,7 +1926,8 @@ class TradingPlaybookObsidianSyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stored[requested_written.snapshot_key].status, "written")
         self.assertTrue(
             all(
-                stored[item.snapshot_key].git_status_json is None
+                stored[item.snapshot_key].git_status_json["state"]
+                == "git_pending"
                 for item in (
                     requested_failed,
                     dashboard_paused,
@@ -1465,7 +1974,11 @@ class TradingPlaybookObsidianSyncTests(unittest.IsolatedAsyncioTestCase):
             await session.execute(
                 update(TradingPlaybookObsidianExport)
                 .where(TradingPlaybookObsidianExport.id == immutable_row.id)
-                .values(status="failed", attempt_no=2, next_attempt_at=datetime(2030, 1, 1))
+                .values(
+                    status="failed",
+                    attempt_no=2,
+                    next_attempt_at=datetime(2026, 7, 16, 14, 40),
+                )
             )
             await session.commit()
 
@@ -1520,6 +2033,49 @@ class TradingPlaybookObsidianSyncTests(unittest.IsolatedAsyncioTestCase):
         )
         stored_immutable = (await self._rows(immutable.snapshot_key))[0]
         self.assertEqual(stored_immutable.status, "written")
+
+    async def test_startup_reconcile_does_not_clear_an_active_immutable_lease(self):
+        immutable = artifact(
+            "active-startup",
+            snapshot_key="rule:v2:active-startup",
+            immutable=True,
+            entity_type="rule",
+            phase="catalog",
+            target_path="30_TradingPlaybook/Modes/Auto/v2/active-startup.md",
+        )
+        row = (await self.coordinator.enqueue_artifacts([immutable]))[0]
+        live_until = datetime(2026, 7, 16, 14, 41)
+        active_status = {
+            "state": "write_in_progress",
+            "lease_token": "another-worker",
+        }
+        async with self.session_factory() as session:
+            await session.execute(
+                update(TradingPlaybookObsidianExport)
+                .where(TradingPlaybookObsidianExport.id == row.id)
+                .values(
+                    status="pending",
+                    next_attempt_at=live_until,
+                    git_status_json=active_status,
+                )
+            )
+            await session.commit()
+        writer = FakeWriter(self.temporary_directory.name)
+        coordinator = self._coordinator(
+            self.session_factory,
+            builder=FakeBuilder(),
+            exporter=FakeExporter(),
+            writer=writer,
+        )
+
+        result = await coordinator.startup_reconcile()
+
+        self.assertEqual(writer.write_calls, [])
+        self.assertEqual(result.written_files, ())
+        stored = (await self._rows(immutable.snapshot_key))[0]
+        self.assertEqual(stored.status, "pending")
+        self.assertEqual(stored.next_attempt_at, live_until)
+        self.assertEqual(stored.git_status_json, active_status)
 
     async def test_cancelled_error_is_rethrown_and_does_not_mark_failed(self):
         item = artifact("cancel", snapshot_key="alerts:cancel")
