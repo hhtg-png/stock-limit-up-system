@@ -1313,6 +1313,39 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(plan_count, 1)
 
+    async def test_revise_rejects_altered_risk_source_excerpt_without_child(self):
+        async with self.Session() as db:
+            generated = await self._generate(
+                db,
+                [_evaluation("leader", "000001")],
+            )
+            parent = await db.get(TradingPlanVersion, generated["id"])
+            altered_risk_settings = copy.deepcopy(parent.risk_settings_json)
+            altered_risk_settings["source_refs"][0][
+                "excerpt"
+            ] = "经过改写但仍是非空文本的风险摘要"
+            parent.risk_settings_json = altered_risk_settings
+            await db.commit()
+            parent_before = copy.deepcopy(parent.risk_settings_json)
+
+            with self.assertRaisesRegex(
+                InvalidTransitionError,
+                "regenerate",
+            ):
+                await self.service.revise(
+                    db,
+                    generated["id"],
+                    {"change_note": "不能复制被改写的来源摘要"},
+                )
+
+            parent_after = await db.get(TradingPlanVersion, generated["id"])
+            plan_count = await db.scalar(
+                select(func.count()).select_from(TradingPlanVersion)
+            )
+
+        self.assertEqual(parent_after.risk_settings_json, parent_before)
+        self.assertEqual(plan_count, 1)
+
     async def test_revise_accepts_stock_and_mode_as_a_unique_locator(self):
         async with self.Session() as db:
             generated = await self._generate(

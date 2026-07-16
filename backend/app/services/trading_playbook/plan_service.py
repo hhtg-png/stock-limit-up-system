@@ -1454,6 +1454,27 @@ class TradingPlanService:
                 "legacy plan risk sources are not transcript-bound; regenerate "
                 "the plan before revising"
             )
+        stored_hash_by_key = {
+            ref["source_key"]: ref["source_content_hash"]
+            for ref in canonical_refs
+        }
+        expected_refs = canonical_rule_source_refs(
+            {
+                "source_refs": [
+                    {
+                        "source_key": source_key,
+                        "excerpt": excerpt,
+                        "source_content_hash": stored_hash_by_key[source_key],
+                    }
+                    for source_key, excerpt in _RISK_SOURCE_EXCERPTS.items()
+                ]
+            }
+        )
+        if canonical_refs != expected_refs:
+            raise InvalidTransitionError(
+                "plan risk transcript excerpts were altered; regenerate "
+                "the plan before revising"
+            )
         expected_pairs = {
             (ref["source_key"], ref["source_content_hash"])
             for ref in canonical_refs
