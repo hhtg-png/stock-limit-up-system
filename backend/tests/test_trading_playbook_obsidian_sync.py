@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import re
 import stat
 import tempfile
 import threading
@@ -17,6 +18,7 @@ from sqlalchemy.pool import NullPool
 
 from app.database import Base
 from app.models.trading_playbook import (
+    TradingAlertEvent,
     TradingExecutionReview,
     TradingExecutionReviewPhaseSnapshot,
     TradingModeRule,
@@ -26,15 +28,22 @@ from app.models.trading_playbook import (
 from app.services.trading_playbook.obsidian_exporter import (
     TradingPlaybookObsidianExporter,
 )
+from app.services.trading_playbook.obsidian_snapshot_builder import (
+    TradingPlaybookObsidianSnapshotBuilder,
+)
 from app.services.trading_playbook.obsidian_sync import (
     TradingPlaybookObsidianSyncCoordinator,
 )
 from app.services.trading_playbook.obsidian_types import ObsidianArtifact
 from app.services.obsidian_vault_writer import ObsidianVaultWriter, VaultWriteResult
+from test_trading_playbook_obsidian_snapshot_builder import (
+    seed_golden_catalog_v2_fixture,
+)
 
 
 FIXED_NOW = datetime(2026, 7, 16, 6, 40, tzinfo=timezone.utc)
 TRADE_DATE = date(2026, 7, 16)
+ACCEPTANCE_SOURCE_DATE = date(2026, 7, 15)
 
 
 class MutableClock:
@@ -255,6 +264,110 @@ class TradingPlaybookObsidianSyncTests(unittest.IsolatedAsyncioTestCase):
                     TradingPlaybookObsidianExport.snapshot_key == snapshot_key
                 )
             return list((await session.execute(statement)).scalars())
+
+    async def _seed_acceptance_plan(
+        self,
+        fixture,
+        *,
+        plan_id: int,
+        stage: str,
+        version_no: int,
+        generated_at: datetime,
+        previous_plan_id: int | None,
+        active: bool = True,
+    ) -> None:
+        plan, _ = fixture._plan_row(
+            plan_id,
+            stage,
+            version_no,
+            confirmed=active,
+        )
+        plan.source_trade_date = ACCEPTANCE_SOURCE_DATE
+        plan.target_trade_date = TRADE_DATE
+        plan.parent_plan_version_id = previous_plan_id
+        plan.generated_at = generated_at
+        plan.status = "active" if active else "draft"
+        plan.confirmed_at = generated_at if active else None
+        plan.confirmed_by = "acceptance-user" if active else None
+        candidates, _ = fixture._candidate_rows(plan_id)
+        for candidate in candidates:
+            candidate.action_trade_date = (
+                ACCEPTANCE_SOURCE_DATE if candidate.rank == 1 else TRADE_DATE
+            )
+        async with self.session_factory() as session:
+            if previous_plan_id is not None:
+                previous = await session.get(
+                    TradingPlanVersion,
+                    previous_plan_id,
+                )
+                previous.status = "superseded"
+            session.add(plan)
+            session.add_all(candidates)
+            await session.commit()
+
+    async def _seed_acceptance_alert(
+        self,
+        *,
+        event_id: int,
+        plan_id: int,
+        stage: str,
+        triggered_at: datetime,
+        message: str,
+        review: bool = False,
+    ) -> None:
+        async with self.session_factory() as session:
+            session.add(
+                TradingAlertEvent(
+                    id=event_id,
+                    plan_version_id=plan_id,
+                    candidate_id=None,
+                    event_type="review_ready" if review else "plan_ready",
+                    severity="info",
+                    dedup_key=f"acceptance:{event_id}",
+                    triggered_at=triggered_at,
+                    market_snapshot_json={
+                        "source_trade_date": ACCEPTANCE_SOURCE_DATE.isoformat(),
+                        "target_trade_date": TRADE_DATE.isoformat(),
+                        "trade_date": triggered_at.date().isoformat(),
+                        "stage": stage,
+                        "status": "ready",
+                    },
+                    message=message,
+                    channel_status_json={
+                        "in_app": {
+                            "status": "delivered",
+                            "attempts": 1,
+                            "delivered_at": triggered_at.replace(
+                                tzinfo=timezone(timedelta(hours=8))
+                            ).isoformat(),
+                        }
+                    },
+                    acknowledged_at=None,
+                )
+            )
+            await session.commit()
+
+    async def _process_acceptance_stage(
+        self,
+        coordinator,
+        *,
+        trade_date: date,
+        phase: str,
+        plan_ids=(),
+        review_ids=(),
+        include_rules: bool = False,
+    ):
+        await coordinator.enqueue_stage(
+            trade_date,
+            phase,
+            plan_version_ids=plan_ids,
+            review_ids=review_ids,
+            include_rules=include_rules,
+        )
+        result = await coordinator.process_due(limit=100)
+        self.assertEqual(result.failed_files, ())
+        self.assertEqual(result.pending_files, ())
+        return result
 
     async def test_status_is_stable_when_empty_disabled_or_unconfigured(self):
         missing_vault = Path(self.temporary_directory.name) / "missing-vault"
@@ -1156,6 +1269,412 @@ class TradingPlaybookObsidianSyncTests(unittest.IsolatedAsyncioTestCase):
                 all(stat.S_IMODE(path.stat().st_mode) == 0o660 for path in lock_files)
             )
 
+    async def test_golden_five_stage_replay_closes_a_real_temporary_vault(self):
+        fixture = await seed_golden_catalog_v2_fixture(self.session_factory)
+        builder = fixture.builder
+        vault = Path(self.temporary_directory.name) / "acceptance-vault"
+        vault.mkdir()
+        coordinator = self._coordinator(
+            self.session_factory,
+            builder=builder,
+            exporter=TradingPlaybookObsidianExporter(),
+            writer=ObsidianVaultWriter(
+                enabled=True,
+                vault_path=vault,
+                auto_git_enabled=False,
+            ),
+        )
+
+        await self._seed_acceptance_plan(
+            fixture,
+            plan_id=201,
+            stage="preclose",
+            version_no=1,
+            generated_at=datetime(2026, 7, 15, 14, 40),
+            previous_plan_id=None,
+            active=False,
+        )
+        await self._seed_acceptance_alert(
+            event_id=9001,
+            plan_id=201,
+            stage="preclose",
+            triggered_at=datetime(2026, 7, 15, 14, 40),
+            message="14:40 preclose acceptance alert",
+        )
+        self.clock.value = datetime(2026, 7, 15, 6, 40, tzinfo=timezone.utc)
+        await self._process_acceptance_stage(
+            coordinator,
+            trade_date=ACCEPTANCE_SOURCE_DATE,
+            phase="preclose",
+            plan_ids=(201,),
+            include_rules=True,
+        )
+        async with self.session_factory() as session:
+            plan = await session.get(TradingPlanVersion, 201)
+            plan.status = "active"
+            plan.confirmed_at = datetime(2026, 7, 15, 14, 45)
+            plan.confirmed_by = "acceptance-user"
+            await session.commit()
+
+        review = fixture._review_row(501, plan_version_id=201)
+        review.trade_date = ACCEPTANCE_SOURCE_DATE
+        review.generated_at = datetime(2026, 7, 15, 15, 10)
+        review.manual_execution_json = {
+            "600001": {"executed": True, "note": "15:10 initial fact"}
+        }
+        async with self.session_factory() as session:
+            session.add(review)
+            await session.commit()
+        await self._seed_acceptance_alert(
+            event_id=9002,
+            plan_id=201,
+            stage="preclose",
+            triggered_at=datetime(2026, 7, 15, 15, 10),
+            message="15:10 initial review acceptance alert",
+            review=True,
+        )
+        self.clock.value = datetime(2026, 7, 15, 7, 10, tzinfo=timezone.utc)
+        await self._process_acceptance_stage(
+            coordinator,
+            trade_date=ACCEPTANCE_SOURCE_DATE,
+            phase="initial_review",
+            review_ids=(501,),
+        )
+
+        await self._seed_acceptance_plan(
+            fixture,
+            plan_id=202,
+            stage="after_close",
+            version_no=2,
+            generated_at=datetime(2026, 7, 15, 15, 30),
+            previous_plan_id=201,
+        )
+        await self._seed_acceptance_alert(
+            event_id=9003,
+            plan_id=202,
+            stage="after_close",
+            triggered_at=datetime(2026, 7, 15, 15, 30),
+            message="15:30 after-close acceptance alert",
+        )
+        self.clock.value = datetime(2026, 7, 15, 7, 30, tzinfo=timezone.utc)
+        await self._process_acceptance_stage(
+            coordinator,
+            trade_date=ACCEPTANCE_SOURCE_DATE,
+            phase="after_close",
+            plan_ids=(202,),
+        )
+        async with self.session_factory() as session:
+            stored_review = await session.get(TradingExecutionReview, 501)
+            stored_review.signal_review_json = {
+                "candidates": {"600001": {"triggered": False}}
+            }
+            stored_review.manual_execution_json = {
+                "600001": {"executed": False, "note": "15:30 final correction"}
+            }
+            stored_review.outcome_snapshot_json = {
+                "600001": {"close": 19.8}
+            }
+            stored_review.finalized_at = datetime(2026, 7, 15, 15, 30)
+            await session.commit()
+        await self._seed_acceptance_alert(
+            event_id=9004,
+            plan_id=201,
+            stage="preclose",
+            triggered_at=datetime(2026, 7, 15, 15, 30, 1),
+            message="15:30 final review acceptance alert",
+            review=True,
+        )
+        await self._process_acceptance_stage(
+            coordinator,
+            trade_date=ACCEPTANCE_SOURCE_DATE,
+            phase="final_review",
+            review_ids=(501,),
+        )
+
+        await self._seed_acceptance_plan(
+            fixture,
+            plan_id=203,
+            stage="overnight",
+            version_no=3,
+            generated_at=datetime(2026, 7, 16, 8, 50),
+            previous_plan_id=202,
+        )
+        await self._seed_acceptance_alert(
+            event_id=9005,
+            plan_id=203,
+            stage="overnight",
+            triggered_at=datetime(2026, 7, 16, 8, 50),
+            message="08:50 overnight acceptance alert",
+        )
+        self.clock.value = datetime(2026, 7, 16, 0, 50, tzinfo=timezone.utc)
+        await self._process_acceptance_stage(
+            coordinator,
+            trade_date=TRADE_DATE,
+            phase="overnight",
+            plan_ids=(203,),
+        )
+        target_index = (
+            vault
+            / "30_TradingPlaybook"
+            / "Daily"
+            / "Auto"
+            / "2026"
+            / "2026-07-16"
+            / "index.md"
+        )
+        overnight_index = target_index.read_text(encoding="utf-8")
+        self.assertNotIn("auction-v4", overnight_index)
+        self.assertNotIn("计划 #204", overnight_index)
+
+        await self._seed_acceptance_plan(
+            fixture,
+            plan_id=204,
+            stage="auction",
+            version_no=4,
+            generated_at=datetime(2026, 7, 16, 9, 26),
+            previous_plan_id=203,
+        )
+        await self._seed_acceptance_alert(
+            event_id=9006,
+            plan_id=204,
+            stage="auction",
+            triggered_at=datetime(2026, 7, 16, 9, 26),
+            message="09:26 auction latest acceptance alert",
+        )
+        self.clock.value = datetime(2026, 7, 16, 1, 26, tzinfo=timezone.utc)
+        await self._process_acceptance_stage(
+            coordinator,
+            trade_date=TRADE_DATE,
+            phase="auction",
+            plan_ids=(204,),
+        )
+
+        review_artifacts = []
+        review_id = 1000
+        for plan_id in (201, 202, 203, 204):
+            for review_date in (ACCEPTANCE_SOURCE_DATE, TRADE_DATE):
+                if plan_id == 201 and review_date == ACCEPTANCE_SOURCE_DATE:
+                    continue
+                review_id += 1
+                review_row_value = fixture._review_row(
+                    review_id,
+                    plan_version_id=plan_id,
+                )
+                review_row_value.trade_date = review_date
+                review_row_value.generated_at = datetime.combine(
+                    review_date,
+                    datetime.min.time(),
+                ).replace(hour=15, minute=10)
+                review_row_value.manual_execution_json = {
+                    "600001": {
+                        "executed": True,
+                        "note": f"initial {plan_id} {review_date.isoformat()}",
+                    }
+                }
+                async with self.session_factory() as session:
+                    session.add(review_row_value)
+                    await session.commit()
+                review_artifacts.append(
+                    await builder.build_review_artifact(
+                        review_id,
+                        phase="initial_review",
+                    )
+                )
+                async with self.session_factory() as session:
+                    current = await session.get(
+                        TradingExecutionReview,
+                        review_id,
+                    )
+                    current.manual_execution_json = {
+                        "600001": {
+                            "executed": False,
+                            "note": f"final {plan_id} {review_date.isoformat()}",
+                        }
+                    }
+                    current.finalized_at = datetime.combine(
+                        review_date,
+                        datetime.min.time(),
+                    ).replace(hour=15, minute=30)
+                    await session.commit()
+                review_artifacts.append(
+                    await builder.build_review_artifact(
+                        review_id,
+                        phase="final_review",
+                    )
+                )
+        await coordinator.enqueue_artifacts(review_artifacts)
+        supplemental = await coordinator.process_due(limit=100)
+        self.assertEqual(supplemental.failed_files, ())
+        self.assertEqual(supplemental.pending_files, ())
+
+        markdown = {
+            path.relative_to(vault).as_posix(): path.read_text(encoding="utf-8")
+            for path in vault.rglob("*.md")
+        }
+        mode_paths = {
+            path
+            for path in markdown
+            if path.startswith("30_TradingPlaybook/Modes/Auto/v2/")
+        }
+        self.assertEqual(len(mode_paths), 19)
+        self.assertEqual(
+            mode_paths,
+            {
+                f"30_TradingPlaybook/Modes/Auto/v2/{rule['mode_key']}.md"
+                for rule in fixture.catalog["rules"]
+            },
+        )
+        combined = "\n".join(markdown.values())
+        mode_source_hashes = set()
+        for path in mode_paths:
+            page_hashes = {
+                source_hash
+                for source_hash in fixture.declared_source_hashes
+                if source_hash in markdown[path]
+            }
+            self.assertTrue(page_hashes, f"{path} must cite a golden source hash")
+            mode_source_hashes.update(page_hashes)
+        self.assertEqual(mode_source_hashes, fixture.rule_source_hashes)
+        all_source_hashes = {
+            source_hash
+            for source_hash in fixture.declared_source_hashes
+            if source_hash in combined
+        }
+        self.assertEqual(all_source_hashes, fixture.declared_source_hashes)
+
+        plan_root = "30_TradingPlaybook/Daily/Auto/2026/2026-07-16"
+        plan_paths = {
+            f"{plan_root}/preclose-v1.md",
+            f"{plan_root}/after_close-v2.md",
+            f"{plan_root}/overnight-v3.md",
+            f"{plan_root}/auction-v4.md",
+        }
+        self.assertTrue(plan_paths.issubset(markdown))
+        self.assertEqual(len({markdown[path] for path in plan_paths}), 4)
+        initial_path = (
+            "30_TradingPlaybook/Reviews/Auto/2026/2026-07-15/"
+            "initial-review-201.md"
+        )
+        final_path = (
+            "30_TradingPlaybook/Reviews/Auto/2026/2026-07-15/"
+            "final-review-201.md"
+        )
+        self.assertIn("15:10 initial fact", markdown[initial_path])
+        self.assertNotIn("15:30 final correction", markdown[initial_path])
+        self.assertIn("15:30 final correction", markdown[final_path])
+        self.assertNotEqual(markdown[initial_path], markdown[final_path])
+        self.assertNotIn("after_close-v2", markdown[f"{plan_root}/preclose-v1.md"])
+        self.assertNotIn("overnight-v3", markdown[f"{plan_root}/preclose-v1.md"])
+        self.assertNotIn("auction-v4", markdown[f"{plan_root}/preclose-v1.md"])
+
+        target_alerts = markdown[
+            "30_TradingPlaybook/Alerts/Auto/2026/2026-07-16.md"
+        ]
+        self.assertIn("09:26 auction latest acceptance alert", target_alerts)
+        final_index = markdown[f"{plan_root}/index.md"]
+        self.assertIn("auction-v4", final_index)
+        self.assertIn("计划 #204", final_index)
+        dashboard = markdown["Dashboards/交易预案.md"]
+        self.assertIn("2026/2026-07-16/index", dashboard)
+        self.assertNotIn("2026/2026-07-15/index", dashboard)
+
+        artifact_stems = {path.removesuffix(".md") for path in markdown}
+        system_links = {
+            match.group(1)
+            for content in markdown.values()
+            for match in re.finditer(
+                r"\[\[([^\]|#]+)(?:\|[^\]]+)?\]\]",
+                content,
+            )
+            if not match.group(1).startswith("30_TradingPlaybook/Notes/")
+        }
+        self.assertEqual(system_links - artifact_stems, set())
+        self.assertFalse((vault / "30_TradingPlaybook" / "Notes").exists())
+        for content in markdown.values():
+            frontmatter = content.split("---", 2)[1]
+            self.assertIn("manual_required: true", frontmatter)
+            self.assertIn("auto_execute: false", frontmatter)
+        for forbidden in (
+            "微信发送",
+            "wechat",
+            "账户盈亏",
+            "account_profit",
+            "realized_pnl",
+            "unrealized_pnl",
+        ):
+            self.assertNotIn(forbidden, combined)
+
+    async def test_restart_reconcile_recovers_a_failed_real_vault_write(self):
+        fixture = await seed_golden_catalog_v2_fixture(self.session_factory)
+        await self._seed_acceptance_plan(
+            fixture,
+            plan_id=201,
+            stage="preclose",
+            version_no=1,
+            generated_at=datetime(2026, 7, 15, 14, 40),
+            previous_plan_id=None,
+            active=False,
+        )
+        vault = Path(self.temporary_directory.name) / "recovery-vault"
+        vault.mkdir()
+        failing_writer = ObsidianVaultWriter(
+            enabled=True,
+            vault_path=vault,
+            auto_git_enabled=False,
+        )
+
+        def fail_write(*args, **kwargs):
+            raise OSError("temporary acceptance writer failure")
+
+        failing_writer.write_text = fail_write
+        first = self._coordinator(
+            self.session_factory,
+            builder=fixture.builder,
+            exporter=TradingPlaybookObsidianExporter(),
+            writer=failing_writer,
+        )
+        await first.enqueue_stage(
+            ACCEPTANCE_SOURCE_DATE,
+            "preclose",
+            plan_version_ids=(201,),
+        )
+        failed = await first.process_due(limit=100)
+        plan_path = (
+            "30_TradingPlaybook/Daily/Auto/2026/2026-07-16/"
+            "preclose-v1.md"
+        )
+        self.assertIn(plan_path, failed.failed_files)
+        self.assertFalse((vault / Path(plan_path)).exists())
+        async with self.session_factory() as session:
+            committed_plan = await session.get(TradingPlanVersion, 201)
+            self.assertIsNotNone(committed_plan)
+            self.assertEqual(committed_plan.status, "draft")
+        failed_rows = await self._rows("plan:201")
+        self.assertEqual([row.status for row in failed_rows], ["failed"])
+
+        self.clock.value += timedelta(seconds=61)
+        recovered = self._coordinator(
+            self.session_factory,
+            builder=TradingPlaybookObsidianSnapshotBuilder(
+                self.session_factory
+            ),
+            exporter=TradingPlaybookObsidianExporter(),
+            writer=ObsidianVaultWriter(
+                enabled=True,
+                vault_path=vault,
+                auto_git_enabled=False,
+            ),
+        )
+        await recovered.startup_reconcile()
+        await recovered.process_due(limit=100)
+
+        self.assertTrue((vault / Path(plan_path)).is_file())
+        recovered_rows = await self._rows("plan:201")
+        self.assertEqual([row.status for row in recovered_rows], ["written"])
+        self.assertFalse(
+            any(row.status in {"pending", "failed"} for row in await self._rows())
+        )
+
     async def test_lock_root_rejects_a_lexical_symlink_inside_the_vault(self):
         vault = Path(self.temporary_directory.name) / "symlink-vault"
         auto_root = vault / "30_TradingPlaybook" / "Daily" / "Auto"
@@ -1880,8 +2399,8 @@ class TradingPlaybookObsidianSyncTests(unittest.IsolatedAsyncioTestCase):
             release.set()
         await worker
 
-    async def test_target_lock_prevents_expired_old_worker_from_writing_last(self):
-        old = artifact("old", snapshot_key="alerts:target-fence")
+    async def test_mutable_index_old_version_finishing_late_cannot_overwrite_new(self):
+        old = artifact("old-index", snapshot_key="daily-index:2026-07-16")
         new = artifact("new", snapshot_key=old.snapshot_key)
         await self.coordinator.enqueue_artifacts([old])
         entered_old = threading.Event()
@@ -1896,9 +2415,12 @@ class TradingPlaybookObsidianSyncTests(unittest.IsolatedAsyncioTestCase):
                 if not release_old.wait(timeout=5):
                     raise RuntimeError("old writer release timed out")
             writes.append(content)
+            absolute_path = Path(writer.vault_path) / relative_path
+            absolute_path.parent.mkdir(parents=True, exist_ok=True)
+            absolute_path.write_text(content, encoding="utf-8")
             return VaultWriteResult(
                 relative_path=relative_path,
-                absolute_path=Path(writer.vault_path) / relative_path,
+                absolute_path=absolute_path,
                 changed=True,
             )
 
@@ -1938,6 +2460,11 @@ class TradingPlaybookObsidianSyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(writes), 2)
         self.assertIn(old.source_hash, writes[0])
         self.assertIn(new.source_hash, writes[1])
+        final_content = (Path(writer.vault_path) / old.target_path).read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(new.source_hash, final_content)
+        self.assertNotIn(old.source_hash, final_content)
         rows = await self._rows(old.snapshot_key)
         self.assertEqual([row.status for row in rows], ["superseded", "written"])
 

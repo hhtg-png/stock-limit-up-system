@@ -89,6 +89,63 @@ npm run dev
 - 规则 API：<http://localhost:8000/api/v1/trading-playbook/rules>
 - 完整 API 文档：<http://localhost:8000/docs>
 
+### Obsidian 交易预案单向同步
+
+交易预案复用项目已有的 Obsidian Vault 配置，不设置第二套目录。建议初次验证保持自动 Git 关闭：
+
+```env
+OBSIDIAN_ENABLED=false
+OBSIDIAN_VAULT_PATH=C:\path\to\test-vault
+OBSIDIAN_AUTO_GIT_ENABLED=false
+```
+
+启用后，系统只把已提交的数据库事实单向导出到 Vault，不从 Obsidian 读取或回写交易数据。所有自动页都标记 `manual_required: true` 和 `auto_execute: false`；预案仍须在项目内人工确认，系统不会自动下单或交易。Obsidian 不是提醒发送通道，当前微信机器人继续禁用，不会产生微信发送记录。
+
+系统写入范围如下：
+
+```text
+30_TradingPlaybook/
+├── Modes/Auto/v2/                         # 19 个版本化模式页
+├── Daily/Auto/YYYY/YYYY-MM-DD/            # 四阶段预案与日期 index.md
+├── Reviews/Auto/YYYY/YYYY-MM-DD/          # initial-review / final-review
+├── Alerts/Auto/YYYY/YYYY-MM-DD.md          # 项目内提醒时间线
+└── Notes/                                  # 仅作为链接目标，系统永不创建或修改
+Dashboards/
+└── 交易预案.md                             # 最新交易预案 Dashboard
+```
+
+五个中国时间同步点及产物：
+
+| 时间 | 阶段 | Obsidian 产物 |
+|------|------|---------------|
+| 14:40 | `preclose` | 次日提前预案、当日尾盘候选、索引与提醒 |
+| 15:10 | `initial_review` | 独立且不可变的初步复盘、索引与提醒 |
+| 15:30 | `after_close` + `final_review` | 正式次日预案、独立最终复盘、索引与提醒 |
+| 次日 08:50 | `overnight` | 隔夜刷新版本与索引 |
+| 次日 09:26 | `auction` | 竞价最终版本、索引与提醒 |
+
+每 60 秒运行一次补偿扫描；写入失败按 1、5、15 分钟退避重试。Vault 暂时禁用或未配置时任务进入暂停状态，不影响预案、复盘或提醒的业务事务；服务重启后会从已提交的数据库事实补齐缺失页面。可选 Git 只提交本批发生变化的系统文件，绝不包含 `Notes` 或 Vault 中其他用户文件。
+
+查询状态可调用 `GET /api/v1/trading-playbook/obsidian/status`。按固定日期手动重导示例：
+
+```powershell
+Invoke-RestMethod `
+  -Method Post `
+  -Uri 'http://127.0.0.1:8000/api/v1/trading-playbook/obsidian/export' `
+  -ContentType 'application/json' `
+  -Body '{"trade_date":"2026-07-15","include_rules":true,"force":false}'
+```
+
+首次上线按以下顺序启用：
+
+1. 保持 `OBSIDIAN_ENABLED=false` 部署代码和数据库变更。
+2. 使用独立测试 Vault 验证状态接口、19 个规则页和一个历史交易日的完整重导。
+3. 配置 `OBSIDIAN_VAULT_PATH`，保持 `OBSIDIAN_AUTO_GIT_ENABLED=false`。
+4. 设置 `OBSIDIAN_ENABLED=true`，观察五个时点以及 60 秒补偿状态。
+5. 仅在确认测试 Vault 是独立 Git 仓库且路径限定正确后，选择是否启用 `OBSIDIAN_AUTO_GIT_ENABLED=true`。
+
+测试使用临时 SQLite 和临时 Vault，不会触碰用户目录。真实 PostgreSQL、真实 Vault 和可选 Git 必须在部署环境单独联调后再启用，不能以临时测试结果替代。
+
 ### 从文字稿导入 19 种模式
 
 导入命令会校验指定目录中的文字稿来源，并把项目内版本化的 19 种交易模式目录写入数据库。在项目根目录的 PowerShell 中执行：

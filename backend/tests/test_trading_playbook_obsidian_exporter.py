@@ -755,6 +755,72 @@ class TradingPlaybookObsidianExporterContractTests(unittest.TestCase):
         )
         self.assertIn("不推断账户盈亏", rendered)
 
+    def test_frozen_stage_pages_do_not_invent_future_or_external_execution_facts(self) -> None:
+        initial_base = self._review_artifact(
+            plan_id=101,
+            phase="initial_review",
+            review_id=501,
+        )
+        initial_payload = initial_base.payload_json()
+        initial_payload["manual_execution"] = {
+            "planned": True,
+            "records": [{"note": "15:10 initial fact"}],
+        }
+        initial_payload["outcome_snapshot"] = {
+            "market_result": "close price fact only"
+        }
+        initial_payload["finalized_at"] = None
+        initial = ObsidianArtifact(
+            snapshot_key=initial_base.snapshot_key,
+            trade_date=initial_base.trade_date,
+            entity_type=initial_base.entity_type,
+            entity_id=initial_base.entity_id,
+            phase=initial_base.phase,
+            target_path=initial_base.target_path,
+            immutable=initial_base.immutable,
+            payload=initial_payload,
+        )
+        final = self._review_artifact(
+            plan_id=101,
+            phase="final_review",
+            review_id=502,
+        )
+        pages = {
+            "preclose": self.exporter.render(
+                self._plan_artifact(
+                    plan_id=101,
+                    stage="preclose",
+                    version_no=1,
+                ),
+                generated_at=self.generated_at,
+            ),
+            "initial": self.exporter.render(
+                initial,
+                generated_at=self.generated_at,
+            ),
+            "final": self.exporter.render(
+                final,
+                generated_at=self.generated_at,
+            ),
+            "alerts": self.exporter.render(
+                self._alerts_artifact(),
+                generated_at=self.generated_at,
+            ),
+        }
+
+        self.assertNotIn("after_close-v2", pages["preclose"])
+        self.assertNotIn("overnight-v3", pages["preclose"])
+        self.assertNotIn("auction-v4", pages["preclose"])
+        self.assertIn("15:10 initial fact", pages["initial"])
+        self.assertNotIn("final correction", pages["initial"])
+        self.assertNotEqual(pages["initial"], pages["final"])
+        for content in pages.values():
+            self.assertNotIn("微信发送", content)
+            self.assertNotIn("wechat", content.lower())
+            self.assertNotIn("account_profit", content.lower())
+            self.assertNotIn("realized_pnl", content.lower())
+            self.assertNotIn("auto_execute: true", content)
+
     def test_alerts_page_has_four_states_and_no_external_channel_or_secrets(self) -> None:
         rendered = self.exporter.render(
             self._alerts_artifact(), generated_at=self.generated_at

@@ -1994,5 +1994,26 @@ class TradingPlaybookObsidianSnapshotBuilderTests(
             )
 
 
+async def seed_golden_catalog_v2_fixture(session_factory):
+    """Reuse the canonical catalog/row builders in real sync acceptance tests."""
+
+    fixture = TradingPlaybookObsidianSnapshotBuilderTests(
+        "test_rule_builder_exports_actual_v2_catalog_deterministically"
+    )
+    fixture.session_factory = session_factory
+    fixture.builder = TradingPlaybookObsidianSnapshotBuilder(session_factory)
+    fixture.catalog = RuleCatalog(CATALOG_PATH).load()
+    fixture.declared_source_hashes = {
+        source["content_hash"] for source in fixture.catalog["sources"]
+    }
+    fixture.rule_source_hashes = {
+        source_ref["source_content_hash"]
+        for rule in fixture.catalog["rules"]
+        for source_ref in rule["source_refs"]
+    }
+    await fixture._seed_rules()
+    return fixture
+
+
 if __name__ == "__main__":
     unittest.main()
