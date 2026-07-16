@@ -22,6 +22,7 @@ from app.models.trading_playbook import (
     TradingExecutionReview,
     TradingExecutionReviewPhaseSnapshot,
     TradingModeRule,
+    TradingPlanCandidate,
     TradingPlanVersion,
     TradingPlaybookObsidianExport,
 )
@@ -292,7 +293,9 @@ class TradingPlaybookObsidianSyncTests(unittest.IsolatedAsyncioTestCase):
         candidates, _ = fixture._candidate_rows(plan_id)
         for candidate in candidates:
             candidate.action_trade_date = (
-                ACCEPTANCE_SOURCE_DATE if candidate.rank == 1 else TRADE_DATE
+                ACCEPTANCE_SOURCE_DATE
+                if stage == "preclose" and candidate.rank == 1
+                else TRADE_DATE
             )
         async with self.session_factory() as session:
             if previous_plan_id is not None:
@@ -1449,63 +1452,176 @@ class TradingPlaybookObsidianSyncTests(unittest.IsolatedAsyncioTestCase):
             plan_ids=(204,),
         )
 
-        review_artifacts = []
-        review_id = 1000
+        auction_markdown = {
+            path.relative_to(vault).as_posix(): path.read_text(encoding="utf-8")
+            for path in vault.rglob("*.md")
+        }
         for plan_id in (201, 202, 203, 204):
-            for review_date in (ACCEPTANCE_SOURCE_DATE, TRADE_DATE):
-                if plan_id == 201 and review_date == ACCEPTANCE_SOURCE_DATE:
-                    continue
-                review_id += 1
-                review_row_value = fixture._review_row(
+            target_review_root = (
+                "30_TradingPlaybook/Reviews/Auto/2026/2026-07-16"
+            )
+            self.assertNotIn(
+                f"{target_review_root}/initial-review-{plan_id}.md",
+                auction_markdown,
+            )
+            self.assertNotIn(
+                f"{target_review_root}/final-review-{plan_id}.md",
+                auction_markdown,
+            )
+        auction_combined = "\n".join(auction_markdown.values())
+        self.assertNotIn("2026-07-16 15:10 target initial fact", auction_combined)
+        self.assertNotIn("2026-07-16 15:30 target final fact", auction_combined)
+
+        target_review_ids = []
+        self.clock.value = datetime(2026, 7, 16, 7, 10, tzinfo=timezone.utc)
+        for offset, plan_id in enumerate((201, 202, 203, 204), start=1):
+            review_id = 1000 + offset
+            target_review_ids.append(review_id)
+            target_review = fixture._review_row(
+                review_id,
+                plan_version_id=plan_id,
+            )
+            target_review.trade_date = TRADE_DATE
+            target_review.generated_at = datetime(2026, 7, 16, 15, 10)
+            target_review.manual_execution_json = {
+                "600001": {
+                    "executed": True,
+                    "note": (
+                        "2026-07-16 15:10 target initial fact "
+                        f"for plan {plan_id}"
+                    ),
+                }
+            }
+            async with self.session_factory() as session:
+                session.add(target_review)
+                await session.commit()
+        await self._process_acceptance_stage(
+            coordinator,
+            trade_date=TRADE_DATE,
+            phase="initial_review",
+            review_ids=tuple(target_review_ids),
+        )
+
+        self.clock.value = datetime(2026, 7, 16, 7, 30, tzinfo=timezone.utc)
+        async with self.session_factory() as session:
+            for review_id, plan_id in zip(
+                target_review_ids,
+                (201, 202, 203, 204),
+                strict=True,
+            ):
+                target_review = await session.get(
+                    TradingExecutionReview,
                     review_id,
-                    plan_version_id=plan_id,
                 )
-                review_row_value.trade_date = review_date
-                review_row_value.generated_at = datetime.combine(
-                    review_date,
-                    datetime.min.time(),
-                ).replace(hour=15, minute=10)
-                review_row_value.manual_execution_json = {
+                target_review.manual_execution_json = {
                     "600001": {
-                        "executed": True,
-                        "note": f"initial {plan_id} {review_date.isoformat()}",
+                        "executed": False,
+                        "note": (
+                            "2026-07-16 15:30 target final fact "
+                            f"for plan {plan_id}"
+                        ),
                     }
                 }
-                async with self.session_factory() as session:
-                    session.add(review_row_value)
-                    await session.commit()
-                review_artifacts.append(
-                    await builder.build_review_artifact(
-                        review_id,
-                        phase="initial_review",
+                target_review.finalized_at = datetime(2026, 7, 16, 15, 30)
+            await session.commit()
+        await self._process_acceptance_stage(
+            coordinator,
+            trade_date=TRADE_DATE,
+            phase="final_review",
+            review_ids=tuple(target_review_ids),
+        )
+
+        final_replay_time = self.clock.value.astimezone(
+            timezone(timedelta(hours=8))
+        ).replace(tzinfo=None)
+        async with self.session_factory() as session:
+            plans = list(
+                (
+                    await session.execute(
+                        select(TradingPlanVersion).where(
+                            TradingPlanVersion.id.in_((201, 202, 203, 204))
+                        )
                     )
-                )
-                async with self.session_factory() as session:
-                    current = await session.get(
-                        TradingExecutionReview,
-                        review_id,
+                ).scalars()
+            )
+            reviews = list(
+                (
+                    await session.execute(
+                        select(TradingExecutionReview).where(
+                            TradingExecutionReview.id.in_(
+                                (501, *target_review_ids)
+                            )
+                        )
                     )
-                    current.manual_execution_json = {
-                        "600001": {
-                            "executed": False,
-                            "note": f"final {plan_id} {review_date.isoformat()}",
-                        }
-                    }
-                    current.finalized_at = datetime.combine(
-                        review_date,
-                        datetime.min.time(),
-                    ).replace(hour=15, minute=30)
-                    await session.commit()
-                review_artifacts.append(
-                    await builder.build_review_artifact(
-                        review_id,
-                        phase="final_review",
+                ).scalars()
+            )
+            alerts = list(
+                (
+                    await session.execute(
+                        select(TradingAlertEvent).where(
+                            TradingAlertEvent.id.in_(
+                                (9001, 9002, 9003, 9004, 9005, 9006)
+                            )
+                        )
                     )
-                )
-        await coordinator.enqueue_artifacts(review_artifacts)
-        supplemental = await coordinator.process_due(limit=100)
-        self.assertEqual(supplemental.failed_files, ())
-        self.assertEqual(supplemental.pending_files, ())
+                ).scalars()
+            )
+            candidates = list(
+                (
+                    await session.execute(
+                        select(TradingPlanCandidate).where(
+                            TradingPlanCandidate.plan_version_id.in_(
+                                (201, 202, 203, 204)
+                            )
+                        )
+                    )
+                ).scalars()
+            )
+        plan_generated_at = {plan.id: plan.generated_at for plan in plans}
+        self.assertEqual(len(plan_generated_at), 4)
+        self.assertEqual(len(reviews), 5)
+        self.assertEqual(len(alerts), 6)
+        self.assertEqual(len(candidates), 8)
+        for review_row_value in reviews:
+            self.assertGreaterEqual(
+                review_row_value.generated_at,
+                plan_generated_at[review_row_value.plan_version_id],
+            )
+            self.assertIsNotNone(review_row_value.finalized_at)
+            self.assertGreaterEqual(
+                review_row_value.finalized_at,
+                review_row_value.generated_at,
+            )
+        for fact_time in (
+            *(plan.generated_at for plan in plans),
+            *(review.generated_at for review in reviews),
+            *(review.finalized_at for review in reviews),
+            *(alert.triggered_at for alert in alerts),
+        ):
+            self.assertLessEqual(fact_time, final_replay_time)
+        candidates_by_plan = {
+            plan_id: [
+                candidate
+                for candidate in candidates
+                if candidate.plan_version_id == plan_id
+            ]
+            for plan_id in (201, 202, 203, 204)
+        }
+        self.assertEqual(
+            {
+                candidate.action_trade_date
+                for candidate in candidates_by_plan[201]
+            },
+            {ACCEPTANCE_SOURCE_DATE, TRADE_DATE},
+        )
+        for plan_id in (202, 203, 204):
+            self.assertEqual(
+                {
+                    candidate.action_trade_date
+                    for candidate in candidates_by_plan[plan_id]
+                },
+                {TRADE_DATE},
+            )
 
         markdown = {
             path.relative_to(vault).as_posix(): path.read_text(encoding="utf-8")
@@ -1563,6 +1679,30 @@ class TradingPlaybookObsidianSyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("15:30 final correction", markdown[initial_path])
         self.assertIn("15:30 final correction", markdown[final_path])
         self.assertNotEqual(markdown[initial_path], markdown[final_path])
+        target_initial_path = (
+            "30_TradingPlaybook/Reviews/Auto/2026/2026-07-16/"
+            "initial-review-204.md"
+        )
+        target_final_path = (
+            "30_TradingPlaybook/Reviews/Auto/2026/2026-07-16/"
+            "final-review-204.md"
+        )
+        self.assertIn(
+            "2026-07-16 15:10 target initial fact",
+            markdown[target_initial_path],
+        )
+        self.assertNotIn(
+            "2026-07-16 15:30 target final fact",
+            markdown[target_initial_path],
+        )
+        self.assertIn(
+            "2026-07-16 15:30 target final fact",
+            markdown[target_final_path],
+        )
+        self.assertNotEqual(
+            markdown[target_initial_path],
+            markdown[target_final_path],
+        )
         self.assertNotIn("after_close-v2", markdown[f"{plan_root}/preclose-v1.md"])
         self.assertNotIn("overnight-v3", markdown[f"{plan_root}/preclose-v1.md"])
         self.assertNotIn("auction-v4", markdown[f"{plan_root}/preclose-v1.md"])
