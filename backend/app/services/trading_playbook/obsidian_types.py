@@ -43,12 +43,24 @@ CanonicalValue: TypeAlias = (
     | tuple["CanonicalValue", ...]
 )
 CanonicalMapping: TypeAlias = dict[str, CanonicalValue]
+ReadOnlyCanonicalValue: TypeAlias = (
+    CanonicalScalar
+    | Mapping[str, "ReadOnlyCanonicalValue"]
+    | tuple["ReadOnlyCanonicalValue", ...]
+)
+ReadOnlyCanonicalMapping: TypeAlias = Mapping[str, ReadOnlyCanonicalValue]
 
 JSONScalar: TypeAlias = str | bool | int | float | None
 JSONValue: TypeAlias = (
     JSONScalar | dict[str, "JSONValue"] | list["JSONValue"]
 )
 JSONMapping: TypeAlias = dict[str, JSONValue]
+ReadOnlyJSONValue: TypeAlias = (
+    JSONScalar
+    | Mapping[str, "ReadOnlyJSONValue"]
+    | tuple["ReadOnlyJSONValue", ...]
+)
+ReadOnlyJSONMapping: TypeAlias = Mapping[str, ReadOnlyJSONValue]
 
 
 _MAX_NESTING_DEPTH = 64
@@ -80,6 +92,12 @@ class _FrozenDict(Mapping[str, object]):
 
     def __len__(self) -> int:
         return len(self.__items)
+
+    def __deepcopy__(self, memo: dict[int, object]) -> JSONMapping:
+        plain = _canonical_value(self)
+        assert type(plain) is dict
+        memo[id(self)] = plain
+        return plain
 
     def _items(self) -> tuple[tuple[str, object], ...]:
         return self.__items
@@ -191,7 +209,18 @@ def _freeze_canonical_value(
     if isinstance(value, datetime):
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("canonical JSON datetime values must be timezone-aware")
-        return value
+        normalized = value.astimezone(timezone.utc)
+        return datetime(
+            normalized.year,
+            normalized.month,
+            normalized.day,
+            normalized.hour,
+            normalized.minute,
+            normalized.second,
+            normalized.microsecond,
+            tzinfo=timezone.utc,
+            fold=normalized.fold,
+        )
     if isinstance(value, date):
         return value
     if type(value) is dict or type(value) is _FrozenDict:
@@ -332,7 +361,7 @@ def database_datetime_to_cn(value: datetime | None) -> datetime | None:
     return value.astimezone(timezone.utc).astimezone(CN_TZ)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class ObsidianArtifact:
     snapshot_key: str
     trade_date: date
@@ -341,7 +370,28 @@ class ObsidianArtifact:
     phase: str
     target_path: str
     immutable: bool
-    payload: CanonicalMapping
+    payload: ReadOnlyCanonicalMapping
+
+    def __init__(
+        self,
+        snapshot_key: str,
+        trade_date: date,
+        entity_type: str,
+        entity_id: int | None,
+        phase: str,
+        target_path: str,
+        immutable: bool,
+        payload: CanonicalMapping,
+    ) -> None:
+        object.__setattr__(self, "snapshot_key", snapshot_key)
+        object.__setattr__(self, "trade_date", trade_date)
+        object.__setattr__(self, "entity_type", entity_type)
+        object.__setattr__(self, "entity_id", entity_id)
+        object.__setattr__(self, "phase", phase)
+        object.__setattr__(self, "target_path", target_path)
+        object.__setattr__(self, "immutable", immutable)
+        object.__setattr__(self, "payload", payload)
+        self.__post_init__()
 
     def __post_init__(self) -> None:
         if not isinstance(self.snapshot_key, str) or not self.snapshot_key.strip():
@@ -352,9 +402,13 @@ class ObsidianArtifact:
             raise ValueError(f"entity_type must be one of {OBSIDIAN_ENTITY_TYPES}")
         if self.phase not in OBSIDIAN_PHASES:
             raise ValueError(f"phase must be one of {OBSIDIAN_PHASES}")
-        if type(self.payload) is not dict:
+        if type(self.payload) not in (dict, _FrozenDict):
             raise TypeError("payload must be a dict")
-        frozen_payload = _freeze_canonical_value(self.payload)
+        frozen_payload = (
+            self.payload
+            if type(self.payload) is _FrozenDict
+            else _freeze_canonical_value(self.payload)
+        )
         object.__setattr__(self, "payload", frozen_payload)
         object.__setattr__(
             self,
@@ -372,7 +426,7 @@ class ObsidianArtifact:
         return plain
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class ObsidianSyncBatchResult:
     trade_date: date
     phase: str
@@ -380,7 +434,26 @@ class ObsidianSyncBatchResult:
     skipped_files: tuple[str, ...]
     pending_files: tuple[str, ...]
     failed_files: tuple[str, ...]
-    git_status: JSONMapping
+    git_status: ReadOnlyJSONMapping
+
+    def __init__(
+        self,
+        trade_date: date,
+        phase: str,
+        written_files: tuple[str, ...],
+        skipped_files: tuple[str, ...],
+        pending_files: tuple[str, ...],
+        failed_files: tuple[str, ...],
+        git_status: JSONMapping,
+    ) -> None:
+        object.__setattr__(self, "trade_date", trade_date)
+        object.__setattr__(self, "phase", phase)
+        object.__setattr__(self, "written_files", written_files)
+        object.__setattr__(self, "skipped_files", skipped_files)
+        object.__setattr__(self, "pending_files", pending_files)
+        object.__setattr__(self, "failed_files", failed_files)
+        object.__setattr__(self, "git_status", git_status)
+        self.__post_init__()
 
     def __post_init__(self) -> None:
         if self.phase not in OBSIDIAN_PHASES:
@@ -396,12 +469,14 @@ class ObsidianSyncBatchResult:
                 type(item) is str for item in value
             ):
                 raise TypeError(f"{field_name} must be a tuple of strings")
-        if type(self.git_status) is not dict:
+        if type(self.git_status) not in (dict, _FrozenDict):
             raise TypeError("git_status must be a dict")
         object.__setattr__(
             self,
             "git_status",
-            _freeze_json_value(self.git_status),
+            self.git_status
+            if type(self.git_status) is _FrozenDict
+            else _freeze_json_value(self.git_status),
         )
 
     def git_status_json(self) -> JSONMapping:
@@ -417,6 +492,10 @@ __all__ = (
     "JSONMapping",
     "JSONScalar",
     "JSONValue",
+    "ReadOnlyCanonicalMapping",
+    "ReadOnlyCanonicalValue",
+    "ReadOnlyJSONMapping",
+    "ReadOnlyJSONValue",
     "OBSIDIAN_ENTITY_TYPES",
     "OBSIDIAN_EXPORT_STATUSES",
     "OBSIDIAN_PHASES",

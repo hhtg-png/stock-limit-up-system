@@ -5,10 +5,12 @@ import json
 import re
 import unittest
 from collections import UserDict
-from dataclasses import FrozenInstanceError
-from datetime import date, datetime, timedelta, timezone
+from collections.abc import Mapping
+from dataclasses import FrozenInstanceError, asdict, replace
+from datetime import date, datetime, timedelta, timezone, tzinfo
 from decimal import Decimal, localcontext
 from types import MappingProxyType
+from typing import get_origin, get_type_hints
 
 from app.services.trading_playbook.obsidian_types import (
     OBSIDIAN_ENTITY_TYPES,
@@ -375,6 +377,88 @@ class ObsidianContractTests(unittest.TestCase):
         self.assertEqual(artifact.source_hash, expected_hash)
         self.assertEqual(canonical_json_bytes(artifact.payload), expected_bytes)  # type: ignore[arg-type]
 
+    def test_artifact_detaches_aware_datetimes_from_mutable_tzinfo(self) -> None:
+        class MutableOffset(tzinfo):
+            def __init__(self, offset: timedelta) -> None:
+                self.offset = offset
+
+            def utcoffset(self, value: datetime | None) -> timedelta:
+                return self.offset
+
+            def dst(self, value: datetime | None) -> timedelta:
+                return timedelta(0)
+
+            def tzname(self, value: datetime | None) -> str:
+                return "mutable"
+
+        mutable_tz = MutableOffset(timedelta(hours=8))
+        payload = {
+            "captured_at": datetime(2026, 7, 15, 9, 30, tzinfo=mutable_tz),
+        }
+        expected_bytes = canonical_json_bytes(payload)
+        artifact = ObsidianArtifact(
+            snapshot_key="plan:42:2026-07-15",
+            trade_date=date(2026, 7, 15),
+            entity_type="plan",
+            entity_id=42,
+            phase="preclose",
+            target_path="30_TradingPlaybook/Daily/Auto/2026-07-15.md",
+            immutable=True,
+            payload=payload,
+        )
+        expected_hash = hashlib.sha256(expected_bytes).hexdigest()
+
+        mutable_tz.offset = timedelta(hours=9)
+
+        self.assertEqual(canonical_json_bytes(artifact.payload), expected_bytes)  # type: ignore[arg-type]
+        self.assertEqual(artifact.source_hash, expected_hash)
+        self.assertEqual(
+            artifact.source_hash,
+            hashlib.sha256(canonical_json_bytes(artifact.payload)).hexdigest(),  # type: ignore[arg-type]
+        )
+
+    def test_artifact_asdict_exports_a_fresh_plain_canonical_payload(self) -> None:
+        artifact = ObsidianArtifact(
+            snapshot_key="plan:42:2026-07-15",
+            trade_date=date(2026, 7, 15),
+            entity_type="plan",
+            entity_id=42,
+            phase="preclose",
+            target_path="30_TradingPlaybook/Daily/Auto/2026-07-15.md",
+            immutable=True,
+            payload={
+                "trade_date": date(2026, 7, 15),
+                "levels": [Decimal("10.500"), 11],
+            },
+        )
+
+        exported = asdict(artifact)
+
+        self.assertIs(type(exported["payload"]), dict)
+        self.assertEqual(exported["payload"], artifact.payload_json())
+        exported["payload"]["levels"].append(12)  # type: ignore[index,union-attr]
+        self.assertEqual(artifact.payload_json()["levels"], ["10.5", 11])
+
+    def test_artifact_replace_reconstructs_from_the_frozen_payload(self) -> None:
+        artifact = ObsidianArtifact(
+            snapshot_key="plan:42:2026-07-15",
+            trade_date=date(2026, 7, 15),
+            entity_type="plan",
+            entity_id=42,
+            phase="preclose",
+            target_path="30_TradingPlaybook/Daily/Auto/2026-07-15.md",
+            immutable=True,
+            payload={"nested": {"levels": [Decimal("10.500"), 11]}},
+        )
+
+        replaced = replace(artifact, phase="after_close")
+
+        self.assertEqual(replaced.phase, "after_close")
+        self.assertEqual(replaced.payload_json(), artifact.payload_json())
+        self.assertEqual(replaced.source_hash, artifact.source_hash)
+        with self.assertRaises(TypeError):
+            replaced.payload["new"] = "mutation"  # type: ignore[index]
+
     def test_artifact_validates_identity_phase_path_and_payload(self) -> None:
         base = {
             "snapshot_key": "rule:1",
@@ -571,6 +655,49 @@ class ObsidianContractTests(unittest.TestCase):
         self.assertIsNot(plain, result.git_status_json())
         plain["files"][0]["path"] = "copy-mutated.md"  # type: ignore[index]
         self.assertEqual(result.git_status_json(), expected)
+
+    def test_sync_batch_asdict_exports_a_fresh_plain_git_status(self) -> None:
+        result = ObsidianSyncBatchResult(
+            trade_date=date(2026, 7, 15),
+            phase="reconcile",
+            written_files=("written.md",),
+            skipped_files=(),
+            pending_files=(),
+            failed_files=(),
+            git_status={"branch": "main", "files": [{"path": "plan.md"}]},
+        )
+
+        exported = asdict(result)
+
+        self.assertIs(type(exported["git_status"]), dict)
+        self.assertEqual(exported["git_status"], result.git_status_json())
+        exported["git_status"]["files"][0]["path"] = "mutated.md"  # type: ignore[index]
+        self.assertEqual(result.git_status_json()["files"][0]["path"], "plan.md")  # type: ignore[index]
+
+    def test_sync_batch_replace_reconstructs_from_frozen_git_status(self) -> None:
+        result = ObsidianSyncBatchResult(
+            trade_date=date(2026, 7, 15),
+            phase="reconcile",
+            written_files=("written.md",),
+            skipped_files=(),
+            pending_files=(),
+            failed_files=(),
+            git_status={"branch": "main", "files": [{"path": "plan.md"}]},
+        )
+
+        replaced = replace(result, phase="catalog")
+
+        self.assertEqual(replaced.phase, "catalog")
+        self.assertEqual(replaced.git_status_json(), result.git_status_json())
+        with self.assertRaises(TypeError):
+            replaced.git_status["branch"] = "mutation"  # type: ignore[index]
+
+    def test_dto_mapping_annotations_are_read_only(self) -> None:
+        artifact_hints = get_type_hints(ObsidianArtifact)
+        batch_hints = get_type_hints(ObsidianSyncBatchResult)
+
+        self.assertIs(get_origin(artifact_hints["payload"]), Mapping)
+        self.assertIs(get_origin(batch_hints["git_status"]), Mapping)
 
     def test_sync_batch_json_freeze_rejects_cycles_and_excess_depth(self) -> None:
         cycle: list[object] = []
