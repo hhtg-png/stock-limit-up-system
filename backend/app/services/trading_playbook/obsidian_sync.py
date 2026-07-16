@@ -41,6 +41,7 @@ from app.services.trading_playbook.obsidian_types import (
     ObsidianSyncBatchResult,
     TRADING_PLAYBOOK_ALLOWED_ROOTS,
     canonical_json_bytes,
+    contains_absolute_path_fragment,
     database_datetime_to_cn,
 )
 from app.utils.time_utils import CN_TZ
@@ -54,9 +55,6 @@ _MAX_GIT_JSON_STRING = 512
 _MAX_GIT_JSON_BYTES = 32 * 1024
 _LOCK_ROOT = "30_TradingPlaybook/Daily/Auto/.sync-locks"
 _DASHBOARD_PATH = "Dashboards/交易预案.md"
-_ABSOLUTE_PATH_FRAGMENT = re.compile(
-    r"(?i)(?:[a-z]:[\\/]|\\\\[^\\\s]+[\\/]|(?:^|[\s:])/(?:[^\s]+))"
-)
 
 
 class _TargetFileLock:
@@ -471,7 +469,7 @@ class TradingPlaybookObsidianSyncCoordinator:
         if type(value) is not str or not value:
             return None
         safe = cls._safe_text(value, limit=_MAX_ERROR_LENGTH)
-        if _ABSOLUTE_PATH_FRAGMENT.search(safe):
+        if contains_absolute_path_fragment(safe):
             return "Obsidian export failed"
         return safe
 

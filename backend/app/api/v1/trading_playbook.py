@@ -45,6 +45,7 @@ from app.services.trading_playbook.obsidian_types import (
     OBSIDIAN_PHASES,
     ObsidianSyncBatchResult,
     TRADING_PLAYBOOK_ALLOWED_ROOTS,
+    contains_absolute_path_fragment,
 )
 from app.services.trading_playbook.plan_service import TradingPlanService
 from app.services.trading_playbook.runtime import trading_playbook_runtime
@@ -65,9 +66,6 @@ STATE_CONFLICT_DETAIL = "Trading plan state conflict"
 NOT_FOUND_DETAIL = "Trading plan not found"
 SERVICE_UNAVAILABLE_DETAIL = "Trading playbook service is unavailable"
 _OBSIDIAN_DASHBOARD_PATH = "Dashboards/交易预案.md"
-_ABSOLUTE_PATH_FRAGMENT = re.compile(
-    r"(?i)(?:[a-z]:[\\/]|\\\\[^\\\s]+[\\/]|(?:^|[\s:])/(?:[^\s]+))"
-)
 
 
 def _service_unavailable() -> HTTPException:
@@ -189,7 +187,7 @@ def _public_json(value: object, *, depth: int = 0) -> Any:
         )[:2000]
         return (
             "redacted"
-            if _ABSOLUTE_PATH_FRAGMENT.search(safe)
+            if contains_absolute_path_fragment(safe)
             else safe
         )
     if isinstance(value, Mapping):
@@ -202,7 +200,7 @@ def _public_json(value: object, *, depth: int = 0) -> Any:
                 or not key
                 or len(key) > 128
                 or any(ord(character) < 32 for character in key)
-                or _ABSOLUTE_PATH_FRAGMENT.search(key)
+                or contains_absolute_path_fragment(key)
             ):
                 raise ValueError("Obsidian response JSON key is unsafe")
             result[key] = _public_json(item, depth=depth + 1)
@@ -230,7 +228,7 @@ def _serialize_obsidian_status(
         raise ValueError("Obsidian dashboard path is unsafe")
     last_error = payload.get("last_error")
     if last_error is not None:
-        if type(last_error) is not str or _ABSOLUTE_PATH_FRAGMENT.search(
+        if type(last_error) is not str or contains_absolute_path_fragment(
             last_error
         ):
             raise ValueError("Obsidian status error is unsafe")

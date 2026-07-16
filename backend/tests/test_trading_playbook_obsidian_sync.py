@@ -419,6 +419,60 @@ class TradingPlaybookObsidianSyncTests(unittest.IsolatedAsyncioTestCase):
             before,
         )
 
+    async def test_status_redacts_delimited_posix_absolute_paths(self):
+        writer = FakeWriter(self.temporary_directory.name)
+        coordinator = self._coordinator(
+            self.session_factory,
+            writer=writer,
+        )
+        now = datetime(2026, 7, 16, 15, 30)
+        async with self.session_factory() as session:
+            row = TradingPlaybookObsidianExport(
+                snapshot_key="status:absolute-error",
+                snapshot_version=1,
+                trade_date=TRADE_DATE,
+                entity_type="daily_index",
+                entity_id=None,
+                phase="reconcile",
+                target_path=(
+                    "30_TradingPlaybook/Daily/Auto/2026/status-error.md"
+                ),
+                source_hash="a" * 64,
+                snapshot_json={"payload": {}},
+                immutable=False,
+                status="failed",
+                attempt_no=1,
+                next_attempt_at=None,
+                last_error=None,
+                git_status_json={"state": "write_failed"},
+                exported_at=None,
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(row)
+            await session.commit()
+            row_id = row.id
+
+        errors = (
+            ("failed opening '/srv/private/vault/file.md'", "srv"),
+            ("failed(/home/admin/private/file.md)", "home"),
+            ("failed=/opt/private/file.md", "opt"),
+        )
+        for error, private_fragment in errors:
+            with self.subTest(error=error):
+                async with self.session_factory() as session:
+                    await session.execute(
+                        update(TradingPlaybookObsidianExport)
+                        .where(TradingPlaybookObsidianExport.id == row_id)
+                        .values(last_error=error)
+                    )
+                    await session.commit()
+
+                status = await coordinator.get_status()
+
+                self.assertEqual(status["last_error"], "Obsidian export failed")
+                self.assertNotIn(private_fragment, repr(status))
+
     async def test_status_propagates_writer_errors_and_cancellation(self):
         for error in (
             RuntimeError("configured status unavailable"),

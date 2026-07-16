@@ -2294,6 +2294,67 @@ class TradingPlaybookApiTests(unittest.TestCase):
                 self.assertEqual(response.status_code, 503, response.text)
                 self.assertNotIn("secret", response.text)
 
+    def test_obsidian_status_rejects_delimited_posix_paths_without_leak(self):
+        base_status = dict(self.obsidian_sync.get_status.return_value)
+        errors = (
+            ("failed opening '/srv/private/vault/file.md'", "srv"),
+            ("failed(/home/admin/private/file.md)", "home"),
+            ("failed=/opt/private/file.md", "opt"),
+        )
+        for error, private_fragment in errors:
+            with self.subTest(error=error):
+                self.obsidian_sync.get_status.return_value = {
+                    **base_status,
+                    "last_error": error,
+                }
+
+                response = self.client.get(
+                    "/trading-playbook/obsidian/status"
+                )
+
+                self.assertEqual(response.status_code, 503, response.text)
+                self.assertEqual(
+                    response.json(),
+                    {"detail": "Trading playbook service is unavailable"},
+                )
+                self.assertNotIn(private_fragment, response.text)
+        self.obsidian_sync.get_status.return_value = base_status
+
+    def test_obsidian_export_redacts_delimited_posix_git_errors(self):
+        errors = (
+            ("failed opening '/srv/private/vault/file.md'", "srv"),
+            ("failed(/home/admin/private/file.md)", "home"),
+            ("failed=/opt/private/file.md", "opt"),
+        )
+        for error, private_fragment in errors:
+            with self.subTest(error=error):
+                self.obsidian_sync.export_trade_date.return_value = (
+                    ObsidianSyncBatchResult(
+                        trade_date=date(2026, 7, 16),
+                        phase="reconcile",
+                        written_files=(),
+                        skipped_files=(),
+                        pending_files=(),
+                        failed_files=(),
+                        git_status={
+                            "state": "git_error",
+                            "error": error,
+                        },
+                    )
+                )
+
+                response = self.client.post(
+                    "/trading-playbook/obsidian/export",
+                    json={"trade_date": "2026-07-16"},
+                )
+
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(
+                    response.json()["git_status"]["error"],
+                    "redacted",
+                )
+                self.assertNotIn(private_fragment, response.text)
+
     def test_obsidian_api_does_not_mutate_trading_business_tables(self):
         async def business_state():
             async with self.Session() as db:

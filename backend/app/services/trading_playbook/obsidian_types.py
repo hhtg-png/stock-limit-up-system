@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -64,6 +65,15 @@ ReadOnlyJSONMapping: TypeAlias = Mapping[str, ReadOnlyJSONValue]
 
 
 _MAX_NESTING_DEPTH = 64
+_ABSOLUTE_PATH_FRAGMENT = re.compile(
+    r"(?i)(?<![\w./\\])(?:[a-z]:[\\/]|\\\\[^\\/\s]+[\\/]|/(?![/\s]))"
+)
+
+
+def contains_absolute_path_fragment(value: object) -> bool:
+    """Return whether text contains a delimited absolute filesystem path."""
+
+    return isinstance(value, str) and bool(_ABSOLUTE_PATH_FRAGMENT.search(value))
 
 
 class _FrozenDict(Mapping[str, object]):
@@ -541,5 +551,6 @@ __all__ = (
     "ObsidianArtifact",
     "ObsidianSyncBatchResult",
     "canonical_json_bytes",
+    "contains_absolute_path_fragment",
     "database_datetime_to_cn",
 )

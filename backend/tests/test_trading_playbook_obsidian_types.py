@@ -21,6 +21,7 @@ from app.services.trading_playbook.obsidian_types import (
     ObsidianArtifact,
     ObsidianSyncBatchResult,
     canonical_json_bytes,
+    contains_absolute_path_fragment,
     database_datetime_to_cn,
 )
 from app.utils.time_utils import CN_TZ
@@ -35,6 +36,39 @@ def _nested_dict(depth: int) -> dict[str, object]:
         value = {"child": value}
     assert isinstance(value, dict)
     return value
+
+
+class AbsolutePathFragmentTests(unittest.TestCase):
+    def test_detects_delimited_windows_unc_and_posix_absolute_paths(self) -> None:
+        fragments = (
+            r"failed opening 'C:\private\vault\file.md'",
+            r"failed=(D:/private/vault/file.md)",
+            r"failed opening '\\server\private\file.md'",
+            "failed opening '/srv/private/vault/file.md'",
+            "failed(/home/admin/private/file.md)",
+            "failed=/opt/private/file.md",
+            "failed：/var/private/file.md",
+        )
+
+        for fragment in fragments:
+            with self.subTest(fragment=fragment):
+                self.assertTrue(contains_absolute_path_fragment(fragment))
+
+    def test_does_not_misclassify_relative_obsidian_paths(self) -> None:
+        relative_paths = (
+            "30_TradingPlaybook/foo/bar.md",
+            "failed: 30_TradingPlaybook/Daily/Auto/2026/index.md",
+            "Dashboards/交易预案.md",
+            "./relative/file.md",
+            "../relative/file.md",
+            "relative/file.md",
+        )
+
+        for relative_path in relative_paths:
+            with self.subTest(relative_path=relative_path):
+                self.assertFalse(
+                    contains_absolute_path_fragment(relative_path)
+                )
 
 
 class CanonicalJsonBytesTests(unittest.TestCase):
