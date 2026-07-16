@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
@@ -19,6 +19,7 @@ from app.models.trading_playbook import (
     TradingPlanCandidate,
     TradingPlanVersion,
     TradingPlaybookSettings,
+    TradingRuleSource,
 )
 from app.models.stock import Stock
 from app.services.trading_playbook.domain import (
@@ -36,12 +37,30 @@ from app.services.trading_playbook import serialization as serialization_module
 from app.services.trading_playbook.errors import (
     InvalidRequestError,
     InvalidTransitionError,
+    UpstreamUnavailableError,
 )
 
 
 SOURCE_DATE = date(2026, 7, 10)
 TARGET_DATE = date(2026, 7, 13)
 AS_OF = datetime(2026, 7, 10, 14, 40)
+RISK_SOURCE_HASHES = {
+    source_key: hashlib.sha256(f"{source_key}:v1".encode("utf-8")).hexdigest()
+    for source_key in ("03-loss-qa", "04-trading-plan")
+}
+
+
+def _risk_source_rows() -> list[TradingRuleSource]:
+    return [
+        TradingRuleSource(
+            source_key=source_key,
+            source_path=f"videos/{source_key}.md",
+            source_title=source_key,
+            content_hash=content_hash,
+            status="ready",
+        )
+        for source_key, content_hash in RISK_SOURCE_HASHES.items()
+    ]
 
 
 def _rule_hash(mode_key: str) -> str:
@@ -170,6 +189,9 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
         self.Session = async_sessionmaker(self.engine, expire_on_commit=False)
         async with self.engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
+        async with self.Session() as db:
+            db.add_all(_risk_source_rows())
+            await db.commit()
         self.service = TradingPlanService()
 
     async def asyncTearDown(self):
@@ -391,6 +413,116 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(plan["status"], "draft")
         serialize.assert_not_awaited()
+
+    async def test_generate_binds_risk_refs_to_exact_ready_transcript_hashes(self):
+        async with self.Session() as db:
+            plan = await self._generate(
+                db,
+                [_evaluation("leader", "000001")],
+            )
+
+        self.assertEqual(
+            plan["risk_settings_json"]["source_refs"],
+            [
+                {
+                    "source_key": "03-loss-qa",
+                    "excerpt": "候选不超过三只，开仓和退出条件必须预先写清，并执行刚性止损",
+                    "source_content_hash": RISK_SOURCE_HASHES["03-loss-qa"],
+                },
+                {
+                    "source_key": "04-trading-plan",
+                    "excerpt": "交易前形成书面计划，盘后区分信号、执行与结果",
+                    "source_content_hash": RISK_SOURCE_HASHES["04-trading-plan"],
+                },
+            ],
+        )
+
+    async def test_risk_source_version_changes_input_hash_and_remains_idempotent(self):
+        evaluation = _evaluation("leader", "000001")
+        new_hash = hashlib.sha256(b"03-loss-qa:v2").hexdigest()
+        async with self.Session() as db:
+            first = await self._generate(db, [evaluation])
+            same_v1 = await self._generate(db, [copy.deepcopy(evaluation)])
+            db.add(
+                TradingRuleSource(
+                    source_key="03-loss-qa",
+                    source_path="videos/03-loss-qa-v2.md",
+                    source_title="03-loss-qa v2",
+                    content_hash=new_hash,
+                    status="ready",
+                )
+            )
+            await db.commit()
+            second = await self._generate(db, [copy.deepcopy(evaluation)])
+            same_v2 = await self._generate(db, [copy.deepcopy(evaluation)])
+
+        self.assertEqual(same_v1["id"], first["id"])
+        self.assertEqual(same_v2["id"], second["id"])
+        self.assertNotEqual(second["id"], first["id"])
+        self.assertNotEqual(second["input_hash"], first["input_hash"])
+        self.assertEqual(
+            second["risk_settings_json"]["source_refs"][0][
+                "source_content_hash"
+            ],
+            new_hash,
+        )
+
+    async def test_generate_rejects_missing_risk_source_without_persistence(self):
+        async with self.Session() as db:
+            await db.execute(
+                delete(TradingRuleSource).where(
+                    TradingRuleSource.source_key == "03-loss-qa"
+                )
+            )
+            await db.commit()
+
+            with self.assertRaisesRegex(
+                UpstreamUnavailableError,
+                "03-loss-qa",
+            ):
+                await self._generate(db, [_evaluation("leader", "000001")])
+
+            plan_count = await db.scalar(
+                select(func.count()).select_from(TradingPlanVersion)
+            )
+            candidate_count = await db.scalar(
+                select(func.count()).select_from(TradingPlanCandidate)
+            )
+            settings_count = await db.scalar(
+                select(func.count()).select_from(TradingPlaybookSettings)
+            )
+
+        self.assertEqual((plan_count, candidate_count, settings_count), (0, 0, 0))
+
+    async def test_generate_rejects_latest_not_ready_without_older_fallback(self):
+        async with self.Session() as db:
+            db.add(
+                TradingRuleSource(
+                    source_key="04-trading-plan",
+                    source_path="videos/04-trading-plan-pending.md",
+                    source_title="04-trading-plan pending",
+                    content_hash=hashlib.sha256(
+                        b"04-trading-plan:pending"
+                    ).hexdigest(),
+                    status="pending",
+                )
+            )
+            await db.commit()
+
+            with self.assertRaisesRegex(
+                UpstreamUnavailableError,
+                "04-trading-plan",
+            ):
+                await self._generate(db, [_evaluation("leader", "000001")])
+
+            plan_count = await db.scalar(
+                select(func.count()).select_from(TradingPlanVersion)
+            )
+            candidate_count = await db.scalar(
+                select(func.count()).select_from(TradingPlanCandidate)
+            )
+
+        self.assertEqual((plan_count, candidate_count), (0, 0))
 
     async def test_generate_is_idempotent_and_hashes_every_effective_input(self):
         evaluation = _evaluation("leader", "000001")
@@ -1075,6 +1207,111 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
             child_payload["change_summary_json"]["change_note"],
             "人工调整触发位",
         )
+
+    async def test_revise_preserves_exact_hash_bound_risk_sources(self):
+        async with self.Session() as db:
+            generated = await self._generate(
+                db,
+                [_evaluation("leader", "000001")],
+            )
+            expected_refs = copy.deepcopy(
+                generated["risk_settings_json"]["source_refs"]
+            )
+            db.add(
+                TradingRuleSource(
+                    source_key="03-loss-qa",
+                    source_path="videos/03-loss-qa-v2.md",
+                    source_title="03-loss-qa v2",
+                    content_hash=hashlib.sha256(b"03-loss-qa:v2").hexdigest(),
+                    status="ready",
+                )
+            )
+            await db.commit()
+            child = await self.service.revise(
+                db,
+                generated["id"],
+                {
+                    "change_note": "保留原始风险依据",
+                    "candidate_overrides": [
+                        {
+                            "candidate_id": generated["candidates"][0]["id"],
+                            "manual_note": "已复核",
+                        }
+                    ],
+                },
+            )
+
+        self.assertEqual(
+            child["risk_settings_json"]["source_refs"],
+            expected_refs,
+        )
+
+    async def test_revise_rejects_legacy_unbound_risk_sources_without_child(self):
+        async with self.Session() as db:
+            generated = await self._generate(
+                db,
+                [_evaluation("leader", "000001")],
+            )
+            parent = await db.get(TradingPlanVersion, generated["id"])
+            legacy_risk_settings = copy.deepcopy(parent.risk_settings_json)
+            for source_ref in legacy_risk_settings["source_refs"]:
+                source_ref.pop("source_content_hash")
+            parent.risk_settings_json = legacy_risk_settings
+            await db.commit()
+
+            with self.assertRaisesRegex(
+                InvalidTransitionError,
+                "regenerate",
+            ):
+                await self.service.revise(
+                    db,
+                    generated["id"],
+                    {
+                        "change_note": "不能复制未绑定来源",
+                        "candidate_overrides": [
+                            {
+                                "candidate_id": generated["candidates"][0]["id"],
+                                "manual_note": "旧计划",
+                            }
+                        ],
+                    },
+                )
+
+            plan_count = await db.scalar(
+                select(func.count()).select_from(TradingPlanVersion)
+            )
+
+        self.assertEqual(plan_count, 1)
+
+    async def test_revise_rejects_hash_bound_ref_without_persisted_source(self):
+        async with self.Session() as db:
+            generated = await self._generate(
+                db,
+                [_evaluation("leader", "000001")],
+            )
+            parent = await db.get(TradingPlanVersion, generated["id"])
+            corrupted_risk_settings = copy.deepcopy(parent.risk_settings_json)
+            corrupted_risk_settings["source_refs"][0][
+                "source_content_hash"
+            ] = hashlib.sha256(b"not-persisted").hexdigest()
+            parent.risk_settings_json = corrupted_risk_settings
+            await db.commit()
+
+            with self.assertRaisesRegex(
+                InvalidTransitionError,
+                "regenerate",
+            ):
+                await self.service.revise(
+                    db,
+                    generated["id"],
+                    {"change_note": "不能复制伪造来源"},
+                )
+
+            plan_count = await db.scalar(
+                select(func.count()).select_from(TradingPlanVersion)
+            )
+
+        self.assertEqual(plan_count, 1)
 
     async def test_revise_accepts_stock_and_mode_as_a_unique_locator(self):
         async with self.Session() as db:
@@ -1888,6 +2125,8 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
                 async with first_engine.begin() as connection:
                     await connection.run_sync(Base.metadata.create_all)
                 async with FirstSession() as setup:
+                    setup.add_all(_risk_source_rows())
+                    await setup.commit()
                     parent = await TradingPlanService().generate(
                         setup,
                         _snapshot(),
@@ -1959,6 +2198,8 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
                 async with first_engine.begin() as connection:
                     await connection.run_sync(Base.metadata.create_all)
                 async with FirstSession() as setup:
+                    setup.add_all(_risk_source_rows())
+                    await setup.commit()
                     parent = await TradingPlanService().generate(
                         setup,
                         _snapshot(),
@@ -2244,6 +2485,20 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(row["trial_position_pct"], 50.0)
         self.assertEqual(row["confirmed_position_pct"], 60.0)
+
+    async def test_settings_validation_does_not_require_transcript_sources(self):
+        async with self.Session() as db:
+            await db.execute(delete(TradingRuleSource))
+            db.add(TradingPlaybookSettings(id=1))
+            await db.commit()
+
+            row = await self.service.update_settings(
+                db,
+                {"hard_stop_pct": 4.0},
+                AS_OF.replace(tzinfo=ZoneInfo("Asia/Shanghai")),
+            )
+
+        self.assertEqual(row["hard_stop_pct"], 4.0)
 
     async def test_update_settings_does_not_query_after_successful_commit(self):
         async with self.Session() as db:

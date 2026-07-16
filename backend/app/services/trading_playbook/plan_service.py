@@ -13,7 +13,7 @@ from datetime import date, datetime
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, tuple_, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 from app.config import settings as app_settings
@@ -21,6 +21,7 @@ from app.models.trading_playbook import (
     TradingPlanCandidate,
     TradingPlanVersion,
     TradingPlaybookSettings,
+    TradingRuleSource,
 )
 
 from .domain import MarketSnapshot, ModeEvaluation
@@ -31,6 +32,7 @@ from .errors import (
     UpstreamUnavailableError,
 )
 from .quality import action_quality_ready
+from .rule_catalog import canonical_rule_source_refs
 from .serialization import (
     ValidatedSettingsPayload,
     json_value,
@@ -47,6 +49,10 @@ _RISK_LEVELS = {"avoid", "watch", "trial", "confirmed"}
 _ACTION_SCOPES = {"target", "tail"}
 _RULE_HASH = re.compile(r"[0-9a-f]{64}")
 _STAGE_SEQUENCE = ("preclose", "after_close", "overnight", "auction")
+_RISK_SOURCE_EXCERPTS = {
+    "03-loss-qa": "候选不超过三只，开仓和退出条件必须预先写清，并执行刚性止损",
+    "04-trading-plan": "交易前形成书面计划，盘后区分信号、执行与结果",
+}
 
 
 def _finite_number(value: Any) -> Optional[float]:
@@ -169,7 +175,10 @@ class TradingPlanService:
                     settings_row, created_settings = await self._get_or_create_settings(
                         db
                     )
-                    risk_settings = self._risk_settings(settings_row)
+                    risk_settings = await self._risk_settings_with_sources(
+                        db,
+                        settings_row,
+                    )
                     input_hash = self._input_hash(
                         snapshot_payload,
                         radar,
@@ -663,7 +672,7 @@ class TradingPlanService:
             hard_stop_pct=hard_stop,
             max_action_candidates=maximum,
         )
-        self._risk_settings(validation_row)
+        self._base_risk_settings(validation_row)
 
         conditions = [TradingPlaybookSettings.id == 1]
         has_trial = "trial_position_pct" in changes
@@ -713,7 +722,9 @@ class TradingPlanService:
             raise
 
     @staticmethod
-    def _risk_settings(settings_row: TradingPlaybookSettings) -> Dict[str, Any]:
+    def _base_risk_settings(
+        settings_row: TradingPlaybookSettings,
+    ) -> Dict[str, Any]:
         trial = _finite_number(settings_row.trial_position_pct)
         confirmed = _finite_number(settings_row.confirmed_position_pct)
         hard_stop = _finite_number(settings_row.hard_stop_pct)
@@ -740,17 +751,56 @@ class TradingPlanService:
             "confirmed": confirmed,
             "hard_stop": hard_stop,
             "max_candidates": maximum,
-            "source_refs": [
-                {
-                    "source_key": "03-loss-qa",
-                    "excerpt": "候选不超过三只，开仓和退出条件必须预先写清，并执行刚性止损",
-                },
-                {
-                    "source_key": "04-trading-plan",
-                    "excerpt": "交易前形成书面计划，盘后区分信号、执行与结果",
-                },
-            ],
         }
+
+    @classmethod
+    async def _risk_settings_with_sources(
+        cls,
+        db,
+        settings_row: TradingPlaybookSettings,
+    ) -> Dict[str, Any]:
+        risk_settings = cls._base_risk_settings(settings_row)
+        rows = (
+            await db.scalars(
+                select(TradingRuleSource)
+                .where(
+                    TradingRuleSource.source_key.in_(
+                        tuple(_RISK_SOURCE_EXCERPTS)
+                    )
+                )
+                .order_by(
+                    TradingRuleSource.source_key,
+                    TradingRuleSource.id.desc(),
+                )
+            )
+        ).all()
+        latest_by_key: Dict[str, TradingRuleSource] = {}
+        for row in rows:
+            latest_by_key.setdefault(row.source_key, row)
+
+        refs = []
+        for source_key, excerpt in _RISK_SOURCE_EXCERPTS.items():
+            source = latest_by_key.get(source_key)
+            if (
+                source is None
+                or source.status != "ready"
+                or not isinstance(source.content_hash, str)
+                or _RULE_HASH.fullmatch(source.content_hash) is None
+            ):
+                raise UpstreamUnavailableError(
+                    f"current risk transcript source is unavailable: {source_key}"
+                )
+            refs.append(
+                {
+                    "source_key": source_key,
+                    "excerpt": excerpt,
+                    "source_content_hash": source.content_hash,
+                }
+            )
+        risk_settings["source_refs"] = canonical_rule_source_refs(
+            {"source_refs": refs}
+        )
+        return risk_settings
 
     @classmethod
     def _select_candidates(
@@ -1272,6 +1322,7 @@ class TradingPlanService:
             raise PlaybookNotFoundError("plan not found")
         if parent.status not in {"draft", "confirmed", "active"}:
             raise InvalidTransitionError("plan cannot be revised")
+        await self._require_bound_revision_risk_sources(db, parent)
         parent_candidates = await self._load_candidates(db, parent.id)
         normalize_plan_payload(
             self._serialize_loaded(parent, parent_candidates)
@@ -1378,6 +1429,56 @@ class TradingPlanService:
                     await db.rollback()
                     raise
         raise RuntimeError("could not revise plan")
+
+    @staticmethod
+    async def _require_bound_revision_risk_sources(
+        db,
+        parent: TradingPlanVersion,
+    ) -> None:
+        try:
+            stored_refs = parent.risk_settings_json.get("source_refs")
+            canonical_refs = canonical_rule_source_refs(
+                {"source_refs": stored_refs}
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise InvalidTransitionError(
+                "legacy plan risk sources are not transcript-bound; regenerate "
+                "the plan before revising"
+            ) from exc
+        if (
+            stored_refs != canonical_refs
+            or [ref["source_key"] for ref in canonical_refs]
+            != sorted(_RISK_SOURCE_EXCERPTS)
+        ):
+            raise InvalidTransitionError(
+                "legacy plan risk sources are not transcript-bound; regenerate "
+                "the plan before revising"
+            )
+        expected_pairs = {
+            (ref["source_key"], ref["source_content_hash"])
+            for ref in canonical_refs
+        }
+        persisted_pairs = set(
+            (
+                await db.execute(
+                    select(
+                        TradingRuleSource.source_key,
+                        TradingRuleSource.content_hash,
+                    ).where(
+                        tuple_(
+                            TradingRuleSource.source_key,
+                            TradingRuleSource.content_hash,
+                        ).in_(sorted(expected_pairs)),
+                        TradingRuleSource.status == "ready",
+                    )
+                )
+            ).all()
+        )
+        if persisted_pairs != expected_pairs:
+            raise InvalidTransitionError(
+                "plan risk transcript sources are unavailable; regenerate "
+                "the plan before revising"
+            )
 
     @staticmethod
     async def _find_revision_by_hash(
