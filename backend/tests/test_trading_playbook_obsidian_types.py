@@ -699,6 +699,59 @@ class ObsidianContractTests(unittest.TestCase):
         self.assertIs(get_origin(artifact_hints["payload"]), Mapping)
         self.assertIs(get_origin(batch_hints["git_status"]), Mapping)
 
+    def test_frozen_mapping_domains_only_reconstruct_their_own_dtos(self) -> None:
+        artifact = ObsidianArtifact(
+            snapshot_key="plan:42:2026-07-15",
+            trade_date=date(2026, 7, 15),
+            entity_type="plan",
+            entity_id=42,
+            phase="preclose",
+            target_path="30_TradingPlaybook/Daily/Auto/2026-07-15.md",
+            immutable=True,
+            payload={
+                "trade_date": date(2026, 7, 15),
+                "captured_at": datetime(2026, 7, 15, 1, 30, tzinfo=timezone.utc),
+                "amount": Decimal("10.500"),
+            },
+        )
+        batch = ObsidianSyncBatchResult(
+            trade_date=date(2026, 7, 15),
+            phase="reconcile",
+            written_files=(),
+            skipped_files=(),
+            pending_files=(),
+            failed_files=(),
+            git_status={"branch": "main", "clean": True},
+        )
+
+        with self.assertRaisesRegex(TypeError, "git_status must be a dict"):
+            ObsidianSyncBatchResult(
+                trade_date=date(2026, 7, 15),
+                phase="reconcile",
+                written_files=(),
+                skipped_files=(),
+                pending_files=(),
+                failed_files=(),
+                git_status=artifact.payload,  # type: ignore[arg-type]
+            )
+        with self.assertRaisesRegex(TypeError, "payload must be a dict"):
+            ObsidianArtifact(
+                snapshot_key="plan:43:2026-07-15",
+                trade_date=date(2026, 7, 15),
+                entity_type="plan",
+                entity_id=43,
+                phase="preclose",
+                target_path="30_TradingPlaybook/Daily/Auto/2026-07-15-43.md",
+                immutable=True,
+                payload=batch.git_status,  # type: ignore[arg-type]
+            )
+
+        replaced_artifact = replace(artifact, phase="after_close")
+        replaced_batch = replace(batch, phase="catalog")
+        self.assertEqual(replaced_artifact.payload_json(), artifact.payload_json())
+        self.assertEqual(replaced_artifact.source_hash, artifact.source_hash)
+        self.assertEqual(replaced_batch.git_status_json(), batch.git_status_json())
+
     def test_sync_batch_json_freeze_rejects_cycles_and_excess_depth(self) -> None:
         cycle: list[object] = []
         cycle.append(cycle)

@@ -93,14 +93,28 @@ class _FrozenDict(Mapping[str, object]):
     def __len__(self) -> int:
         return len(self.__items)
 
+    def _items(self) -> tuple[tuple[str, object], ...]:
+        return self.__items
+
+
+class _FrozenCanonicalDict(_FrozenDict):
+    __slots__ = ()
+
     def __deepcopy__(self, memo: dict[int, object]) -> JSONMapping:
         plain = _canonical_value(self)
         assert type(plain) is dict
         memo[id(self)] = plain
         return plain
 
-    def _items(self) -> tuple[tuple[str, object], ...]:
-        return self.__items
+
+class _FrozenJSONDict(_FrozenDict):
+    __slots__ = ()
+
+    def __deepcopy__(self, memo: dict[int, object]) -> JSONMapping:
+        plain = _plain_json_value(self)
+        assert type(plain) is dict
+        memo[id(self)] = plain
+        return plain
 
 
 def _decimal_string(value: Decimal) -> str:
@@ -147,7 +161,7 @@ def _canonical_value(
         return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
     if isinstance(value, date):
         return value.isoformat()
-    if type(value) is dict or type(value) is _FrozenDict:
+    if type(value) is dict or type(value) is _FrozenCanonicalDict:
         container_depth = _container_depth(depth)
         identity = id(value)
         if identity in active_ids:
@@ -223,16 +237,15 @@ def _freeze_canonical_value(
         )
     if isinstance(value, date):
         return value
-    if type(value) is dict or type(value) is _FrozenDict:
+    if type(value) is dict:
         container_depth = _container_depth(depth)
         identity = id(value)
         if identity in active_ids:
             raise ValueError("canonical JSON cycle detected")
         active_ids.add(identity)
         try:
-            items = value.items() if type(value) is dict else value._items()
             frozen_items: list[tuple[str, object]] = []
-            for key, item in items:
+            for key, item in value.items():
                 if not isinstance(key, str):
                     raise TypeError("canonical JSON dict keys must be strings")
                 frozen_items.append(
@@ -245,7 +258,7 @@ def _freeze_canonical_value(
                         ),
                     )
                 )
-            return _FrozenDict(tuple(frozen_items))
+            return _FrozenCanonicalDict(tuple(frozen_items))
         finally:
             active_ids.remove(identity)
     if type(value) in (list, tuple):
@@ -305,7 +318,7 @@ def _freeze_json_value(
                         ),
                     )
                 )
-            return _FrozenDict(tuple(frozen_items))
+            return _FrozenJSONDict(tuple(frozen_items))
         finally:
             active_ids.remove(identity)
     if type(value) is list:
@@ -331,7 +344,7 @@ def _freeze_json_value(
 def _plain_json_value(value: object) -> JSONValue:
     if value is None or isinstance(value, (str, bool, int, float)):
         return value
-    if type(value) is _FrozenDict:
+    if type(value) is _FrozenJSONDict:
         return {key: _plain_json_value(item) for key, item in value._items()}
     if type(value) is tuple:
         return [_plain_json_value(item) for item in value]
@@ -402,11 +415,11 @@ class ObsidianArtifact:
             raise ValueError(f"entity_type must be one of {OBSIDIAN_ENTITY_TYPES}")
         if self.phase not in OBSIDIAN_PHASES:
             raise ValueError(f"phase must be one of {OBSIDIAN_PHASES}")
-        if type(self.payload) not in (dict, _FrozenDict):
+        if type(self.payload) not in (dict, _FrozenCanonicalDict):
             raise TypeError("payload must be a dict")
         frozen_payload = (
             self.payload
-            if type(self.payload) is _FrozenDict
+            if type(self.payload) is _FrozenCanonicalDict
             else _freeze_canonical_value(self.payload)
         )
         object.__setattr__(self, "payload", frozen_payload)
@@ -469,13 +482,13 @@ class ObsidianSyncBatchResult:
                 type(item) is str for item in value
             ):
                 raise TypeError(f"{field_name} must be a tuple of strings")
-        if type(self.git_status) not in (dict, _FrozenDict):
+        if type(self.git_status) not in (dict, _FrozenJSONDict):
             raise TypeError("git_status must be a dict")
         object.__setattr__(
             self,
             "git_status",
             self.git_status
-            if type(self.git_status) is _FrozenDict
+            if type(self.git_status) is _FrozenJSONDict
             else _freeze_json_value(self.git_status),
         )
 
