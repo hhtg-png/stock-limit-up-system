@@ -2,8 +2,10 @@
 任务调度器
 """
 import asyncio
+import uuid
+from collections.abc import Mapping, Sequence
 from datetime import datetime, time, date, timedelta
-from typing import List, Dict, Tuple, Optional
+from typing import Any, Awaitable, Callable, List, Dict, Tuple, Optional
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
@@ -13,11 +15,21 @@ from loguru import logger
 from app.config import settings
 from app.services.intelligence_service import intelligence_service
 from app.services.market_review_pipeline_service import market_review_pipeline_service
+from app.services.trading_playbook.calendar_service import (
+    TradingCalendarLookupError,
+    TradingCalendarService,
+)
+from app.services.trading_playbook.job_claim_service import (
+    TradingPlaybookJobClaimService,
+)
 from app.utils.time_utils import CN_TZ, get_market_status, is_trading_time, today_cn
 
 
-class TradingCalendarLookupError(RuntimeError):
-    """Raised when the China trading calendar cannot be loaded reliably."""
+_PLAYBOOK_NOTIFICATION_RETRY_BATCH_SIZE = 100
+
+
+class TradingPlaybookClaimLost(RuntimeError):
+    """Raised when a running phase no longer owns its database lease."""
 
 
 def _normalize_trade_calendar_date(raw_value) -> Optional[date]:
@@ -96,15 +108,69 @@ def _daily_analysis_after_close_time() -> time:
 class DataScheduler:
     """数据采集任务调度器"""
     
-    def __init__(self):
-        self.scheduler = AsyncIOScheduler()
+    def __init__(
+        self,
+        *,
+        trading_playbook_orchestrator: Any = None,
+        trading_playbook_alert_service: Any = None,
+        trading_playbook_review_service: Any = None,
+        session_factory: Optional[Callable[[], Any]] = None,
+        now_provider: Optional[Callable[[], datetime]] = None,
+        sleep: Optional[Callable[[float], Awaitable[None]]] = None,
+        calendar_service: Optional[TradingCalendarService] = None,
+        job_claim_service: Optional[TradingPlaybookJobClaimService] = None,
+        claim_owner: Optional[str] = None,
+        scheduler_factory: Optional[Callable[[], Any]] = None,
+        monotonic: Optional[Callable[[], float]] = None,
+    ):
+        self._scheduler_factory = scheduler_factory or AsyncIOScheduler
+        self.scheduler = self._scheduler_factory()
         self._is_running = False
+        self._trading_playbook_orchestrator = trading_playbook_orchestrator
+        self._trading_playbook_alert_service = trading_playbook_alert_service
+        self._trading_playbook_review_service = trading_playbook_review_service
+        self._trading_playbook_obsidian_sync = None
+        self._trading_playbook_obsidian_rules_enqueued = False
+        self._playbook_session_factory = session_factory
+        self._playbook_now_provider = now_provider or (
+            lambda: datetime.now(CN_TZ)
+        )
+        self._playbook_sleep = sleep or asyncio.sleep
+        self._playbook_monotonic = monotonic
+        self._playbook_calendar = calendar_service or TradingCalendarService(
+            loader=lambda start, end: _get_cn_trading_dates(start, end),
+            refresh_timeout_seconds=(
+                settings.TRADING_PLAYBOOK_CALENDAR_REFRESH_TIMEOUT_SECONDS
+            ),
+            retry_interval_seconds=(
+                settings.TRADING_PLAYBOOK_CALENDAR_RETRY_INTERVAL_SECONDS
+            ),
+        )
+        self._playbook_upgrade_lock = asyncio.Lock()
+        self._playbook_job_claims = (
+            job_claim_service
+            or TradingPlaybookJobClaimService(
+                lease_seconds=settings.TRADING_PLAYBOOK_JOB_LEASE_SECONDS
+            )
+        )
+        self._playbook_claim_owner = claim_owner or uuid.uuid4().hex
         # 监控股票缓存
         self._monitored_stocks: List[Dict] = []
         self._stocks_cache_time: datetime = datetime.min
         self._STOCKS_CACHE_TTL = 10  # 10秒刷新一次监控列表，优先跟随实时涨停池
     
     def start(self):
+        """Register and start all jobs, leaving a clean scheduler on failure."""
+        if self._is_running or self._scheduler_is_running(self.scheduler):
+            self._is_running = True
+            return
+        try:
+            self._start_registered_scheduler()
+        except BaseException:
+            self._replace_scheduler()
+            raise
+
+    def _start_registered_scheduler(self):
         """启动调度器"""
         if self._is_running:
             return
@@ -259,6 +325,12 @@ class DataScheduler:
                 replace_existing=True,
             )
 
+        if settings.TRADING_PLAYBOOK_ENABLED:
+            self._register_trading_playbook_jobs()
+
+        if self._trading_playbook_obsidian_sync is not None:
+            self._register_trading_playbook_obsidian_jobs()
+
         self.scheduler.add_job(
             self._run_after_close_catchup,
             DateTrigger(
@@ -274,13 +346,1522 @@ class DataScheduler:
         self.scheduler.start()
         self._is_running = True
         logger.info("DataScheduler started")
+
+    def _register_trading_playbook_jobs(self) -> None:
+        jobs = (
+            (
+                self._build_trading_playbook_preclose,
+                CronTrigger(hour=14, minute=40, timezone=CN_TZ),
+                "trading_playbook_preclose",
+                "交易作战手册14:40预案",
+                19 * 60,
+            ),
+            (
+                self._review_trading_playbook,
+                CronTrigger(hour=15, minute=10, timezone=CN_TZ),
+                "trading_playbook_review",
+                "交易作战手册15:10复盘",
+                19 * 60,
+            ),
+            (
+                self._build_trading_playbook_after_close,
+                CronTrigger(hour=15, minute=30, timezone=CN_TZ),
+                "trading_playbook_after_close",
+                "交易作战手册15:30定稿",
+                30 * 60,
+            ),
+            (
+                self._build_trading_playbook_overnight,
+                CronTrigger(hour=8, minute=50, timezone=CN_TZ),
+                "trading_playbook_overnight",
+                "交易作战手册08:50隔夜刷新",
+                35 * 60,
+            ),
+            (
+                self._build_trading_playbook_auction,
+                CronTrigger(hour=9, minute=26, timezone=CN_TZ),
+                "trading_playbook_auction",
+                "交易作战手册09:26竞价确认",
+                3 * 60,
+            ),
+            (
+                self._monitor_trading_playbook,
+                IntervalTrigger(
+                    seconds=settings.TRADING_PLAYBOOK_MONITOR_INTERVAL_SECONDS,
+                    timezone=CN_TZ,
+                ),
+                "trading_playbook_monitor",
+                "交易作战手册盘中监控",
+                self._calendar_misfire_seconds(),
+            ),
+        )
+        for func, trigger, job_id, name, misfire_seconds in jobs:
+            self.scheduler.add_job(
+                func,
+                trigger,
+                id=job_id,
+                name=name,
+                max_instances=1,
+                misfire_grace_time=misfire_seconds,
+                coalesce=True,
+            )
+        self.scheduler.add_job(
+            self._run_trading_playbook_catchup,
+            DateTrigger(
+                run_date=datetime.now(CN_TZ) + timedelta(seconds=6),
+                timezone=CN_TZ,
+            ),
+            id="trading_playbook_startup_catchup",
+            name="交易作战手册启动补跑",
+            max_instances=1,
+            replace_existing=True,
+            misfire_grace_time=60,
+            coalesce=True,
+        )
+
+    def _register_trading_playbook_obsidian_jobs(self) -> None:
+        self.scheduler.add_job(
+            self._reconcile_trading_playbook_obsidian,
+            IntervalTrigger(seconds=60, timezone=CN_TZ),
+            id="trading_playbook_obsidian_reconcile",
+            name="交易作战手册 Obsidian 补偿同步",
+            max_instances=1,
+            coalesce=True,
+        )
+        self.scheduler.add_job(
+            self._startup_reconcile_trading_playbook_obsidian,
+            DateTrigger(
+                run_date=self._playbook_now() + timedelta(seconds=7),
+                timezone=CN_TZ,
+            ),
+            id="trading_playbook_obsidian_startup_reconcile",
+            name="交易作战手册 Obsidian 启动恢复",
+            max_instances=1,
+            replace_existing=True,
+            misfire_grace_time=60,
+            coalesce=True,
+        )
     
     def stop(self):
         """停止调度器"""
-        if self._is_running:
-            self.scheduler.shutdown()
-            self._is_running = False
+        was_running = self._is_running or self._scheduler_is_running(
+            self.scheduler
+        )
+        self._replace_scheduler()
+        if was_running:
             logger.info("DataScheduler stopped")
+
+    @staticmethod
+    def _scheduler_is_running(scheduler: Any) -> bool:
+        try:
+            return bool(getattr(scheduler, "running", False))
+        except Exception:
+            return False
+
+    def _replace_scheduler(self) -> None:
+        scheduler = self.scheduler
+        remove_all_jobs = getattr(scheduler, "remove_all_jobs", None)
+        if callable(remove_all_jobs):
+            try:
+                remove_all_jobs()
+            except Exception as exc:
+                logger.warning("Unable to clear scheduler jobs: {}", exc)
+        if self._is_running or self._scheduler_is_running(scheduler):
+            shutdown = getattr(scheduler, "shutdown", None)
+            if callable(shutdown):
+                try:
+                    shutdown()
+                except Exception as exc:
+                    logger.warning("Unable to shutdown scheduler: {}", exc)
+        self._is_running = False
+        self.scheduler = self._scheduler_factory()
+
+    def install_trading_playbook_orchestrator(self, orchestrator: Any) -> None:
+        if not callable(getattr(orchestrator, "build_stage", None)):
+            raise TypeError("orchestrator must provide build_stage")
+        self._trading_playbook_orchestrator = orchestrator
+
+    def install_trading_playbook_alert_service(self, service: Any) -> None:
+        if getattr(service, "durable_delivery", None) is not True:
+            raise TypeError(
+                "alert service must declare durable_delivery=True"
+            )
+        if not (
+            callable(getattr(service, "notify_plan_ready", None))
+            or callable(getattr(service, "monitor", None))
+        ):
+            raise TypeError(
+                "alert service must provide notify_plan_ready or monitor"
+            )
+        self._trading_playbook_alert_service = service
+
+    def install_trading_playbook_review_service(self, service: Any) -> None:
+        if not callable(getattr(service, "build", None)):
+            raise TypeError("review service must provide build")
+        self._trading_playbook_review_service = service
+
+    def install_trading_playbook_obsidian_sync(self, coordinator: Any) -> None:
+        required = (
+            "enqueue_stage",
+            "reconcile_committed_facts",
+            "process_due",
+            "startup_reconcile",
+        )
+        if any(not callable(getattr(coordinator, name, None)) for name in required):
+            raise TypeError(
+                "Obsidian coordinator must provide enqueue_stage, "
+                "reconcile_committed_facts, process_due, and startup_reconcile"
+            )
+        self._trading_playbook_obsidian_sync = coordinator
+        self._trading_playbook_obsidian_rules_enqueued = False
+
+    def reset_trading_playbook_services(self) -> None:
+        self._trading_playbook_orchestrator = None
+        self._trading_playbook_alert_service = None
+        self._trading_playbook_review_service = None
+        self._trading_playbook_obsidian_sync = None
+        self._trading_playbook_obsidian_rules_enqueued = False
+
+    def get_trading_playbook_orchestrator(self) -> Any:
+        return self._trading_playbook_orchestrator
+
+    def _playbook_sessions(self):
+        if self._playbook_session_factory is not None:
+            return self._playbook_session_factory()
+        from app.database import async_session_maker
+
+        return async_session_maker()
+
+    def _playbook_now(self) -> datetime:
+        value = self._playbook_now_provider()
+        if not isinstance(value, datetime):
+            raise TypeError("trading playbook clock must return a datetime")
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("trading playbook clock must be timezone-aware")
+        return value.astimezone(CN_TZ)
+
+    @staticmethod
+    def _calendar_misfire_seconds() -> int:
+        return max(settings.TRADING_PLAYBOOK_MONITOR_INTERVAL_SECONDS * 3, 15)
+
+    async def _ensure_playbook_calendar(self, value: date) -> bool:
+        await self._playbook_calendar.ensure_date(value)
+        return self._is_cn_trading_day(value)
+
+    def _is_cn_trading_day(self, value: date) -> bool:
+        return self._playbook_calendar.is_trading_day(value)
+
+    def _next_cn_trading_date(self, value: date) -> date:
+        return self._playbook_calendar.next_trade_date(value)
+
+    def get_trading_calendar_service(self) -> TradingCalendarService:
+        return self._playbook_calendar
+
+    @staticmethod
+    def _persisted_entity_ids(result: Any) -> tuple[int, ...]:
+        """Extract only top-level persisted IDs from dict/ORM/list results."""
+
+        if isinstance(result, Sequence) and not isinstance(
+            result,
+            (str, bytes, bytearray),
+        ):
+            values = result
+        else:
+            values = (result,)
+        entity_ids: list[int] = []
+        for value in values:
+            raw_id = (
+                value.get("id")
+                if isinstance(value, Mapping)
+                else getattr(value, "id", None)
+            )
+            if type(raw_id) is int and raw_id > 0 and raw_id not in entity_ids:
+                entity_ids.append(raw_id)
+        return tuple(entity_ids)
+
+    @staticmethod
+    def _strict_completion_entity_ids(
+        result: Any,
+        *,
+        entity_type: str,
+    ) -> tuple[int, ...]:
+        """Validate every entity returned before recording job completion."""
+
+        if entity_type not in {"plan", "review"}:
+            raise ValueError(
+                f"unsupported completion entity type: {entity_type}"
+            )
+        is_sequence = isinstance(result, Sequence) and not isinstance(
+            result,
+            (str, bytes, bytearray),
+        )
+        if is_sequence:
+            values = tuple(result)
+            if not values:
+                if entity_type == "review":
+                    return ()
+                raise ValueError("plan build must return exactly one entity")
+        else:
+            if result is None:
+                raise ValueError(
+                    f"{entity_type} build result must not be None"
+                )
+            values = (result,)
+        if entity_type == "plan" and len(values) != 1:
+            raise ValueError("plan build must return exactly one entity")
+
+        entity_ids: list[int] = []
+        for value in values:
+            if isinstance(value, Mapping):
+                raw_id = value.get("id")
+            else:
+                raw_id = getattr(value, "id", None)
+            if type(raw_id) is not int or raw_id <= 0:
+                raise ValueError(
+                    f"{entity_type} build returned an entity without a "
+                    "positive persisted integer id"
+                )
+            if raw_id in entity_ids:
+                raise ValueError(
+                    f"{entity_type} build returned duplicate entity id {raw_id}"
+                )
+            entity_ids.append(raw_id)
+        return tuple(entity_ids)
+
+    async def _sync_trading_playbook_obsidian_after_commit(
+        self,
+        trade_date: date,
+        phase: str,
+        *,
+        plan_version_ids: Sequence[int] = (),
+        review_ids: Sequence[int] = (),
+    ) -> None:
+        coordinator = self._trading_playbook_obsidian_sync
+        if coordinator is None:
+            return
+        include_rules = not self._trading_playbook_obsidian_rules_enqueued
+        try:
+            await coordinator.enqueue_stage(
+                trade_date,
+                phase,
+                plan_version_ids=tuple(plan_version_ids),
+                review_ids=tuple(review_ids),
+                include_rules=include_rules,
+            )
+            if include_rules:
+                self._trading_playbook_obsidian_rules_enqueued = True
+            await coordinator.process_due()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(
+                "Trading playbook Obsidian sync failed for {} {}: {}",
+                trade_date,
+                phase,
+                exc,
+            )
+
+    async def _reconcile_trading_playbook_obsidian(self) -> None:
+        coordinator = self._trading_playbook_obsidian_sync
+        if coordinator is None:
+            return
+        try:
+            await coordinator.reconcile_committed_facts()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(
+                "Trading playbook Obsidian fact compensation failed: {}",
+                exc,
+            )
+        try:
+            await coordinator.process_due()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("Trading playbook Obsidian retry failed: {}", exc)
+
+    async def _startup_reconcile_trading_playbook_obsidian(self) -> None:
+        coordinator = self._trading_playbook_obsidian_sync
+        if coordinator is None:
+            return
+        try:
+            await coordinator.startup_reconcile()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("Trading playbook Obsidian startup recovery failed: {}", exc)
+
+    async def _build_trading_playbook_plan(
+        self,
+        stage: str,
+        *,
+        degraded: bool = False,
+        degradation_reason: Optional[str] = None,
+        send_notifications: bool = True,
+    ):
+        now = self._playbook_now()
+        source_trade_date = now.date()
+        if not await self._ensure_playbook_calendar(source_trade_date):
+            logger.info(
+                "Skipping trading playbook {} because {} is not a China trading day",
+                stage,
+                source_trade_date,
+            )
+            return None
+        orchestrator = self._trading_playbook_orchestrator
+        if orchestrator is None:
+            logger.warning(
+                "Skipping trading playbook {} because orchestrator is not installed",
+                stage,
+            )
+            return None
+        target_trade_date = (
+            self._next_cn_trading_date(source_trade_date)
+            if stage in {"preclose", "after_close"}
+            else source_trade_date
+        )
+        generation_key = degradation_reason or (
+            "forced" if degraded else "ready"
+        )
+        job_key = (
+            f"playbook:build:{source_trade_date}:{target_trade_date}:"
+            f"{stage}:{generation_key}"
+        )
+        async with self._playbook_sessions() as db:
+            token = await self._playbook_job_claims.claim(
+                db,
+                job_key=job_key,
+                job_type="stage",
+                phase="build",
+                owner=self._playbook_claim_owner,
+                now=self._claim_now(),
+                source_trade_date=source_trade_date,
+                target_trade_date=target_trade_date,
+                stage=stage,
+                generation_key=generation_key,
+            )
+            if token is None:
+                claim_status = await self._playbook_job_claims.get_status(
+                    db,
+                    job_key,
+                )
+                if claim_status != "completed":
+                    return None
+                mapped_plan_ids = (
+                    await self._playbook_job_claims.get_completed_result_ids(
+                        db,
+                        job_key,
+                        "plan",
+                    )
+                )
+                if mapped_plan_ids is None:
+                    return None
+                plan = await self._validated_plan_result_in_session(
+                    db,
+                    mapped_plan_ids,
+                    source_trade_date=source_trade_date,
+                    target_trade_date=target_trade_date,
+                    stage=stage,
+                )
+                if plan is None:
+                    return None
+            else:
+                try:
+                    build_kwargs = {"degraded": degraded}
+                    if degradation_reason is not None:
+                        build_kwargs["degradation_reason"] = degradation_reason
+                    plan = await self._run_with_playbook_claim(
+                        token,
+                        lambda: orchestrator.build_stage(
+                            db,
+                            source_trade_date,
+                            stage,
+                            now,
+                            **build_kwargs,
+                        ),
+                    )
+                except asyncio.CancelledError as exc:
+                    await self._rollback_playbook_session(db)
+                    await self._fail_playbook_claim_fresh(token, exc)
+                    raise
+                except Exception as exc:
+                    await self._rollback_playbook_session(db)
+                    await self._fail_playbook_claim_fresh(token, exc)
+                    if isinstance(exc, TradingPlaybookClaimLost):
+                        logger.error("{}", exc)
+                        return None
+                    raise
+                try:
+                    plan_ids = self._strict_completion_entity_ids(
+                        plan,
+                        entity_type="plan",
+                    )
+                    persisted_plan = await self._validated_plan_result_in_session(
+                        db,
+                        plan_ids,
+                        source_trade_date=source_trade_date,
+                        target_trade_date=target_trade_date,
+                        stage=stage,
+                    )
+                    if persisted_plan is None:
+                        raise ValueError(
+                            "trading playbook build did not persist exactly one "
+                            "matching plan"
+                        )
+                    plan = persisted_plan
+                    completed = await self._playbook_job_claims.complete(
+                        db,
+                        token,
+                        now=self._claim_now(),
+                        result_entity_type="plan",
+                        result_entity_ids=plan_ids,
+                    )
+                except asyncio.CancelledError as exc:
+                    await self._rollback_playbook_session(db)
+                    await self._fail_playbook_claim_fresh(token, exc)
+                    raise
+                except Exception as exc:
+                    await self._rollback_playbook_session(db)
+                    await self._fail_playbook_claim_fresh(token, exc)
+                    logger.error(
+                        "Trading playbook build result validation failed: {}",
+                        exc,
+                    )
+                    return None
+                if not completed:
+                    logger.error("Trading playbook build claim lost before completion")
+                    return None
+        plan_ids = self._persisted_entity_ids(plan)
+        if plan_ids:
+            await self._sync_trading_playbook_obsidian_after_commit(
+                source_trade_date,
+                stage,
+                plan_version_ids=plan_ids,
+            )
+        if send_notifications and plan is not None:
+            await self._notify_trading_playbook_plan(plan)
+        return plan
+
+    def _claim_now(self) -> datetime:
+        return self._playbook_now().replace(tzinfo=None)
+
+    @staticmethod
+    async def _rollback_playbook_session(db) -> None:
+        try:
+            await db.rollback()
+        except Exception as exc:
+            logger.error("Trading playbook session rollback failed: {}", exc)
+
+    async def _fail_playbook_claim_fresh(self, token, error) -> bool:
+        """Mark retry without relying on a possibly broken business session."""
+        try:
+            async with self._playbook_sessions() as fail_db:
+                return await self._playbook_job_claims.fail(
+                    fail_db,
+                    token,
+                    now=self._claim_now(),
+                    error=error,
+                )
+        except Exception as fail_error:
+            logger.error(
+                "Trading playbook fresh claim failure update failed for {}: {}",
+                token.job_key,
+                fail_error,
+            )
+            return False
+
+    async def _run_with_playbook_claim(self, token, operation):
+        """Run work behind a renewable lease and cancel immediately if fenced."""
+        interval = max(
+            min(float(self._playbook_job_claims.lease_seconds) / 3.0, 30.0),
+            0.05,
+        )
+        work_task = asyncio.create_task(operation())
+
+        async def heartbeat():
+            while True:
+                await asyncio.sleep(interval)
+                async with self._playbook_sessions() as heartbeat_db:
+                    renewed = await self._playbook_job_claims.renew(
+                        heartbeat_db,
+                        token,
+                        now=self._claim_now(),
+                    )
+                if not renewed:
+                    raise TradingPlaybookClaimLost(
+                        f"playbook claim lost: {token.job_key}"
+                    )
+
+        heartbeat_task = asyncio.create_task(heartbeat())
+        try:
+            done, _pending = await asyncio.wait(
+                {work_task, heartbeat_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if heartbeat_task in done:
+                error = heartbeat_task.exception()
+                work_task.cancel()
+                await asyncio.gather(work_task, return_exceptions=True)
+                raise error or TradingPlaybookClaimLost(
+                    f"playbook claim heartbeat stopped: {token.job_key}"
+                )
+            result = await work_task
+            heartbeat_task.cancel()
+            await asyncio.gather(heartbeat_task, return_exceptions=True)
+            async with self._playbook_sessions() as fence_db:
+                fenced = await self._playbook_job_claims.renew(
+                    fence_db,
+                    token,
+                    now=self._claim_now(),
+                )
+            if not fenced:
+                raise TradingPlaybookClaimLost(
+                    f"playbook claim lost before completion: {token.job_key}"
+                )
+            return result
+        finally:
+            for task in (work_task, heartbeat_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                work_task,
+                heartbeat_task,
+                return_exceptions=True,
+            )
+
+    @staticmethod
+    def _plan_value(plan: Any, key: str) -> Any:
+        if isinstance(plan, dict):
+            return plan.get(key)
+        return getattr(plan, key, None)
+
+    @staticmethod
+    def _coerce_date(value: Any, field_name: str) -> date:
+        if isinstance(value, datetime):
+            return value.date()
+        if type(value) is date:
+            return value
+        if isinstance(value, str):
+            try:
+                return date.fromisoformat(value.strip())
+            except ValueError as exc:
+                raise ValueError(f"invalid {field_name}: {value!r}") from exc
+        raise ValueError(f"invalid {field_name}: {value!r}")
+
+    @staticmethod
+    async def _validated_plan_result_in_session(
+        db,
+        plan_version_ids: Sequence[int],
+        *,
+        source_trade_date: date,
+        target_trade_date: date,
+        stage: str,
+    ):
+        from sqlalchemy import select
+        from app.models.trading_playbook import TradingPlanVersion
+
+        normalized_ids = tuple(
+            sorted(
+                {
+                    value
+                    for value in plan_version_ids
+                    if type(value) is int and value > 0
+                }
+            )
+        )
+        if len(normalized_ids) != 1:
+            return None
+        rows = list(
+            (
+                await db.scalars(
+                    select(TradingPlanVersion).where(
+                        TradingPlanVersion.id.in_(normalized_ids),
+                        TradingPlanVersion.source_trade_date
+                        == source_trade_date,
+                        TradingPlanVersion.target_trade_date
+                        == target_trade_date,
+                        TradingPlanVersion.stage == stage,
+                    )
+                )
+            ).all()
+        )
+        return rows[0] if len(rows) == 1 else None
+
+    @staticmethod
+    async def _validated_review_result_ids_in_session(
+        db,
+        review_ids: Sequence[int],
+        review_date: date,
+        *,
+        finalized: bool,
+        plan_version_id: Optional[int] = None,
+    ) -> tuple[int, ...]:
+        from sqlalchemy import select
+        from app.models.trading_playbook import (
+            TradingExecutionReview,
+            TradingExecutionReviewPhaseSnapshot,
+        )
+
+        normalized_ids = tuple(
+            sorted(
+                {
+                    value
+                    for value in review_ids
+                    if type(value) is int and value > 0
+                }
+            )
+        )
+        if not normalized_ids:
+            return ()
+        phase = "final_review" if finalized else "initial_review"
+        snapshot_statement = select(
+            TradingExecutionReviewPhaseSnapshot.review_id,
+            TradingExecutionReviewPhaseSnapshot.trade_date,
+            TradingExecutionReviewPhaseSnapshot.plan_version_id,
+        ).where(
+            TradingExecutionReviewPhaseSnapshot.review_id.in_(normalized_ids),
+            TradingExecutionReviewPhaseSnapshot.phase == phase,
+        )
+        snapshot_rows = tuple((await db.execute(snapshot_statement)).all())
+        snapshot_ids = {int(row.review_id) for row in snapshot_rows}
+        matched_ids = {
+            int(row.review_id)
+            for row in snapshot_rows
+            if row.trade_date == review_date
+            and (
+                plan_version_id is None
+                or row.plan_version_id == plan_version_id
+            )
+        }
+        legacy_ids = tuple(
+            review_id
+            for review_id in normalized_ids
+            if review_id not in snapshot_ids
+        )
+        statement = select(TradingExecutionReview.id).where(
+            TradingExecutionReview.id.in_(legacy_ids),
+            TradingExecutionReview.trade_date == review_date,
+            (
+                TradingExecutionReview.finalized_at.is_not(None)
+                if finalized
+                else TradingExecutionReview.finalized_at.is_(None)
+            ),
+        )
+        if type(plan_version_id) is int and plan_version_id > 0:
+            statement = statement.where(
+                TradingExecutionReview.plan_version_id == plan_version_id
+            )
+        if legacy_ids:
+            values = await db.scalars(
+                statement.order_by(TradingExecutionReview.id)
+            )
+            matched_ids.update(int(review_id) for review_id in values.all())
+        persisted_ids = tuple(sorted(matched_ids))
+        return persisted_ids if persisted_ids == normalized_ids else ()
+
+    async def _notify_trading_playbook_plan(self, plan: Any):
+        service = self._trading_playbook_alert_service
+        notify = getattr(service, "notify_plan_ready", None)
+        if not callable(notify):
+            return None
+        plan_id = self._plan_value(plan, "id")
+        if not isinstance(plan_id, int):
+            logger.error("Skipping playbook notification without plan id")
+            return None
+        raw_source_date = self._plan_value(plan, "source_trade_date")
+        raw_target_date = self._plan_value(plan, "target_trade_date")
+        date_error = None
+        try:
+            source_trade_date = (
+                self._coerce_date(raw_source_date, "source_trade_date")
+                if raw_source_date is not None
+                else None
+            )
+            target_trade_date = (
+                self._coerce_date(raw_target_date, "target_trade_date")
+                if raw_target_date is not None
+                else None
+            )
+        except ValueError as exc:
+            source_trade_date = None
+            target_trade_date = None
+            date_error = exc
+        async with self._playbook_sessions() as db:
+            claim_kwargs = {
+                "job_key": f"playbook:notify:plan:{plan_id}",
+                "job_type": "plan",
+                "phase": "notify",
+                "owner": self._playbook_claim_owner,
+                "now": self._claim_now(),
+                "source_trade_date": source_trade_date,
+                "target_trade_date": target_trade_date,
+                "stage": self._plan_value(plan, "stage"),
+                "generation_key": str(plan_id),
+            }
+            try:
+                token = await self._playbook_job_claims.claim(db, **claim_kwargs)
+            except Exception as claim_error:
+                await db.rollback()
+                logger.error(
+                    "Trading playbook notification claim failed: {}",
+                    claim_error,
+                )
+                # A second metadata-free attempt preserves a retry marker when
+                # optional payload fields caused the original claim failure.
+                claim_kwargs["source_trade_date"] = None
+                claim_kwargs["target_trade_date"] = None
+                try:
+                    token = await self._playbook_job_claims.claim(
+                        db,
+                        **claim_kwargs,
+                    )
+                except Exception:
+                    return None
+                if token is not None:
+                    await self._fail_playbook_claim_fresh(
+                        token,
+                        claim_error,
+                    )
+                return None
+            if token is None:
+                return None
+            if date_error is not None:
+                await self._fail_playbook_claim_fresh(token, date_error)
+                logger.error("Trading playbook notification payload invalid: {}", date_error)
+                return None
+            try:
+                result = await self._run_with_playbook_claim(
+                    token,
+                    lambda: notify(db, plan, send=True),
+                )
+            except asyncio.CancelledError as exc:
+                await self._rollback_playbook_session(db)
+                await self._fail_playbook_claim_fresh(token, exc)
+                raise
+            except Exception as exc:
+                await self._rollback_playbook_session(db)
+                await self._fail_playbook_claim_fresh(token, exc)
+                logger.error("Trading playbook notification failed: {}", exc)
+                return None
+            completed = await self._playbook_job_claims.complete(
+                db,
+                token,
+                now=self._claim_now(),
+            )
+            return result if completed else None
+
+    async def _build_trading_playbook_preclose(self):
+        return await self._build_trading_playbook_plan("preclose")
+
+    async def _build_trading_playbook_overnight(self):
+        return await self._build_trading_playbook_plan("overnight")
+
+    async def _build_trading_playbook_auction(self):
+        return await self._build_trading_playbook_plan("auction")
+
+    async def _review_trading_playbook(self):
+        now = self._playbook_now()
+        if not await self._ensure_playbook_calendar(now.date()):
+            logger.info("Skipping trading playbook review on non-trading day")
+            return None
+        return await self._run_trading_playbook_review_phase(
+            now.date(),
+            finalized=False,
+        )
+
+    async def _finalize_trading_playbook_review(
+        self,
+        trade_date: Optional[date] = None,
+        plan_version_id: Optional[int] = None,
+    ):
+        now = self._playbook_now()
+        review_date = trade_date or now.date()
+        if not await self._ensure_playbook_calendar(review_date):
+            logger.info("Skipping trading playbook final review on non-trading day")
+            return None
+        service = self._trading_playbook_review_service
+        if not callable(getattr(service, "build", None)):
+            logger.info("Trading playbook review service is not installed")
+            return None
+        return await self._run_trading_playbook_review_phase(
+            review_date,
+            finalized=True,
+            plan_version_id=plan_version_id,
+        )
+
+    async def _run_trading_playbook_review_phase(
+        self,
+        review_date: date,
+        *,
+        finalized: bool,
+        plan_version_id: Optional[int] = None,
+    ):
+        service = self._trading_playbook_review_service
+        build = getattr(service, "build", None)
+        if not callable(build):
+            logger.info("Trading playbook review service is not installed")
+            return None
+        phase = "finalize" if finalized else "initial_review"
+        result = None
+        review_ids: tuple[int, ...] = ()
+        async with self._playbook_sessions() as db:
+            generation = getattr(service, "generation_key", None)
+            if callable(generation):
+                generation_key = await generation(
+                    db,
+                    review_date,
+                    plan_version_id=plan_version_id,
+                )
+                if (
+                    not isinstance(generation_key, str)
+                    or not generation_key
+                    or len(generation_key) > 120
+                ):
+                    raise ValueError(
+                        "review generation key must contain 1 to 120 characters"
+                    )
+            else:
+                selection = (
+                    plan_version_id
+                    if plan_version_id is not None
+                    else "all"
+                )
+                generation_key = f"legacy:{review_date.isoformat()}:{selection}"
+            job_key = f"playbook:{phase}:{review_date}:{generation_key}"
+            token = await self._playbook_job_claims.claim(
+                db,
+                job_key=job_key,
+                job_type="review",
+                phase=phase,
+                owner=self._playbook_claim_owner,
+                now=self._claim_now(),
+                source_trade_date=review_date,
+                generation_key=generation_key,
+            )
+            if token is None:
+                claim_status = await self._playbook_job_claims.get_status(
+                    db,
+                    job_key,
+                )
+                if claim_status != "completed":
+                    return None
+                mapped_review_ids = (
+                    await self._playbook_job_claims.get_completed_result_ids(
+                        db,
+                        job_key,
+                        "review",
+                    )
+                )
+                if mapped_review_ids is None:
+                    return None
+                if mapped_review_ids:
+                    review_ids = (
+                        await self._validated_review_result_ids_in_session(
+                            db,
+                            mapped_review_ids,
+                            review_date,
+                            finalized=finalized,
+                            plan_version_id=plan_version_id,
+                        )
+                    )
+                    if not review_ids:
+                        return None
+            else:
+                try:
+                    build_kwargs = {"finalized": finalized}
+                    if plan_version_id is not None:
+                        build_kwargs["plan_version_id"] = plan_version_id
+                    result = await self._run_with_playbook_claim(
+                        token,
+                        lambda: build(db, review_date, **build_kwargs),
+                    )
+                except asyncio.CancelledError as exc:
+                    await self._rollback_playbook_session(db)
+                    await self._fail_playbook_claim_fresh(token, exc)
+                    raise
+                except Exception as exc:
+                    await self._rollback_playbook_session(db)
+                    await self._fail_playbook_claim_fresh(token, exc)
+                    logger.error("Trading playbook {} failed: {}", phase, exc)
+                    return None
+                try:
+                    built_review_ids = self._strict_completion_entity_ids(
+                        result,
+                        entity_type="review",
+                    )
+                    if built_review_ids:
+                        review_ids = (
+                            await self._validated_review_result_ids_in_session(
+                                db,
+                                built_review_ids,
+                                review_date,
+                                finalized=finalized,
+                                plan_version_id=plan_version_id,
+                            )
+                        )
+                        if not review_ids:
+                            raise ValueError(
+                                "trading playbook review returned non-persisted "
+                                "or mismatched results"
+                            )
+                    completed = await self._playbook_job_claims.complete(
+                        db,
+                        token,
+                        now=self._claim_now(),
+                        result_entity_type="review",
+                        result_entity_ids=review_ids,
+                    )
+                except asyncio.CancelledError as exc:
+                    await self._rollback_playbook_session(db)
+                    await self._fail_playbook_claim_fresh(token, exc)
+                    raise
+                except Exception as exc:
+                    await self._rollback_playbook_session(db)
+                    await self._fail_playbook_claim_fresh(token, exc)
+                    logger.error(
+                        "Trading playbook {} result validation failed: {}",
+                        phase,
+                        exc,
+                    )
+                    return None
+                if not completed:
+                    return None
+        await self._sync_trading_playbook_obsidian_after_commit(
+            review_date,
+            "final_review" if finalized else "initial_review",
+            review_ids=review_ids,
+        )
+        return result
+
+    async def _monitor_trading_playbook(self):
+        now = self._playbook_now()
+        monitor_result = None
+        service = self._trading_playbook_alert_service
+        monitor = getattr(service, "monitor", None)
+        if callable(monitor):
+            try:
+                async with self._playbook_sessions() as db:
+                    monitor_result = await monitor(db, now)
+            except Exception as exc:
+                logger.error("Trading playbook alert monitor failed: {}", exc)
+        else:
+            logger.debug("Trading playbook alert monitor is not installed")
+        next_trade_date = None
+        notification_earliest_date = now.date()
+        notification_latest_date = None
+        try:
+            if not await self._ensure_playbook_calendar(now.date()):
+                return monitor_result
+            next_trade_date = self._next_cn_trading_date(now.date())
+            notification_earliest_date = now.date()
+            notification_latest_date = next_trade_date
+        except Exception as exc:
+            logger.error("Trading playbook calendar refresh failed: {}", exc)
+        try:
+            await self._upgrade_forced_trading_playbook_after_close(
+                send_notifications=True,
+                trade_date=now.date(),
+                next_trade_date=next_trade_date,
+            )
+        except Exception as exc:
+            logger.error(
+                "Trading playbook forced after-close upgrade failed: {}",
+                exc,
+            )
+        try:
+            await self._retry_incomplete_playbook_notifications(
+                notification_earliest_date,
+                notification_latest_date,
+            )
+        except Exception as exc:
+            logger.error(
+                "Trading playbook notification compensation failed: {}",
+                exc,
+            )
+        try:
+            await self._compensate_trading_playbook_phases(
+                now.date(),
+                next_trade_date,
+                send_notifications=True,
+            )
+        except Exception as exc:
+            logger.error("Trading playbook phase compensation failed: {}", exc)
+        return monitor_result
+
+    async def _retry_incomplete_playbook_notifications(
+        self,
+        earliest_target_date: Optional[date],
+        latest_target_date: Optional[date],
+    ) -> None:
+        service = self._trading_playbook_alert_service
+        if not callable(getattr(service, "notify_plan_ready", None)):
+            return
+        from sqlalchemy import or_, select, update
+        from app.models.trading_playbook import (
+            TradingPlanVersion,
+            TradingPlaybookJobClaim,
+        )
+
+        now = self._claim_now()
+        effective_earliest_target_date = (
+            earliest_target_date or self._playbook_now().date()
+        )
+        async with self._playbook_sessions() as db:
+            claims = list(
+                (
+                    await db.execute(
+                        select(TradingPlaybookJobClaim)
+                        .where(
+                            TradingPlaybookJobClaim.job_type == "plan",
+                            TradingPlaybookJobClaim.phase == "notify",
+                            TradingPlaybookJobClaim.status != "completed",
+                            or_(
+                                TradingPlaybookJobClaim.status == "retry",
+                                TradingPlaybookJobClaim.lease_expires_at.is_(None),
+                                TradingPlaybookJobClaim.lease_expires_at <= now,
+                            ),
+                        )
+                        .order_by(
+                            TradingPlaybookJobClaim.updated_at.asc(),
+                            TradingPlaybookJobClaim.id.asc(),
+                        )
+                        .limit(_PLAYBOOK_NOTIFICATION_RETRY_BATCH_SIZE)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            if not claims:
+                return
+            plan_id_by_claim_id = {}
+            plan_ids = set()
+            retirement_reason_by_claim_id = {}
+            for claim in claims:
+                try:
+                    plan_id = int(claim.generation_key)
+                except (TypeError, ValueError):
+                    retirement_reason_by_claim_id[claim.id] = (
+                        "invalid generation key"
+                    )
+                    continue
+                if plan_id < 1:
+                    retirement_reason_by_claim_id[claim.id] = (
+                        "invalid generation key"
+                    )
+                    continue
+                plan_id_by_claim_id[claim.id] = plan_id
+                plan_ids.add(plan_id)
+            plans = []
+            if plan_ids:
+                plans = list(
+                    (
+                        await db.execute(
+                            select(TradingPlanVersion).where(
+                                TradingPlanVersion.id.in_(plan_ids)
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+            plan_by_id = {plan.id: plan for plan in plans}
+            eligible_plans = []
+            deferred_claim_ids = set()
+            for claim in claims:
+                if claim.id in retirement_reason_by_claim_id:
+                    continue
+                plan = plan_by_id.get(plan_id_by_claim_id[claim.id])
+                if plan is None:
+                    retirement_reason_by_claim_id[claim.id] = "plan missing"
+                    continue
+                if plan.status not in ("draft", "confirmed", "active"):
+                    retirement_reason_by_claim_id[claim.id] = (
+                        f"plan status {plan.status!r} is not notifiable"
+                    )
+                    continue
+                if plan.target_trade_date < effective_earliest_target_date:
+                    retirement_reason_by_claim_id[claim.id] = (
+                        "stale target date "
+                        f"{plan.target_trade_date.isoformat()} before "
+                        f"{effective_earliest_target_date.isoformat()}"
+                    )
+                    continue
+                if (
+                    latest_target_date is not None
+                    and plan.target_trade_date > latest_target_date
+                ):
+                    deferred_claim_ids.add(claim.id)
+                    continue
+                eligible_plans.append(plan)
+
+            for claim in claims:
+                reason = retirement_reason_by_claim_id.get(claim.id)
+                values = None
+                if reason is not None:
+                    values = {
+                        "status": "completed",
+                        "completed_at": now,
+                        "lease_expires_at": None,
+                        "last_error": (
+                            f"notification retry retired: {reason}"
+                        )[:2000],
+                        "updated_at": now,
+                    }
+                elif claim.id in deferred_claim_ids:
+                    values = {
+                        "status": "retry",
+                        "lease_expires_at": now,
+                        "last_error": (
+                            "notification retry deferred: target date "
+                            "outside current window"
+                        ),
+                        "updated_at": now,
+                    }
+                if values is None:
+                    continue
+                await db.execute(
+                    update(TradingPlaybookJobClaim)
+                    .where(
+                        TradingPlaybookJobClaim.id == claim.id,
+                        TradingPlaybookJobClaim.status == claim.status,
+                        TradingPlaybookJobClaim.owner == claim.owner,
+                        TradingPlaybookJobClaim.attempt_no == claim.attempt_no,
+                        TradingPlaybookJobClaim.updated_at == claim.updated_at,
+                        TradingPlaybookJobClaim.status != "completed",
+                    )
+                    .values(**values)
+                )
+            await db.commit()
+        for plan in eligible_plans:
+            await self._notify_trading_playbook_plan(plan)
+
+    async def _compensate_trading_playbook_phases(
+        self,
+        trade_date: date,
+        next_trade_date: date,
+        *,
+        send_notifications: bool,
+    ) -> None:
+        if self._playbook_now().time().replace(tzinfo=None) < time(15, 30):
+            return
+        plan = await self._latest_relevant_after_close_plan(
+            trade_date,
+            next_trade_date,
+        )
+        if plan is None:
+            return
+        if send_notifications:
+            await self._notify_trading_playbook_plan(plan)
+        await self._finalize_trading_playbook_review(
+            trade_date,
+        )
+
+    async def _latest_relevant_after_close_plan(
+        self,
+        trade_date: date,
+        next_trade_date: Optional[date] = None,
+    ):
+        from sqlalchemy import select
+        from app.models.trading_playbook import TradingPlanVersion
+
+        if next_trade_date is None:
+            if not await self._ensure_playbook_calendar(trade_date):
+                return None
+            next_trade_date = self._next_cn_trading_date(trade_date)
+        target_trade_date = next_trade_date
+        async with self._playbook_sessions() as db:
+            result = await db.execute(
+                select(TradingPlanVersion)
+                .where(
+                    TradingPlanVersion.stage == "after_close",
+                    TradingPlanVersion.source_trade_date == trade_date,
+                    TradingPlanVersion.target_trade_date == target_trade_date,
+                )
+                .order_by(
+                    TradingPlanVersion.version_no.desc(),
+                    TradingPlanVersion.id.desc(),
+                )
+                .limit(1)
+            )
+            return result.scalar_one_or_none()
+
+    @staticmethod
+    def _is_forced_degraded_plan(plan: Any) -> bool:
+        quality = getattr(plan, "data_quality_json", None)
+        if not isinstance(quality, dict):
+            return False
+        if "forced_degraded" in quality:
+            return quality.get("forced_degraded") is True
+        warnings = quality.get("warnings")
+        if not isinstance(warnings, (list, tuple)):
+            return False
+        return "force_degraded requested" in warnings
+
+    async def _upgrade_forced_trading_playbook_after_close(
+        self,
+        *,
+        send_notifications: bool,
+        trade_date: Optional[date] = None,
+        next_trade_date: Optional[date] = None,
+    ):
+        now = self._playbook_now()
+        current_time = now.time().replace(tzinfo=None)
+        if current_time < time(15, 30):
+            return None
+        source_trade_date = trade_date or now.date()
+        target_trade_date = next_trade_date
+        if target_trade_date is None:
+            if not await self._ensure_playbook_calendar(source_trade_date):
+                return None
+            target_trade_date = self._next_cn_trading_date(source_trade_date)
+        orchestrator = self._trading_playbook_orchestrator
+        if orchestrator is None:
+            return None
+
+        async with self._playbook_upgrade_lock:
+            predecessor = await self._latest_relevant_after_close_plan(
+                source_trade_date,
+                target_trade_date,
+            )
+            if not self._is_forced_degraded_plan(predecessor):
+                return None
+            if not await self._trading_playbook_data_ready_once(
+                source_trade_date
+            ):
+                return None
+            plan = await self._build_trading_playbook_plan(
+                "after_close",
+                degraded=False,
+                send_notifications=send_notifications,
+            )
+            if plan is None:
+                return None
+            await self._finalize_trading_playbook_review(
+                source_trade_date,
+            )
+            return plan
+
+    async def _wait_for_trading_playbook_data(
+        self,
+        trade_date: date,
+        *,
+        timeout_seconds: float = 180,
+        poll_seconds: float = 10,
+    ) -> bool:
+        clock = self._playbook_monotonic
+        if clock is None:
+            clock = asyncio.get_running_loop().time
+        deadline = clock() + max(float(timeout_seconds), 0.0)
+        while True:
+            remaining = deadline - clock()
+            if remaining <= 0:
+                break
+            try:
+                ready = await asyncio.wait_for(
+                    self._trading_playbook_data_ready_once(trade_date),
+                    timeout=min(10.0, remaining),
+                )
+                if ready:
+                    return True
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Trading playbook data-ready poll timed out for {}",
+                    trade_date,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Trading playbook data-ready poll failed for {}: {}",
+                    trade_date,
+                    exc,
+                )
+            remaining = deadline - clock()
+            wait_seconds = min(float(poll_seconds), remaining, 10.0)
+            if wait_seconds <= 0:
+                break
+            await self._playbook_sleep(wait_seconds)
+        return False
+
+    async def _trading_playbook_data_ready_once(
+        self,
+        trade_date: date,
+    ) -> bool:
+        from sqlalchemy import select
+        from app.models.market_review import MarketReviewDailyMetric
+
+        cutoff = datetime.combine(trade_date, time(15, 0), tzinfo=CN_TZ)
+        async with self._playbook_sessions() as db:
+            result = await db.execute(
+                select(MarketReviewDailyMetric)
+                .where(MarketReviewDailyMetric.trade_date == trade_date)
+                .limit(1)
+            )
+            metric = result.scalar_one_or_none()
+        updated_at = getattr(metric, "updated_at", None)
+        if isinstance(updated_at, datetime):
+            if updated_at.tzinfo is None or updated_at.utcoffset() is None:
+                updated_at = updated_at.replace(tzinfo=CN_TZ)
+            else:
+                updated_at = updated_at.astimezone(CN_TZ)
+            if updated_at > cutoff:
+                return True
+        return False
+
+    async def _build_trading_playbook_after_close(
+        self,
+        *,
+        send_notifications: bool = True,
+    ):
+        now = self._playbook_now()
+        if not await self._ensure_playbook_calendar(now.date()):
+            logger.info("Skipping trading playbook after-close on non-trading day")
+            return None
+        ready = await self._wait_for_trading_playbook_data(now.date())
+        plan = await self._build_trading_playbook_plan(
+            "after_close",
+            degraded=not ready,
+            degradation_reason=(
+                None if ready else "after_close_barrier_timeout"
+            ),
+            send_notifications=send_notifications,
+        )
+        if plan is not None:
+            await self._finalize_trading_playbook_review()
+        return plan
+
+    async def _playbook_stage_exists(
+        self,
+        target_trade_date: date,
+        stage: str,
+    ) -> bool:
+        from sqlalchemy import select
+        from app.models.trading_playbook import TradingPlanVersion
+
+        async with self._playbook_sessions() as db:
+            result = await db.execute(
+                select(TradingPlanVersion.id)
+                .where(
+                    TradingPlanVersion.target_trade_date == target_trade_date,
+                    TradingPlanVersion.stage == stage,
+                )
+                .limit(1)
+            )
+            return result.scalar_one_or_none() is not None
+
+    async def _playbook_review_exists(
+        self,
+        trade_date: date,
+        *,
+        finalized: bool = False,
+        plan_version_id: Optional[int] = None,
+    ) -> bool:
+        from sqlalchemy import select
+        from app.models.trading_playbook import TradingExecutionReview
+
+        async with self._playbook_sessions() as db:
+            query = select(TradingExecutionReview.id).where(
+                TradingExecutionReview.trade_date == trade_date
+            )
+            if finalized:
+                query = query.where(
+                    TradingExecutionReview.finalized_at.is_not(None)
+                )
+            if isinstance(plan_version_id, int) and not finalized:
+                query = query.where(
+                    TradingExecutionReview.plan_version_id == plan_version_id
+                )
+            result = await db.execute(query.limit(1))
+            return result.scalar_one_or_none() is not None
+
+    async def _run_trading_playbook_catchup(
+        self,
+        now: Optional[datetime] = None,
+    ) -> None:
+        current = now or self._playbook_now()
+        if current.tzinfo is None or current.utcoffset() is None:
+            raise ValueError("trading playbook catch-up time must be timezone-aware")
+        current = current.astimezone(CN_TZ)
+        today = current.date()
+        if not await self._ensure_playbook_calendar(today):
+            logger.info("Skipping trading playbook catch-up on non-trading day")
+            return
+        next_trade_date = self._next_cn_trading_date(today)
+        current_time = current.time().replace(tzinfo=None)
+
+        if time(8, 50) <= current_time < time(9, 26):
+            if not await self._playbook_stage_exists(today, "overnight"):
+                await self._build_trading_playbook_plan(
+                    "overnight",
+                    send_notifications=False,
+                )
+        elif time(9, 26) <= current_time < time(15, 0):
+            if not await self._playbook_stage_exists(today, "auction"):
+                await self._build_trading_playbook_plan(
+                    "auction",
+                    degraded=True,
+                    send_notifications=False,
+                )
+
+        if time(14, 40) <= current_time < time(15, 0):
+            if not await self._playbook_stage_exists(
+                next_trade_date,
+                "preclose",
+            ):
+                await self._build_trading_playbook_plan(
+                    "preclose",
+                    send_notifications=False,
+                )
+
+        if current_time >= time(15, 10):
+            # The phase claim is the completeness gate.  One persisted row is
+            # not proof that every applicable plan review was written while
+            # the preliminary-review window is still open.  From 15:30 the
+            # final reconciliation below covers every applicable plan.
+            if (
+                current_time < time(15, 30)
+                or not await self._playbook_review_exists(today)
+            ):
+                await self._review_trading_playbook()
+        if current_time >= time(15, 30):
+            if not await self._playbook_stage_exists(
+                next_trade_date,
+                "after_close",
+            ):
+                await self._build_trading_playbook_after_close(
+                    send_notifications=False,
+                )
+        try:
+            await self._upgrade_forced_trading_playbook_after_close(
+                send_notifications=False,
+                trade_date=today,
+                next_trade_date=next_trade_date,
+            )
+        except Exception as exc:
+            logger.error(
+                "Trading playbook startup forced upgrade failed: {}",
+                exc,
+            )
+        try:
+            await self._compensate_trading_playbook_phases(
+                today,
+                next_trade_date,
+                send_notifications=False,
+            )
+        except Exception as exc:
+            logger.error(
+                "Trading playbook startup phase compensation failed: {}",
+                exc,
+            )
+        try:
+            await self._retry_incomplete_playbook_notifications(
+                today,
+                next_trade_date,
+            )
+        except Exception as exc:
+            logger.error(
+                "Trading playbook startup notification compensation failed: {}",
+                exc,
+            )
     
     async def _get_monitored_stocks(self, db) -> List[Dict]:
         """获取需要监控的股票列表（优先实时涨停池，其次数据库），带缓存"""

@@ -12,8 +12,10 @@ from __future__ import annotations
 import asyncio
 import copy
 import time
+from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 import httpx
 from loguru import logger
@@ -28,6 +30,15 @@ from app.services.tradable_market_value_service import tradable_market_value_ser
 from app.utils.market_data_sanitizer import normalize_change_pct
 
 
+@dataclass(frozen=True)
+class RealtimeLimitUpSnapshot:
+    items: List[Dict]
+    authoritative: bool
+    complete: bool
+    evidence_trade_date: Optional[date]
+    warning: Optional[str] = None
+
+
 class RealtimeLimitUpService:
     """高实时涨停数据聚合服务"""
 
@@ -35,6 +46,7 @@ class RealtimeLimitUpService:
         self._pool_cache: Dict[date, List[Dict]] = {}
         self._pool_cache_time: Dict[date, float] = {}
         self._pool_refresh_tasks: Dict[date, asyncio.Task] = {}
+        self._pool_refresh_errors: Dict[date, str] = {}
 
         self._ths_reason_cache: Dict[str, str] = {}
         self._ths_reason_cache_time: float = 0.0
@@ -73,6 +85,36 @@ class RealtimeLimitUpService:
 
         data = await self._refresh_pool_cache(trade_date)
         return copy.deepcopy(data)
+
+    async def get_fast_limit_up_snapshot(
+        self,
+        trade_date: Optional[date] = None,
+    ) -> RealtimeLimitUpSnapshot:
+        """Return pool data together with explicit completeness metadata."""
+        if trade_date is None:
+            trade_date = date.today()
+        now = time.time()
+        cached_at = self._pool_cache_time.get(trade_date, 0.0)
+        if (
+            trade_date in self._pool_cache
+            and now - cached_at < self._POOL_CACHE_TTL
+        ):
+            return RealtimeLimitUpSnapshot(
+                items=copy.deepcopy(self._pool_cache[trade_date]),
+                authoritative=True,
+                complete=True,
+                evidence_trade_date=trade_date,
+            )
+
+        data = await self._refresh_pool_cache(trade_date)
+        warning = self._pool_refresh_errors.get(trade_date)
+        return RealtimeLimitUpSnapshot(
+            items=copy.deepcopy(data),
+            authoritative=warning is None,
+            complete=warning is None,
+            evidence_trade_date=trade_date if warning is None else None,
+            warning=warning,
+        )
 
     async def get_realtime_limit_up_list(
         self,
@@ -225,10 +267,18 @@ class RealtimeLimitUpService:
 
             sealed_data = em_crawler.parse(sealed_resp.json(), is_sealed=True)
             opened_data = em_crawler.parse(opened_resp.json(), is_sealed=False)
-            merged = sealed_data + opened_data
+            collected_at = datetime.now(ZoneInfo("Asia/Shanghai"))
+            merged = []
+            for item in sealed_data + opened_data:
+                stamped = dict(item)
+                # Contract: this aware timestamp records the successful pool
+                # refresh and remains unchanged for the lifetime of the cache.
+                stamped["_collected_at"] = collected_at
+                merged.append(stamped)
 
             self._pool_cache[trade_date] = merged
             self._pool_cache_time[trade_date] = time.time()
+            self._pool_refresh_errors.pop(trade_date, None)
             self._prune_pool_cache(current_date=trade_date)
 
             logger.info(
@@ -237,6 +287,7 @@ class RealtimeLimitUpService:
             )
             return merged
         except Exception as exc:
+            self._pool_refresh_errors[trade_date] = str(exc)
             logger.warning(f"快速涨停池刷新失败，trade_date={trade_date}: {exc}")
             return self._pool_cache.get(trade_date, [])
 

@@ -1,8 +1,10 @@
 import { ref, onUnmounted } from 'vue'
 import { useAlertStore } from '@/stores/alert'
 import { useLimitUpStore } from '@/stores/limit-up'
+import { useTradingPlaybookStore } from '@/stores/trading-playbook'
 import { useSpeech } from '@/composables/useSpeech'
 import type { TdxLimitUpEvent, TdxNewsItem } from '@/types/tdx-plugins'
+import type { TradingAlertEvent } from '@/types/trading-playbook'
 
 interface WebSocketMessage {
   type: string
@@ -131,28 +133,53 @@ export function useWebSocket() {
   
   const alertStore = useAlertStore()
   const limitUpStore = useLimitUpStore()
+  const tradingPlaybookStore = useTradingPlaybookStore()
 
   let reconnectTimer: number | null = null
   let pingTimer: number | null = null
+  let shouldReconnect = true
+  let shouldRecoverAlertsOnOpen = false
 
   function connect() {
-    if (ws.value?.readyState === WebSocket.OPEN) return
+    shouldReconnect = true
+    if (reconnectTimer !== null) {
+      clearTimeout(reconnectTimer)
+      reconnectTimer = null
+    }
+
+    const currentSocket = ws.value
+    if (
+      currentSocket?.readyState === WebSocket.CONNECTING ||
+      currentSocket?.readyState === WebSocket.OPEN
+    ) return
+    if (currentSocket) {
+      ws.value = null
+      isConnected.value = false
+      stopPing()
+    }
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
     const host = window.location.host
     const wsUrl = `${protocol}//${host}/ws/realtime`
 
     try {
-      ws.value = new WebSocket(wsUrl)
+      const socket = new WebSocket(wsUrl)
+      ws.value = socket
 
-      ws.value.onopen = () => {
+      socket.onopen = () => {
+        if (ws.value !== socket) return
         console.log('WebSocket connected')
         isConnected.value = true
         reconnectAttempts.value = 0
         startPing()
+        if (shouldRecoverAlertsOnOpen) {
+          shouldRecoverAlertsOnOpen = false
+          void tradingPlaybookStore.loadAlerts(true).catch(() => {})
+        }
       }
 
-      ws.value.onmessage = (event) => {
+      socket.onmessage = (event) => {
+        if (ws.value !== socket) return
         try {
           const message: WebSocketMessage = JSON.parse(event.data)
           handleMessage(message)
@@ -161,14 +188,19 @@ export function useWebSocket() {
         }
       }
 
-      ws.value.onclose = () => {
+      socket.onclose = () => {
+        if (ws.value !== socket) return
         console.log('WebSocket disconnected')
+        ws.value = null
         isConnected.value = false
         stopPing()
+        if (!shouldReconnect) return
+        shouldRecoverAlertsOnOpen = true
         scheduleReconnect()
       }
 
-      ws.value.onerror = (error) => {
+      socket.onerror = (error) => {
+        if (ws.value !== socket) return
         console.error('WebSocket error:', error)
       }
     } catch (e) {
@@ -178,17 +210,18 @@ export function useWebSocket() {
   }
 
   function disconnect() {
-    if (reconnectTimer) {
+    shouldReconnect = false
+    shouldRecoverAlertsOnOpen = false
+    if (reconnectTimer !== null) {
       clearTimeout(reconnectTimer)
       reconnectTimer = null
     }
     stopPing()
-    
-    if (ws.value) {
-      ws.value.close()
-      ws.value = null
-    }
+
+    const socket = ws.value
+    ws.value = null
     isConnected.value = false
+    socket?.close()
   }
 
   function handleMessage(message: WebSocketMessage) {
@@ -298,6 +331,10 @@ export function useWebSocket() {
         }
         break
 
+      case 'trading_plan_alert':
+        tradingPlaybookStore.receiveAlert(message.data as TradingAlertEvent)
+        break
+
       case 'market_update':
         // 处理行情更新
         break
@@ -334,6 +371,7 @@ export function useWebSocket() {
   }
 
   function scheduleReconnect() {
+    if (!shouldReconnect || reconnectTimer !== null) return
     if (reconnectAttempts.value >= maxReconnectAttempts) {
       console.log('Max reconnect attempts reached')
       return
@@ -341,6 +379,8 @@ export function useWebSocket() {
 
     const delay = Math.min(1000 * Math.pow(2, reconnectAttempts.value), 30000)
     reconnectTimer = window.setTimeout(() => {
+      reconnectTimer = null
+      if (!shouldReconnect) return
       reconnectAttempts.value++
       connect()
     }, delay)

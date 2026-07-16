@@ -11,6 +11,13 @@ triggers_module = types.ModuleType("apscheduler.triggers")
 cron_module = types.ModuleType("apscheduler.triggers.cron")
 date_module = types.ModuleType("apscheduler.triggers.date")
 interval_module = types.ModuleType("apscheduler.triggers.interval")
+_installed_stub_modules = []
+
+
+def _install_stub(name, module):
+    if name not in sys.modules:
+        sys.modules[name] = module
+        _installed_stub_modules.append(name)
 
 
 class StubAsyncIOScheduler:
@@ -47,13 +54,16 @@ cron_module.CronTrigger = StubCronTrigger
 date_module.DateTrigger = StubDateTrigger
 interval_module.IntervalTrigger = StubIntervalTrigger
 
-sys.modules.setdefault("apscheduler", apscheduler_module)
-sys.modules.setdefault("apscheduler.schedulers", schedulers_module)
-sys.modules.setdefault("apscheduler.schedulers.asyncio", asyncio_module)
-sys.modules.setdefault("apscheduler.triggers", triggers_module)
-sys.modules.setdefault("apscheduler.triggers.cron", cron_module)
-sys.modules.setdefault("apscheduler.triggers.date", date_module)
-sys.modules.setdefault("apscheduler.triggers.interval", interval_module)
+try:
+    import apscheduler  # noqa: F401
+except ImportError:
+    _install_stub("apscheduler", apscheduler_module)
+    _install_stub("apscheduler.schedulers", schedulers_module)
+    _install_stub("apscheduler.schedulers.asyncio", asyncio_module)
+    _install_stub("apscheduler.triggers", triggers_module)
+    _install_stub("apscheduler.triggers.cron", cron_module)
+    _install_stub("apscheduler.triggers.date", date_module)
+    _install_stub("apscheduler.triggers.interval", interval_module)
 
 
 class StubShanghaiTimezone(tzinfo):
@@ -71,11 +81,26 @@ class StubShanghaiTimezone(tzinfo):
 
 pytz_module = types.ModuleType("pytz")
 pytz_module.timezone = lambda _: StubShanghaiTimezone()
-sys.modules.setdefault("pytz", pytz_module)
+try:
+    import pytz  # noqa: F401
+except ImportError:
+    _install_stub("pytz", pytz_module)
 
 from app.data_collectors.scheduler import DataScheduler, _get_cn_trading_dates
 from app.utils.time_utils import CN_TZ
 from scripts.backfill_market_review import backfill_market_review
+
+for _stub_name in reversed(_installed_stub_modules):
+    sys.modules.pop(_stub_name, None)
+
+
+def _cron_value(trigger, name):
+    if hasattr(trigger, "kwargs"):
+        return trigger.kwargs[name]
+    if name == "timezone":
+        return trigger.timezone
+    field_index = {"hour": 5, "minute": 6}[name]
+    return int(str(trigger.fields[field_index]))
 
 
 class FakeScheduler:
@@ -118,6 +143,10 @@ class MarketReviewSchedulerTests(unittest.IsolatedAsyncioTestCase):
             mock_settings.MARKET_REVIEW_REPAIR_ENABLED = True
             mock_settings.MARKET_REVIEW_REPAIR_HOUR = 20
             mock_settings.MARKET_REVIEW_REPAIR_MINUTE = 15
+            mock_settings.INTELLIGENCE_ENABLED = False
+            mock_settings.DAILY_ANALYSIS_INTRADAY_HOUR = 14
+            mock_settings.DAILY_ANALYSIS_INTRADAY_MINUTE = 50
+            mock_settings.TRADING_PLAYBOOK_ENABLED = False
 
             scheduler.start()
 
@@ -126,10 +155,23 @@ class MarketReviewSchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("market_review_build", job_ids)
         self.assertIn("market_review_repair", job_ids)
         self.assertEqual(getattr(CN_TZ, "zone", None), "Asia/Shanghai")
-        self.assertIs(jobs_by_id["market_review_build"]["trigger"].kwargs["timezone"], CN_TZ)
-        self.assertIs(jobs_by_id["market_review_repair"]["trigger"].kwargs["timezone"], CN_TZ)
+        self.assertIs(
+            _cron_value(jobs_by_id["market_review_build"]["trigger"], "timezone"),
+            CN_TZ,
+        )
+        self.assertIs(
+            _cron_value(jobs_by_id["market_review_repair"]["trigger"], "timezone"),
+            CN_TZ,
+        )
         self.assertEqual(
-            getattr(jobs_by_id["market_review_build"]["trigger"].kwargs["timezone"], "zone", None),
+            getattr(
+                _cron_value(
+                    jobs_by_id["market_review_build"]["trigger"],
+                    "timezone",
+                ),
+                "zone",
+                None,
+            ),
             "Asia/Shanghai",
         )
         self.assertIn("after_close_catchup", job_ids)
@@ -151,6 +193,7 @@ class MarketReviewSchedulerTests(unittest.IsolatedAsyncioTestCase):
             mock_settings.INTELLIGENCE_ENABLED = False
             mock_settings.DAILY_ANALYSIS_INTRADAY_HOUR = 14
             mock_settings.DAILY_ANALYSIS_INTRADAY_MINUTE = 50
+            mock_settings.TRADING_PLAYBOOK_ENABLED = False
 
             scheduler.start()
 
@@ -174,6 +217,7 @@ class MarketReviewSchedulerTests(unittest.IsolatedAsyncioTestCase):
             mock_settings.INTELLIGENCE_ENABLED = False
             mock_settings.DAILY_ANALYSIS_INTRADAY_HOUR = 14
             mock_settings.DAILY_ANALYSIS_INTRADAY_MINUTE = 50
+            mock_settings.TRADING_PLAYBOOK_ENABLED = False
 
             scheduler.start()
 
@@ -197,6 +241,7 @@ class MarketReviewSchedulerTests(unittest.IsolatedAsyncioTestCase):
             mock_settings.INTELLIGENCE_ENABLED = False
             mock_settings.DAILY_ANALYSIS_INTRADAY_HOUR = 14
             mock_settings.DAILY_ANALYSIS_INTRADAY_MINUTE = 50
+            mock_settings.TRADING_PLAYBOOK_ENABLED = False
 
             scheduler.start()
 
@@ -204,9 +249,9 @@ class MarketReviewSchedulerTests(unittest.IsolatedAsyncioTestCase):
         job = jobs_by_id["tdx_limit_up_broadcast_refresh"]
         self.assertIs(job["func"].__self__, scheduler)
         self.assertEqual(job["func"].__name__, "_refresh_tdx_limit_up_broadcast")
-        self.assertEqual(job["trigger"].kwargs["hour"], 9)
-        self.assertEqual(job["trigger"].kwargs["minute"], 0)
-        self.assertIs(job["trigger"].kwargs["timezone"], CN_TZ)
+        self.assertEqual(_cron_value(job["trigger"], "hour"), 9)
+        self.assertEqual(_cron_value(job["trigger"], "minute"), 0)
+        self.assertIs(_cron_value(job["trigger"], "timezone"), CN_TZ)
         self.assertEqual(job["max_instances"], 1)
 
     def test_start_skips_market_review_jobs_when_disabled(self):
@@ -223,6 +268,10 @@ class MarketReviewSchedulerTests(unittest.IsolatedAsyncioTestCase):
             mock_settings.MARKET_REVIEW_REPAIR_ENABLED = True
             mock_settings.MARKET_REVIEW_REPAIR_HOUR = 20
             mock_settings.MARKET_REVIEW_REPAIR_MINUTE = 15
+            mock_settings.INTELLIGENCE_ENABLED = False
+            mock_settings.DAILY_ANALYSIS_INTRADAY_HOUR = 14
+            mock_settings.DAILY_ANALYSIS_INTRADAY_MINUTE = 50
+            mock_settings.TRADING_PLAYBOOK_ENABLED = False
 
             scheduler.start()
 
@@ -244,6 +293,10 @@ class MarketReviewSchedulerTests(unittest.IsolatedAsyncioTestCase):
             mock_settings.MARKET_REVIEW_REPAIR_ENABLED = False
             mock_settings.MARKET_REVIEW_REPAIR_HOUR = 20
             mock_settings.MARKET_REVIEW_REPAIR_MINUTE = 15
+            mock_settings.INTELLIGENCE_ENABLED = False
+            mock_settings.DAILY_ANALYSIS_INTRADAY_HOUR = 14
+            mock_settings.DAILY_ANALYSIS_INTRADAY_MINUTE = 50
+            mock_settings.TRADING_PLAYBOOK_ENABLED = False
 
             scheduler.start()
 

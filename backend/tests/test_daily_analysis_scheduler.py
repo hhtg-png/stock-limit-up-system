@@ -12,6 +12,13 @@ triggers_module = types.ModuleType("apscheduler.triggers")
 cron_module = types.ModuleType("apscheduler.triggers.cron")
 date_module = types.ModuleType("apscheduler.triggers.date")
 interval_module = types.ModuleType("apscheduler.triggers.interval")
+_installed_stub_modules = []
+
+
+def _install_stub(name, module):
+    if name not in sys.modules:
+        sys.modules[name] = module
+        _installed_stub_modules.append(name)
 
 
 class StubAsyncIOScheduler:
@@ -48,15 +55,30 @@ cron_module.CronTrigger = StubCronTrigger
 date_module.DateTrigger = StubDateTrigger
 interval_module.IntervalTrigger = StubIntervalTrigger
 
-sys.modules.setdefault("apscheduler", apscheduler_module)
-sys.modules.setdefault("apscheduler.schedulers", schedulers_module)
-sys.modules.setdefault("apscheduler.schedulers.asyncio", asyncio_module)
-sys.modules.setdefault("apscheduler.triggers", triggers_module)
-sys.modules.setdefault("apscheduler.triggers.cron", cron_module)
-sys.modules.setdefault("apscheduler.triggers.date", date_module)
-sys.modules.setdefault("apscheduler.triggers.interval", interval_module)
+try:
+    import apscheduler  # noqa: F401
+except ImportError:
+    _install_stub("apscheduler", apscheduler_module)
+    _install_stub("apscheduler.schedulers", schedulers_module)
+    _install_stub("apscheduler.schedulers.asyncio", asyncio_module)
+    _install_stub("apscheduler.triggers", triggers_module)
+    _install_stub("apscheduler.triggers.cron", cron_module)
+    _install_stub("apscheduler.triggers.date", date_module)
+    _install_stub("apscheduler.triggers.interval", interval_module)
 
 from app.data_collectors.scheduler import DataScheduler
+
+for _stub_name in reversed(_installed_stub_modules):
+    sys.modules.pop(_stub_name, None)
+
+
+def _cron_value(trigger, name):
+    if hasattr(trigger, "kwargs"):
+        return trigger.kwargs[name]
+    if name == "seconds":
+        return int(trigger.interval.total_seconds())
+    field_index = {"hour": 5, "minute": 6}[name]
+    return int(str(trigger.fields[field_index]))
 
 
 class FakeScheduler:
@@ -86,8 +108,8 @@ class DailyAnalysisSchedulerTests(unittest.TestCase):
         self.assertIn("daily_analysis", job_ids)
 
         daily_job = next(job for job in scheduler.scheduler.jobs if job["id"] == "daily_analysis")
-        self.assertEqual(daily_job["trigger"].kwargs["hour"], 15)
-        self.assertEqual(daily_job["trigger"].kwargs["minute"], 6)
+        self.assertEqual(_cron_value(daily_job["trigger"], "hour"), 15)
+        self.assertEqual(_cron_value(daily_job["trigger"], "minute"), 6)
 
     def test_start_registers_limit_up_classification_archive_after_close_job(self):
         scheduler = DataScheduler()
@@ -99,8 +121,8 @@ class DailyAnalysisSchedulerTests(unittest.TestCase):
             job for job in scheduler.scheduler.jobs
             if job["id"] == "limit_up_classification_archive"
         )
-        self.assertEqual(archive_job["trigger"].kwargs["hour"], 15)
-        self.assertEqual(archive_job["trigger"].kwargs["minute"], 6)
+        self.assertEqual(_cron_value(archive_job["trigger"], "hour"), 15)
+        self.assertEqual(_cron_value(archive_job["trigger"], "minute"), 6)
 
     def test_start_registers_daily_analysis_intraday_job_at_1450(self):
         scheduler = DataScheduler()
@@ -109,8 +131,8 @@ class DailyAnalysisSchedulerTests(unittest.TestCase):
         scheduler.start()
 
         intraday_job = next(job for job in scheduler.scheduler.jobs if job["id"] == "daily_analysis_intraday")
-        self.assertEqual(intraday_job["trigger"].kwargs["hour"], 14)
-        self.assertEqual(intraday_job["trigger"].kwargs["minute"], 50)
+        self.assertEqual(_cron_value(intraday_job["trigger"], "hour"), 14)
+        self.assertEqual(_cron_value(intraday_job["trigger"], "minute"), 50)
 
     def test_start_registers_intelligence_sync_jobs(self):
         scheduler = DataScheduler()
@@ -127,7 +149,7 @@ class DailyAnalysisSchedulerTests(unittest.TestCase):
         self.assertIn("intelligence_probe", job_ids)
 
         probe_job = next(job for job in scheduler.scheduler.jobs if job["id"] == "intelligence_probe")
-        self.assertEqual(probe_job["trigger"].kwargs["seconds"], 60)
+        self.assertEqual(_cron_value(probe_job["trigger"], "seconds"), 60)
 
     def test_calculate_daily_analysis_skips_non_trading_day(self):
         scheduler = DataScheduler()

@@ -698,6 +698,76 @@ class ThsLimitUpClassificationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stock_payload["classification_method"], "ai")
         self.assertEqual(stock_payload["limit_up_reason"], "MLCC+超级电容+存储代理+商业航天")
 
+    async def test_historical_unarchived_date_uses_stale_ai_cache_without_new_tokens(self):
+        engine = create_async_engine(
+            "sqlite+aiosqlite://",
+            future=True,
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        Session = async_sessionmaker(engine, expire_on_commit=False)
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+        trade_date = date(2026, 6, 15)
+        async with Session() as session:
+            stock = Stock(stock_code="603678", stock_name="火炬电子", market="SH")
+            session.add(stock)
+            await session.flush()
+            session.add(
+                LimitUpRecord(
+                    stock_id=stock.id,
+                    trade_date=trade_date,
+                    first_limit_up_time=datetime(2026, 6, 15, 9, 40, 45),
+                    final_seal_time=datetime(2026, 6, 15, 9, 40, 45),
+                    limit_up_reason="MLCC+超级电容+存储代理+商业航天",
+                    continuous_limit_up_days=3,
+                    open_count=0,
+                    is_final_sealed=True,
+                    current_status="sealed",
+                )
+            )
+            session.add(
+                LimitUpClassificationDigest(
+                    trade_date=trade_date,
+                    classifications_json={
+                        "model": "deepseek-test",
+                        "model_status": "ready",
+                        "classifications": [
+                            {
+                                "stock_code": "603678",
+                                "plate_name": "军工电子",
+                                "confidence": 0.91,
+                                "reason_summary": "同花顺原因含商业航天和军工电子链条。",
+                                "keywords": ["商业航天", "MLCC"],
+                            }
+                        ],
+                    },
+                    status="ready",
+                    content_hash="old-input-hash",
+                    model="deepseek-test",
+                )
+            )
+            await session.commit()
+
+        service = ThsLimitUpClassificationService(
+            realtime_service=FailingRealtimeLimitUpService(),
+            ai_classification_client=FailingAiClassificationClient([]),
+        )
+        async with Session() as session:
+            payload = await service.get_classification(trade_date, db=session)
+
+        await engine.dispose()
+
+        self.assertEqual(payload["classification_method"], "ai")
+        self.assertEqual(payload["source_status"]["ai_classification"], "cache_stale_partial_hit")
+        self.assertEqual(payload["source_status"]["ai_applied_count"], "1")
+        self.assertEqual(payload["source_status"]["realtime_path"], "skipped_historical")
+        self.assertEqual(payload["groups"][0]["plate_name"], "军工电子")
+        stock_payload = payload["groups"][0]["stocks"][0]
+        self.assertEqual(stock_payload["classification_method"], "ai")
+        self.assertEqual(stock_payload["limit_up_reason"], "MLCC+超级电容+存储代理+商业航天")
+
     async def test_archive_daily_classification_persists_snapshot_and_historical_reads_use_archive(self):
         engine = create_async_engine(
             "sqlite+aiosqlite://",

@@ -80,6 +80,208 @@ def ensure_sqlite_schema_compat(sync_connection) -> None:
         "intraday_generated_at",
         "DATETIME",
     )
+    _ensure_trading_plan_active_unique_index(sync_connection)
+    _ensure_sqlite_playbook_settings_guard(sync_connection)
+    _ensure_sqlite_playbook_job_claims(sync_connection)
+    _ensure_sqlite_obsidian_fact_lookup_index(sync_connection)
+
+
+def ensure_postgresql_schema_compat(sync_connection) -> None:
+    """Apply idempotent PostgreSQL migrations for an existing schema."""
+    table_name = sync_connection.exec_driver_sql(
+        "SELECT to_regclass('trading_plan_versions')"
+    ).scalar_one_or_none()
+    if table_name is not None:
+        sync_connection.exec_driver_sql(
+            "LOCK TABLE trading_plan_versions IN ACCESS EXCLUSIVE MODE"
+        )
+        sync_connection.exec_driver_sql(
+            "WITH ranked AS ("
+            "SELECT id, ROW_NUMBER() OVER ("
+            "PARTITION BY target_trade_date "
+            "ORDER BY generated_at DESC NULLS LAST, id DESC"
+            ") AS active_rank "
+            "FROM trading_plan_versions WHERE status='active'"
+            ") "
+            "UPDATE trading_plan_versions AS plan SET status='superseded' "
+            "FROM ranked WHERE plan.id=ranked.id AND ranked.active_rank > 1"
+        )
+        sync_connection.exec_driver_sql(
+            "CREATE UNIQUE INDEX IF NOT EXISTS "
+            "uq_trading_plan_one_active_target "
+            "ON trading_plan_versions (target_trade_date) "
+            "WHERE status='active'"
+        )
+
+    settings_table = sync_connection.exec_driver_sql(
+        "SELECT to_regclass('trading_playbook_settings')"
+    ).scalar_one_or_none()
+    if settings_table is not None:
+        sync_connection.exec_driver_sql(
+            "LOCK TABLE trading_playbook_settings IN ACCESS EXCLUSIVE MODE"
+        )
+        sync_connection.exec_driver_sql(
+            "UPDATE trading_playbook_settings SET "
+            "confirmed_position_pct=LEAST(100, GREATEST(0, confirmed_position_pct)), "
+            "hard_stop_pct=CASE WHEN hard_stop_pct > 0 AND hard_stop_pct <= 20 "
+            "THEN hard_stop_pct ELSE 5 END, "
+            "max_action_candidates=LEAST(3, GREATEST(1, max_action_candidates)), "
+            "wechat_enabled=false"
+        )
+        sync_connection.exec_driver_sql(
+            "UPDATE trading_playbook_settings SET "
+            "trial_position_pct=LEAST(confirmed_position_pct, "
+            "GREATEST(0, trial_position_pct))"
+        )
+        sync_connection.exec_driver_sql(
+            "DO $$ BEGIN "
+            "IF NOT EXISTS (SELECT 1 FROM pg_constraint "
+            "WHERE conname='ck_trading_playbook_settings_risk' AND "
+            "conrelid='trading_playbook_settings'::regclass) THEN "
+            "ALTER TABLE trading_playbook_settings ADD CONSTRAINT "
+            "ck_trading_playbook_settings_risk CHECK ("
+            "trial_position_pct >= 0 AND "
+            "trial_position_pct <= confirmed_position_pct AND "
+            "confirmed_position_pct <= 100 AND "
+            "hard_stop_pct > 0 AND hard_stop_pct <= 20 AND "
+            "max_action_candidates >= 1 AND max_action_candidates <= 3 AND "
+            "wechat_enabled = false); END IF; END $$"
+        )
+    _ensure_postgresql_playbook_job_claims(sync_connection)
+    _ensure_postgresql_obsidian_fact_lookup_index(sync_connection)
+
+
+def _ensure_postgresql_obsidian_fact_lookup_index(sync_connection) -> None:
+    table_name = sync_connection.exec_driver_sql(
+        "SELECT to_regclass('trading_playbook_obsidian_exports')"
+    ).scalar_one_or_none()
+    if table_name is None:
+        return
+    sync_connection.exec_driver_sql(
+        "CREATE INDEX IF NOT EXISTS "
+        "ix_trading_playbook_obsidian_fact_lookup "
+        "ON trading_playbook_obsidian_exports "
+        "(immutable, entity_type, entity_id, phase)"
+    )
+
+
+def _ensure_postgresql_playbook_job_claims(sync_connection) -> None:
+    sync_connection.exec_driver_sql(
+        "CREATE TABLE IF NOT EXISTS trading_playbook_job_claims ("
+        "id BIGSERIAL PRIMARY KEY, job_key VARCHAR(255) NOT NULL, "
+        "job_type VARCHAR(40) NOT NULL, phase VARCHAR(40) NOT NULL, "
+        "source_trade_date DATE, target_trade_date DATE, stage VARCHAR(20), "
+        "generation_key VARCHAR(120), owner VARCHAR(80) NOT NULL, "
+        "status VARCHAR(20) NOT NULL DEFAULT 'running', "
+        "attempt_no INTEGER NOT NULL DEFAULT 1, lease_expires_at TIMESTAMP, "
+        "completed_at TIMESTAMP, last_error TEXT, created_at TIMESTAMP NOT NULL, "
+        "updated_at TIMESTAMP NOT NULL)"
+    )
+    sync_connection.exec_driver_sql(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_trading_playbook_job_claim_key "
+        "ON trading_playbook_job_claims (job_key)"
+    )
+    sync_connection.exec_driver_sql(
+        "CREATE INDEX IF NOT EXISTS ix_trading_playbook_job_claim_status_lease "
+        "ON trading_playbook_job_claims (status, lease_expires_at)"
+    )
+
+
+def _ensure_trading_plan_active_unique_index(sync_connection) -> None:
+    table = sync_connection.exec_driver_sql(
+        "SELECT 1 FROM sqlite_master "
+        "WHERE type='table' AND name='trading_plan_versions'"
+    ).first()
+    if table is None:
+        return
+    sync_connection.exec_driver_sql(
+        "UPDATE trading_plan_versions SET status='superseded' "
+        "WHERE status='active' AND id NOT IN ("
+        "SELECT MAX(id) FROM trading_plan_versions "
+        "WHERE status='active' GROUP BY target_trade_date"
+        ")"
+    )
+    sync_connection.exec_driver_sql(
+        "CREATE UNIQUE INDEX IF NOT EXISTS "
+        "uq_trading_plan_one_active_target "
+        "ON trading_plan_versions (target_trade_date) "
+        "WHERE status='active'"
+    )
+
+
+def _ensure_sqlite_playbook_settings_guard(sync_connection) -> None:
+    table = sync_connection.exec_driver_sql(
+        "SELECT 1 FROM sqlite_master "
+        "WHERE type='table' AND name='trading_playbook_settings'"
+    ).first()
+    if table is None:
+        return
+    sync_connection.exec_driver_sql(
+        "UPDATE trading_playbook_settings SET "
+        "confirmed_position_pct=MIN(100, MAX(0, confirmed_position_pct)), "
+        "hard_stop_pct=CASE WHEN hard_stop_pct > 0 AND hard_stop_pct <= 20 "
+        "THEN hard_stop_pct ELSE 5 END, "
+        "max_action_candidates=MIN(3, MAX(1, max_action_candidates)), "
+        "wechat_enabled=0"
+    )
+    sync_connection.exec_driver_sql(
+        "UPDATE trading_playbook_settings SET "
+        "trial_position_pct=MIN(confirmed_position_pct, "
+        "MAX(0, trial_position_pct))"
+    )
+    guard = (
+        "NEW.trial_position_pct >= 0 AND "
+        "NEW.trial_position_pct <= NEW.confirmed_position_pct AND "
+        "NEW.confirmed_position_pct <= 100 AND "
+        "NEW.hard_stop_pct > 0 AND NEW.hard_stop_pct <= 20 AND "
+        "NEW.max_action_candidates >= 1 AND "
+        "NEW.max_action_candidates <= 3 AND NEW.wechat_enabled = 0"
+    )
+    for operation in ("INSERT", "UPDATE"):
+        name = f"trg_playbook_settings_guard_{operation.lower()}"
+        sync_connection.exec_driver_sql(
+            f"CREATE TRIGGER IF NOT EXISTS {name} "
+            f"BEFORE {operation} ON trading_playbook_settings "
+            f"WHEN NOT ({guard}) BEGIN "
+            "SELECT RAISE(ABORT, 'invalid trading playbook settings'); END"
+        )
+
+
+def _ensure_sqlite_playbook_job_claims(sync_connection) -> None:
+    sync_connection.exec_driver_sql(
+        "CREATE TABLE IF NOT EXISTS trading_playbook_job_claims ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, job_key VARCHAR(255) NOT NULL, "
+        "job_type VARCHAR(40) NOT NULL, phase VARCHAR(40) NOT NULL, "
+        "source_trade_date DATE, target_trade_date DATE, stage VARCHAR(20), "
+        "generation_key VARCHAR(120), owner VARCHAR(80) NOT NULL, "
+        "status VARCHAR(20) NOT NULL DEFAULT 'running', "
+        "attempt_no INTEGER NOT NULL DEFAULT 1, lease_expires_at DATETIME, "
+        "completed_at DATETIME, last_error TEXT, created_at DATETIME NOT NULL, "
+        "updated_at DATETIME NOT NULL)"
+    )
+    sync_connection.exec_driver_sql(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_trading_playbook_job_claim_key "
+        "ON trading_playbook_job_claims (job_key)"
+    )
+    sync_connection.exec_driver_sql(
+        "CREATE INDEX IF NOT EXISTS ix_trading_playbook_job_claim_status_lease "
+        "ON trading_playbook_job_claims (status, lease_expires_at)"
+    )
+
+
+def _ensure_sqlite_obsidian_fact_lookup_index(sync_connection) -> None:
+    table = sync_connection.exec_driver_sql(
+        "SELECT 1 FROM sqlite_master "
+        "WHERE type='table' AND name='trading_playbook_obsidian_exports'"
+    ).first()
+    if table is None:
+        return
+    sync_connection.exec_driver_sql(
+        "CREATE INDEX IF NOT EXISTS "
+        "ix_trading_playbook_obsidian_fact_lookup "
+        "ON trading_playbook_obsidian_exports "
+        "(immutable, entity_type, entity_id, phase)"
+    )
 
 
 def _add_sqlite_column_if_missing(sync_connection, table_name: str, column_name: str, column_def: str) -> None:
@@ -134,6 +336,8 @@ async def init_db():
         await conn.run_sync(Base.metadata.create_all)
         if settings.DATABASE_URL.startswith("sqlite"):
             await conn.run_sync(ensure_sqlite_schema_compat)
+        elif settings.DATABASE_URL.startswith(("postgresql", "postgres")):
+            await conn.run_sync(ensure_postgresql_schema_compat)
 
 
 async def close_db():

@@ -13,6 +13,7 @@ from app.models.intelligence import DailyInfoDigest, JiegeModeSignal, KnowledgeD
 from app.models.market_review import DailyAnalysisRecord, MarketReviewDailyMetric, MarketReviewStockDaily
 from app.models.stock import Stock
 from app.services.obsidian_knowledge_service import ObsidianKnowledgeService
+from app.services.obsidian_vault_writer import ObsidianVaultWriter
 
 
 class ObsidianKnowledgeServiceTests(unittest.TestCase):
@@ -228,6 +229,19 @@ class ObsidianKnowledgeServiceTests(unittest.TestCase):
         self.assertEqual(signals[0]["trade_date"], "2026-05-18")
         self.assertIn(signals[0]["alert_type"], {"watchlist", "plan", "buy_candidate", "sell_candidate"})
 
+    def test_service_reuses_an_injected_vault_writer(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            writer = ObsidianVaultWriter(
+                enabled=True,
+                vault_path=temp_dir,
+                auto_git_enabled=False,
+            )
+
+            service = ObsidianKnowledgeService(settings=self._settings(temp_dir), writer=writer)
+
+            self.assertIs(service.writer, writer)
+            self.assertEqual(service._vault_path(), Path(temp_dir).resolve())
+
     def test_export_daily_knowledge_is_idempotent_and_writes_stable_markdown(self):
         async def run(vault_path):
             service = ObsidianKnowledgeService(settings=self._settings(vault_path))
@@ -249,6 +263,7 @@ class ObsidianKnowledgeServiceTests(unittest.TestCase):
             self.assertTrue(signal_note.exists())
             self.assertTrue(industry_dashboard.exists())
             self.assertTrue(ultra_short_dashboard.exists())
+            self.assertFalse((vault / "Notes").exists())
             self.assertEqual(daily_note.read_text(encoding="utf-8"), daily_note.read_text(encoding="utf-8"))
 
             content = daily_note.read_text(encoding="utf-8")

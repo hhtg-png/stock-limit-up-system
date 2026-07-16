@@ -45,6 +45,7 @@ class ConnectionManager:
                 "tdx_stock_move_event",
                 "tdx_news_event",
                 "tdx_plate_strength_update",
+                "trading_plan_alert",
             }
         logger.info(f"WebSocket connected: {client_id}, total: {len(self.active_connections)}")
     
@@ -94,8 +95,7 @@ class ConnectionManager:
     
     async def broadcast(self, message: dict, message_type: str, stock_code: Optional[str] = None):
         """广播消息"""
-        disconnected = []
-        
+        recipients = []
         for client_id, websocket in list(self.active_connections.items()):
             # 检查消息类型订阅
             if message_type not in self.message_types.get(client_id, set()):
@@ -105,17 +105,56 @@ class ConnectionManager:
             if stock_code and self.subscriptions.get(client_id):
                 if stock_code not in self.subscriptions[client_id]:
                     continue
-            
+
+            recipients.append((client_id, websocket))
+
+        async def send_one(client_id: str, websocket: WebSocket):
             try:
-                await websocket.send_json({
-                    "type": message_type,
-                    "data": message,
-                    "timestamp": datetime.now().isoformat()
-                })
+                await asyncio.wait_for(
+                    websocket.send_json({
+                        "type": message_type,
+                        "data": message,
+                        "timestamp": datetime.now().isoformat()
+                    }),
+                    timeout=max(
+                        float(settings.WS_SEND_TIMEOUT_SECONDS),
+                        0.01,
+                    ),
+                )
+                return None
+            except asyncio.TimeoutError:
+                logger.error("Broadcast timed out for {}", client_id)
+                return client_id
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.error(f"Broadcast error to {client_id}: {e}")
-                disconnected.append(client_id)
-        
+                return client_id
+
+        tasks = [
+            asyncio.create_task(send_one(client_id, websocket))
+            for client_id, websocket in recipients
+        ]
+        try:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+        except BaseException:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+
+        disconnected = []
+        for result in results:
+            if isinstance(result, BaseException):
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise result
+            if result is not None:
+                disconnected.append(result)
+
         # 清理断开的连接
         for client_id in disconnected:
             await self.disconnect(client_id)
@@ -203,6 +242,14 @@ class ConnectionManager:
             message_type,
             stock_code,
         )
+
+    async def broadcast_trading_plan_alert(
+        self,
+        data: dict,
+        stock_code: Optional[str] = None,
+    ):
+        """Broadcast a hint for an event already persisted in the alert inbox."""
+        await self.broadcast(data, "trading_plan_alert", stock_code)
     
     @property
     def connection_count(self) -> int:

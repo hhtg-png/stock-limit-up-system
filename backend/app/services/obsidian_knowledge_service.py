@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import re
-import subprocess
 from collections import OrderedDict
 from datetime import date, datetime
 from pathlib import Path
@@ -14,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.models.intelligence import DailyInfoDigest, JiegeModeSignal, KnowledgeDocument
 from app.models.market_review import DailyAnalysisRecord, MarketReviewDailyMetric
+from app.services.obsidian_vault_writer import ObsidianVaultWriter
 from app.utils.time_utils import today_cn
 
 
@@ -31,18 +31,23 @@ STOCK_CODE_PATTERN = re.compile(r"([\u4e00-\u9fa5A-Za-z0-9·]{2,16})[（(]([0368
 class ObsidianKnowledgeService:
     """Export project intelligence into an external Obsidian vault."""
 
-    def __init__(self, settings=settings):
+    def __init__(self, settings=settings, writer: Optional[ObsidianVaultWriter] = None):
         self.settings = settings
+        self.writer = writer or ObsidianVaultWriter(
+            enabled=bool(getattr(settings, "OBSIDIAN_ENABLED", False)),
+            vault_path=str(getattr(settings, "OBSIDIAN_VAULT_PATH", "") or ""),
+            auto_git_enabled=bool(getattr(settings, "OBSIDIAN_AUTO_GIT_ENABLED", False)),
+        )
 
     def get_status(self) -> Dict[str, Any]:
         vault_path = self._vault_path()
         allowlist = self._web_allowlist()
         return {
-            "enabled": bool(getattr(self.settings, "OBSIDIAN_ENABLED", False)),
+            "enabled": self.writer.enabled,
             "vault_configured": vault_path is not None,
             "vault_exists": bool(vault_path and vault_path.exists()),
             "vault_path": str(vault_path) if vault_path else "",
-            "auto_git_enabled": bool(getattr(self.settings, "OBSIDIAN_AUTO_GIT_ENABLED", False)),
+            "auto_git_enabled": self.writer.auto_git_enabled,
             "web_research_enabled": bool(getattr(self.settings, "WEB_RESEARCH_ENABLED", False)),
             "web_research_allowlist": allowlist,
             "required_directories": VAULT_DIRECTORIES,
@@ -478,20 +483,17 @@ class ObsidianKnowledgeService:
         return []
 
     def _vault_path(self) -> Optional[Path]:
-        raw_path = str(getattr(self.settings, "OBSIDIAN_VAULT_PATH", "") or "").strip()
-        if not raw_path:
-            return None
-        return Path(raw_path).expanduser()
+        return self.writer.configured_vault()
 
     def _ensure_vault(self) -> Optional[Path]:
-        if not bool(getattr(self.settings, "OBSIDIAN_ENABLED", False)):
-            return None
-        vault = self._vault_path()
+        vault = self.writer.ensure_vault()
         if vault is None:
             return None
-        vault.mkdir(parents=True, exist_ok=True)
         for directory in VAULT_DIRECTORIES:
-            (vault / directory).mkdir(parents=True, exist_ok=True)
+            self.writer.resolve_target(directory, allowed_roots=tuple(VAULT_DIRECTORIES)).mkdir(
+                parents=True,
+                exist_ok=True,
+            )
         return vault
 
     def _web_allowlist(self) -> List[str]:
@@ -499,38 +501,21 @@ class ObsidianKnowledgeService:
         return [item.strip() for item in raw.split(",") if item.strip()]
 
     def _write_if_changed(self, path: Path, content: str) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        normalized = content.replace("\r\n", "\n")
-        if path.exists() and path.read_text(encoding="utf-8") == normalized:
-            return
-        path.write_text(normalized, encoding="utf-8")
+        vault = self.writer.configured_vault()
+        if vault is None:
+            raise ValueError("Obsidian Vault path is not configured")
+        try:
+            relative_path = path.resolve(strict=False).relative_to(vault).as_posix()
+        except ValueError as exc:
+            raise ValueError(f"Knowledge export path is outside the configured Vault: {path}") from exc
+        self.writer.write_text(relative_path, content, allowed_roots=tuple(VAULT_DIRECTORIES))
 
     def _maybe_git_commit(self, vault: Path, trade_date: date, written_files: List[str]) -> Dict[str, Any]:
-        if not bool(getattr(self.settings, "OBSIDIAN_AUTO_GIT_ENABLED", False)):
-            return {"enabled": False}
-        if not (vault / ".git").exists():
-            return {"enabled": True, "committed": False, "reason": "vault_is_not_git_repo"}
-        if not written_files:
-            return {"enabled": True, "committed": False, "reason": "no_written_files"}
-        try:
-            subprocess.run(["git", "-C", str(vault), "add", *written_files], check=True, capture_output=True, text=True)
-            status = subprocess.run(
-                ["git", "-C", str(vault), "status", "--porcelain"],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            if not status.stdout.strip():
-                return {"enabled": True, "committed": False, "reason": "no_changes"}
-            subprocess.run(
-                ["git", "-C", str(vault), "commit", "-m", f"chore: sync knowledge {trade_date.isoformat()}"],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            return {"enabled": True, "committed": True}
-        except Exception as exc:
-            return {"enabled": True, "committed": False, "error": str(exc)}
+        return self.writer.commit_paths(
+            written_files,
+            allowed_roots=tuple(VAULT_DIRECTORIES),
+            message=f"chore: sync knowledge {trade_date.isoformat()}",
+        )
 
     def _frontmatter(self, values: Dict[str, Any]) -> str:
         lines = ["---"]
