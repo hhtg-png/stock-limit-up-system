@@ -15,6 +15,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
+from loguru import logger
 from sqlalchemy import case, desc, exists, func, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -38,6 +39,7 @@ from app.services.trading_playbook.obsidian_types import (
     TRADING_PLAYBOOK_ALLOWED_ROOTS,
     canonical_json_bytes,
 )
+from app.services.trading_playbook.rule_catalog import EXPECTED_RULE_COUNT
 from app.utils.time_utils import CN_TZ
 
 
@@ -1039,15 +1041,167 @@ class TradingPlaybookObsidianSyncCoordinator:
         )
 
     async def startup_reconcile(self) -> ObsidianSyncBatchResult:
-        """Resume immutable work and refresh only the two latest date axes."""
+        """Discover missed committed facts, then resume every due export."""
 
-        dates = await self._latest_plan_dates()
-        artifact_count = 0
-        for trade_date in dates:
-            artifacts = await self._build_mutable_artifacts(trade_date)
-            artifact_count += len(artifacts)
-            await self.enqueue_artifacts(artifacts)
-        return await self.process_due(limit=max(100, artifact_count))
+        rows = await self.reconcile_committed_facts()
+        return await self.process_due(limit=max(100, len(rows)))
+
+    async def reconcile_committed_facts(
+        self,
+    ) -> tuple[TradingPlaybookObsidianExport, ...]:
+        """Freeze exports omitted after a business commit or process crash.
+
+        Immutable plan/review/rule facts are rebuilt only when they have no
+        persisted export. Mutable daily views are refreshed for the latest
+        source and target plan dates on every pass.
+        """
+
+        immutable_export = aliased(TradingPlaybookObsidianExport)
+        plan_is_exported = exists(
+            select(1).where(
+                immutable_export.immutable.is_(True),
+                immutable_export.entity_type == "plan",
+                immutable_export.entity_id == TradingPlanVersion.id,
+            )
+        )
+        initial_review_is_exported = exists(
+            select(1).where(
+                immutable_export.immutable.is_(True),
+                immutable_export.entity_type == "review",
+                immutable_export.entity_id == TradingExecutionReview.id,
+                immutable_export.phase == "initial_review",
+            )
+        )
+        final_review_is_exported = exists(
+            select(1).where(
+                immutable_export.immutable.is_(True),
+                immutable_export.entity_type == "review",
+                immutable_export.entity_id == TradingExecutionReview.id,
+                immutable_export.phase == "final_review",
+            )
+        )
+        async with self.session_factory() as session:
+            exported_v2_rule_keys = {
+                snapshot_key
+                for snapshot_key in (
+                    await session.scalars(
+                        select(TradingPlaybookObsidianExport.snapshot_key).where(
+                            TradingPlaybookObsidianExport.immutable.is_(True),
+                            TradingPlaybookObsidianExport.entity_type == "rule",
+                            TradingPlaybookObsidianExport.snapshot_key.like(
+                                "rule:v2:%"
+                            ),
+                        )
+                    )
+                ).all()
+            }
+            missing_plan_ids = tuple(
+                int(plan_id)
+                for plan_id in (
+                    await session.scalars(
+                        select(TradingPlanVersion.id)
+                        .where(~plan_is_exported)
+                        .order_by(TradingPlanVersion.id)
+                    )
+                ).all()
+            )
+            review_rows = tuple(
+                (
+                    int(review_id),
+                    "final_review"
+                    if finalized_at is not None
+                    else "initial_review",
+                )
+                for review_id, finalized_at in (
+                    await session.execute(
+                        select(
+                            TradingExecutionReview.id,
+                            TradingExecutionReview.finalized_at,
+                        )
+                        .where(
+                            or_(
+                                (
+                                    TradingExecutionReview.finalized_at.is_(None)
+                                    & ~initial_review_is_exported
+                                ),
+                                (
+                                    TradingExecutionReview.finalized_at.is_not(None)
+                                    & ~final_review_is_exported
+                                ),
+                            )
+                        )
+                        .order_by(TradingExecutionReview.id)
+                    )
+                ).all()
+            )
+
+        rows: list[TradingPlaybookObsidianExport] = []
+
+        async def enqueue_one(artifact: ObsidianArtifact, label: str) -> None:
+            try:
+                rows.extend(await self.enqueue_artifacts((artifact,)))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error(
+                    "Trading playbook Obsidian compensation enqueue failed "
+                    "for {}: {}",
+                    label,
+                    exc,
+                )
+
+        async def build_one(awaitable, label: str) -> None:
+            try:
+                built = await awaitable
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error(
+                    "Trading playbook Obsidian compensation build failed "
+                    "for {}: {}",
+                    label,
+                    exc,
+                )
+                return
+            await enqueue_one(built, label)
+
+        if len(exported_v2_rule_keys) < EXPECTED_RULE_COUNT:
+            try:
+                rules = await self.builder.build_rule_artifacts("v2")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error(
+                    "Trading playbook Obsidian compensation build failed "
+                    "for rules v2: {}",
+                    exc,
+                )
+            else:
+                for rule in rules:
+                    if rule.snapshot_key not in exported_v2_rule_keys:
+                        await enqueue_one(rule, rule.snapshot_key)
+        for plan_id in missing_plan_ids:
+            await build_one(
+                self.builder.build_plan_artifact(plan_id),
+                f"plan {plan_id}",
+            )
+        for review_id, phase in review_rows:
+            await build_one(
+                self.builder.build_review_artifact(review_id, phase=phase),
+                f"review {review_id} {phase}",
+            )
+        for trade_date in await self._latest_plan_dates():
+            mutable_builders = (
+                ("alerts", self.builder.build_alerts_artifact),
+                ("daily index", self.builder.build_daily_index_artifact),
+                ("dashboard", self.builder.build_dashboard_artifact),
+            )
+            for label, build in mutable_builders:
+                await build_one(
+                    build(trade_date),
+                    f"{label} {trade_date.isoformat()}",
+                )
+        return tuple(rows)
 
     async def _pause_due(
         self,

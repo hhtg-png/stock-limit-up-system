@@ -18,6 +18,41 @@ class _NullAsyncSessionContext:
 
 
 class TradingPlaybookJobClaimTests(unittest.IsolatedAsyncioTestCase):
+    async def test_get_status_distinguishes_missing_running_and_completed(self):
+        from app.models.trading_playbook import TradingPlaybookJobClaim
+        from app.services.trading_playbook.job_claim_service import (
+            TradingPlaybookJobClaimService,
+        )
+
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+        async with engine.begin() as connection:
+            await connection.run_sync(TradingPlaybookJobClaim.__table__.create)
+        service = TradingPlaybookJobClaimService(lease_seconds=30)
+        now = datetime(2026, 7, 13, 15, 30)
+        try:
+            async with maker() as db:
+                self.assertIsNone(await service.get_status(db, "missing"))
+                token = await service.claim(
+                    db,
+                    job_key="status-probe",
+                    job_type="stage",
+                    phase="build",
+                    owner="worker-a",
+                    now=now,
+                )
+                self.assertEqual(
+                    await service.get_status(db, "status-probe"),
+                    "running",
+                )
+                await service.complete(db, token, now=now)
+                self.assertEqual(
+                    await service.get_status(db, "status-probe"),
+                    "completed",
+                )
+        finally:
+            await engine.dispose()
+
     async def test_dual_engine_claim_is_single_winner_and_completed_is_terminal(self):
         from app.models.trading_playbook import TradingPlaybookJobClaim
         from app.services.trading_playbook.job_claim_service import (

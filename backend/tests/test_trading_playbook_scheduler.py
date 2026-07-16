@@ -39,10 +39,18 @@ class FakeScheduler:
 
 
 class FakeObsidianCoordinator:
-    def __init__(self, *, enqueue_error=None, process_error=None, startup_error=None):
+    def __init__(
+        self,
+        *,
+        enqueue_error=None,
+        process_error=None,
+        startup_error=None,
+        reconcile_error=None,
+    ):
         self.enqueue_stage = AsyncMock(side_effect=enqueue_error)
         self.process_due = AsyncMock(side_effect=process_error)
         self.startup_reconcile = AsyncMock(side_effect=startup_error)
+        self.reconcile_committed_facts = AsyncMock(side_effect=reconcile_error)
 
 
 class LifecycleFakeScheduler(FakeScheduler):
@@ -103,6 +111,13 @@ class InMemoryClaimService:
             owner=owner,
             attempt_no=1,
         )
+
+    async def get_status(self, _db, job_key):
+        if job_key in self.completed:
+            return "completed"
+        if job_key in self.active:
+            return "running"
+        return None
 
     async def complete(self, _db, token, **_kwargs):
         self.active.discard(token.job_key)
@@ -282,7 +297,12 @@ class TradingPlaybookSchedulerRegistrationTests(unittest.TestCase):
         scheduler = self._scheduler()
         coordinator = FakeObsidianCoordinator()
 
-        for missing in ("enqueue_stage", "process_due", "startup_reconcile"):
+        for missing in (
+            "enqueue_stage",
+            "process_due",
+            "startup_reconcile",
+            "reconcile_committed_facts",
+        ):
             invalid = FakeObsidianCoordinator()
             setattr(invalid, missing, None)
             with self.subTest(missing=missing), self.assertRaises(TypeError):
@@ -516,6 +536,39 @@ class TradingPlaybookObsidianStageHookTests(unittest.IsolatedAsyncioTestCase):
             include_rules=True,
         )
 
+    async def test_running_build_claim_never_reloads_stale_plan_or_syncs_or_notifies(self):
+        now = datetime(2026, 7, 16, 9, 26, tzinfo=CN_TZ)
+        coordinator = FakeObsidianCoordinator()
+        claims = InMemoryClaimService()
+        claims.active.add(
+            "playbook:build:2026-07-16:2026-07-16:auction:ready"
+        )
+        scheduler, orchestrator, db = self._scheduler(
+            now=now,
+            coordinator=coordinator,
+            claim_service=claims,
+        )
+        db.execute = AsyncMock(
+            side_effect=AssertionError("running claim must not reload stale plan")
+        )
+        alert_service = SimpleNamespace(
+            durable_delivery=True,
+            notify_plan_ready=AsyncMock(),
+        )
+        scheduler.install_trading_playbook_alert_service(alert_service)
+
+        with patch(
+            "app.data_collectors.scheduler._get_cn_trading_dates",
+            return_value=[date(2026, 7, 16), date(2026, 7, 17)],
+        ):
+            result = await scheduler._build_trading_playbook_auction()
+
+        self.assertIsNone(result)
+        orchestrator.build_stage.assert_not_awaited()
+        coordinator.enqueue_stage.assert_not_awaited()
+        coordinator.process_due.assert_not_awaited()
+        alert_service.notify_plan_ready.assert_not_awaited()
+
     async def test_after_close_and_final_review_enqueue_as_independent_phases(self):
         now = datetime(2026, 7, 15, 15, 30, tzinfo=CN_TZ)
         coordinator = FakeObsidianCoordinator()
@@ -639,6 +692,94 @@ class TradingPlaybookObsidianStageHookTests(unittest.IsolatedAsyncioTestCase):
         )
         coordinator.process_due.assert_awaited_once_with()
 
+    async def test_completed_review_reentry_reloads_ids_and_recovers_failed_enqueue(self):
+        now = datetime(2026, 7, 15, 15, 10, tzinfo=CN_TZ)
+        coordinator = FakeObsidianCoordinator(
+            enqueue_error=RuntimeError("first enqueue failed")
+        )
+        claims = InMemoryClaimService()
+        scheduler, _orchestrator, _db = self._scheduler(
+            now=now,
+            coordinator=coordinator,
+            claim_service=claims,
+        )
+        review_service = SimpleNamespace(
+            build=AsyncMock(return_value=[SimpleNamespace(id=91)])
+        )
+        scheduler.install_trading_playbook_review_service(review_service)
+
+        with patch(
+            "app.data_collectors.scheduler._get_cn_trading_dates",
+            return_value=[date(2026, 7, 15), date(2026, 7, 16)],
+        ):
+            first = await scheduler._review_trading_playbook()
+
+        self.assertEqual([row.id for row in first], [91])
+        coordinator.enqueue_stage.assert_awaited_once()
+        coordinator.process_due.assert_not_awaited()
+
+        coordinator.enqueue_stage.side_effect = None
+        scheduler._persisted_review_ids_in_session = AsyncMock(
+            return_value=(91,)
+        )
+        with patch(
+            "app.data_collectors.scheduler._get_cn_trading_dates",
+            return_value=[date(2026, 7, 15), date(2026, 7, 16)],
+        ):
+            replay = await scheduler._review_trading_playbook()
+
+        self.assertIsNone(replay)
+        review_service.build.assert_awaited_once()
+        scheduler._persisted_review_ids_in_session.assert_awaited_once_with(
+            _db,
+            date(2026, 7, 15),
+            finalized=False,
+            plan_version_id=None,
+        )
+        self.assertEqual(coordinator.enqueue_stage.await_count, 2)
+        self.assertEqual(
+            coordinator.enqueue_stage.await_args_list[-1],
+            unittest.mock.call(
+                date(2026, 7, 15),
+                "initial_review",
+                plan_version_ids=(),
+                review_ids=(91,),
+                include_rules=True,
+            ),
+        )
+        coordinator.process_due.assert_awaited_once_with()
+
+    async def test_running_review_claim_does_not_reload_or_sync(self):
+        now = datetime(2026, 7, 15, 15, 10, tzinfo=CN_TZ)
+        coordinator = FakeObsidianCoordinator()
+        claims = InMemoryClaimService()
+        job_key = (
+            "playbook:initial_review:2026-07-15:"
+            "legacy:2026-07-15:all"
+        )
+        claims.active.add(job_key)
+        scheduler, _orchestrator, _db = self._scheduler(
+            now=now,
+            coordinator=coordinator,
+            claim_service=claims,
+        )
+        review_service = SimpleNamespace(build=AsyncMock())
+        scheduler.install_trading_playbook_review_service(review_service)
+        scheduler._persisted_review_ids_in_session = AsyncMock(
+            side_effect=AssertionError("running claim must not reload reviews")
+        )
+
+        with patch(
+            "app.data_collectors.scheduler._get_cn_trading_dates",
+            return_value=[date(2026, 7, 15), date(2026, 7, 16)],
+        ):
+            result = await scheduler._review_trading_playbook()
+
+        self.assertIsNone(result)
+        review_service.build.assert_not_awaited()
+        coordinator.enqueue_stage.assert_not_awaited()
+        coordinator.process_due.assert_not_awaited()
+
     async def test_sync_failures_preserve_committed_business_result_and_claim(self):
         for failure_at in ("enqueue", "process"):
             with self.subTest(failure_at=failure_at):
@@ -734,12 +875,27 @@ class TradingPlaybookObsidianStageHookTests(unittest.IsolatedAsyncioTestCase):
 
         await scheduler._reconcile_trading_playbook_obsidian()
         await scheduler._startup_reconcile_trading_playbook_obsidian()
+        coordinator.reconcile_committed_facts.assert_awaited_once_with()
         coordinator.process_due.assert_awaited_once_with()
         coordinator.startup_reconcile.assert_awaited_once_with()
 
         coordinator.process_due.side_effect = asyncio.CancelledError()
         with self.assertRaises(asyncio.CancelledError):
             await scheduler._reconcile_trading_playbook_obsidian()
+
+    async def test_reconcile_processes_due_even_when_fact_discovery_fails(self):
+        coordinator = FakeObsidianCoordinator(
+            reconcile_error=RuntimeError("fact scan failed")
+        )
+        scheduler, _orchestrator, _db = self._scheduler(
+            now=datetime(2026, 7, 16, 9, 26, tzinfo=CN_TZ),
+            coordinator=coordinator,
+        )
+
+        await scheduler._reconcile_trading_playbook_obsidian()
+
+        coordinator.reconcile_committed_facts.assert_awaited_once_with()
+        coordinator.process_due.assert_awaited_once_with()
 
 
 class TradingPlaybookDataReadyBarrierTests(unittest.IsolatedAsyncioTestCase):

@@ -240,6 +240,7 @@ class MainLifespanTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_real_mounted_app_resolves_same_startup_orchestrator_and_cleans_up(self):
         scheduler = LifecycleScheduler()
+        original_knowledge_writer = app_main.obsidian_knowledge_service.writer
         sentinel = types.SimpleNamespace(
             build_stage=AsyncMock(
                 return_value=ValidatedPlanPayload(
@@ -316,6 +317,10 @@ class MainLifespanTests(unittest.IsolatedAsyncioTestCase):
                     "C:/temporary-test-vault",
                 )
                 self.assertTrue(coordinator.writer.auto_git_enabled)
+                self.assertIs(
+                    app_main.obsidian_knowledge_service.writer,
+                    coordinator.writer,
+                )
                 transport = httpx.ASGITransport(app=app_main.app)
                 async with httpx.AsyncClient(
                     transport=transport,
@@ -349,6 +354,10 @@ class MainLifespanTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(scheduler.obsidian_sync)
         self.assertFalse(
             hasattr(app_main.app.state, "trading_playbook_obsidian_sync")
+        )
+        self.assertIs(
+            app_main.obsidian_knowledge_service.writer,
+            original_knowledge_writer,
         )
 
     async def test_shutdown_closes_shared_tencent_after_scheduler_and_isolates_failure(self):
@@ -544,6 +553,40 @@ class MainLifespanTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(scheduler.stop_calls, 1)
         self.assertEqual(scheduler.reset_calls, 2)
         self.assertIsNone(trading_playbook_runtime.get_orchestrator())
+        self.assertIsNone(scheduler.obsidian_sync)
+        self.assertFalse(
+            hasattr(app_main.app.state, "trading_playbook_obsidian_sync")
+        )
+        stop_bus.assert_awaited_once()
+        close_db.assert_awaited_once()
+
+    async def test_partial_obsidian_startup_failure_closes_local_orchestrator_and_restores_writer(self):
+        scheduler = LifecycleScheduler()
+        sentinel = types.SimpleNamespace(
+            build_stage=AsyncMock(),
+            aclose=AsyncMock(),
+        )
+        original_writer = app_main.obsidian_knowledge_service.writer
+        patches = self._lifecycle_patches(scheduler)
+        with patches[0], patches[1], patches[2] as close_db, patches[3], patches[4] as stop_bus, patches[5], patches[6], patches[7], patch.object(
+            app_main.settings,
+            "TRADING_PLAYBOOK_ENABLED",
+            True,
+        ), patch.object(
+            app_main,
+            "build_production_trading_playbook_orchestrator",
+            return_value=sentinel,
+        ), patch.object(
+            app_main,
+            "TradingPlaybookObsidianSnapshotBuilder",
+            side_effect=RuntimeError("snapshot builder failed"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "snapshot builder failed"):
+                async with app_main.lifespan(app_main.app):
+                    self.fail("lifespan must not yield after partial startup failure")
+
+        sentinel.aclose.assert_awaited_once_with()
+        self.assertIs(app_main.obsidian_knowledge_service.writer, original_writer)
         self.assertIsNone(scheduler.obsidian_sync)
         self.assertFalse(
             hasattr(app_main.app.state, "trading_playbook_obsidian_sync")

@@ -102,6 +102,16 @@ class TradingPlaybookJobClaimService:
         ).scalar_one()
         return TradingPlaybookClaimToken(row.job_key, row.owner, row.attempt_no)
 
+    async def get_status(self, db, job_key: str) -> Optional[str]:
+        """Return the persisted claim status without changing claim state."""
+
+        return await db.scalar(
+            select(TradingPlaybookJobClaim.status).where(
+                TradingPlaybookJobClaim.job_key
+                == self._required(job_key, "job_key", 255)
+            )
+        )
+
     async def complete(
         self,
         db,

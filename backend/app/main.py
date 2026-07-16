@@ -30,6 +30,7 @@ from app.services.trading_playbook.review_service import (
     TradingPlaybookReviewService,
 )
 from app.services.obsidian_vault_writer import ObsidianVaultWriter
+from app.services.obsidian_knowledge_service import obsidian_knowledge_service
 from app.services.trading_playbook.obsidian_exporter import (
     TradingPlaybookObsidianExporter,
 )
@@ -60,6 +61,9 @@ def _clear_trading_playbook_runtime(app: FastAPI) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
+    orchestrator = None
+    obsidian_writer = None
+    original_knowledge_writer = None
     setup_logging()
     logger.info(f"Starting {settings.APP_NAME} v{settings.APP_VERSION}")
     try:
@@ -99,6 +103,8 @@ async def lifespan(app: FastAPI):
                 vault_path=settings.OBSIDIAN_VAULT_PATH,
                 auto_git_enabled=settings.OBSIDIAN_AUTO_GIT_ENABLED,
             )
+            original_knowledge_writer = obsidian_knowledge_service.writer
+            obsidian_knowledge_service.writer = obsidian_writer
             obsidian_builder = TradingPlaybookObsidianSnapshotBuilder(
                 async_session_maker
             )
@@ -133,11 +139,6 @@ async def lifespan(app: FastAPI):
         except Exception as exc:
             logger.error(f"DataScheduler shutdown failed: {exc}")
         try:
-            orchestrator = getattr(
-                app.state,
-                "trading_playbook_orchestrator",
-                None,
-            )
             close = getattr(orchestrator, "aclose", None)
             if callable(close):
                 await close()
@@ -151,6 +152,14 @@ async def lifespan(app: FastAPI):
             _clear_trading_playbook_runtime(app)
         except Exception as exc:
             logger.error(f"Trading playbook runtime cleanup failed: {exc}")
+        try:
+            if (
+                obsidian_writer is not None
+                and obsidian_knowledge_service.writer is obsidian_writer
+            ):
+                obsidian_knowledge_service.writer = original_knowledge_writer
+        except Exception as exc:
+            logger.error(f"Obsidian writer restoration failed: {exc}")
         try:
             await data_scheduler.get_trading_calendar_service().close()
         except Exception as exc:

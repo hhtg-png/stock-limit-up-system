@@ -2176,21 +2176,36 @@ class TradingPlaybookObsidianSyncTests(unittest.IsolatedAsyncioTestCase):
         source_latest = date(2026, 7, 15)
         target_latest = date(2026, 7, 17)
         async with self.session_factory() as session:
-            session.add_all(
-                [
-                    plan_row(
-                        source_trade_date=date(2026, 7, 14),
-                        target_trade_date=date(2026, 7, 16),
-                        version_no=1,
-                    ),
-                    plan_row(
-                        source_trade_date=source_latest,
-                        target_trade_date=target_latest,
-                        version_no=2,
-                    ),
-                ]
+            older_plan = plan_row(
+                source_trade_date=date(2026, 7, 14),
+                target_trade_date=date(2026, 7, 16),
+                version_no=1,
             )
+            latest_plan = plan_row(
+                source_trade_date=source_latest,
+                target_trade_date=target_latest,
+                version_no=2,
+            )
+            session.add_all([older_plan, latest_plan])
             await session.commit()
+            plan_ids = (int(older_plan.id), int(latest_plan.id))
+        await self.coordinator.enqueue_artifacts(
+            [
+                artifact(
+                    f"existing-plan-{plan_id}",
+                    snapshot_key=f"plan:{plan_id}",
+                    immutable=True,
+                    entity_type="plan",
+                    entity_id=plan_id,
+                    phase="preclose",
+                    target_path=(
+                        "30_TradingPlaybook/Daily/Auto/2026/2026-07-16/"
+                        f"existing-plan-{plan_id}.md"
+                    ),
+                )
+                for plan_id in plan_ids
+            ]
+        )
         immutable = artifact(
             "resume",
             snapshot_key="rule:v2:resume",
@@ -2253,6 +2268,7 @@ class TradingPlaybookObsidianSyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             builder.calls,
             [
+                ("rules", "v2"),
                 ("alerts", source_latest),
                 ("index", source_latest),
                 ("dashboard", source_latest),
@@ -2263,6 +2279,214 @@ class TradingPlaybookObsidianSyncTests(unittest.IsolatedAsyncioTestCase):
         )
         stored_immutable = (await self._rows(immutable.snapshot_key))[0]
         self.assertEqual(stored_immutable.status, "written")
+
+    async def test_reconcile_committed_facts_enqueues_only_missing_immutable_and_latest_mutable(self):
+        async with self.session_factory() as session:
+            exported_plan = plan_row(version_no=1)
+            missing_plan = plan_row(version_no=2)
+            session.add_all([exported_plan, missing_plan])
+            await session.flush()
+            initial_review = review_row(exported_plan.id, finalized=False)
+            final_review = review_row(missing_plan.id, finalized=True)
+            session.add_all([initial_review, final_review])
+            await session.commit()
+            exported_plan_id = int(exported_plan.id)
+            missing_plan_id = int(missing_plan.id)
+            initial_review_id = int(initial_review.id)
+            final_review_id = int(final_review.id)
+
+        already_exported = artifact(
+            "already-exported-plan",
+            snapshot_key=f"plan:{exported_plan_id}",
+            immutable=True,
+            entity_type="plan",
+            entity_id=exported_plan_id,
+            phase="preclose",
+            target_path=(
+                "30_TradingPlaybook/Daily/Auto/2026/2026-07-16/"
+                "preclose-v1.md"
+            ),
+        )
+        await self.coordinator.enqueue_artifacts([already_exported])
+        rules = tuple(
+            artifact(
+                f"rule-{index}",
+                snapshot_key=f"rule:v2:mode_{index:02d}",
+                immutable=True,
+                entity_type="rule",
+                entity_id=index,
+                phase="catalog",
+                target_path=(
+                    "30_TradingPlaybook/Modes/Auto/v2/"
+                    f"mode_{index:02d}.md"
+                ),
+            )
+            for index in range(1, 20)
+        )
+        missing_plan_artifact = artifact(
+            "missing-plan",
+            snapshot_key=f"plan:{missing_plan_id}",
+            immutable=True,
+            entity_type="plan",
+            entity_id=missing_plan_id,
+            phase="preclose",
+            target_path=(
+                "30_TradingPlaybook/Daily/Auto/2026/2026-07-16/"
+                "preclose-v2.md"
+            ),
+        )
+        initial_artifact = artifact(
+            "initial-review",
+            snapshot_key=f"review:{initial_review_id}:initial",
+            immutable=True,
+            entity_type="review",
+            entity_id=initial_review_id,
+            phase="initial_review",
+            target_path=(
+                "30_TradingPlaybook/Reviews/Auto/2026/2026-07-16/"
+                f"initial-review-{exported_plan_id}.md"
+            ),
+        )
+        final_artifact = artifact(
+            "final-review",
+            snapshot_key=f"review:{final_review_id}:final",
+            immutable=True,
+            entity_type="review",
+            entity_id=final_review_id,
+            phase="final_review",
+            target_path=(
+                "30_TradingPlaybook/Reviews/Auto/2026/2026-07-16/"
+                f"final-review-{missing_plan_id}.md"
+            ),
+        )
+        alerts = artifact(
+            "reconcile-alerts",
+            snapshot_key=f"alerts:{TRADE_DATE.isoformat()}",
+            entity_type="alerts",
+            target_path=(
+                "30_TradingPlaybook/Alerts/Auto/2026/2026-07-16.md"
+            ),
+        )
+        index = artifact("reconcile-index")
+        dashboard = artifact(
+            "reconcile-dashboard",
+            snapshot_key="dashboard:trading-playbook",
+            entity_type="dashboard",
+            target_path="Dashboards/交易预案.md",
+        )
+        builder = FakeBuilder(
+            rules=rules,
+            by_date={
+                ("plan", missing_plan_id): missing_plan_artifact,
+                (
+                    "review",
+                    initial_review_id,
+                    "initial_review",
+                ): initial_artifact,
+                (
+                    "review",
+                    final_review_id,
+                    "final_review",
+                ): final_artifact,
+                ("alerts", TRADE_DATE): alerts,
+                ("index", TRADE_DATE): index,
+                ("dashboard", TRADE_DATE): dashboard,
+            },
+        )
+        coordinator = self._coordinator(
+            self.session_factory,
+            builder=builder,
+        )
+
+        rows = await coordinator.reconcile_committed_facts()
+
+        self.assertEqual(len(rows), 25)
+        self.assertEqual(
+            builder.calls,
+            [
+                ("rules", "v2"),
+                ("plan", missing_plan_id),
+                ("review", initial_review_id, "initial_review"),
+                ("review", final_review_id, "final_review"),
+                ("alerts", TRADE_DATE),
+                ("index", TRADE_DATE),
+                ("dashboard", TRADE_DATE),
+            ],
+        )
+        stored = await self._rows()
+        self.assertEqual(len(stored), 26)
+
+        builder.calls.clear()
+        await coordinator.reconcile_committed_facts()
+
+        self.assertEqual(
+            builder.calls,
+            [
+                ("alerts", TRADE_DATE),
+                ("index", TRADE_DATE),
+                ("dashboard", TRADE_DATE),
+            ],
+        )
+
+    async def test_bad_committed_fact_does_not_starve_other_missing_facts(self):
+        async with self.session_factory() as session:
+            broken_plan = plan_row(version_no=1)
+            healthy_plan = plan_row(version_no=2)
+            session.add_all([broken_plan, healthy_plan])
+            await session.commit()
+            broken_plan_id = int(broken_plan.id)
+            healthy_plan_id = int(healthy_plan.id)
+
+        healthy_artifact = artifact(
+            "healthy-plan",
+            snapshot_key=f"plan:{healthy_plan_id}",
+            immutable=True,
+            entity_type="plan",
+            entity_id=healthy_plan_id,
+            phase="preclose",
+            target_path=(
+                "30_TradingPlaybook/Daily/Auto/2026/2026-07-16/"
+                "healthy-plan.md"
+            ),
+        )
+
+        class PartiallyBrokenBuilder(FakeBuilder):
+            async def build_plan_artifact(self, plan_version_id):
+                self.calls.append(("plan", plan_version_id))
+                if plan_version_id == broken_plan_id:
+                    raise ValueError("broken historical plan")
+                return self.by_date[("plan", plan_version_id)]
+
+        builder = PartiallyBrokenBuilder(
+            by_date={("plan", healthy_plan_id): healthy_artifact}
+        )
+        coordinator = self._coordinator(
+            self.session_factory,
+            builder=builder,
+        )
+
+        rows = await coordinator.reconcile_committed_facts()
+
+        self.assertIn(("plan", broken_plan_id), builder.calls)
+        self.assertIn(("plan", healthy_plan_id), builder.calls)
+        self.assertIn(
+            healthy_artifact.snapshot_key,
+            {row.snapshot_key for row in rows},
+        )
+        self.assertEqual(len(await self._rows(healthy_artifact.snapshot_key)), 1)
+
+    async def test_reconcile_committed_facts_propagates_cancellation(self):
+        class CancelledBuilder(FakeBuilder):
+            async def build_rule_artifacts(self, catalog_version="v2"):
+                raise asyncio.CancelledError()
+
+        coordinator = self._coordinator(
+            self.session_factory,
+            builder=CancelledBuilder(),
+        )
+
+        with self.assertRaises(asyncio.CancelledError):
+            await coordinator.reconcile_committed_facts()
 
     async def test_startup_reconcile_does_not_clear_an_active_immutable_lease(self):
         immutable = artifact(

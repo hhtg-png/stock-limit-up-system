@@ -489,11 +489,16 @@ class DataScheduler:
         self._trading_playbook_review_service = service
 
     def install_trading_playbook_obsidian_sync(self, coordinator: Any) -> None:
-        required = ("enqueue_stage", "process_due", "startup_reconcile")
+        required = (
+            "enqueue_stage",
+            "reconcile_committed_facts",
+            "process_due",
+            "startup_reconcile",
+        )
         if any(not callable(getattr(coordinator, name, None)) for name in required):
             raise TypeError(
-                "Obsidian coordinator must provide enqueue_stage, process_due, "
-                "and startup_reconcile"
+                "Obsidian coordinator must provide enqueue_stage, "
+                "reconcile_committed_facts, process_due, and startup_reconcile"
             )
         self._trading_playbook_obsidian_sync = coordinator
         self._trading_playbook_obsidian_rules_enqueued = False
@@ -600,11 +605,20 @@ class DataScheduler:
         if coordinator is None:
             return
         try:
+            await coordinator.reconcile_committed_facts()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(
+                "Trading playbook Obsidian fact compensation failed: {}",
+                exc,
+            )
+        try:
             await coordinator.process_due()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.error("Trading playbook Obsidian compensation failed: {}", exc)
+            logger.error("Trading playbook Obsidian retry failed: {}", exc)
 
     async def _startup_reconcile_trading_playbook_obsidian(self) -> None:
         coordinator = self._trading_playbook_obsidian_sync
@@ -667,6 +681,12 @@ class DataScheduler:
                 generation_key=generation_key,
             )
             if token is None:
+                claim_status = await self._playbook_job_claims.get_status(
+                    db,
+                    job_key,
+                )
+                if claim_status != "completed":
+                    return None
                 plan = await self._latest_stage_plan_in_session(
                     db,
                     target_trade_date,
@@ -843,6 +863,32 @@ class DataScheduler:
             )
         ).scalar_one_or_none()
 
+    @staticmethod
+    async def _persisted_review_ids_in_session(
+        db,
+        review_date: date,
+        *,
+        finalized: bool,
+        plan_version_id: Optional[int] = None,
+    ) -> tuple[int, ...]:
+        from sqlalchemy import select
+        from app.models.trading_playbook import TradingExecutionReview
+
+        statement = select(TradingExecutionReview.id).where(
+            TradingExecutionReview.trade_date == review_date,
+            (
+                TradingExecutionReview.finalized_at.is_not(None)
+                if finalized
+                else TradingExecutionReview.finalized_at.is_(None)
+            ),
+        )
+        if type(plan_version_id) is int and plan_version_id > 0:
+            statement = statement.where(
+                TradingExecutionReview.plan_version_id == plan_version_id
+            )
+        values = await db.scalars(statement.order_by(TradingExecutionReview.id))
+        return tuple(int(review_id) for review_id in values.all())
+
     async def _notify_trading_playbook_plan(self, plan: Any):
         service = self._trading_playbook_alert_service
         notify = getattr(service, "notify_plan_ready", None)
@@ -987,6 +1033,7 @@ class DataScheduler:
             return None
         phase = "finalize" if finalized else "initial_review"
         result = None
+        review_ids: tuple[int, ...] = ()
         async with self._playbook_sessions() as db:
             generation = getattr(service, "generation_key", None)
             if callable(generation):
@@ -1010,9 +1057,10 @@ class DataScheduler:
                     else "all"
                 )
                 generation_key = f"legacy:{review_date.isoformat()}:{selection}"
+            job_key = f"playbook:{phase}:{review_date}:{generation_key}"
             token = await self._playbook_job_claims.claim(
                 db,
-                job_key=f"playbook:{phase}:{review_date}:{generation_key}",
+                job_key=job_key,
                 job_type="review",
                 phase=phase,
                 owner=self._playbook_claim_owner,
@@ -1021,32 +1069,44 @@ class DataScheduler:
                 generation_key=generation_key,
             )
             if token is None:
-                return None
-            try:
-                build_kwargs = {"finalized": finalized}
-                if plan_version_id is not None:
-                    build_kwargs["plan_version_id"] = plan_version_id
-                result = await self._run_with_playbook_claim(
-                    token,
-                    lambda: build(db, review_date, **build_kwargs),
+                claim_status = await self._playbook_job_claims.get_status(
+                    db,
+                    job_key,
                 )
-            except asyncio.CancelledError as exc:
-                await self._rollback_playbook_session(db)
-                await self._fail_playbook_claim_fresh(token, exc)
-                raise
-            except Exception as exc:
-                await self._rollback_playbook_session(db)
-                await self._fail_playbook_claim_fresh(token, exc)
-                logger.error("Trading playbook {} failed: {}", phase, exc)
-                return None
-            completed = await self._playbook_job_claims.complete(
-                db,
-                token,
-                now=self._claim_now(),
-            )
-            if not completed:
-                return None
-        review_ids = self._persisted_entity_ids(result)
+                if claim_status != "completed":
+                    return None
+                review_ids = await self._persisted_review_ids_in_session(
+                    db,
+                    review_date,
+                    finalized=finalized,
+                    plan_version_id=plan_version_id,
+                )
+            else:
+                try:
+                    build_kwargs = {"finalized": finalized}
+                    if plan_version_id is not None:
+                        build_kwargs["plan_version_id"] = plan_version_id
+                    result = await self._run_with_playbook_claim(
+                        token,
+                        lambda: build(db, review_date, **build_kwargs),
+                    )
+                except asyncio.CancelledError as exc:
+                    await self._rollback_playbook_session(db)
+                    await self._fail_playbook_claim_fresh(token, exc)
+                    raise
+                except Exception as exc:
+                    await self._rollback_playbook_session(db)
+                    await self._fail_playbook_claim_fresh(token, exc)
+                    logger.error("Trading playbook {} failed: {}", phase, exc)
+                    return None
+                completed = await self._playbook_job_claims.complete(
+                    db,
+                    token,
+                    now=self._claim_now(),
+                )
+                if not completed:
+                    return None
+                review_ids = self._persisted_entity_ids(result)
         await self._sync_trading_playbook_obsidian_after_commit(
             review_date,
             "final_review" if finalized else "initial_review",
