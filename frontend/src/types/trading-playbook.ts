@@ -114,6 +114,18 @@ export interface TradingPlaybookSettings {
   wechat_enabled: false
 }
 
+export interface TradingPlaybookPersonalWechatStatus {
+  provider: 'wxpusher'
+  delivery: 'personal_wechat'
+  configured: boolean
+  enabled: boolean
+  recipient_masked?: string | null
+  setup_qr_url: string
+  docs_url: string
+  schedule: string[]
+  requires_server_configuration: boolean
+}
+
 export interface TradingCandidateOverride {
   candidate_id?: number
   stock_code?: string

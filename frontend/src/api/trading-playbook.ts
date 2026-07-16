@@ -10,6 +10,7 @@ import type {
   TradingPlaybookObsidianExportRequest,
   TradingPlaybookObsidianExportResponse,
   TradingPlaybookObsidianStatus,
+  TradingPlaybookPersonalWechatStatus,
   TradingPlaybookSettings,
   TradingPlaybookSettingsUpdate
 } from '@/types/trading-playbook'
@@ -102,6 +103,13 @@ export async function getTradingPlaybookSettings() {
 export async function updateTradingPlaybookSettings(settings: TradingPlaybookSettingsUpdate) {
   const { data } = await tradingPlaybookApi.put('/trading-playbook/settings', settings)
   return data as TradingPlaybookSettings
+}
+
+export async function getTradingPlaybookPersonalWechatStatus() {
+  const { data } = await tradingPlaybookApi.get(
+    '/trading-playbook/notifications/personal-wechat/status'
+  )
+  return data as TradingPlaybookPersonalWechatStatus
 }
 
 export async function getObsidianStatus(): Promise<TradingPlaybookObsidianStatus> {

@@ -428,11 +428,38 @@
         <el-form-item label="正式行动候选上限">
           <el-input-number v-model="settingsDraft.max_action_candidates" :min="1" :max="3" :step="1" :precision="0" />
         </el-form-item>
-        <el-form-item label="微信机器人">
+        <el-form-item label="个人微信提醒">
           <div class="wechat-setting">
-            <el-switch :model-value="false" disabled active-text="启用" inactive-text="不可用" />
-            <span>微信机器人暂未接入，后续接入机器人后再开放。</span>
+            <el-tag
+              :type="personalWechatStatus?.enabled ? 'success' : personalWechatStatus?.configured ? 'warning' : 'info'"
+            >
+              {{ personalWechatStatus?.enabled ? '已启用' : personalWechatStatus?.configured ? '待启用' : '未绑定' }}
+            </el-tag>
+            <span v-if="personalWechatStatus?.enabled">
+              WxPusher {{ personalWechatStatus.recipient_masked }}，将在 {{ personalWechatStatus.schedule.join('、') }} 推送。
+            </span>
+            <span v-else-if="personalWechatStatus?.configured">
+              个人微信凭证已安全配置，请启用服务器推送开关。
+            </span>
+            <span v-else>
+              使用个人微信扫描官方二维码获取 SPT，再由服务器安全配置；网页不会保存或显示完整凭证。
+            </span>
+            <el-link
+              v-if="personalWechatStatus?.setup_qr_url"
+              :href="personalWechatStatus.setup_qr_url"
+              target="_blank"
+              type="primary"
+            >
+              打开个人微信绑定二维码
+            </el-link>
           </div>
+          <el-alert
+            v-if="personalWechatStatusError"
+            type="error"
+            :title="`个人微信状态加载失败：${personalWechatStatusError}`"
+            :closable="false"
+            show-icon
+          />
         </el-form-item>
       </el-form>
       <el-empty v-else-if="!store.settingsLoading && !store.settingsError" description="暂无设置数据" />
@@ -797,6 +824,7 @@ import { ElMessage } from 'element-plus'
 import {
   cancelTradingPlan,
   confirmTradingPlan,
+  getTradingPlaybookPersonalWechatStatus,
   getTradingPlan,
   getTradingRules,
   reviseTradingPlan,
@@ -810,7 +838,8 @@ import type {
   TradingModeRule,
   TradingPlanCandidate,
   TradingPlanStage,
-  TradingPlanVersion
+  TradingPlanVersion,
+  TradingPlaybookPersonalWechatStatus
 } from '@/types/trading-playbook'
 import {
   buildManualExecutionUpdate,
@@ -877,6 +906,8 @@ const acknowledgingAlertIds = ref<Set<number>>(new Set())
 const reviewSaving = ref(false)
 const settingsSaving = ref(false)
 const settingsActionError = ref<string | null>(null)
+const personalWechatStatus = ref<TradingPlaybookPersonalWechatStatus | null>(null)
+const personalWechatStatusError = ref<string | null>(null)
 const revisionDialogVisible = ref(false)
 const revisionSaving = ref(false)
 const revisionError = ref<string | null>(null)
@@ -1312,6 +1343,16 @@ async function loadSettings() {
   }
 }
 
+async function loadPersonalWechatStatus() {
+  personalWechatStatusError.value = null
+  try {
+    personalWechatStatus.value = await getTradingPlaybookPersonalWechatStatus()
+  } catch (error) {
+    personalWechatStatus.value = null
+    personalWechatStatusError.value = errorMessage(error)
+  }
+}
+
 async function saveSettings() {
   settingsSaving.value = true
   settingsActionError.value = null
@@ -1360,6 +1401,7 @@ async function loadAll() {
     loadReviewDomain(),
     loadInbox(),
     loadSettings(),
+    loadPersonalWechatStatus(),
     loadRules(),
     store.loadObsidianStatus()
   ])

@@ -13,6 +13,9 @@ services:
     environment:
       - DATABASE_URL=sqlite+aiosqlite:///./data/stock_limit_up.db
       - DEBUG=false
+      - TRADING_PLAYBOOK_WXPUSHER_ENABLED=${TRADING_PLAYBOOK_WXPUSHER_ENABLED:-false}
+      - TRADING_PLAYBOOK_WXPUSHER_SPT=${TRADING_PLAYBOOK_WXPUSHER_SPT:-}
+      - TRADING_PLAYBOOK_PUBLIC_URL=${TRADING_PLAYBOOK_PUBLIC_URL:-http://111.229.27.195/trading-playbook}
     restart: unless-stopped
 
   frontend:

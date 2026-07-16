@@ -129,6 +129,21 @@ def get_trading_playbook_review_service(request: Request):
     return service
 
 
+def get_personal_wechat_channel(request: Request):
+    """Return the app-owned personal WeChat delivery channel."""
+    try:
+        channel = getattr(
+            request.app.state,
+            "trading_playbook_wxpusher_channel",
+            None,
+        )
+    except Exception as exc:
+        raise _service_unavailable() from exc
+    if channel is None or not callable(getattr(channel, "status", None)):
+        raise _service_unavailable()
+    return channel
+
+
 def get_trading_playbook_obsidian_sync(request: Request):
     """Return only the application-owned Obsidian coordinator."""
 
@@ -921,6 +936,24 @@ async def get_settings(
         raise _service_unavailable() from exc
     except Exception as exc:
         await _rollback_quietly(db)
+        raise _service_unavailable() from exc
+
+
+@router.get(
+    "/notifications/personal-wechat/status",
+    summary="查询个人微信提醒配置状态",
+)
+async def get_personal_wechat_status(
+    channel=Depends(get_personal_wechat_channel),
+):
+    try:
+        payload = channel.status()
+        if not isinstance(payload, Mapping):
+            raise TypeError("personal WeChat status must be a mapping")
+        return dict(payload)
+    except HTTPException:
+        raise
+    except Exception as exc:
         raise _service_unavailable() from exc
 
 

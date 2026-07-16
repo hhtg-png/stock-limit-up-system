@@ -22,8 +22,12 @@ from app.services.trading_playbook.composition import (
 from app.services.trading_playbook.alert_service import (
     TradingPlaybookAlertService,
 )
+from app.services.trading_playbook.alert_fanout import (
+    TradingPlaybookScheduledAlertFanout,
+)
 from app.services.trading_playbook.channels import (
     InAppTradingPlanAlertChannel,
+    WxPusherTradingPlanAlertChannel,
 )
 from app.services.trading_playbook.runtime import trading_playbook_runtime
 from app.services.trading_playbook.review_service import (
@@ -52,6 +56,8 @@ def _clear_trading_playbook_runtime(app: FastAPI) -> None:
         delattr(app.state, "trading_playbook_calendar")
     if hasattr(app.state, "trading_playbook_alert_service"):
         delattr(app.state, "trading_playbook_alert_service")
+    if hasattr(app.state, "trading_playbook_wxpusher_channel"):
+        delattr(app.state, "trading_playbook_wxpusher_channel")
     if hasattr(app.state, "trading_playbook_review_service"):
         delattr(app.state, "trading_playbook_review_service")
     if hasattr(app.state, "trading_playbook_obsidian_sync"):
@@ -85,12 +91,33 @@ async def lifespan(app: FastAPI):
                 next_trade_date=calendar.next_trade_date,
             )
             data_scheduler.install_trading_playbook_orchestrator(orchestrator)
-            alert_service = TradingPlaybookAlertService(
+            in_app_alert_service = TradingPlaybookAlertService(
                 InAppTradingPlanAlertChannel(),
                 session_factory=async_session_maker,
                 quote_api=tencent_api,
                 realtime_limit_up_loader=load_production_realtime_limit_up,
                 trading_calendar=calendar,
+            )
+            wxpusher_channel = WxPusherTradingPlanAlertChannel(
+                settings.TRADING_PLAYBOOK_WXPUSHER_SPT,
+                enabled=settings.TRADING_PLAYBOOK_WXPUSHER_ENABLED,
+                public_url=settings.TRADING_PLAYBOOK_PUBLIC_URL,
+                timeout_seconds=(
+                    settings.TRADING_PLAYBOOK_WXPUSHER_TIMEOUT_SECONDS
+                ),
+            )
+            scheduled_channels = []
+            if wxpusher_channel.enabled:
+                scheduled_channels.append(
+                    TradingPlaybookAlertService(
+                        wxpusher_channel,
+                        session_factory=async_session_maker,
+                        trading_calendar=calendar,
+                    )
+                )
+            alert_service = TradingPlaybookScheduledAlertFanout(
+                in_app_alert_service,
+                scheduled_channels,
             )
             data_scheduler.install_trading_playbook_alert_service(alert_service)
             review_service = TradingPlaybookReviewService(
@@ -123,6 +150,7 @@ async def lifespan(app: FastAPI):
             trading_playbook_runtime.install_review_service(review_service)
             app.state.trading_playbook_orchestrator = orchestrator
             app.state.trading_playbook_alert_service = alert_service
+            app.state.trading_playbook_wxpusher_channel = wxpusher_channel
             app.state.trading_playbook_review_service = review_service
             app.state.trading_playbook_calendar = calendar
             app.state.trading_playbook_obsidian_sync = obsidian_sync

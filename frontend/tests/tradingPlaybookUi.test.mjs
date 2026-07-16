@@ -84,14 +84,15 @@ test('version timeline displays persisted version differences', () => {
   assert.match(view, /版本变化/, 'timeline should label the persisted change summary')
 })
 
-test('page exposes loading, error, and empty states and keeps WeChat unavailable', () => {
+test('page exposes loading, error, empty states, and personal WeChat status', () => {
   const view = read('src/views/TradingPlaybook.vue')
 
   assert.match(view, /v-loading=/, 'sections should expose loading state')
   assert.match(view, /el-alert[\s\S]*Error|plansError|reviewsError|alertsError|settingsError/, 'page should render request errors')
   assert.match(view, /<el-empty/, 'collections should render explicit empty states')
-  assert.match(view, /微信机器人暂未接入/, 'settings should explain the future WeChat channel')
-  assert.match(view, /disabled[\s\S]*微信|微信[\s\S]*disabled/, 'WeChat control should be disabled')
+  assert.match(view, /个人微信提醒/, 'settings should expose the personal WeChat channel')
+  assert.match(view, /getTradingPlaybookPersonalWechatStatus/, 'WeChat status should come from the backend')
+  assert.match(view, /打开个人微信绑定二维码/, 'settings should expose the secure setup entry')
 })
 
 test('page exposes compact Obsidian sync controls without weakening manual boundaries', () => {

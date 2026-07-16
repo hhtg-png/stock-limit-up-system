@@ -88,6 +88,10 @@ class Settings(BaseSettings):
     TRADING_PLAYBOOK_CONFIRMED_POSITION_PCT: float = 30.0
     TRADING_PLAYBOOK_HARD_STOP_PCT: float = 5.0
     TRADING_PLAYBOOK_MAX_ACTION_CANDIDATES: int = 3
+    TRADING_PLAYBOOK_WXPUSHER_ENABLED: bool = False
+    TRADING_PLAYBOOK_WXPUSHER_SPT: Optional[str] = None
+    TRADING_PLAYBOOK_WXPUSHER_TIMEOUT_SECONDS: float = 10.0
+    TRADING_PLAYBOOK_PUBLIC_URL: str = "http://111.229.27.195/trading-playbook"
 
     # DeepSeek 总结配置
     DEEPSEEK_API_KEY: Optional[str] = None

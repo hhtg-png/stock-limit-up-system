@@ -1677,12 +1677,12 @@ class TradingPlaybookAlertService:
             return winner
 
     async def _channel_enabled(self, db) -> bool:
-        if self.channel_name != "in_app":
-            return True
         settings = await db.get(TradingPlaybookSettings, 1)
-        return settings is not None and (
-            bool(settings.enabled) and bool(settings.in_app_enabled)
-        )
+        if settings is None or not bool(settings.enabled):
+            return False
+        if self.channel_name == "in_app":
+            return bool(settings.in_app_enabled)
+        return bool(getattr(self.channel, "enabled", True))
 
     @staticmethod
     def _initial_channel_status(
@@ -1873,8 +1873,6 @@ class TradingPlaybookAlertService:
         )
 
     async def _delivery_enabled_under_lock(self, db, event_id: int) -> bool:
-        if self.channel_name != "in_app":
-            return True
         settings = await self._lock_delivery_settings(db)
         if settings is None:
             await self._skip_owned_delivery(
@@ -1883,7 +1881,12 @@ class TradingPlaybookAlertService:
                 reason="settings_missing",
             )
             return False
-        if not bool(settings.enabled) or not bool(settings.in_app_enabled):
+        channel_enabled = (
+            bool(settings.in_app_enabled)
+            if self.channel_name == "in_app"
+            else bool(getattr(self.channel, "enabled", True))
+        )
+        if not bool(settings.enabled) or not channel_enabled:
             await self._skip_owned_delivery(
                 db,
                 event_id,

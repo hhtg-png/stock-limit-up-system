@@ -1578,6 +1578,30 @@ class TradingPlaybookApiTests(unittest.TestCase):
                     422,
                 )
 
+    def test_personal_wechat_status_masks_recipient_and_exposes_schedule(self):
+        self.app.state.trading_playbook_wxpusher_channel = SimpleNamespace(
+            status=lambda: {
+                "provider": "wxpusher",
+                "delivery": "personal_wechat",
+                "configured": True,
+                "enabled": True,
+                "recipient_masked": "SPT_****1234",
+                "setup_qr_url": "https://wxpusher.example/qr.jpg",
+                "docs_url": "https://wxpusher.example/docs/",
+                "schedule": ["08:50", "09:26", "14:40", "15:10", "15:30"],
+                "requires_server_configuration": False,
+            }
+        )
+
+        response = self.client.get(
+            "/trading-playbook/notifications/personal-wechat/status"
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["recipient_masked"], "SPT_****1234")
+        self.assertEqual(len(response.json()["schedule"]), 5)
+        self.assertNotIn("private", response.text)
+
     def test_settings_get_persistently_disables_legacy_wechat_flag(self):
         async def set_legacy_flag():
             async with self.Session() as db:
@@ -2424,8 +2448,15 @@ class TradingPlaybookApiTests(unittest.TestCase):
             if route.path.startswith("/trading-playbook")
             for method in route.methods
         ]
-        self.assertEqual(len(operations), 15)
-        self.assertEqual(len(set(operations)), 15)
+        self.assertEqual(len(operations), 16)
+        self.assertEqual(len(set(operations)), 16)
+        self.assertIn(
+            (
+                "/trading-playbook/notifications/personal-wechat/status",
+                "GET",
+            ),
+            operations,
+        )
 
 
 if __name__ == "__main__":

@@ -121,6 +121,7 @@ test('trading playbook API sends exact backend routes, params, and payloads', as
     await client.updateTradingExecutionReview('2026-07-15', review)
     await client.getTradingPlaybookSettings()
     await client.updateTradingPlaybookSettings(settings)
+    await client.getTradingPlaybookPersonalWechatStatus()
 
     assert.equal(client.tradingPlaybookApi.defaults.baseURL, '/api/v1')
     assert.deepEqual(calls, [
@@ -163,7 +164,13 @@ test('trading playbook API sends exact backend routes, params, and payloads', as
         data: review
       },
       { method: 'get', url: '/trading-playbook/settings', params: undefined, data: undefined },
-      { method: 'put', url: '/trading-playbook/settings', params: undefined, data: settings }
+      { method: 'put', url: '/trading-playbook/settings', params: undefined, data: settings },
+      {
+        method: 'get',
+        url: '/trading-playbook/notifications/personal-wechat/status',
+        params: undefined,
+        data: undefined
+      }
     ])
   })
 })
