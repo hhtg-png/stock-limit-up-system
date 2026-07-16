@@ -31,6 +31,7 @@ from app.services.trading_playbook.serialization import normalize_plan_payload
 _CATALOG_VERSION = re.compile(r"v([1-9][0-9]*)\Z")
 _MODE_KEY = re.compile(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)*\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_STOCK_CODE = re.compile(r"[0-9]{6}\Z")
 _PLAN_STAGES = ("preclose", "after_close", "overnight", "auction")
 _CANDIDATE_STATUSES = {"waiting", "triggered", "invalidated", "exit"}
 _MAX_DATABASE_INTEGER = (1 << 63) - 1
@@ -166,7 +167,7 @@ class TradingPlaybookObsidianSnapshotBuilder:
                     f"trading plan version {plan_version_id} has more than 3 candidates"
                 )
             self._validate_plan_data(plan, candidates)
-            await self._validate_plan_rule_provenance(db, plan)
+            await self._validate_plan_rule_provenance(db, plan, candidates)
             return self._build_plan_artifact(plan, candidates)
 
     @staticmethod
@@ -320,6 +321,7 @@ class TradingPlaybookObsidianSnapshotBuilder:
         cls,
         db: AsyncSession,
         plan: TradingPlanVersion,
+        candidates: list[TradingPlanCandidate],
     ) -> None:
         plan_id = plan.id
         snapshot_rows = plan.rule_snapshot_json
@@ -431,6 +433,33 @@ class TradingPlaybookObsidianSnapshotBuilder:
                 (ref["source_key"], ref["source_content_hash"])
                 for ref in persisted_refs
             )
+        try:
+            risk_source_refs = canonical_rule_source_refs(
+                {
+                    "source_refs": plan.risk_settings_json.get(
+                        "source_refs"
+                    )
+                }
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"plan {plan_id} risk_settings source_refs are malformed: {exc}"
+            ) from exc
+        if plan.risk_settings_json.get("source_refs") != risk_source_refs:
+            raise ValueError(
+                f"plan {plan_id} risk_settings source_refs are not canonical"
+            )
+        risk_hash_by_key: dict[str, str] = {}
+        for risk_source_ref in risk_source_refs:
+            source_key = risk_source_ref["source_key"]
+            source_hash = risk_source_ref["source_content_hash"]
+            previous = risk_hash_by_key.setdefault(source_key, source_hash)
+            if previous != source_hash:
+                raise ValueError(
+                    f"plan {plan_id} risk_settings source hashes conflict"
+                )
+        risk_source_pairs = set(risk_hash_by_key.items())
+        required_sources.update(risk_source_pairs)
         ready_sources = set(
             (
                 await db.execute(
@@ -447,19 +476,33 @@ class TradingPlaybookObsidianSnapshotBuilder:
                 )
             ).all()
         )
+        if risk_source_pairs - ready_sources:
+            raise ValueError(
+                f"plan {plan_id} risk_settings has no exact persisted ready source"
+            )
         if required_sources - ready_sources:
             raise ValueError(
                 f"plan {plan_id} rule_snapshot references a missing persisted ready source"
             )
 
+        radar_identities: set[tuple[str, str]] = set()
+        radar_modes_by_stock: dict[str, set[str]] = {}
         for index, radar_row in enumerate(plan.mode_radar_json):
             if type(radar_row) is not dict:
                 raise ValueError(
                     f"plan {plan_id} mode_radar[{index}] must be a JSON object"
                 )
             mode_key = radar_row.get("mode_key")
+            stock_code = radar_row.get("stock_code")
             rule_version = radar_row.get("rule_version")
             rule_hash = radar_row.get("rule_hash")
+            if (
+                not isinstance(stock_code, str)
+                or _STOCK_CODE.fullmatch(stock_code) is None
+            ):
+                raise ValueError(
+                    f"plan {plan_id} mode_radar stock_code is malformed"
+                )
             if (
                 not isinstance(mode_key, str)
                 or _MODE_KEY.fullmatch(mode_key) is None
@@ -486,6 +529,28 @@ class TradingPlaybookObsidianSnapshotBuilder:
             ):
                 raise ValueError(
                     f"plan {plan_id} mode_radar does not match rule_snapshot"
+                )
+            radar_identity = (stock_code, mode_key)
+            if radar_identity in radar_identities:
+                raise ValueError(
+                    f"plan {plan_id} mode_radar has duplicate stock/mode identity"
+                )
+            radar_identities.add(radar_identity)
+            radar_modes_by_stock.setdefault(stock_code, set()).add(mode_key)
+
+        for candidate in candidates:
+            candidate_modes = {
+                candidate.primary_mode_key,
+                *candidate.supporting_mode_keys_json,
+            }
+            missing_modes = candidate_modes - radar_modes_by_stock.get(
+                candidate.stock_code,
+                set(),
+            )
+            if missing_modes:
+                raise ValueError(
+                    f"candidate {candidate.id} mode_radar is missing same-stock "
+                    f"modes: {', '.join(sorted(missing_modes))}"
                 )
 
     @staticmethod

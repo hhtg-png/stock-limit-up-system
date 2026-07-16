@@ -172,25 +172,43 @@ class TradingPlaybookObsidianSnapshotBuilderTests(
         self.rule_rows = rows
 
     def _plan_row(self, plan_id, stage, version_no, confirmed):
-        snapshot_rule = next(
-            rule
-            for rule in self.catalog["rules"]
-            if rule["mode_key"] == "leader_turn_two"
-        )
-        rule_hash = canonical_rule_content_hash(snapshot_rule)
-        source_refs = canonical_rule_source_refs(snapshot_rule)
-        source_hashes = [
-            {
-                "source_key": source_key,
-                "content_hash": content_hash,
+        catalog_by_mode = {
+            rule["mode_key"]: rule for rule in self.catalog["rules"]
+        }
+
+        def snapshot_row(mode_key):
+            snapshot_rule = catalog_by_mode[mode_key]
+            source_refs = canonical_rule_source_refs(snapshot_rule)
+            return {
+                "mode_key": mode_key,
+                "version": 2,
+                "content_hash": canonical_rule_content_hash(snapshot_rule),
+                "source_hashes": [
+                    {
+                        "source_key": source_key,
+                        "content_hash": content_hash,
+                    }
+                    for source_key, content_hash in sorted(
+                        {
+                            ref["source_key"]: ref["source_content_hash"]
+                            for ref in source_refs
+                        }.items()
+                    )
+                ],
+                "source_refs": _json_copy(source_refs),
             }
-            for source_key, content_hash in sorted(
-                {
-                    ref["source_key"]: ref["source_content_hash"]
-                    for ref in source_refs
-                }.items()
+
+        snapshot_rows = [
+            snapshot_row(mode_key)
+            for mode_key in (
+                "leader_turn_two",
+                "trend_core_pullback",
+                "first_mover_leader",
             )
         ]
+        snapshot_by_mode = {
+            row["mode_key"]: row for row in snapshot_rows
+        }
         source_hashes_by_key = {
             source["source_key"]: source["content_hash"]
             for source in self.catalog["sources"]
@@ -213,20 +231,31 @@ class TradingPlaybookObsidianSnapshotBuilderTests(
             ],
             mode_radar_json=[
                 {
+                    "stock_code": "600001",
+                    "mode_key": "trend_core_pullback",
+                    "rule_version": 2,
+                    "rule_hash": snapshot_by_mode["trend_core_pullback"][
+                        "content_hash"
+                    ],
+                },
+                {
+                    "stock_code": "600002",
                     "mode_key": "leader_turn_two",
                     "rule_version": 2,
-                    "rule_hash": rule_hash,
-                }
-            ],
-            rule_snapshot_json=[
+                    "rule_hash": snapshot_by_mode["leader_turn_two"][
+                        "content_hash"
+                    ],
+                },
                 {
-                    "mode_key": "leader_turn_two",
-                    "version": 2,
-                    "content_hash": rule_hash,
-                    "source_hashes": _json_copy(source_hashes),
-                    "source_refs": _json_copy(source_refs),
-                }
+                    "stock_code": "600002",
+                    "mode_key": "first_mover_leader",
+                    "rule_version": 2,
+                    "rule_hash": snapshot_by_mode["first_mover_leader"][
+                        "content_hash"
+                    ],
+                },
             ],
+            rule_snapshot_json=snapshot_rows,
             risk_settings_json={
                 "trial": 10,
                 "confirmed": 30,
@@ -933,6 +962,28 @@ class TradingPlaybookObsidianSnapshotBuilderTests(
                 [self.candidate_rows[2011]],
             )
 
+    async def test_plan_builder_requires_candidate_modes_in_same_stock_radar(self):
+        await self._assert_candidate_field_rejected(
+            "primary_mode_key",
+            "new_theme_high_volatility",
+            "mode_radar",
+            candidate_id=2021,
+        )
+        await self._assert_candidate_field_rejected(
+            "supporting_mode_keys_json",
+            ["leader_turn_two"],
+            "mode_radar",
+            candidate_id=2021,
+        )
+
+        duplicate_radar = deepcopy(self.plan_rows[202].mode_radar_json)
+        duplicate_radar.append(deepcopy(duplicate_radar[0]))
+        await self._assert_plan_field_rejected(
+            "mode_radar_json",
+            duplicate_radar,
+            "duplicate",
+        )
+
     async def test_plan_builder_validates_rule_snapshot_and_radar_provenance(self):
         fabricated_snapshot = deepcopy(
             self.plan_rows[202].rule_snapshot_json
@@ -976,6 +1027,34 @@ class TradingPlaybookObsidianSnapshotBuilderTests(
             fabricated_radar,
             "mode_radar.*rule_snapshot",
         )
+
+    async def test_plan_builder_validates_risk_setting_source_provenance(self):
+        fabricated_risk = deepcopy(self.plan_rows[202].risk_settings_json)
+        fabricated_risk["source_refs"][0]["source_content_hash"] = "f" * 64
+        await self._assert_plan_field_rejected(
+            "risk_settings_json",
+            fabricated_risk,
+            "risk_settings.*persisted ready source",
+        )
+
+        source_row = next(
+            row for row in self.source_rows if row.source_key == "03-loss-qa"
+        )
+        async with self.session_factory() as session:
+            source = await session.get(TradingRuleSource, source_row.id)
+            source.status = "missing"
+            await session.commit()
+        try:
+            with self.assertRaisesRegex(
+                ValueError,
+                "risk_settings.*persisted ready source",
+            ):
+                await self.builder.build_plan_artifact(202)
+        finally:
+            async with self.session_factory() as session:
+                source = await session.get(TradingRuleSource, source_row.id)
+                source.status = "ready"
+                await session.commit()
 
 
 if __name__ == "__main__":
