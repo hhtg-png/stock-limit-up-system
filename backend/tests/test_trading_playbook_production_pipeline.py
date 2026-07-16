@@ -1,5 +1,6 @@
 import unittest
 from datetime import date, datetime, time, timedelta
+from pathlib import Path
 from unittest.mock import patch
 
 from sqlalchemy import delete
@@ -13,10 +14,12 @@ from app.models.market_review import (
     MarketReviewStockDaily,
 )
 from app.models.stock import Stock
+from app.models.trading_playbook import TradingRuleSource
 from app.services.realtime_limit_up_service import RealtimeLimitUpSnapshot
 from app.services.trading_playbook.composition import (
     build_production_trading_playbook_orchestrator,
 )
+from app.services.trading_playbook.rule_catalog import RuleCatalog
 from app.utils.time_utils import CN_TZ
 
 
@@ -46,6 +49,15 @@ class TradingPlaybookProductionPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.Session = async_sessionmaker(self.engine, expire_on_commit=False)
         async with self.engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
+        catalog = RuleCatalog(
+            Path(__file__).resolve().parents[1]
+            / "app"
+            / "data"
+            / "trading_playbook_rules_v2.json"
+        ).load()
+        self.catalog_sources = {
+            source["source_key"]: source for source in catalog["sources"]
+        }
         await self._seed_real_facts()
 
     async def asyncTearDown(self):
@@ -70,6 +82,20 @@ class TradingPlaybookProductionPipelineTests(unittest.IsolatedAsyncioTestCase):
             ]
             db.add_all(stocks)
             await db.flush()
+            # Production reaches this state only after the verified rule import
+            # command has checked transcript files and persisted their hashes.
+            db.add_all(
+                [
+                    TradingRuleSource(
+                        source_key=source["source_key"],
+                        source_path=source["source_path"],
+                        source_title=source["source_title"],
+                        content_hash=source["content_hash"],
+                        status="ready",
+                    )
+                    for source in self.catalog_sources.values()
+                ]
+            )
             db.add_all(
                 [
                     MarketReviewDailyMetric(
@@ -325,6 +351,18 @@ class TradingPlaybookProductionPipelineTests(unittest.IsolatedAsyncioTestCase):
                         candidate["risk_level"] in {"trial", "confirmed"}
                         for candidate in plan["candidates"]
                     )
+                )
+                self.assertEqual(
+                    {
+                        ref["source_key"]: ref["source_content_hash"]
+                        for ref in plan["risk_settings_json"]["source_refs"]
+                    },
+                    {
+                        source_key: self.catalog_sources[source_key][
+                            "content_hash"
+                        ]
+                        for source_key in ("03-loss-qa", "04-trading-plan")
+                    },
                 )
 
     async def test_missing_previous_facts_remain_degraded_without_candidates(self):
