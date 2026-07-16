@@ -1,15 +1,22 @@
 import hashlib
 import json
 import unittest
+from copy import deepcopy
 from datetime import date, datetime
 from pathlib import Path
 from unittest.mock import patch
 
+from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
 from app.database import Base
-from app.models import TradingModeRule, TradingPlanCandidate, TradingPlanVersion
+from app.models import (
+    TradingModeRule,
+    TradingPlanCandidate,
+    TradingPlanVersion,
+    TradingRuleSource,
+)
 from app.services.trading_playbook.obsidian_snapshot_builder import (
     TradingPlaybookObsidianSnapshotBuilder,
 )
@@ -68,6 +75,18 @@ class TradingPlaybookObsidianSnapshotBuilderTests(
 
     async def _seed_rules(self):
         created_at = datetime(2026, 7, 1, 10, 20, 30, 456789)
+        sources = [
+            TradingRuleSource(
+                id=index,
+                source_key=source["source_key"],
+                source_path=source["source_path"],
+                source_title=source["source_title"],
+                content_hash=source["content_hash"],
+                ingested_at=created_at,
+                status="ready",
+            )
+            for index, source in enumerate(self.catalog["sources"], start=1)
+        ]
         rows = []
         for index, rule in enumerate(self.catalog["rules"], start=1):
             rows.append(
@@ -146,12 +165,32 @@ class TradingPlaybookObsidianSnapshotBuilderTests(
             ]
         )
         async with self.session_factory() as session:
+            session.add_all(sources)
             session.add_all(rows)
             await session.commit()
+        self.source_rows = sources
         self.rule_rows = rows
 
     def _plan_row(self, plan_id, stage, version_no, confirmed):
-        source_ref = self.catalog["rules"][0]["source_refs"][0]
+        snapshot_rule = next(
+            rule
+            for rule in self.catalog["rules"]
+            if rule["mode_key"] == "leader_turn_two"
+        )
+        rule_hash = canonical_rule_content_hash(snapshot_rule)
+        source_refs = canonical_rule_source_refs(snapshot_rule)
+        source_hashes = [
+            {
+                "source_key": source_key,
+                "content_hash": content_hash,
+            }
+            for source_key, content_hash in sorted(
+                {
+                    ref["source_key"]: ref["source_content_hash"]
+                    for ref in source_refs
+                }.items()
+            )
+        ]
         source_hashes_by_key = {
             source["source_key"]: source["content_hash"]
             for source in self.catalog["sources"]
@@ -176,15 +215,16 @@ class TradingPlaybookObsidianSnapshotBuilderTests(
                 {
                     "mode_key": "leader_turn_two",
                     "rule_version": 2,
-                    "rule_hash": "a" * 64,
+                    "rule_hash": rule_hash,
                 }
             ],
             rule_snapshot_json=[
                 {
                     "mode_key": "leader_turn_two",
                     "version": 2,
-                    "content_hash": "a" * 64,
-                    "source_refs": [_json_copy(source_ref)],
+                    "content_hash": rule_hash,
+                    "source_hashes": _json_copy(source_hashes),
+                    "source_refs": _json_copy(source_refs),
                 }
             ],
             risk_settings_json={
@@ -233,18 +273,18 @@ class TradingPlaybookObsidianSnapshotBuilderTests(
                 plan_version_id=plan_id,
                 stock_code="600002",
                 stock_name="候选乙",
-                action_trade_date=date(2026, 7, 17),
+                action_trade_date=date(2026, 7, 16),
                 theme_name="机器人",
                 primary_mode_key="leader_turn_two",
                 supporting_mode_keys_json=["first_mover_leader"],
                 role="leader",
-                rank=1,
+                rank=2,
                 recognition_json={"score": 88.5},
-                entry_trigger_json={"above": 12.3},
-                invalidation_json={"below": 11.8},
-                exit_trigger_json={"target": 13.5},
-                risk_level="medium",
-                position_reference=10.0,
+                entry_trigger_json={"reference_price": 12.34, "price_gte": 12.3},
+                invalidation_json={"price_lte": 11.72},
+                exit_trigger_json={"price_gte": 13.5},
+                risk_level="confirmed",
+                position_reference=30.0,
                 evidence_json=[{"kind": "limit_up", "days": 2}],
                 manual_overrides_json=shared_overrides,
                 status="waiting",
@@ -254,21 +294,21 @@ class TradingPlaybookObsidianSnapshotBuilderTests(
                 plan_version_id=plan_id,
                 stock_code="600001",
                 stock_name="候选甲",
-                action_trade_date=date(2026, 7, 18),
+                action_trade_date=date(2026, 7, 14),
                 theme_name="算力",
                 primary_mode_key="trend_core_pullback",
                 supporting_mode_keys_json=[],
                 role="trend_core",
                 rank=1,
                 recognition_json={"score": 86},
-                entry_trigger_json={"above": 20.0},
-                invalidation_json={"below": 19.0},
-                exit_trigger_json={"target": 22.0},
-                risk_level="low",
-                position_reference=8.5,
+                entry_trigger_json={"reference_price": 20.0, "price_gte": 20.0},
+                invalidation_json={"price_lte": 19.0},
+                exit_trigger_json={"price_gte": 22.0},
+                risk_level="trial",
+                position_reference=10.0,
                 evidence_json=[{"kind": "trend", "days": 5}],
                 manual_overrides_json={},
-                status="observing",
+                status="triggered",
             ),
         ]
         return rows, shared_overrides
@@ -302,6 +342,50 @@ class TradingPlaybookObsidianSnapshotBuilderTests(
         self.candidate_rows = {
             candidate.id: candidate for candidate in candidates
         }
+
+    async def _assert_plan_field_rejected(
+        self,
+        field,
+        value,
+        message,
+        *,
+        plan_id=202,
+    ):
+        async with self.session_factory() as session:
+            plan = await session.get(TradingPlanVersion, plan_id)
+            original = deepcopy(getattr(plan, field))
+            setattr(plan, field, deepcopy(value))
+            await session.commit()
+        try:
+            with self.assertRaisesRegex(ValueError, message):
+                await self.builder.build_plan_artifact(plan_id)
+        finally:
+            async with self.session_factory() as session:
+                plan = await session.get(TradingPlanVersion, plan_id)
+                setattr(plan, field, original)
+                await session.commit()
+
+    async def _assert_candidate_field_rejected(
+        self,
+        field,
+        value,
+        message,
+        *,
+        candidate_id=2021,
+    ):
+        async with self.session_factory() as session:
+            candidate = await session.get(TradingPlanCandidate, candidate_id)
+            original = deepcopy(getattr(candidate, field))
+            setattr(candidate, field, deepcopy(value))
+            await session.commit()
+        try:
+            with self.assertRaisesRegex(ValueError, message):
+                await self.builder.build_plan_artifact(202)
+        finally:
+            async with self.session_factory() as session:
+                candidate = await session.get(TradingPlanCandidate, candidate_id)
+                setattr(candidate, field, original)
+                await session.commit()
 
     async def test_rule_builder_exports_actual_v2_catalog_deterministically(self):
         with patch(
@@ -507,6 +591,41 @@ class TradingPlaybookObsidianSnapshotBuilderTests(
                 with self.assertRaisesRegex(ValueError, message):
                     await self.builder.build_rule_artifacts(version)
 
+    async def test_rule_builder_recomputes_valid_looking_content_hash(self):
+        async with self.session_factory() as session:
+            stored = await session.get(TradingModeRule, 1)
+            self.assertIsNotNone(stored)
+            stored.content_hash = "f" * 64
+            await session.commit()
+
+        with self.assertRaisesRegex(ValueError, "content_hash does not match"):
+            await self.builder.build_rule_artifacts("v2")
+
+    async def test_rule_builder_requires_exact_ready_persisted_sources(self):
+        source_ref = self.catalog["rules"][0]["source_refs"][0]
+        async with self.session_factory() as session:
+            await session.execute(
+                delete(TradingRuleSource).where(
+                    TradingRuleSource.source_key == source_ref["source_key"],
+                    TradingRuleSource.content_hash
+                    == source_ref["source_content_hash"],
+                )
+            )
+            session.add(
+                TradingRuleSource(
+                    source_key=source_ref["source_key"],
+                    source_path="wrong-version.txt",
+                    source_title="wrong version",
+                    content_hash="f" * 64,
+                    ingested_at=datetime(2026, 7, 1, 11),
+                    status="ready",
+                )
+            )
+            await session.commit()
+
+        with self.assertRaisesRegex(ValueError, "persisted ready source"):
+            await self.builder.build_rule_artifacts("v2")
+
     async def test_plan_builder_maps_all_stages_and_preserves_distinct_dates(self):
         expected_stages = ("preclose", "after_close", "overnight", "auction")
         for offset, stage in enumerate(expected_stages, start=1):
@@ -529,7 +648,7 @@ class TradingPlaybookObsidianSnapshotBuilderTests(
                 self.assertEqual(payload["target_trade_date"], "2026-07-16")
                 self.assertEqual(
                     [row["action_trade_date"] for row in payload["candidates"]],
-                    ["2026-07-18", "2026-07-17"],
+                    ["2026-07-14", "2026-07-16"],
                 )
                 self.assertEqual(
                     [row["candidate_id"] for row in payload["candidates"]],
@@ -615,9 +734,11 @@ class TradingPlaybookObsidianSnapshotBuilderTests(
             payload["rule_snapshot"][0]["source_refs"][0][
                 "source_content_hash"
             ],
-            self.catalog["rules"][0]["source_refs"][0][
-                "source_content_hash"
-            ],
+            next(
+                rule
+                for rule in self.catalog["rules"]
+                if rule["mode_key"] == "leader_turn_two"
+            )["source_refs"][0]["source_content_hash"],
         )
         self.assertEqual(
             payload["candidates"][1]["manual_overrides"],
@@ -729,6 +850,132 @@ class TradingPlaybookObsidianSnapshotBuilderTests(
             await self.builder.build_plan_artifact(401)
         with self.assertRaisesRegex(ValueError, "version_no"):
             await self.builder.build_plan_artifact(402)
+
+    async def test_plan_builder_rejects_corrupt_plan_scalars_and_json_roots(self):
+        for field, value, message in (
+            ("status", "publishing", "status"),
+            ("input_hash", "f" * 63, "input_hash"),
+            ("market_state_json", None, "market_state"),
+            ("theme_ranking_json", {}, "theme_ranking"),
+            ("mode_radar_json", {}, "mode_radar"),
+            ("rule_snapshot_json", None, "rule_snapshot"),
+            ("risk_settings_json", [], "risk_settings"),
+            ("data_quality_json", [], "data_quality"),
+            ("change_summary_json", [], "change_summary"),
+        ):
+            with self.subTest(field=field):
+                await self._assert_plan_field_rejected(
+                    field,
+                    value,
+                    message,
+                )
+
+        await self._assert_plan_field_rejected(
+            "source_trade_date",
+            date(2026, 7, 17),
+            "trade-date order",
+        )
+
+    async def test_plan_builder_rejects_corrupt_candidate_semantics_and_roots(self):
+        for field, value, message, candidate_id in (
+            ("rank", 0, "rank", 2021),
+            ("rank", 1, "ranks are not unique", 2022),
+            ("stock_code", "../bad", "stock code", 2021),
+            ("primary_mode_key", "../bad", "primary mode", 2021),
+            ("action_trade_date", date(2026, 7, 15), "action trade date", 2021),
+            ("supporting_mode_keys_json", None, "supporting_mode_keys", 2021),
+            (
+                "supporting_mode_keys_json",
+                ["../bad"],
+                "supporting_mode_keys",
+                2021,
+            ),
+            ("recognition_json", [], "recognition", 2021),
+            ("entry_trigger_json", None, "entry trigger", 2021),
+            (
+                "entry_trigger_json",
+                {"price_gte": 20.0},
+                "reference price is missing",
+                2021,
+            ),
+            ("invalidation_json", [], "invalidation", 2021),
+            (
+                "invalidation_json",
+                {"price_lte": 18.5},
+                "hard stop does not match",
+                2021,
+            ),
+            ("exit_trigger_json", [], "exit trigger", 2021),
+            (
+                "exit_trigger_json",
+                {"change_pct_lte": 1},
+                "exit percentage is unsafe",
+                2021,
+            ),
+            ("evidence_json", {}, "evidence", 2021),
+            ("manual_overrides_json", [], "manual_overrides", 2021),
+            ("risk_level", "medium", "risk level", 2021),
+            ("position_reference", -1, "position", 2021),
+            ("position_reference", 30, "does not match", 2021),
+            ("status", "observing", "candidate status", 2021),
+        ):
+            with self.subTest(field=field, value=value):
+                await self._assert_candidate_field_rejected(
+                    field,
+                    value,
+                    message,
+                    candidate_id=candidate_id,
+                )
+
+        with self.assertRaisesRegex(ValueError, "ownership"):
+            self.builder._validate_plan_data(
+                self.plan_rows[202],
+                [self.candidate_rows[2011]],
+            )
+
+    async def test_plan_builder_validates_rule_snapshot_and_radar_provenance(self):
+        fabricated_snapshot = deepcopy(
+            self.plan_rows[202].rule_snapshot_json
+        )
+        fabricated_snapshot[0]["content_hash"] = "f" * 64
+        await self._assert_plan_field_rejected(
+            "rule_snapshot_json",
+            fabricated_snapshot,
+            "persisted rule",
+        )
+
+        wrong_rule = self.catalog["rules"][0]
+        wrong_sources_snapshot = deepcopy(
+            self.plan_rows[202].rule_snapshot_json
+        )
+        wrong_sources_snapshot[0]["source_refs"] = canonical_rule_source_refs(
+            wrong_rule
+        )
+        wrong_sources_snapshot[0]["source_hashes"] = [
+            {
+                "source_key": source_key,
+                "content_hash": content_hash,
+            }
+            for source_key, content_hash in sorted(
+                {
+                    ref["source_key"]: ref["source_content_hash"]
+                    for ref in canonical_rule_source_refs(wrong_rule)
+                }.items()
+            )
+        ]
+        await self._assert_plan_field_rejected(
+            "rule_snapshot_json",
+            wrong_sources_snapshot,
+            "source_refs",
+        )
+
+        fabricated_radar = deepcopy(self.plan_rows[202].mode_radar_json)
+        fabricated_radar[0]["rule_hash"] = "e" * 64
+        await self._assert_plan_field_rejected(
+            "mode_radar_json",
+            fabricated_radar,
+            "mode_radar.*rule_snapshot",
+        )
 
 
 if __name__ == "__main__":
