@@ -14,6 +14,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from app.models.trading_playbook import (
     TradingPlaybookJobClaim,
     TradingPlaybookJobResult,
+    TradingPlaybookJobResultManifest,
 )
 
 
@@ -22,6 +23,10 @@ class TradingPlaybookClaimToken:
     job_key: str
     owner: str
     attempt_no: int
+
+
+class TradingPlaybookJobResultIntegrityError(RuntimeError):
+    """A completed job's result manifest does not match its persisted rows."""
 
 
 class TradingPlaybookJobClaimService:
@@ -121,11 +126,27 @@ class TradingPlaybookJobClaimService:
         db,
         job_key: str,
         entity_type: str,
-    ) -> tuple[int, ...]:
-        """Return exact entity IDs bound to a completed job."""
+    ) -> Optional[tuple[int, ...]]:
+        """Return a completed result set, or ``None`` without a manifest."""
 
         normalized_key = self._required(job_key, "job_key", 255)
         normalized_type = self._required(entity_type, "entity_type", 32)
+        manifest = await db.scalar(
+            select(TradingPlaybookJobResultManifest)
+            .join(
+                TradingPlaybookJobClaim,
+                TradingPlaybookJobClaim.job_key
+                == TradingPlaybookJobResultManifest.job_key,
+            )
+            .where(
+                TradingPlaybookJobResultManifest.job_key == normalized_key,
+                TradingPlaybookJobResultManifest.entity_type
+                == normalized_type,
+                TradingPlaybookJobClaim.status == "completed",
+            )
+        )
+        if manifest is None:
+            return None
         values = await db.scalars(
             select(TradingPlaybookJobResult.entity_id)
             .join(
@@ -140,7 +161,17 @@ class TradingPlaybookJobClaimService:
             )
             .order_by(TradingPlaybookJobResult.entity_id)
         )
-        return tuple(int(entity_id) for entity_id in values.all())
+        result_ids = tuple(int(entity_id) for entity_id in values.all())
+        if (
+            type(manifest.result_count) is not int
+            or manifest.result_count < 0
+            or manifest.result_count != len(result_ids)
+        ):
+            raise TradingPlaybookJobResultIntegrityError(
+                "completed playbook result manifest is inconsistent for "
+                f"{normalized_key}:{normalized_type}"
+            )
+        return result_ids
 
     async def complete(
         self,
@@ -181,6 +212,34 @@ class TradingPlaybookJobClaimService:
                 return False
             if normalized_type is not None:
                 dialect = db.get_bind().dialect.name
+                manifest_values = {
+                    "job_key": token.job_key,
+                    "entity_type": normalized_type,
+                    "result_count": len(normalized_ids),
+                    "created_at": now,
+                }
+                if dialect == "sqlite":
+                    manifest_statement = sqlite_insert(
+                        TradingPlaybookJobResultManifest
+                    ).values(**manifest_values)
+                elif dialect == "postgresql":
+                    manifest_statement = postgresql_insert(
+                        TradingPlaybookJobResultManifest
+                    ).values(**manifest_values)
+                else:
+                    raise RuntimeError(
+                        f"unsupported playbook claim dialect: {dialect}"
+                    )
+                manifest_insert = await db.execute(
+                    manifest_statement.on_conflict_do_nothing(
+                        index_elements=["job_key", "entity_type"]
+                    )
+                )
+                if manifest_insert.rowcount != 1:
+                    raise TradingPlaybookJobResultIntegrityError(
+                        "playbook result manifest already exists for "
+                        f"{token.job_key}:{normalized_type}"
+                    )
                 for entity_id in normalized_ids:
                     values = {
                         "job_key": token.job_key,
@@ -200,7 +259,7 @@ class TradingPlaybookJobClaimService:
                         raise RuntimeError(
                             f"unsupported playbook claim dialect: {dialect}"
                         )
-                    await db.execute(
+                    inserted = await db.execute(
                         statement.on_conflict_do_nothing(
                             index_elements=[
                                 "job_key",
@@ -208,6 +267,27 @@ class TradingPlaybookJobClaimService:
                                 "entity_id",
                             ]
                         )
+                    )
+                    if inserted.rowcount != 1:
+                        raise TradingPlaybookJobResultIntegrityError(
+                            "playbook result row already exists for "
+                            f"{token.job_key}:{normalized_type}:{entity_id}"
+                        )
+                persisted = await db.scalars(
+                    select(TradingPlaybookJobResult.entity_id)
+                    .where(
+                        TradingPlaybookJobResult.job_key == token.job_key,
+                        TradingPlaybookJobResult.entity_type == normalized_type,
+                    )
+                    .order_by(TradingPlaybookJobResult.entity_id)
+                )
+                persisted_ids = tuple(
+                    int(entity_id) for entity_id in persisted.all()
+                )
+                if persisted_ids != normalized_ids:
+                    raise TradingPlaybookJobResultIntegrityError(
+                        "playbook result rows do not match completion payload for "
+                        f"{token.job_key}:{normalized_type}"
                     )
             await db.commit()
             return True
@@ -291,4 +371,5 @@ class TradingPlaybookJobClaimService:
 __all__ = [
     "TradingPlaybookClaimToken",
     "TradingPlaybookJobClaimService",
+    "TradingPlaybookJobResultIntegrityError",
 ]

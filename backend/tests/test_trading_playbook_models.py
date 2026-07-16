@@ -172,6 +172,13 @@ TABLE_COLUMNS = {
         "created_at",
         "updated_at",
     },
+    "trading_playbook_job_result_manifests": {
+        "id",
+        "job_key",
+        "entity_type",
+        "result_count",
+        "created_at",
+    },
     "trading_playbook_job_results": {
         "id",
         "job_key",
@@ -350,6 +357,13 @@ COLUMN_TYPES = {
         "created_at": (DateTime, None),
         "updated_at": (DateTime, None),
     },
+    "trading_playbook_job_result_manifests": {
+        "id": (Integer, None),
+        "job_key": (String, 255),
+        "entity_type": (String, 32),
+        "result_count": (Integer, None),
+        "created_at": (DateTime, None),
+    },
     "trading_playbook_job_results": {
         "id": (Integer, None),
         "job_key": (String, 255),
@@ -451,6 +465,7 @@ DATETIME_DEFAULTS = {
     ("trading_execution_review_phase_snapshots", "created_at"),
     ("trading_playbook_job_claims", "created_at"),
     ("trading_playbook_job_claims", "updated_at"),
+    ("trading_playbook_job_result_manifests", "created_at"),
     ("trading_playbook_job_results", "created_at"),
     ("trading_playbook_settings", "updated_at"),
     ("trading_playbook_obsidian_exports", "created_at"),
@@ -537,6 +552,18 @@ UNIQUE_CONSTRAINTS = {
     "trading_playbook_job_claims": {
         ("uq_trading_playbook_job_claim_key", ("job_key",)),
     },
+    "trading_playbook_job_result_manifests": {
+        (
+            "uq_trading_playbook_job_result_manifest",
+            ("job_key", "entity_type"),
+        ),
+    },
+    "trading_playbook_job_results": {
+        (
+            "uq_trading_playbook_job_result_entity",
+            ("job_key", "entity_type", "entity_id"),
+        ),
+    },
     "trading_playbook_settings": set(),
     "trading_playbook_obsidian_exports": {
         (
@@ -556,6 +583,14 @@ FOREIGN_KEYS = {
         "candidate_id",
     ): "trading_plan_candidates.id",
     ("trading_execution_reviews", "plan_version_id"): "trading_plan_versions.id",
+    (
+        "trading_playbook_job_result_manifests",
+        "job_key",
+    ): "trading_playbook_job_claims.job_key",
+    (
+        "trading_playbook_job_results",
+        "job_key",
+    ): "trading_playbook_job_claims.job_key",
 }
 
 INDEXED_COLUMNS = {
@@ -860,6 +895,10 @@ class TradingPlaybookPersistenceTests(unittest.IsolatedAsyncioTestCase):
     async def test_new_result_and_review_phase_tables_are_exported_and_created(self):
         self.assertIn("TradingPlaybookJobResult", app.models.__all__)
         self.assertIn(
+            "TradingPlaybookJobResultManifest",
+            app.models.__all__,
+        )
+        self.assertIn(
             "TradingExecutionReviewPhaseSnapshot",
             app.models.__all__,
         )
@@ -875,6 +914,10 @@ class TradingPlaybookPersistenceTests(unittest.IsolatedAsyncioTestCase):
                     )
                 )
             self.assertIn("trading_playbook_job_results", table_names)
+            self.assertIn(
+                "trading_playbook_job_result_manifests",
+                table_names,
+            )
             self.assertIn(
                 "trading_execution_review_phase_snapshots",
                 table_names,

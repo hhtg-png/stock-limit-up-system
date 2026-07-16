@@ -19,6 +19,7 @@ from app.models.trading_playbook import (
     TradingPlanVersion,
     TradingPlaybookJobClaim,
     TradingPlaybookJobResult,
+    TradingPlaybookJobResultManifest,
 )
 from app.utils.time_utils import CN_TZ
 
@@ -102,6 +103,7 @@ class InMemoryClaimService:
         self.lease_seconds = 300
         self.active = set()
         self.completed = set()
+        self.manifests = set()
         self.results = {}
 
     async def claim(self, _db, *, job_key, owner, **_kwargs):
@@ -123,7 +125,9 @@ class InMemoryClaimService:
 
     async def get_completed_result_ids(self, _db, job_key, entity_type):
         if job_key not in self.completed:
-            return ()
+            return None
+        if (job_key, entity_type) not in self.manifests:
+            return None
         return self.results.get((job_key, entity_type), ())
 
     async def complete(
@@ -138,6 +142,7 @@ class InMemoryClaimService:
         self.active.discard(token.job_key)
         self.completed.add(token.job_key)
         if result_entity_type is not None:
+            self.manifests.add((token.job_key, result_entity_type))
             self.results[(token.job_key, result_entity_type)] = tuple(
                 sorted(set(result_entity_ids))
             )
@@ -348,6 +353,9 @@ class TradingPlaybookSchedulerStageTests(unittest.IsolatedAsyncioTestCase):
             sleep=AsyncMock(),
             job_claim_service=InMemoryClaimService(),
         )
+        self.scheduler._validated_plan_result_in_session = AsyncMock(
+            return_value={"id": 9}
+        )
         self.scheduler._playbook_review_exists = AsyncMock(return_value=False)
 
     async def test_build_plan_uses_aware_china_now_same_session_and_notifies_when_installed(self):
@@ -470,6 +478,15 @@ class TradingPlaybookObsidianStageHookTests(unittest.IsolatedAsyncioTestCase):
             sleep=AsyncMock(),
             job_claim_service=claim_service or InMemoryClaimService(),
         )
+        persisted_plan = plan or {"id": 9}
+        scheduler._validated_plan_result_in_session = AsyncMock(
+            return_value=persisted_plan
+        )
+        scheduler._validated_review_result_ids_in_session = AsyncMock(
+            side_effect=lambda _db, review_ids, *_args, **_kwargs: tuple(
+                sorted(set(review_ids))
+            )
+        )
         if coordinator is not None:
             scheduler.install_trading_playbook_obsidian_sync(coordinator)
         return scheduler, orchestrator, db
@@ -530,6 +547,12 @@ class TradingPlaybookObsidianStageHookTests(unittest.IsolatedAsyncioTestCase):
         claims = InMemoryClaimService()
         claims.completed.add(
             "playbook:build:2026-07-16:2026-07-16:auction:ready"
+        )
+        claims.manifests.add(
+            (
+                "playbook:build:2026-07-16:2026-07-16:auction:ready",
+                "plan",
+            )
         )
         claims.results[
             (
@@ -1431,6 +1454,9 @@ class TradingPlaybookForcedUpgradeTests(unittest.IsolatedAsyncioTestCase):
                 )
                 await connection.run_sync(
                     TradingPlaybookJobClaim.__table__.create
+                )
+                await connection.run_sync(
+                    TradingPlaybookJobResultManifest.__table__.create
                 )
                 await connection.run_sync(
                     TradingPlaybookJobResult.__table__.create

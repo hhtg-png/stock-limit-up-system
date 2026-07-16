@@ -23,6 +23,7 @@ class TradingPlaybookJobClaimTests(unittest.IsolatedAsyncioTestCase):
         from app.models.trading_playbook import (
             TradingPlaybookJobClaim,
             TradingPlaybookJobResult,
+            TradingPlaybookJobResultManifest,
         )
         from app.services.trading_playbook.job_claim_service import (
             TradingPlaybookClaimToken,
@@ -64,7 +65,7 @@ class TradingPlaybookJobClaimTests(unittest.IsolatedAsyncioTestCase):
                         "exact-plan-result",
                         "plan",
                     ),
-                    (),
+                    None,
                 )
                 self.assertTrue(
                     await service.complete(
@@ -89,6 +90,110 @@ class TradingPlaybookJobClaimTests(unittest.IsolatedAsyncioTestCase):
                     len((await db.execute(TradingPlaybookJobResult.__table__.select())).all()),
                     2,
                 )
+                manifest = (
+                    await db.execute(
+                        TradingPlaybookJobResultManifest.__table__.select()
+                    )
+                ).one()
+                self.assertEqual(manifest.result_count, 2)
+        finally:
+            await engine.dispose()
+
+    async def test_result_manifest_distinguishes_missing_empty_and_corrupt(self):
+        from sqlalchemy import update
+
+        from app.database import Base
+        from app.models.trading_playbook import TradingPlaybookJobResultManifest
+        from app.services.trading_playbook.job_claim_service import (
+            TradingPlaybookJobResultIntegrityError,
+            TradingPlaybookJobClaimService,
+        )
+
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        service = TradingPlaybookJobClaimService(lease_seconds=30)
+        now = datetime(2026, 7, 13, 15, 30)
+        try:
+            async with maker() as db:
+                legacy = await service.claim(
+                    db,
+                    job_key="legacy-without-manifest",
+                    job_type="review",
+                    phase="initial_review",
+                    owner="worker-a",
+                    now=now,
+                )
+                self.assertTrue(await service.complete(db, legacy, now=now))
+                self.assertIsNone(
+                    await service.get_completed_result_ids(
+                        db,
+                        legacy.job_key,
+                        "review",
+                    )
+                )
+
+                empty = await service.claim(
+                    db,
+                    job_key="manifest-empty",
+                    job_type="review",
+                    phase="initial_review",
+                    owner="worker-a",
+                    now=now,
+                )
+                self.assertTrue(
+                    await service.complete(
+                        db,
+                        empty,
+                        now=now,
+                        result_entity_type="review",
+                        result_entity_ids=(),
+                    )
+                )
+                self.assertEqual(
+                    await service.get_completed_result_ids(
+                        db,
+                        empty.job_key,
+                        "review",
+                    ),
+                    (),
+                )
+
+                populated = await service.claim(
+                    db,
+                    job_key="manifest-corrupt",
+                    job_type="review",
+                    phase="initial_review",
+                    owner="worker-a",
+                    now=now,
+                )
+                self.assertTrue(
+                    await service.complete(
+                        db,
+                        populated,
+                        now=now,
+                        result_entity_type="review",
+                        result_entity_ids=(7,),
+                    )
+                )
+                await db.execute(
+                    update(TradingPlaybookJobResultManifest)
+                    .where(
+                        TradingPlaybookJobResultManifest.job_key
+                        == populated.job_key,
+                        TradingPlaybookJobResultManifest.entity_type
+                        == "review",
+                    )
+                    .values(result_count=2)
+                )
+                await db.commit()
+                with self.assertRaises(TradingPlaybookJobResultIntegrityError):
+                    await service.get_completed_result_ids(
+                        db,
+                        populated.job_key,
+                        "review",
+                    )
         finally:
             await engine.dispose()
 
@@ -99,6 +204,7 @@ class TradingPlaybookJobClaimTests(unittest.IsolatedAsyncioTestCase):
         from app.models.trading_playbook import (
             TradingPlaybookJobClaim,
             TradingPlaybookJobResult,
+            TradingPlaybookJobResultManifest,
         )
         from app.services.trading_playbook.job_claim_service import (
             TradingPlaybookJobClaimService,
@@ -176,6 +282,103 @@ class TradingPlaybookJobClaimTests(unittest.IsolatedAsyncioTestCase):
                             )
                         )
                     ).scalars().all(),
+                    [],
+                )
+                self.assertEqual(
+                    (
+                        await db.execute(
+                            select(TradingPlaybookJobResultManifest).where(
+                                TradingPlaybookJobResultManifest.job_key
+                                == "atomic-plan-result"
+                            )
+                        )
+                    ).scalars().all(),
+                    [],
+                )
+        finally:
+            await engine.dispose()
+
+    async def test_complete_rolls_back_claim_when_manifest_insert_fails(self):
+        from sqlalchemy import event, select
+
+        from app.database import Base
+        from app.models.trading_playbook import (
+            TradingPlaybookJobClaim,
+            TradingPlaybookJobResult,
+            TradingPlaybookJobResultManifest,
+        )
+        from app.services.trading_playbook.job_claim_service import (
+            TradingPlaybookJobClaimService,
+        )
+
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        service = TradingPlaybookJobClaimService(lease_seconds=30)
+        now = datetime(2026, 7, 13, 15, 30)
+
+        def fail_manifest_insert(
+            connection,
+            cursor,
+            statement,
+            parameters,
+            context,
+            executemany,
+        ):
+            if "INSERT INTO trading_playbook_job_result_manifests" in statement:
+                raise RuntimeError("manifest insert failed")
+
+        try:
+            async with maker() as db:
+                token = await service.claim(
+                    db,
+                    job_key="atomic-manifest",
+                    job_type="review",
+                    phase="initial_review",
+                    owner="worker-a",
+                    now=now,
+                )
+                event.listen(
+                    engine.sync_engine,
+                    "before_cursor_execute",
+                    fail_manifest_insert,
+                )
+                try:
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "manifest insert failed",
+                    ):
+                        await service.complete(
+                            db,
+                            token,
+                            now=now,
+                            result_entity_type="review",
+                            result_entity_ids=(),
+                        )
+                finally:
+                    event.remove(
+                        engine.sync_engine,
+                        "before_cursor_execute",
+                        fail_manifest_insert,
+                    )
+
+            async with maker() as db:
+                claim = (
+                    await db.execute(
+                        select(TradingPlaybookJobClaim).where(
+                            TradingPlaybookJobClaim.job_key
+                            == "atomic-manifest"
+                        )
+                    )
+                ).scalar_one()
+                self.assertEqual(claim.status, "running")
+                self.assertEqual(
+                    (await db.scalars(select(TradingPlaybookJobResultManifest))).all(),
+                    [],
+                )
+                self.assertEqual(
+                    (await db.scalars(select(TradingPlaybookJobResult))).all(),
                     [],
                 )
         finally:
@@ -416,6 +619,7 @@ class TradingPlaybookSchedulerClaimTests(unittest.IsolatedAsyncioTestCase):
             TradingPlanVersion,
             TradingPlaybookJobClaim,
             TradingPlaybookJobResult,
+            TradingPlaybookJobResultManifest,
         )
         from app.utils.time_utils import CN_TZ
 
@@ -494,6 +698,18 @@ class TradingPlaybookSchedulerClaimTests(unittest.IsolatedAsyncioTestCase):
                 )
             db.add_all(
                 [
+                    TradingPlaybookJobResultManifest(
+                        job_key=plan_job_key,
+                        entity_type="plan",
+                        result_count=1,
+                        created_at=built_at,
+                    ),
+                    TradingPlaybookJobResultManifest(
+                        job_key=review_job_key,
+                        entity_type="review",
+                        result_count=1,
+                        created_at=built_at,
+                    ),
                     TradingPlaybookJobResult(
                         job_key=plan_job_key,
                         entity_type="plan",
@@ -591,6 +807,277 @@ class TradingPlaybookSchedulerClaimTests(unittest.IsolatedAsyncioTestCase):
             initial_two_id,
             coordinator.enqueue_stage.await_args_list[1].kwargs["review_ids"],
         )
+
+    async def test_first_plan_completion_rejects_unpersisted_multiple_and_mismatched_results(self):
+        from sqlalchemy import select
+
+        from app.data_collectors.scheduler import DataScheduler
+        from app.database import Base
+        from app.models.trading_playbook import (
+            TradingPlanVersion,
+            TradingPlaybookJobClaim,
+            TradingPlaybookJobResult,
+            TradingPlaybookJobResultManifest,
+        )
+        from app.utils.time_utils import CN_TZ
+
+        for invalid_kind in ("missing", "multiple", "mismatch"):
+            with self.subTest(invalid_kind=invalid_kind):
+                engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+                maker = async_sessionmaker(engine, expire_on_commit=False)
+                async with engine.begin() as connection:
+                    await connection.run_sync(Base.metadata.create_all)
+                now = CN_TZ.localize(datetime(2026, 7, 13, 9, 26))
+
+                class InvalidOrchestrator:
+                    async def build_stage(
+                        self,
+                        db,
+                        source_trade_date,
+                        stage,
+                        as_of,
+                        **_kwargs,
+                    ):
+                        if invalid_kind == "missing":
+                            return SimpleNamespace(id=999)
+                        targets = (
+                            (source_trade_date, source_trade_date)
+                            if invalid_kind == "multiple"
+                            else (
+                                source_trade_date,
+                                source_trade_date + timedelta(days=1),
+                            )
+                        )
+                        rows = [
+                            TradingPlanVersion(
+                                source_trade_date=targets[0],
+                                target_trade_date=targets[1],
+                                stage=stage,
+                                version_no=index + 1,
+                                status="draft",
+                                input_hash=(
+                                    f"invalid-{invalid_kind}-{index}"
+                                ),
+                                generated_at=as_of.replace(tzinfo=None),
+                            )
+                            for index in range(
+                                2 if invalid_kind == "multiple" else 1
+                            )
+                        ]
+                        db.add_all(rows)
+                        await db.commit()
+                        return rows if len(rows) > 1 else rows[0]
+
+                alert = SimpleNamespace(
+                    durable_delivery=True,
+                    notify_plan_ready=AsyncMock(),
+                )
+                coordinator = SimpleNamespace(
+                    enqueue_stage=AsyncMock(),
+                    process_due=AsyncMock(),
+                    reconcile_committed_facts=AsyncMock(),
+                    startup_reconcile=AsyncMock(),
+                )
+                scheduler = DataScheduler(
+                    trading_playbook_orchestrator=InvalidOrchestrator(),
+                    trading_playbook_alert_service=alert,
+                    session_factory=maker,
+                    now_provider=lambda: now,
+                    calendar_service=self._calendar(),
+                )
+                scheduler.install_trading_playbook_obsidian_sync(coordinator)
+                try:
+                    result = await scheduler._build_trading_playbook_plan(
+                        "auction"
+                    )
+
+                    self.assertIsNone(result)
+                    alert.notify_plan_ready.assert_not_awaited()
+                    coordinator.enqueue_stage.assert_not_awaited()
+                    coordinator.process_due.assert_not_awaited()
+                    async with maker() as db:
+                        claim = (
+                            await db.scalars(select(TradingPlaybookJobClaim))
+                        ).one()
+                        self.assertEqual(claim.status, "retry")
+                        self.assertEqual(
+                            (
+                                await db.scalars(
+                                    select(TradingPlaybookJobResultManifest)
+                                )
+                            ).all(),
+                            [],
+                        )
+                        self.assertEqual(
+                            (
+                                await db.scalars(
+                                    select(TradingPlaybookJobResult)
+                                )
+                            ).all(),
+                            [],
+                        )
+                finally:
+                    await engine.dispose()
+
+    async def test_first_review_completion_rejects_invalid_nonempty_results(self):
+        from sqlalchemy import select
+
+        from app.data_collectors.scheduler import DataScheduler
+        from app.database import Base
+        from app.models.trading_playbook import (
+            TradingExecutionReview,
+            TradingPlanVersion,
+            TradingPlaybookJobClaim,
+            TradingPlaybookJobResult,
+            TradingPlaybookJobResultManifest,
+        )
+        from app.utils.time_utils import CN_TZ
+
+        for invalid_kind in ("missing", "wrong-date"):
+            with self.subTest(invalid_kind=invalid_kind):
+                engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+                maker = async_sessionmaker(engine, expire_on_commit=False)
+                async with engine.begin() as connection:
+                    await connection.run_sync(Base.metadata.create_all)
+                now = CN_TZ.localize(datetime(2026, 7, 13, 15, 10))
+
+                class InvalidReviewService:
+                    async def generation_key(self, *_args, **_kwargs):
+                        return f"invalid-{invalid_kind}"
+
+                    async def build(self, db, trade_date, **_kwargs):
+                        if invalid_kind == "missing":
+                            return [SimpleNamespace(id=999)]
+                        plan = TradingPlanVersion(
+                            source_trade_date=trade_date,
+                            target_trade_date=trade_date,
+                            stage="auction",
+                            version_no=1,
+                            status="active",
+                            input_hash="wrong-date-review-plan",
+                            generated_at=now.replace(tzinfo=None),
+                        )
+                        db.add(plan)
+                        await db.flush()
+                        review = TradingExecutionReview(
+                            trade_date=trade_date + timedelta(days=1),
+                            plan_version_id=plan.id,
+                            generated_at=now.replace(tzinfo=None),
+                        )
+                        db.add(review)
+                        await db.commit()
+                        return [review]
+
+                coordinator = SimpleNamespace(
+                    enqueue_stage=AsyncMock(),
+                    process_due=AsyncMock(),
+                    reconcile_committed_facts=AsyncMock(),
+                    startup_reconcile=AsyncMock(),
+                )
+                service = InvalidReviewService()
+                scheduler = DataScheduler(
+                    trading_playbook_review_service=service,
+                    session_factory=maker,
+                    now_provider=lambda: now,
+                )
+                scheduler.install_trading_playbook_obsidian_sync(coordinator)
+                try:
+                    result = await scheduler._run_trading_playbook_review_phase(
+                        now.date(),
+                        finalized=False,
+                    )
+
+                    self.assertIsNone(result)
+                    coordinator.enqueue_stage.assert_not_awaited()
+                    coordinator.process_due.assert_not_awaited()
+                    async with maker() as db:
+                        claim = (
+                            await db.scalars(select(TradingPlaybookJobClaim))
+                        ).one()
+                        self.assertEqual(claim.status, "retry")
+                        self.assertEqual(
+                            (
+                                await db.scalars(
+                                    select(TradingPlaybookJobResultManifest)
+                                )
+                            ).all(),
+                            [],
+                        )
+                        self.assertEqual(
+                            (
+                                await db.scalars(
+                                    select(TradingPlaybookJobResult)
+                                )
+                            ).all(),
+                            [],
+                        )
+                finally:
+                    await engine.dispose()
+
+    async def test_empty_review_manifest_retries_failed_obsidian_enqueue_without_rebuild(self):
+        from sqlalchemy import select
+
+        from app.data_collectors.scheduler import DataScheduler
+        from app.database import Base
+        from app.models.trading_playbook import TradingPlaybookJobResultManifest
+        from app.utils.time_utils import CN_TZ
+
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        now = CN_TZ.localize(datetime(2026, 7, 13, 15, 10))
+        review = SimpleNamespace(
+            generation_key=AsyncMock(return_value="empty-review"),
+            build=AsyncMock(return_value=[]),
+        )
+        coordinator = SimpleNamespace(
+            enqueue_stage=AsyncMock(
+                side_effect=[RuntimeError("first enqueue failed"), None]
+            ),
+            process_due=AsyncMock(),
+            reconcile_committed_facts=AsyncMock(),
+            startup_reconcile=AsyncMock(),
+        )
+        scheduler = DataScheduler(
+            trading_playbook_review_service=review,
+            session_factory=maker,
+            now_provider=lambda: now,
+        )
+        scheduler.install_trading_playbook_obsidian_sync(coordinator)
+        try:
+            first = await scheduler._run_trading_playbook_review_phase(
+                now.date(),
+                finalized=False,
+            )
+            replay = await scheduler._run_trading_playbook_review_phase(
+                now.date(),
+                finalized=False,
+            )
+
+            self.assertEqual(first, [])
+            self.assertIsNone(replay)
+            review.build.assert_awaited_once()
+            self.assertEqual(coordinator.enqueue_stage.await_count, 2)
+            self.assertEqual(
+                coordinator.enqueue_stage.await_args_list[-1],
+                unittest.mock.call(
+                    now.date(),
+                    "initial_review",
+                    plan_version_ids=(),
+                    review_ids=(),
+                    include_rules=True,
+                ),
+            )
+            coordinator.process_due.assert_awaited_once_with()
+            async with maker() as db:
+                manifest = (
+                    await db.scalars(select(TradingPlaybookJobResultManifest))
+                ).one()
+                self.assertEqual(manifest.entity_type, "review")
+                self.assertEqual(manifest.result_count, 0)
+        finally:
+            await engine.dispose()
 
     async def _notification_retry_fairness_case(self, *, valid_is_oldest):
         from app.models.trading_playbook import (
@@ -1050,6 +1537,7 @@ class TradingPlaybookSchedulerClaimTests(unittest.IsolatedAsyncioTestCase):
             TradingPlanVersion,
             TradingPlaybookJobClaim,
             TradingPlaybookJobResult,
+            TradingPlaybookJobResultManifest,
         )
         from app.utils.time_utils import CN_TZ
 
@@ -1069,6 +1557,7 @@ class TradingPlaybookSchedulerClaimTests(unittest.IsolatedAsyncioTestCase):
                     TradingPlanVersion.__table__,
                     TradingExecutionReview.__table__,
                     TradingPlaybookJobClaim.__table__,
+                    TradingPlaybookJobResultManifest.__table__,
                     TradingPlaybookJobResult.__table__,
                 ):
                     await connection.run_sync(table.create)
@@ -1076,16 +1565,30 @@ class TradingPlaybookSchedulerClaimTests(unittest.IsolatedAsyncioTestCase):
             build_calls = 0
 
             class Orchestrator:
-                async def build_stage(self, *_args, **_kwargs):
+                async def build_stage(
+                    self,
+                    db,
+                    source_trade_date,
+                    stage,
+                    as_of,
+                    **_kwargs,
+                ):
                     nonlocal build_calls
                     build_calls += 1
                     await asyncio.sleep(0.03)
-                    return SimpleNamespace(
-                        id=9,
-                        source_trade_date=date(2026, 7, 13),
+                    plan = TradingPlanVersion(
+                        source_trade_date=source_trade_date,
                         target_trade_date=date(2026, 7, 14),
-                        stage="after_close",
+                        stage=stage,
+                        version_no=1,
+                        status="draft",
+                        input_hash="concurrent-build",
+                        generated_at=as_of.replace(tzinfo=None),
                     )
+                    db.add(plan)
+                    await db.commit()
+                    await db.refresh(plan)
+                    return plan
 
             alert = SimpleNamespace(notify_plan_ready=AsyncMock())
             review = SimpleNamespace(
@@ -1434,6 +1937,7 @@ class TradingPlaybookSchedulerClaimTests(unittest.IsolatedAsyncioTestCase):
             TradingPlanVersion,
             TradingPlaybookJobClaim,
             TradingPlaybookJobResult,
+            TradingPlaybookJobResultManifest,
         )
         from app.services.trading_playbook.job_claim_service import (
             TradingPlaybookJobClaimService,
@@ -1451,6 +1955,9 @@ class TradingPlaybookSchedulerClaimTests(unittest.IsolatedAsyncioTestCase):
             async with engines[0].begin() as connection:
                 await connection.run_sync(TradingPlanVersion.__table__.create)
                 await connection.run_sync(TradingPlaybookJobClaim.__table__.create)
+                await connection.run_sync(
+                    TradingPlaybookJobResultManifest.__table__.create
+                )
                 await connection.run_sync(TradingPlaybookJobResult.__table__.create)
             build_calls = 0
 
@@ -1570,6 +2077,7 @@ class TradingPlaybookSchedulerClaimTests(unittest.IsolatedAsyncioTestCase):
             TradingPlanVersion,
             TradingPlaybookJobClaim,
             TradingPlaybookJobResult,
+            TradingPlaybookJobResultManifest,
         )
         from app.utils.time_utils import CN_TZ
 
@@ -1580,6 +2088,7 @@ class TradingPlaybookSchedulerClaimTests(unittest.IsolatedAsyncioTestCase):
                 TradingPlanVersion.__table__,
                 TradingExecutionReview.__table__,
                 TradingPlaybookJobClaim.__table__,
+                TradingPlaybookJobResultManifest.__table__,
                 TradingPlaybookJobResult.__table__,
             ):
                 await connection.run_sync(table.create)

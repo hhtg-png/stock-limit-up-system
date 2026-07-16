@@ -325,6 +325,33 @@ class TradingPlaybookJobClaim(Base):
     )
 
 
+class TradingPlaybookJobResultManifest(Base):
+    """Completion marker and exact result cardinality for one entity type."""
+
+    __tablename__ = "trading_playbook_job_result_manifests"
+    __table_args__ = (
+        UniqueConstraint(
+            "job_key",
+            "entity_type",
+            name="uq_trading_playbook_job_result_manifest",
+        ),
+        CheckConstraint(
+            "result_count >= 0",
+            name="ck_trading_playbook_job_result_manifest_count",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    job_key = Column(
+        String(255),
+        ForeignKey("trading_playbook_job_claims.job_key"),
+        nullable=False,
+    )
+    entity_type = Column(String(32), nullable=False)
+    result_count = Column(Integer, nullable=False)
+    created_at = Column(DateTime, default=datetime.now, nullable=False)
+
+
 class TradingPlaybookJobResult(Base):
     """Exact persisted entities produced by one completed claimed job."""
 

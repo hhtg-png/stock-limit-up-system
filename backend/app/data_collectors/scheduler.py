@@ -694,6 +694,8 @@ class DataScheduler:
                         "plan",
                     )
                 )
+                if mapped_plan_ids is None:
+                    return None
                 plan = await self._validated_plan_result_in_session(
                     db,
                     mapped_plan_ids,
@@ -729,14 +731,40 @@ class DataScheduler:
                         logger.error("{}", exc)
                         return None
                     raise
-                plan_ids = self._persisted_entity_ids(plan)
-                completed = await self._playbook_job_claims.complete(
-                    db,
-                    token,
-                    now=self._claim_now(),
-                    result_entity_type="plan",
-                    result_entity_ids=plan_ids,
-                )
+                try:
+                    plan_ids = self._persisted_entity_ids(plan)
+                    persisted_plan = await self._validated_plan_result_in_session(
+                        db,
+                        plan_ids,
+                        source_trade_date=source_trade_date,
+                        target_trade_date=target_trade_date,
+                        stage=stage,
+                    )
+                    if persisted_plan is None:
+                        raise ValueError(
+                            "trading playbook build did not persist exactly one "
+                            "matching plan"
+                        )
+                    plan = persisted_plan
+                    completed = await self._playbook_job_claims.complete(
+                        db,
+                        token,
+                        now=self._claim_now(),
+                        result_entity_type="plan",
+                        result_entity_ids=plan_ids,
+                    )
+                except asyncio.CancelledError as exc:
+                    await self._rollback_playbook_session(db)
+                    await self._fail_playbook_claim_fresh(token, exc)
+                    raise
+                except Exception as exc:
+                    await self._rollback_playbook_session(db)
+                    await self._fail_playbook_claim_fresh(token, exc)
+                    logger.error(
+                        "Trading playbook build result validation failed: {}",
+                        exc,
+                    )
+                    return None
                 if not completed:
                     logger.error("Trading playbook build claim lost before completion")
                     return None
@@ -1161,15 +1189,20 @@ class DataScheduler:
                         "review",
                     )
                 )
-                if not mapped_review_ids:
+                if mapped_review_ids is None:
                     return None
-                review_ids = await self._validated_review_result_ids_in_session(
-                    db,
-                    mapped_review_ids,
-                    review_date,
-                    finalized=finalized,
-                    plan_version_id=plan_version_id,
-                )
+                if mapped_review_ids:
+                    review_ids = (
+                        await self._validated_review_result_ids_in_session(
+                            db,
+                            mapped_review_ids,
+                            review_date,
+                            finalized=finalized,
+                            plan_version_id=plan_version_id,
+                        )
+                    )
+                    if not review_ids:
+                        return None
             else:
                 try:
                     build_kwargs = {"finalized": finalized}
@@ -1188,16 +1221,45 @@ class DataScheduler:
                     await self._fail_playbook_claim_fresh(token, exc)
                     logger.error("Trading playbook {} failed: {}", phase, exc)
                     return None
-                completed = await self._playbook_job_claims.complete(
-                    db,
-                    token,
-                    now=self._claim_now(),
-                    result_entity_type="review",
-                    result_entity_ids=self._persisted_entity_ids(result),
-                )
+                try:
+                    built_review_ids = self._persisted_entity_ids(result)
+                    if built_review_ids:
+                        review_ids = (
+                            await self._validated_review_result_ids_in_session(
+                                db,
+                                built_review_ids,
+                                review_date,
+                                finalized=finalized,
+                                plan_version_id=plan_version_id,
+                            )
+                        )
+                        if not review_ids:
+                            raise ValueError(
+                                "trading playbook review returned non-persisted "
+                                "or mismatched results"
+                            )
+                    completed = await self._playbook_job_claims.complete(
+                        db,
+                        token,
+                        now=self._claim_now(),
+                        result_entity_type="review",
+                        result_entity_ids=review_ids,
+                    )
+                except asyncio.CancelledError as exc:
+                    await self._rollback_playbook_session(db)
+                    await self._fail_playbook_claim_fresh(token, exc)
+                    raise
+                except Exception as exc:
+                    await self._rollback_playbook_session(db)
+                    await self._fail_playbook_claim_fresh(token, exc)
+                    logger.error(
+                        "Trading playbook {} result validation failed: {}",
+                        phase,
+                        exc,
+                    )
+                    return None
                 if not completed:
                     return None
-                review_ids = self._persisted_entity_ids(result)
         await self._sync_trading_playbook_obsidian_after_commit(
             review_date,
             "final_review" if finalized else "initial_review",
