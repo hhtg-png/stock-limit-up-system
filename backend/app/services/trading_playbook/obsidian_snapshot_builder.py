@@ -57,9 +57,6 @@ _ALERT_EVENT_SEVERITIES = {
 _IN_APP_EXPORT_FIELDS = (
     "status",
     "attempts",
-    "reason",
-    "error",
-    "pre_send_error",
     "accepted",
     "skipped_at",
     "sending_at",
@@ -68,6 +65,45 @@ _IN_APP_EXPORT_FIELDS = (
     "delivered_at",
     "uncertain_at",
     "failed_at",
+)
+_IN_APP_TIMESTAMP_FIELDS = frozenset(
+    field_name
+    for field_name in _IN_APP_EXPORT_FIELDS
+    if field_name.endswith("_at")
+)
+_PLAN_ALERT_MARKET_FIELDS = (
+    "source_trade_date",
+    "target_trade_date",
+    "stage",
+    "status",
+    "trade_date",
+)
+_ACTION_ALERT_MARKET_FIELDS = (
+    "trade_date",
+    "stock_code",
+    "mode_key",
+    "condition_version",
+    "occurrence_no",
+)
+_ACTION_QUOTE_FIELDS = (
+    "code",
+    "name",
+    "price",
+    "change_pct",
+    "sealed",
+    "open_count",
+    "datetime",
+    "captured_at",
+)
+_PLAN_ALERT_EVENT_TYPES = frozenset(
+    {"plan_ready", "confirmation_required", "review_ready"}
+)
+_ACTION_ALERT_EVENT_TYPES = frozenset(
+    {"entry_triggered", "invalidated", "exit_triggered"}
+)
+_SENSITIVE_EXPORT_TEXT = re.compile(
+    r"wechat|微信|webhook|token|secret|password|api_key|bearer",
+    re.IGNORECASE,
 )
 _STAGE_SCHEDULE = (
     {
@@ -276,7 +312,12 @@ class TradingPlaybookObsidianSnapshotBuilder:
                     f"trading plan version {plan_id} has more than 3 candidates"
                 )
             self._validate_plan_data(plan, candidates)
-            self._validate_review_data(review, phase=phase)
+            self._validate_review_data(
+                review,
+                plan,
+                candidates,
+                phase=phase,
+            )
             return self._build_review_artifact(review, plan, phase=phase)
 
     async def build_alerts_artifact(
@@ -423,13 +464,6 @@ class TradingPlaybookObsidianSnapshotBuilder:
                         candidate
                     )
 
-            active_ids = [plan.id for plan in plans if plan.status == "active"]
-            if len(active_ids) > 1:
-                raise ValueError(
-                    f"trade date {trade_date} has multiple active plan versions"
-                )
-            current_effective_id = active_ids[0] if active_ids else None
-            plan_payloads: list[dict[str, object]] = []
             for plan in plans:
                 candidates = candidates_by_plan[plan.id]
                 if len(candidates) > 3:
@@ -437,10 +471,17 @@ class TradingPlaybookObsidianSnapshotBuilder:
                         f"trading plan version {plan.id} has more than 3 candidates"
                     )
                 self._validate_plan_data(plan, candidates)
+
+            current_effective_id = self._current_effective_plan_id(
+                plans,
+                trade_date=trade_date,
+            )
+            plan_payloads: list[dict[str, object]] = []
+            for plan in plans:
                 plan_payloads.append(
                     self._daily_plan_payload(
                         plan,
-                        candidates,
+                        candidates_by_plan[plan.id],
                         current_effective_id=current_effective_id,
                     )
                 )
@@ -531,16 +572,45 @@ class TradingPlaybookObsidianSnapshotBuilder:
             review_ids,
             field_name="review_ids",
         )
+        if plan_ids and phase not in _PLAN_STAGES:
+            raise ValueError(
+                f"plan_version_ids are not allowed for batch phase {phase}"
+            )
+        if normalized_review_ids and phase not in _REVIEW_PHASES:
+            raise ValueError(
+                f"review_ids are not allowed for batch phase {phase}"
+            )
 
         artifacts: list[ObsidianArtifact] = []
         if include_rules:
             artifacts.extend(await self.build_rule_artifacts("v2"))
         for plan_version_id in plan_ids:
-            artifacts.append(await self.build_plan_artifact(plan_version_id))
+            artifact = await self.build_plan_artifact(plan_version_id)
+            payload = artifact.payload_json()
+            if artifact.phase != phase or payload["stage"] != phase:
+                raise ValueError(
+                    f"plan {plan_version_id} stage does not match batch phase {phase}"
+                )
+            if phase in {"preclose", "after_close"}:
+                if payload["source_trade_date"] != trade_date.isoformat():
+                    raise ValueError(
+                        f"plan {plan_version_id} source_trade_date does not match batch trade_date"
+                    )
+            elif payload["target_trade_date"] != trade_date.isoformat():
+                raise ValueError(
+                    f"plan {plan_version_id} target_trade_date does not match batch trade_date"
+                )
+            artifacts.append(artifact)
         for review_id in normalized_review_ids:
-            artifacts.append(
-                await self.build_review_artifact(review_id, phase=phase)
+            artifact = await self.build_review_artifact(
+                review_id,
+                phase=phase,
             )
+            if artifact.trade_date != trade_date:
+                raise ValueError(
+                    f"review trade_date for {review_id} does not match batch trade_date"
+                )
+            artifacts.append(artifact)
         artifacts.append(await self.build_alerts_artifact(trade_date))
         artifacts.append(await self.build_daily_index_artifact(trade_date))
         artifacts.append(await self.build_dashboard_artifact(trade_date))
@@ -568,15 +638,49 @@ class TradingPlaybookObsidianSnapshotBuilder:
     def _validate_review_data(
         cls,
         review: TradingExecutionReview,
+        plan: TradingPlanVersion,
+        candidates: list[TradingPlanCandidate],
         *,
         phase: str,
     ) -> None:
         review_id = _positive_integer(review.id, "review id")
-        _database_date(review.trade_date, "review trade_date")
-        _positive_integer(
+        plan_id = _positive_integer(
             review.plan_version_id,
             f"review {review_id} plan_version_id",
         )
+        if plan_id != _positive_integer(plan.id, "review plan id"):
+            raise ValueError(
+                f"review {review_id} plan identity does not match loaded plan"
+            )
+        if not (
+            plan.status in {"active", "superseded"}
+            or (plan.status == "expired" and plan.confirmed_at is not None)
+        ):
+            raise ValueError(
+                f"review {review_id} plan is not in a review-relevant status"
+            )
+        review_trade_date = _database_date(
+            review.trade_date,
+            "review trade_date",
+        )
+        target_trade_date = _database_date(
+            plan.target_trade_date,
+            "review plan target_trade_date",
+        )
+        action_trade_dates = {
+            _database_date(
+                candidate.action_trade_date,
+                f"review candidate {candidate.id} action_trade_date",
+            )
+            for candidate in candidates
+        }
+        if (
+            review_trade_date != target_trade_date
+            and review_trade_date not in action_trade_dates
+        ):
+            raise ValueError(
+                f"review {review_id} review trade date is not relevant to plan {plan_id}"
+            )
         generated_at = _database_datetime(
             review.generated_at,
             f"review {review_id} generated_at",
@@ -736,6 +840,11 @@ class TradingPlaybookObsidianSnapshotBuilder:
             raise ValueError(
                 f"alert {alert_id} market_snapshot must be a JSON object"
             )
+        safe_market_facts = cls._safe_alert_market_facts(
+            event.event_type,
+            event.market_snapshot_json,
+            alert_id=alert_id,
+        )
         if type(event.channel_status_json) is not dict:
             raise ValueError(
                 f"alert {alert_id} channel_status must be a JSON object"
@@ -762,6 +871,39 @@ class TradingPlaybookObsidianSnapshotBuilder:
             if field_name not in in_app:
                 continue
             value = in_app[field_name]
+            if field_name == "status":
+                safe_status[field_name] = channel_status
+                continue
+            if field_name == "attempts":
+                if attempts is not None:
+                    safe_status[field_name] = attempts
+                continue
+            if field_name == "accepted":
+                if type(value) is not bool:
+                    raise ValueError(
+                        f"alert {alert_id} in_app accepted is malformed"
+                    )
+                safe_status[field_name] = value
+                continue
+            if field_name in _IN_APP_TIMESTAMP_FIELDS:
+                if not isinstance(value, str) or not value.strip():
+                    raise ValueError(
+                        f"alert {alert_id} in_app {field_name} is malformed"
+                    )
+                try:
+                    parsed = datetime.fromisoformat(
+                        value.replace("Z", "+00:00")
+                    )
+                except ValueError as exc:
+                    raise ValueError(
+                        f"alert {alert_id} in_app {field_name} is malformed"
+                    ) from exc
+                if parsed.tzinfo is None or parsed.utcoffset() is None:
+                    raise ValueError(
+                        f"alert {alert_id} in_app {field_name} must be timezone-aware"
+                    )
+                safe_status[field_name] = value
+                continue
             if not isinstance(value, (str, bool, int)):
                 raise ValueError(
                     f"alert {alert_id} in_app {field_name} is malformed"
@@ -772,16 +914,18 @@ class TradingPlaybookObsidianSnapshotBuilder:
             timeline_state = "confirmed"
         elif (
             event.event_type == "confirmation_required"
-            and channel_status in {"pending", "sending"}
+            or channel_status in {"pending", "sending"}
         ):
             timeline_state = "pending_confirmation"
         elif channel_status == "delivered":
             timeline_state = "delivered"
-        elif channel_status in {"uncertain", "failed"}:
+        elif channel_status in {"uncertain", "failed", "skipped"}:
             timeline_state = "failed"
         else:
-            timeline_state = channel_status
-        return {
+            raise ValueError(
+                f"alert {alert_id} cannot map in_app status to timeline state"
+            )
+        payload = {
             "alert_id": alert_id,
             "event_type": event.event_type,
             "severity": event.severity,
@@ -790,10 +934,128 @@ class TradingPlaybookObsidianSnapshotBuilder:
             "plan_version_id": plan_id,
             "candidate_id": candidate_id,
             "message": event.message,
-            "market_facts": event.market_snapshot_json,
+            "market_facts": safe_market_facts,
             "in_app_status": safe_status,
             "acknowledged_at": database_datetime_to_cn(acknowledged_at),
         }
+        cls._reject_sensitive_export_value(payload, alert_id=alert_id)
+        return payload
+
+    @staticmethod
+    def _safe_alert_market_facts(
+        event_type: str,
+        market_snapshot: dict[str, object],
+        *,
+        alert_id: int,
+    ) -> dict[str, object]:
+        if event_type in _PLAN_ALERT_EVENT_TYPES:
+            field_names = _PLAN_ALERT_MARKET_FIELDS
+        elif event_type in _ACTION_ALERT_EVENT_TYPES:
+            field_names = _ACTION_ALERT_MARKET_FIELDS
+        else:
+            raise ValueError(f"alert {alert_id} event_type is unsupported")
+
+        result: dict[str, object] = {}
+        for field_name in field_names:
+            if field_name not in market_snapshot:
+                continue
+            value = market_snapshot[field_name]
+            if value is None or isinstance(value, (dict, list, tuple, set, bytes)):
+                raise ValueError(
+                    f"alert {alert_id} market fact {field_name} must be scalar"
+                )
+            result[field_name] = value
+
+        if event_type in _ACTION_ALERT_EVENT_TYPES and "quote" in market_snapshot:
+            quote = market_snapshot["quote"]
+            if type(quote) is not dict:
+                raise ValueError(
+                    f"alert {alert_id} market quote must be a JSON object"
+                )
+            safe_quote: dict[str, object] = {}
+            for field_name in _ACTION_QUOTE_FIELDS:
+                if field_name not in quote:
+                    continue
+                value = quote[field_name]
+                if value is None or isinstance(
+                    value,
+                    (dict, list, tuple, set, bytes),
+                ):
+                    raise ValueError(
+                        f"alert {alert_id} quote fact {field_name} must be scalar"
+                    )
+                safe_quote[field_name] = value
+            result["quote"] = safe_quote
+        return result
+
+    @classmethod
+    def _reject_sensitive_export_value(
+        cls,
+        value: object,
+        *,
+        alert_id: int,
+    ) -> None:
+        if isinstance(value, str):
+            if _SENSITIVE_EXPORT_TEXT.search(value):
+                raise ValueError(
+                    f"alert {alert_id} contains sensitive export text"
+                )
+            return
+        if type(value) is dict:
+            for key, item in value.items():
+                if not isinstance(key, str):
+                    raise ValueError(
+                        f"alert {alert_id} export field names must be strings"
+                    )
+                if _SENSITIVE_EXPORT_TEXT.search(key):
+                    raise ValueError(
+                        f"alert {alert_id} contains a sensitive export field"
+                    )
+                cls._reject_sensitive_export_value(
+                    item,
+                    alert_id=alert_id,
+                )
+            return
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                cls._reject_sensitive_export_value(
+                    item,
+                    alert_id=alert_id,
+                )
+
+    @staticmethod
+    def _current_effective_plan_id(
+        plans: Sequence[TradingPlanVersion],
+        *,
+        trade_date: date,
+    ) -> int | None:
+        active_plans = [plan for plan in plans if plan.status == "active"]
+        if len(active_plans) > 1:
+            raise ValueError(
+                f"trade date {trade_date} has multiple active plan versions"
+            )
+        status_precedence = {"active": 3, "confirmed": 2, "draft": 1}
+        eligible = [
+            plan for plan in plans if plan.status in status_precedence
+        ]
+        if not eligible:
+            return None
+
+        def precedence_key(
+            plan: TradingPlanVersion,
+        ) -> tuple[int, int, datetime, int]:
+            generated_at = _database_datetime(
+                plan.generated_at,
+                f"plan {plan.id} generated_at",
+            )
+            return (
+                status_precedence[plan.status],
+                _positive_integer(plan.version_no, "version_no"),
+                database_datetime_to_cn(generated_at),
+                _positive_integer(plan.id, "plan id"),
+            )
+
+        return max(eligible, key=precedence_key).id
 
     @staticmethod
     def _daily_plan_payload(

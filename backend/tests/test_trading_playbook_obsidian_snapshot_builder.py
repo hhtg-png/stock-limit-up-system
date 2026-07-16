@@ -1083,7 +1083,17 @@ class TradingPlaybookObsidianSnapshotBuilderTests(
             finalized_at=finalized_at,
         )
 
+    async def _make_plan_review_relevant(self, plan_id, *, status="active"):
+        async with self.session_factory() as session:
+            plan = await session.get(TradingPlanVersion, plan_id)
+            plan.status = status
+            if status == "expired" and plan.confirmed_at is None:
+                plan.confirmed_at = datetime(2026, 7, 15, 18, 30)
+                plan.confirmed_by = "reviewer"
+            await session.commit()
+
     async def test_review_builder_freezes_initial_and_final_same_row_independently(self):
+        await self._make_plan_review_relevant(202)
         async with self.session_factory() as session:
             session.add(self._review_row())
             await session.commit()
@@ -1153,6 +1163,7 @@ class TradingPlaybookObsidianSnapshotBuilderTests(
                 phase="initial_review",
             )
 
+        await self._make_plan_review_relevant(202)
         async with self.session_factory() as session:
             session.add(self._review_row())
             await session.commit()
@@ -1171,7 +1182,91 @@ class TradingPlaybookObsidianSnapshotBuilderTests(
                 phase="initial_review",
             )
 
+    async def test_review_builder_requires_review_service_plan_relevance(self):
+        # confirmed/draft are not historical review targets until activated;
+        # this protects against exporting unrelated plan rows.
+        async with self.session_factory() as session:
+            session.add(self._review_row(511, plan_version_id=202))
+            await session.commit()
+        with self.assertRaisesRegex(ValueError, "review-relevant status"):
+            await self.builder.build_review_artifact(
+                511,
+                phase="initial_review",
+            )
+
+        await self._make_plan_review_relevant(202, status="active")
+        async with self.session_factory() as session:
+            cross_date = self._review_row(512, plan_version_id=202)
+            cross_date.trade_date = date(2026, 7, 15)
+            session.add(cross_date)
+            await session.commit()
+        with self.assertRaisesRegex(ValueError, "review trade date"):
+            await self.builder.build_review_artifact(
+                512,
+                phase="initial_review",
+            )
+
+        # Superseded plans and expired confirmed plans remain valid historical
+        # review targets when the date matches target or candidate action date.
+        await self._make_plan_review_relevant(201, status="superseded")
+        async with self.session_factory() as session:
+            target_match = self._review_row(513, plan_version_id=201)
+            action_match = self._review_row(514, plan_version_id=201)
+            action_match.trade_date = date(2026, 7, 14)
+            session.add_all([target_match, action_match])
+            await session.commit()
+        target_artifact = await self.builder.build_review_artifact(
+            513,
+            phase="initial_review",
+        )
+        action_artifact = await self.builder.build_review_artifact(
+            514,
+            phase="initial_review",
+        )
+        self.assertEqual(target_artifact.trade_date, date(2026, 7, 16))
+        self.assertEqual(action_artifact.trade_date, date(2026, 7, 14))
+
+        await self._make_plan_review_relevant(203, status="expired")
+        async with self.session_factory() as session:
+            expired = self._review_row(515, plan_version_id=203)
+            session.add(expired)
+            await session.commit()
+        artifact = await self.builder.build_review_artifact(
+            515,
+            phase="initial_review",
+        )
+        self.assertEqual(artifact.entity_id, 515)
+
     async def test_alerts_builder_exports_cn_timeline_states_and_excludes_wechat(self):
+        plan_market = {
+            "source_trade_date": "2026-07-14",
+            "target_trade_date": "2026-07-16",
+            "stage": "after_close",
+            "status": "confirmed",
+            "trade_date": "2026-07-16",
+            "api_key": "TOP-SECRET-API-KEY",
+            "nested": {"password": "never-export-this"},
+        }
+        action_market = {
+            "trade_date": "2026-07-16",
+            "stock_code": "600001",
+            "mode_key": "trend_core_pullback",
+            "condition_version": "condition-v1",
+            "occurrence_no": 1,
+            "quote": {
+                "code": "600001",
+                "name": "候选甲",
+                "price": 20.1,
+                "change_pct": 3.2,
+                "sealed": False,
+                "open_count": 1,
+                "datetime": "2026-07-16T09:04:00+08:00",
+                "captured_at": "2026-07-16T09:04:00+08:00",
+                "webhook": "https://private.invalid/token",
+                "nested": {"secret": "quote-secret"},
+            },
+            "output": "raw-provider-output",
+        }
         alert_specs = (
             (
                 601,
@@ -1181,6 +1276,7 @@ class TradingPlaybookObsidianSnapshotBuilderTests(
                 None,
                 {"status": "delivered", "attempts": 1, "delivered_at": "2026-07-16T09:00:01+08:00", "receipt": {"output": "private"}},
                 None,
+                plan_market,
             ),
             (
                 602,
@@ -1190,6 +1286,7 @@ class TradingPlaybookObsidianSnapshotBuilderTests(
                 2021,
                 {"status": "pending", "attempts": 0},
                 None,
+                plan_market,
             ),
             (
                 603,
@@ -1199,6 +1296,7 @@ class TradingPlaybookObsidianSnapshotBuilderTests(
                 2022,
                 {"status": "delivered", "attempts": 1, "delivered_at": "2026-07-16T09:02:01+08:00"},
                 datetime(2026, 7, 16, 9, 3),
+                plan_market,
             ),
             (
                 604,
@@ -1206,12 +1304,33 @@ class TradingPlaybookObsidianSnapshotBuilderTests(
                 "warning",
                 datetime(2026, 7, 16, 9, 4),
                 2021,
-                {"status": "failed", "attempts": 2, "error": "delivery failed", "failed_at": "2026-07-16T09:04:01+08:00"},
+                {"status": "failed", "attempts": 2, "error": "Bearer SECRET-TOKEN", "failed_at": "2026-07-16T09:04:01+08:00"},
                 None,
+                action_market,
+            ),
+            (
+                605,
+                "confirmation_required",
+                "warning",
+                datetime(2026, 7, 16, 9, 5),
+                None,
+                {"status": "sending", "attempts": 1, "sending_at": "2026-07-16T09:05:01+08:00", "owner": "secret-owner", "idempotency_key": "private-token"},
+                None,
+                plan_market,
+            ),
+            (
+                606,
+                "plan_ready",
+                "info",
+                datetime(2026, 7, 16, 9, 6),
+                None,
+                {"status": "skipped", "attempts": 1, "reason": "password=private", "skipped_at": "2026-07-16T09:06:01+08:00"},
+                None,
+                plan_market,
             ),
         )
         async with self.session_factory() as session:
-            for event_id, event_type, severity, triggered_at, candidate_id, in_app, acknowledged_at in alert_specs:
+            for event_id, event_type, severity, triggered_at, candidate_id, in_app, acknowledged_at, market_facts in alert_specs:
                 session.add(
                     TradingAlertEvent(
                         id=event_id,
@@ -1221,15 +1340,13 @@ class TradingPlaybookObsidianSnapshotBuilderTests(
                         severity=severity,
                         dedup_key=f"event:{event_id}",
                         triggered_at=triggered_at,
-                        market_snapshot_json={
-                            "trade_date": "2026-07-16",
-                            "last_price": 20 + event_id / 1000,
-                        },
+                        market_snapshot_json=deepcopy(market_facts),
                         message=f"alert {event_id}",
                         channel_status_json={
                             "in_app": in_app,
                             "wechat": {
                                 "status": "delivered",
+                                "label": "微信发送",
                                 "secret": "must-not-export",
                                 "config": {"webhook": "private"},
                                 "output": "private response",
@@ -1241,11 +1358,11 @@ class TradingPlaybookObsidianSnapshotBuilderTests(
             # Same UTC-looking clock value on another CN date must not leak in.
             session.add(
                 TradingAlertEvent(
-                    id=605,
+                    id=609,
                     plan_version_id=202,
                     event_type="plan_ready",
                     severity="info",
-                    dedup_key="event:605",
+                    dedup_key="event:609",
                     triggered_at=datetime(2026, 7, 15, 23, 59, 59),
                     market_snapshot_json={},
                     message="previous day",
@@ -1262,14 +1379,24 @@ class TradingPlaybookObsidianSnapshotBuilderTests(
             "30_TradingPlaybook/Alerts/Auto/2026/2026-07-16.md",
         )
         self.assertFalse(artifact.immutable)
-        self.assertEqual([row["alert_id"] for row in payload["timeline"]], [601, 602, 603, 604])
+        self.assertEqual(
+            [row["alert_id"] for row in payload["timeline"]],
+            [601, 602, 603, 604, 605, 606],
+        )
         self.assertEqual(
             [row["in_app_status"]["status"] for row in payload["timeline"]],
-            ["delivered", "pending", "delivered", "failed"],
+            ["delivered", "pending", "delivered", "failed", "sending", "skipped"],
         )
         self.assertEqual(
             [row["timeline_state"] for row in payload["timeline"]],
-            ["delivered", "pending_confirmation", "confirmed", "failed"],
+            [
+                "delivered",
+                "pending_confirmation",
+                "confirmed",
+                "failed",
+                "pending_confirmation",
+                "failed",
+            ],
         )
         self.assertEqual(
             payload["timeline"][0]["triggered_at"],
@@ -1281,11 +1408,56 @@ class TradingPlaybookObsidianSnapshotBuilderTests(
             "2026-07-16T01:03:00Z",
         )
         self.assertEqual(
-            payload["timeline"][0]["market_facts"]["trade_date"],
-            "2026-07-16",
+            set(payload["timeline"][0]["market_facts"]),
+            {
+                "source_trade_date",
+                "target_trade_date",
+                "stage",
+                "status",
+                "trade_date",
+            },
+        )
+        self.assertEqual(
+            set(payload["timeline"][3]["market_facts"]),
+            {
+                "trade_date",
+                "stock_code",
+                "mode_key",
+                "condition_version",
+                "occurrence_no",
+                "quote",
+            },
+        )
+        self.assertEqual(
+            set(payload["timeline"][3]["market_facts"]["quote"]),
+            {
+                "code",
+                "name",
+                "price",
+                "change_pct",
+                "sealed",
+                "open_count",
+                "datetime",
+                "captured_at",
+            },
         )
         encoded = canonical_json_bytes(payload).decode("utf-8")
-        for forbidden in ("wechat", "must-not-export", "webhook", "private response", "receipt", "private"):
+        for forbidden in (
+            "wechat",
+            "微信",
+            "webhook",
+            "token",
+            "secret",
+            "password",
+            "api_key",
+            "bearer",
+            "receipt",
+            "config",
+            "output",
+            "owner",
+            "idempotency",
+            "private",
+        ):
             self.assertNotIn(forbidden, encoded.lower())
 
     async def test_alerts_builder_rejects_invalid_date_and_corrupt_roots_or_links(self):
@@ -1368,6 +1540,73 @@ class TradingPlaybookObsidianSnapshotBuilderTests(
             ["after_close", "final_review"],
         )
 
+    async def test_daily_index_current_effective_uses_status_and_newest_precedence(self):
+        async with self.session_factory() as session:
+            rows = {
+                plan_id: await session.get(TradingPlanVersion, plan_id)
+                for plan_id in (201, 202, 203, 204)
+            }
+            rows[201].status = "draft"
+            rows[202].status = "confirmed"
+            rows[203].status = "draft"
+            rows[204].status = "draft"
+            await session.commit()
+
+        confirmed_over_newer_draft = (
+            await self.builder.build_daily_index_artifact(date(2026, 7, 16))
+        ).payload_json()
+        self.assertEqual(
+            confirmed_over_newer_draft["current_effective_plan_version_id"],
+            202,
+        )
+        self.assertEqual(
+            [
+                row["plan_version_id"]
+                for row in confirmed_over_newer_draft["plan_versions"]
+                if row["current_effective"]
+            ],
+            [202],
+        )
+
+        async with self.session_factory() as session:
+            for plan_id in (201, 202, 203, 204):
+                row = await session.get(TradingPlanVersion, plan_id)
+                row.status = "draft"
+            await session.commit()
+        draft_only = (
+            await self.builder.build_daily_index_artifact(date(2026, 7, 16))
+        ).payload_json()
+        self.assertEqual(draft_only["current_effective_plan_version_id"], 204)
+
+        async with self.session_factory() as session:
+            for index, plan_id in enumerate((201, 202, 203, 204)):
+                row = await session.get(TradingPlanVersion, plan_id)
+                row.status = "superseded" if index % 2 == 0 else "expired"
+            await session.commit()
+        historical_only = (
+            await self.builder.build_daily_index_artifact(date(2026, 7, 16))
+        ).payload_json()
+        self.assertIsNone(
+            historical_only["current_effective_plan_version_id"]
+        )
+        self.assertEqual(len(historical_only["plan_versions"]), 4)
+        self.assertFalse(
+            any(
+                row["current_effective"]
+                for row in historical_only["plan_versions"]
+            )
+        )
+
+        active_one, _ = self._plan_row(801, "preclose", 1, True)
+        active_two, _ = self._plan_row(802, "after_close", 2, True)
+        active_one.status = "active"
+        active_two.status = "active"
+        with self.assertRaisesRegex(ValueError, "multiple active"):
+            self.builder._current_effective_plan_id(
+                [active_one, active_two],
+                trade_date=date(2026, 7, 16),
+            )
+
     async def test_daily_index_rejects_invalid_date_and_more_than_three_candidates(self):
         with self.assertRaisesRegex(ValueError, "trade_date"):
             await self.builder.build_daily_index_artifact(
@@ -1435,6 +1674,8 @@ class TradingPlaybookObsidianSnapshotBuilderTests(
             )
 
     async def test_stage_builder_sorts_deduplicates_and_sets_mutability(self):
+        await self._make_plan_review_relevant(201, status="superseded")
+        await self._make_plan_review_relevant(202, status="active")
         async with self.session_factory() as session:
             session.add_all(
                 [
@@ -1444,17 +1685,29 @@ class TradingPlaybookObsidianSnapshotBuilderTests(
             )
             await session.commit()
 
-        artifacts = await self.builder.build_stage_artifacts(
+        plan_batch = await self.builder.build_stage_artifacts(
+            trade_date=date(2026, 7, 14),
+            phase="preclose",
+            plan_version_ids=[201, 201],
+        )
+        self.assertEqual(
+            [artifact.snapshot_key for artifact in plan_batch],
+            [
+                "plan:201",
+                "alerts:2026-07-14",
+                "daily-index:2026-07-14",
+                "dashboard:trading-playbook",
+            ],
+        )
+
+        review_batch = await self.builder.build_stage_artifacts(
             trade_date=date(2026, 7, 16),
             phase="initial_review",
-            plan_version_ids=[202, 201, 202],
             review_ids=[502, 501, 502],
         )
         self.assertEqual(
-            [artifact.snapshot_key for artifact in artifacts],
+            [artifact.snapshot_key for artifact in review_batch],
             [
-                "plan:201",
-                "plan:202",
                 "review:501:initial",
                 "review:502:initial",
                 "alerts:2026-07-16",
@@ -1463,11 +1716,16 @@ class TradingPlaybookObsidianSnapshotBuilderTests(
             ],
         )
         self.assertEqual(
-            [artifact.immutable for artifact in artifacts],
-            [True, True, True, True, False, False, False],
+            [artifact.immutable for artifact in review_batch],
+            [True, True, False, False, False],
         )
-        self.assertFalse(any(artifact.entity_type == "notes" for artifact in artifacts))
-        self.assertFalse(any("/Notes/" in artifact.target_path for artifact in artifacts))
+        all_artifacts = (*plan_batch, *review_batch)
+        self.assertFalse(
+            any(artifact.entity_type == "notes" for artifact in all_artifacts)
+        )
+        self.assertFalse(
+            any("/Notes/" in artifact.target_path for artifact in all_artifacts)
+        )
 
         with self.assertRaisesRegex(ValueError, "phase"):
             await self.builder.build_stage_artifacts(
@@ -1501,12 +1759,72 @@ class TradingPlaybookObsidianSnapshotBuilderTests(
             ["alerts", "daily_index", "dashboard"],
         )
 
+    async def test_stage_builder_rejects_cross_phase_and_cross_date_entities(self):
+        await self._make_plan_review_relevant(202, status="active")
+        async with self.session_factory() as session:
+            session.add(self._review_row(521, plan_version_id=202))
+            await session.commit()
+
+        for phase in ("catalog", "reconcile", "initial_review", "final_review"):
+            with self.subTest(plan_phase=phase):
+                with self.assertRaisesRegex(ValueError, "plan_version_ids.*phase"):
+                    await self.builder.build_stage_artifacts(
+                        trade_date=date(2026, 7, 14),
+                        phase=phase,
+                        plan_version_ids=[201],
+                    )
+        for phase in (
+            "catalog",
+            "reconcile",
+            "preclose",
+            "after_close",
+            "overnight",
+            "auction",
+        ):
+            with self.subTest(review_phase=phase):
+                with self.assertRaisesRegex(ValueError, "review_ids.*phase"):
+                    await self.builder.build_stage_artifacts(
+                        trade_date=date(2026, 7, 16),
+                        phase=phase,
+                        review_ids=[521],
+                    )
+
+        with self.assertRaisesRegex(ValueError, "stage.*batch phase"):
+            await self.builder.build_stage_artifacts(
+                trade_date=date(2026, 7, 14),
+                phase="preclose",
+                plan_version_ids=[202],
+            )
+        with self.assertRaisesRegex(ValueError, "source_trade_date.*batch"):
+            await self.builder.build_stage_artifacts(
+                trade_date=date(2026, 7, 15),
+                phase="preclose",
+                plan_version_ids=[201],
+            )
+        with self.assertRaisesRegex(ValueError, "target_trade_date.*batch"):
+            await self.builder.build_stage_artifacts(
+                trade_date=date(2026, 7, 15),
+                phase="overnight",
+                plan_version_ids=[203],
+            )
+        with self.assertRaisesRegex(ValueError, "review trade_date.*batch"):
+            await self.builder.build_stage_artifacts(
+                trade_date=date(2026, 7, 15),
+                phase="initial_review",
+                review_ids=[521],
+            )
+
     async def test_review_and_index_reject_corrupt_database_timestamps(self):
         corrupt_review = self._review_row()
         corrupt_review.generated_at = "not-a-datetime"
+        plan, _ = self._plan_row(202, "after_close", 2, True)
+        plan.status = "active"
+        candidates, _ = self._candidate_rows(202)
         with self.assertRaisesRegex(ValueError, "generated_at"):
             self.builder._validate_review_data(
                 corrupt_review,
+                plan,
+                candidates,
                 phase="initial_review",
             )
 
