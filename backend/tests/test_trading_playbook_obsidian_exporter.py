@@ -683,6 +683,27 @@ class TradingPlaybookObsidianExporterContractTests(unittest.TestCase):
         self.assertIn("[[30_TradingPlaybook/Notes/2026/2026-07-16", rendered)
         self.assertNotIn("[[伪链接]]", rendered)
 
+    def test_plan_allows_unranked_degraded_themes_and_sorts_them_last(self) -> None:
+        base_plan = self._plan_artifact()
+        payload = base_plan.payload_json()
+        payload["theme_ranking"] = [
+            {"rank": None, "theme_name": "待定题材"},
+            {"rank": 1, "theme_name": "机器人"},
+        ]
+        plan = replace(base_plan, payload=payload)
+
+        rendered = self.exporter.render(plan, generated_at=self.generated_at)
+
+        self.assertLess(rendered.index("机器人"), rendered.index("待定题材"))
+        self.assertIn("| 1 | 机器人 |", rendered)
+        self.assertIn("| — | 待定题材 |", rendered)
+        self.assertIn('themes: ["机器人","待定题材"]', rendered)
+
+        payload["theme_ranking"] = [{"rank": 0, "theme_name": "坏数据"}]
+        plan = replace(base_plan, payload=payload)
+        with self.assertRaisesRegex(ValueError, "theme rank"):
+            self.exporter.render(plan, generated_at=self.generated_at)
+
     def test_plan_links_reviews_for_action_dates_and_target_date(self) -> None:
         source_trade_date = date(2026, 7, 15)
         action_trade_date = date(2026, 7, 16)

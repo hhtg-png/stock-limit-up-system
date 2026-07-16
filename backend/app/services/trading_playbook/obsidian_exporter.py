@@ -338,12 +338,7 @@ class TradingPlaybookObsidianExporter:
                     payload.get("theme_ranking"), "theme_ranking"
                 )
             ]
-            theme_rows.sort(
-                key=lambda row: (
-                    self._positive_int(row.get("rank"), "theme rank"),
-                    str(row.get("theme_name", "")),
-                )
-            )
+            theme_rows.sort(key=self._theme_sort_key)
             values.extend(
                 (
                     ("plan_version_id", payload.get("plan_version_id")),
@@ -474,6 +469,17 @@ class TradingPlaybookObsidianExporter:
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise ValueError(f"{field_name} must be a positive integer")
         return value
+
+    @classmethod
+    def _theme_sort_key(cls, row: dict[str, object]) -> tuple[int, int, str]:
+        rank = row.get("rank")
+        if rank is None:
+            return (1, 0, str(row.get("theme_name", "")))
+        return (
+            0,
+            cls._positive_int(rank, "theme rank"),
+            str(row.get("theme_name", "")),
+        )
 
     @staticmethod
     def _iso_date(value: object, field_name: str) -> str:
@@ -720,12 +726,7 @@ class TradingPlaybookObsidianExporter:
                 payload.get("theme_ranking"), "theme_ranking"
             )
         ]
-        themes.sort(
-            key=lambda row: (
-                self._positive_int(row.get("rank"), "theme rank"),
-                str(row.get("theme_name", "")),
-            )
-        )
+        themes.sort(key=self._theme_sort_key)
         rule_snapshot = [
             self._require_dict(value, "rule snapshot row")
             for value in self._require_list(
@@ -768,7 +769,8 @@ class TradingPlaybookObsidianExporter:
         if themes:
             lines.extend(("| 排名 | 题材 |", "| ---: | --- |"))
             lines.extend(
-                f"| {theme['rank']} | {self._safe_cell(theme.get('theme_name'))} |"
+                f"| {self._safe_cell(theme.get('rank'))} | "
+                f"{self._safe_cell(theme.get('theme_name'))} |"
                 for theme in themes
             )
         else:
