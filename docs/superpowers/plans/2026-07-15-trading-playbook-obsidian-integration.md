@@ -544,6 +544,37 @@ git add backend/app/services/trading_playbook/obsidian_snapshot_builder.py backe
 git commit -m "feat: build Obsidian rule and plan snapshots"
 ```
 
+## Task 4A: 让真实预案绑定风控文字来源版本
+
+**Files:**
+- Modify: `backend/app/services/trading_playbook/plan_service.py`
+- Modify: `backend/tests/test_trading_playbook_plan_service.py`
+
+> Task 4 质量复审发现：严格快照构建器要求 `risk_settings.source_refs` 带精确 `source_content_hash`，但真实预案生产者只持久化了 `source_key` 和短引用。若不先修复，真实生成的预案无法进入 Obsidian 导出闭环。
+
+- [ ] **Step 1: 写真实生产者合同红灯测试**
+
+断言新预案为 `03-loss-qa` 与 `04-trading-plan` 写入当前数据库中最新且 `ready` 的精确 hash；相同来源保持幂等，来源版本变化必须改变预案输入 hash。最新来源缺失或未就绪时失败，并且不得回退到旧的 ready 版本。
+
+- [ ] **Step 2: 写修订与历史边界测试**
+
+绑定来源的父预案修订后必须保留完全相同的来源引用。旧的未绑定父预案必须在创建子版本前失败，提示重新生成；不得原地回填或修改不可变历史行。
+
+- [ ] **Step 3: 实现固定次数来源查询与 canonical 引用**
+
+将数值风控校验和数据库来源绑定分离；一次查询同时解析两个来源，使用 `canonical_rule_source_refs()` 生成精确引用，并在计算 `input_hash` 前放入 `risk_settings`。来源缺失、最新版本未就绪或 hash 非法按上游溯源不可用处理。
+
+- [ ] **Step 4: 回归验证并提交**
+
+```powershell
+Set-Location backend
+python -m unittest discover -s tests -p 'test_trading_playbook_plan_service.py' -v
+python -m unittest discover -s tests -p 'test_trading_playbook_obsidian_snapshot_builder.py' -v
+git diff --check
+git add backend/app/services/trading_playbook/plan_service.py backend/tests/test_trading_playbook_plan_service.py
+git commit -m "fix: bind plan risk sources to transcripts"
+```
+
 ## Task 5: 构建复盘、提醒、日期索引和 Dashboard 快照
 
 **Files:**
