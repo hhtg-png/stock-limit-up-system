@@ -18,6 +18,8 @@ from sqlalchemy.pool import NullPool
 from app.database import Base
 from app.models.trading_playbook import (
     TradingExecutionReview,
+    TradingExecutionReviewPhaseSnapshot,
+    TradingModeRule,
     TradingPlanVersion,
     TradingPlaybookObsidianExport,
 )
@@ -2268,7 +2270,6 @@ class TradingPlaybookObsidianSyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             builder.calls,
             [
-                ("rules", "v2"),
                 ("alerts", source_latest),
                 ("index", source_latest),
                 ("dashboard", source_latest),
@@ -2294,6 +2295,23 @@ class TradingPlaybookObsidianSyncTests(unittest.IsolatedAsyncioTestCase):
             missing_plan_id = int(missing_plan.id)
             initial_review_id = int(initial_review.id)
             final_review_id = int(final_review.id)
+            session.add_all(
+                [
+                    TradingModeRule(
+                        mode_key=f"mode_{index:02d}",
+                        version=2,
+                        name=f"Mode {index}",
+                        family="test",
+                        style="test",
+                        window="test",
+                        automation_level="manual",
+                        content_hash=f"{index:064x}",
+                        enabled=True,
+                    )
+                    for index in range(1, 20)
+                ]
+            )
+            await session.commit()
 
         already_exported = artifact(
             "already-exported-plan",
@@ -2428,6 +2446,120 @@ class TradingPlaybookObsidianSyncTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    async def test_reconcile_discovers_both_review_phase_snapshots_and_only_repairs_missing_phase(self):
+        async with self.session_factory() as session:
+            plan = plan_row(version_no=1)
+            session.add(plan)
+            await session.flush()
+            review = review_row(plan.id, finalized=True)
+            session.add(review)
+            await session.flush()
+            session.add_all(
+                [
+                    TradingExecutionReviewPhaseSnapshot(
+                        review_id=review.id,
+                        phase=phase,
+                        trade_date=TRADE_DATE,
+                        plan_version_id=plan.id,
+                        snapshot_json={"phase": phase},
+                        created_at=datetime(2026, 7, 16, 15, minute),
+                    )
+                    for phase, minute in (
+                        ("initial_review", 10),
+                        ("final_review", 30),
+                    )
+                ]
+            )
+            await session.commit()
+            plan_id = int(plan.id)
+            review_id = int(review.id)
+
+        await self.coordinator.enqueue_artifacts(
+            [
+                artifact(
+                    "existing-plan",
+                    snapshot_key=f"plan:{plan_id}",
+                    immutable=True,
+                    entity_type="plan",
+                    entity_id=plan_id,
+                    phase="preclose",
+                    target_path=(
+                        "30_TradingPlaybook/Daily/Auto/2026/"
+                        "2026-07-16/existing-plan.md"
+                    ),
+                )
+            ]
+        )
+        initial = artifact(
+            "initial-phase-snapshot",
+            snapshot_key=f"review:{review_id}:initial",
+            immutable=True,
+            entity_type="review",
+            entity_id=review_id,
+            phase="initial_review",
+            target_path=(
+                "30_TradingPlaybook/Reviews/Auto/2026/2026-07-16/"
+                f"initial-review-{plan_id}.md"
+            ),
+        )
+        final = artifact(
+            "final-phase-snapshot",
+            snapshot_key=f"review:{review_id}:final",
+            immutable=True,
+            entity_type="review",
+            entity_id=review_id,
+            phase="final_review",
+            target_path=(
+                "30_TradingPlaybook/Reviews/Auto/2026/2026-07-16/"
+                f"final-review-{plan_id}.md"
+            ),
+        )
+        builder = FakeBuilder(
+            by_date={
+                ("review", review_id, "initial_review"): initial,
+                ("review", review_id, "final_review"): final,
+            }
+        )
+        coordinator = self._coordinator(
+            self.session_factory,
+            builder=builder,
+        )
+
+        rows = await coordinator.reconcile_committed_facts()
+
+        self.assertEqual(
+            [call for call in builder.calls if call[0] == "review"],
+            [
+                ("review", review_id, "initial_review"),
+                ("review", review_id, "final_review"),
+            ],
+        )
+        self.assertEqual(
+            {row.snapshot_key for row in rows},
+            {initial.snapshot_key, final.snapshot_key},
+        )
+
+        async with self.session_factory() as session:
+            await session.execute(
+                TradingPlaybookObsidianExport.__table__.delete().where(
+                    TradingPlaybookObsidianExport.snapshot_key
+                    == final.snapshot_key
+                )
+            )
+            await session.commit()
+        builder.calls.clear()
+
+        repaired = await coordinator.reconcile_committed_facts()
+
+        self.assertEqual(
+            [call for call in builder.calls if call[0] == "review"],
+            [("review", review_id, "final_review")],
+        )
+        self.assertEqual(
+            {row.snapshot_key for row in repaired},
+            {final.snapshot_key},
+        )
+
     async def test_bad_committed_fact_does_not_starve_other_missing_facts(self):
         async with self.session_factory() as session:
             broken_plan = plan_row(version_no=1)
@@ -2480,6 +2612,22 @@ class TradingPlaybookObsidianSyncTests(unittest.IsolatedAsyncioTestCase):
             async def build_rule_artifacts(self, catalog_version="v2"):
                 raise asyncio.CancelledError()
 
+        async with self.session_factory() as session:
+            session.add(
+                TradingModeRule(
+                    mode_key="cancelled_rule",
+                    version=2,
+                    name="Cancelled Rule",
+                    family="test",
+                    style="test",
+                    window="test",
+                    automation_level="manual",
+                    content_hash="c" * 64,
+                    enabled=True,
+                )
+            )
+            await session.commit()
+
         coordinator = self._coordinator(
             self.session_factory,
             builder=CancelledBuilder(),
@@ -2487,6 +2635,81 @@ class TradingPlaybookObsidianSyncTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(asyncio.CancelledError):
             await coordinator.reconcile_committed_facts()
+
+    async def test_startup_reconcile_processes_due_after_fact_scan_failure(self):
+        coordinator = self._coordinator(self.session_factory)
+        coordinator.reconcile_committed_facts = AsyncMock(
+            side_effect=RuntimeError("fact scan unavailable")
+        )
+        coordinator.process_due = AsyncMock(return_value="processed")
+
+        result = await coordinator.startup_reconcile()
+
+        self.assertEqual(result, "processed")
+        coordinator.reconcile_committed_facts.assert_awaited_once_with()
+        coordinator.process_due.assert_awaited_once_with(limit=100)
+
+    async def test_bogus_rule_exports_do_not_hide_enabled_v2_rules(self):
+        async with self.session_factory() as session:
+            session.add_all(
+                [
+                    TradingModeRule(
+                        mode_key=f"real_mode_{index}",
+                        version=2,
+                        name=f"Real {index}",
+                        family="test",
+                        style="test",
+                        window="test",
+                        automation_level="manual",
+                        content_hash=str(index) * 64,
+                        enabled=True,
+                    )
+                    for index in range(1, 3)
+                ]
+            )
+            await session.commit()
+        bogus = tuple(
+            artifact(
+                f"bogus-{index}",
+                snapshot_key=f"rule:v2:bogus_{index:02d}",
+                immutable=True,
+                entity_type="rule",
+                phase="catalog",
+                target_path=(
+                    "30_TradingPlaybook/Modes/Auto/v2/"
+                    f"bogus_{index:02d}.md"
+                ),
+            )
+            for index in range(1, 20)
+        )
+        await self.coordinator.enqueue_artifacts(bogus)
+        real_rules = tuple(
+            artifact(
+                f"real-{index}",
+                snapshot_key=f"rule:v2:real_mode_{index}",
+                immutable=True,
+                entity_type="rule",
+                phase="catalog",
+                target_path=(
+                    "30_TradingPlaybook/Modes/Auto/v2/"
+                    f"real_mode_{index}.md"
+                ),
+            )
+            for index in range(1, 3)
+        )
+        builder = FakeBuilder(rules=real_rules)
+        coordinator = self._coordinator(
+            self.session_factory,
+            builder=builder,
+        )
+
+        rows = await coordinator.reconcile_committed_facts()
+
+        self.assertIn(("rules", "v2"), builder.calls)
+        self.assertEqual(
+            {row.snapshot_key for row in rows},
+            {rule.snapshot_key for rule in real_rules},
+        )
 
     async def test_startup_reconcile_does_not_clear_an_active_immutable_lease(self):
         immutable = artifact(

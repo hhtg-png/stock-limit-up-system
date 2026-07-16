@@ -259,6 +259,36 @@ class TradingExecutionReview(Base):
     finalized_at = Column(DateTime, nullable=True)
 
 
+class TradingExecutionReviewPhaseSnapshot(Base):
+    """Immutable business snapshot of one review lifecycle phase."""
+
+    __tablename__ = "trading_execution_review_phase_snapshots"
+    __table_args__ = (
+        UniqueConstraint(
+            "review_id",
+            "phase",
+            name="uq_trading_execution_review_phase_snapshot",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    review_id = Column(
+        Integer,
+        ForeignKey("trading_execution_reviews.id"),
+        nullable=False,
+        index=True,
+    )
+    phase = Column(String(32), nullable=False)
+    trade_date = Column(Date, nullable=False, index=True)
+    plan_version_id = Column(
+        Integer,
+        ForeignKey("trading_plan_versions.id"),
+        nullable=False,
+    )
+    snapshot_json = Column(JSON, nullable=False)
+    created_at = Column(DateTime, default=datetime.now, nullable=False)
+
+
 class TradingPlaybookJobClaim(Base):
     """Cross-process lease for one idempotent playbook work phase."""
 
@@ -295,6 +325,35 @@ class TradingPlaybookJobClaim(Base):
     )
 
 
+class TradingPlaybookJobResult(Base):
+    """Exact persisted entities produced by one completed claimed job."""
+
+    __tablename__ = "trading_playbook_job_results"
+    __table_args__ = (
+        UniqueConstraint(
+            "job_key",
+            "entity_type",
+            "entity_id",
+            name="uq_trading_playbook_job_result_entity",
+        ),
+        Index(
+            "ix_trading_playbook_job_result_lookup",
+            "job_key",
+            "entity_type",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    job_key = Column(
+        String(255),
+        ForeignKey("trading_playbook_job_claims.job_key"),
+        nullable=False,
+    )
+    entity_type = Column(String(32), nullable=False)
+    entity_id = Column(Integer, nullable=False)
+    created_at = Column(DateTime, default=datetime.now, nullable=False)
+
+
 class TradingPlaybookObsidianExport(Base):
     """Immutable snapshot queued for export to an Obsidian vault."""
 
@@ -313,6 +372,13 @@ class TradingPlaybookObsidianExport(Base):
         Index(
             "ix_trading_playbook_obsidian_trade_date",
             "trade_date",
+            "phase",
+        ),
+        Index(
+            "ix_trading_playbook_obsidian_fact_lookup",
+            "immutable",
+            "entity_type",
+            "entity_id",
             "phase",
         ),
     )

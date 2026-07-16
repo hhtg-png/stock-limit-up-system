@@ -15,6 +15,7 @@ from app.models.market_review import MarketReviewStockDaily
 from app.models.trading_playbook import (
     TradingAlertEvent,
     TradingExecutionReview,
+    TradingExecutionReviewPhaseSnapshot,
     TradingPlanCandidate,
     TradingPlanVersion,
     TradingPlaybookSettings,
@@ -401,6 +402,7 @@ class TradingPlaybookReviewPersistenceTests(unittest.IsolatedAsyncioTestCase):
                 TradingPlanCandidate.__table__,
                 TradingAlertEvent.__table__,
                 TradingExecutionReview.__table__,
+                TradingExecutionReviewPhaseSnapshot.__table__,
                 TradingPlaybookSettings.__table__,
                 MarketReviewStockDaily.__table__,
             ):
@@ -680,6 +682,57 @@ class TradingPlaybookReviewPersistenceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(row.data_quality_json["status"], "ready")
         self.assertNotIn("account_profit", json.dumps(row.signal_review_json))
+
+    async def test_build_persists_immutable_initial_and_final_phase_snapshots(self):
+        import app.models
+
+        snapshot_model = app.models.TradingExecutionReviewPhaseSnapshot
+        async with self.engines[0].begin() as connection:
+            await connection.run_sync(
+                lambda sync_connection: snapshot_model.__table__.create(
+                    sync_connection,
+                    checkfirst=True,
+                )
+            )
+        await self._add_plan()
+        service = TradingPlaybookReviewService(
+            now_provider=lambda: FINALIZED_AT,
+        )
+
+        async with self.sessions[0]() as db:
+            initial = (await service.build(db, TRADE_DATE, finalized=False))[0]
+            initial.signal_review_json["mutated_after_commit"] = True
+        async with self.sessions[0]() as db:
+            await service.build(db, TRADE_DATE, finalized=True)
+            snapshots = list(
+                (
+                    await db.scalars(
+                        select(snapshot_model).order_by(snapshot_model.phase)
+                    )
+                ).all()
+            )
+
+        self.assertEqual(
+            {snapshot.phase for snapshot in snapshots},
+            {"initial_review", "final_review"},
+        )
+        initial_snapshot = next(
+            snapshot
+            for snapshot in snapshots
+            if snapshot.phase == "initial_review"
+        )
+        final_snapshot = next(
+            snapshot
+            for snapshot in snapshots
+            if snapshot.phase == "final_review"
+        )
+        self.assertNotIn(
+            "mutated_after_commit",
+            initial_snapshot.snapshot_json["signal_review"],
+        )
+        self.assertIsNone(initial_snapshot.snapshot_json["finalized_at"])
+        self.assertIsNotNone(final_snapshot.snapshot_json["finalized_at"])
+        self.assertIn("plan_version", initial_snapshot.snapshot_json)
 
     async def test_generation_key_tracks_relevant_plan_set_and_target_validation(self):
         service = TradingPlaybookReviewService()

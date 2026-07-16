@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 import sys
 import types
@@ -593,6 +594,42 @@ class MainLifespanTests(unittest.IsolatedAsyncioTestCase):
         )
         stop_bus.assert_awaited_once()
         close_db.assert_awaited_once()
+
+    async def test_cancelled_orchestrator_cleanup_still_finishes_shutdown_and_restores_writer(self):
+        scheduler = LifecycleScheduler()
+        sentinel = types.SimpleNamespace(
+            build_stage=AsyncMock(),
+            aclose=AsyncMock(side_effect=asyncio.CancelledError()),
+        )
+        original_writer = app_main.obsidian_knowledge_service.writer
+        patches = self._lifecycle_patches(scheduler)
+        with patches[0], patches[1], patches[2] as close_db, patches[3], patches[4] as stop_bus, patches[5], patches[6], patches[7], patch.object(
+            app_main.settings,
+            "TRADING_PLAYBOOK_ENABLED",
+            True,
+        ), patch.object(
+            app_main,
+            "build_production_trading_playbook_orchestrator",
+            return_value=sentinel,
+        ), patch.object(
+            app_main.tencent_api,
+            "close",
+            AsyncMock(),
+        ) as close_quote:
+            with self.assertRaises(asyncio.CancelledError):
+                async with app_main.lifespan(app_main.app):
+                    pass
+
+        sentinel.aclose.assert_awaited_once_with()
+        close_quote.assert_awaited_once_with()
+        stop_bus.assert_awaited_once_with()
+        close_db.assert_awaited_once_with()
+        self.assertEqual(scheduler.reset_calls, 2)
+        self.assertEqual(scheduler.calendar.close_calls, 1)
+        self.assertIs(
+            app_main.obsidian_knowledge_service.writer,
+            original_writer,
+        )
 
 
 if __name__ == "__main__":

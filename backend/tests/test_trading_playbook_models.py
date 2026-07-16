@@ -145,6 +145,15 @@ TABLE_COLUMNS = {
         "generated_at",
         "finalized_at",
     },
+    "trading_execution_review_phase_snapshots": {
+        "id",
+        "review_id",
+        "phase",
+        "trade_date",
+        "plan_version_id",
+        "snapshot_json",
+        "created_at",
+    },
     "trading_playbook_job_claims": {
         "id",
         "job_key",
@@ -162,6 +171,13 @@ TABLE_COLUMNS = {
         "last_error",
         "created_at",
         "updated_at",
+    },
+    "trading_playbook_job_results": {
+        "id",
+        "job_key",
+        "entity_type",
+        "entity_id",
+        "created_at",
     },
     "trading_playbook_settings": {
         "id",
@@ -307,6 +323,15 @@ COLUMN_TYPES = {
         "generated_at": (DateTime, None),
         "finalized_at": (DateTime, None),
     },
+    "trading_execution_review_phase_snapshots": {
+        "id": (Integer, None),
+        "review_id": (Integer, None),
+        "phase": (String, 32),
+        "trade_date": (Date, None),
+        "plan_version_id": (Integer, None),
+        "snapshot_json": (JSON, None),
+        "created_at": (DateTime, None),
+    },
     "trading_playbook_job_claims": {
         "id": (Integer, None),
         "job_key": (String, 255),
@@ -324,6 +349,13 @@ COLUMN_TYPES = {
         "last_error": (Text, None),
         "created_at": (DateTime, None),
         "updated_at": (DateTime, None),
+    },
+    "trading_playbook_job_results": {
+        "id": (Integer, None),
+        "job_key": (String, 255),
+        "entity_type": (String, 32),
+        "entity_id": (Integer, None),
+        "created_at": (DateTime, None),
     },
     "trading_playbook_settings": {
         "id": (Integer, None),
@@ -416,8 +448,10 @@ DATETIME_DEFAULTS = {
     ("trading_alert_events", "triggered_at"),
     ("trading_alert_condition_states", "updated_at"),
     ("trading_execution_reviews", "generated_at"),
+    ("trading_execution_review_phase_snapshots", "created_at"),
     ("trading_playbook_job_claims", "created_at"),
     ("trading_playbook_job_claims", "updated_at"),
+    ("trading_playbook_job_results", "created_at"),
     ("trading_playbook_settings", "updated_at"),
     ("trading_playbook_obsidian_exports", "created_at"),
     ("trading_playbook_obsidian_exports", "updated_at"),
@@ -773,6 +807,11 @@ class TradingPlaybookModelTests(unittest.TestCase):
                     ("trade_date", "phase"),
                     False,
                 ),
+                (
+                    "ix_trading_playbook_obsidian_fact_lookup",
+                    ("immutable", "entity_type", "entity_id", "phase"),
+                    False,
+                ),
             },
         )
 
@@ -785,6 +824,64 @@ class TradingPlaybookModelTests(unittest.TestCase):
 
 
 class TradingPlaybookPersistenceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_sqlite_compat_adds_obsidian_fact_lookup_index(self):
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        try:
+            async with engine.begin() as connection:
+                await connection.run_sync(Base.metadata.create_all)
+                await connection.exec_driver_sql(
+                    "DROP INDEX IF EXISTS "
+                    "ix_trading_playbook_obsidian_fact_lookup"
+                )
+                await connection.run_sync(database.ensure_sqlite_schema_compat)
+                indexes = (
+                    await connection.exec_driver_sql(
+                        "PRAGMA index_list(trading_playbook_obsidian_exports)"
+                    )
+                ).all()
+                names = {row[1] for row in indexes}
+                self.assertIn(
+                    "ix_trading_playbook_obsidian_fact_lookup",
+                    names,
+                )
+                columns = (
+                    await connection.exec_driver_sql(
+                        "PRAGMA index_info("
+                        "ix_trading_playbook_obsidian_fact_lookup)"
+                    )
+                ).all()
+                self.assertEqual(
+                    tuple(row[2] for row in columns),
+                    ("immutable", "entity_type", "entity_id", "phase"),
+                )
+        finally:
+            await engine.dispose()
+
+    async def test_new_result_and_review_phase_tables_are_exported_and_created(self):
+        self.assertIn("TradingPlaybookJobResult", app.models.__all__)
+        self.assertIn(
+            "TradingExecutionReviewPhaseSnapshot",
+            app.models.__all__,
+        )
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        try:
+            async with engine.begin() as connection:
+                await connection.run_sync(Base.metadata.create_all)
+                table_names = set(
+                    await connection.run_sync(
+                        lambda sync_connection: sqlalchemy_inspect(
+                            sync_connection
+                        ).get_table_names()
+                    )
+                )
+            self.assertIn("trading_playbook_job_results", table_names)
+            self.assertIn(
+                "trading_execution_review_phase_snapshots",
+                table_names,
+            )
+        finally:
+            await engine.dispose()
+
     async def test_create_all_persists_rows_with_independent_json_defaults(self):
         engine = create_async_engine("sqlite+aiosqlite:///:memory:", future=True)
         try:

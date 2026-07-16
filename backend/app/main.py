@@ -64,6 +64,7 @@ async def lifespan(app: FastAPI):
     orchestrator = None
     obsidian_writer = None
     original_knowledge_writer = None
+    shutdown_cancellation = None
     setup_logging()
     logger.info(f"Starting {settings.APP_NAME} v{settings.APP_VERSION}")
     try:
@@ -131,8 +132,9 @@ async def lifespan(app: FastAPI):
 
         # 自动爬取最近交易日数据（后台任务）
         asyncio.create_task(data_init_service.initialize())
-
         yield
+    except asyncio.CancelledError as exc:
+        shutdown_cancellation = exc
     finally:
         try:
             data_scheduler.stop()
@@ -142,10 +144,16 @@ async def lifespan(app: FastAPI):
             close = getattr(orchestrator, "aclose", None)
             if callable(close):
                 await close()
+        except asyncio.CancelledError as exc:
+            if shutdown_cancellation is None:
+                shutdown_cancellation = exc
         except Exception as exc:
             logger.error(f"Trading playbook provider cleanup failed: {exc}")
         try:
             await tencent_api.close()
+        except asyncio.CancelledError as exc:
+            if shutdown_cancellation is None:
+                shutdown_cancellation = exc
         except Exception as exc:
             logger.error(f"Tencent quote cleanup failed: {exc}")
         try:
@@ -162,17 +170,28 @@ async def lifespan(app: FastAPI):
             logger.error(f"Obsidian writer restoration failed: {exc}")
         try:
             await data_scheduler.get_trading_calendar_service().close()
+        except asyncio.CancelledError as exc:
+            if shutdown_cancellation is None:
+                shutdown_cancellation = exc
         except Exception as exc:
             logger.error(f"Trading calendar cleanup failed: {exc}")
         try:
             await event_bus.stop()
+        except asyncio.CancelledError as exc:
+            if shutdown_cancellation is None:
+                shutdown_cancellation = exc
         except Exception as exc:
             logger.error(f"EventBus shutdown failed: {exc}")
         try:
             await close_db()
+        except asyncio.CancelledError as exc:
+            if shutdown_cancellation is None:
+                shutdown_cancellation = exc
         except Exception as exc:
             logger.error(f"Database shutdown failed: {exc}")
         logger.info("Application shutdown complete")
+        if shutdown_cancellation is not None:
+            raise shutdown_cancellation
 
 
 # 创建FastAPI应用

@@ -1154,6 +1154,67 @@ class TradingPlaybookObsidianSnapshotBuilderTests(
         self.assertEqual(initial.entity_type, "review")
         self.assertEqual(final.phase, "final_review")
 
+    async def test_initial_review_rebuilds_from_business_snapshot_after_finalize(self):
+        import app.models
+
+        snapshot_model = app.models.TradingExecutionReviewPhaseSnapshot
+        await self._make_plan_review_relevant(202)
+        initial_row = self._review_row()
+        initial_snapshot_json = {
+            "review_id": 501,
+            "phase": "initial_review",
+            "trade_date": "2026-07-16",
+            "plan_version_id": 202,
+            "plan_version": {
+                "version_no": 2,
+                "stage": "auction",
+                "status": "active",
+                "source_trade_date": "2026-07-15",
+                "target_trade_date": "2026-07-16",
+            },
+            "signal_review": deepcopy(initial_row.signal_review_json),
+            "manual_execution": deepcopy(initial_row.manual_execution_json),
+            "plan_compliance": deepcopy(initial_row.plan_compliance_json),
+            "outcome_snapshot": deepcopy(initial_row.outcome_snapshot_json),
+            "data_quality": deepcopy(initial_row.data_quality_json),
+            "generated_at": "2026-07-16T15:10:01.123456",
+            "finalized_at": None,
+        }
+        async with self.session_factory() as session:
+            session.add(initial_row)
+            await session.flush()
+            session.add(
+                snapshot_model(
+                    review_id=501,
+                    phase="initial_review",
+                    trade_date=date(2026, 7, 16),
+                    plan_version_id=202,
+                    snapshot_json=deepcopy(initial_snapshot_json),
+                )
+            )
+            await session.commit()
+        async with self.session_factory() as session:
+            review = await session.get(TradingExecutionReview, 501)
+            review.signal_review_json = {"changed": "final"}
+            review.finalized_at = datetime(2026, 7, 16, 15, 30)
+            await session.commit()
+
+        rebuilt = await self.builder.build_review_artifact(
+            501,
+            phase="initial_review",
+        )
+        repeated = await self.builder.build_review_artifact(
+            501,
+            phase="initial_review",
+        )
+
+        self.assertEqual(
+            rebuilt.payload_json()["signal_review"],
+            initial_snapshot_json["signal_review"],
+        )
+        self.assertIsNone(rebuilt.payload_json()["finalized_at"])
+        self.assertEqual(rebuilt.source_hash, repeated.source_hash)
+
     async def test_review_builder_rejects_invalid_identity_phase_state_and_json(self):
         with self.assertRaisesRegex(ValueError, "review_id"):
             await self.builder.build_review_artifact(0, phase="initial_review")

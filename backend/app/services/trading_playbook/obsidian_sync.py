@@ -23,6 +23,8 @@ from sqlalchemy.orm import aliased
 
 from app.models.trading_playbook import (
     TradingExecutionReview,
+    TradingExecutionReviewPhaseSnapshot,
+    TradingModeRule,
     TradingPlanVersion,
     TradingPlaybookObsidianExport,
 )
@@ -39,7 +41,6 @@ from app.services.trading_playbook.obsidian_types import (
     TRADING_PLAYBOOK_ALLOWED_ROOTS,
     canonical_json_bytes,
 )
-from app.services.trading_playbook.rule_catalog import EXPECTED_RULE_COUNT
 from app.utils.time_utils import CN_TZ
 
 
@@ -1043,7 +1044,16 @@ class TradingPlaybookObsidianSyncCoordinator:
     async def startup_reconcile(self) -> ObsidianSyncBatchResult:
         """Discover missed committed facts, then resume every due export."""
 
-        rows = await self.reconcile_committed_facts()
+        try:
+            rows = await self.reconcile_committed_facts()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(
+                "Trading playbook Obsidian startup fact scan failed: {}",
+                exc,
+            )
+            rows = ()
         return await self.process_due(limit=max(100, len(rows)))
 
     async def reconcile_committed_facts(
@@ -1080,6 +1090,33 @@ class TradingPlaybookObsidianSyncCoordinator:
                 immutable_export.phase == "final_review",
             )
         )
+        phase_snapshot_is_exported = exists(
+            select(1).where(
+                immutable_export.immutable.is_(True),
+                immutable_export.entity_type == "review",
+                immutable_export.entity_id
+                == TradingExecutionReviewPhaseSnapshot.review_id,
+                immutable_export.phase
+                == TradingExecutionReviewPhaseSnapshot.phase,
+            )
+        )
+        current_phase_snapshot = aliased(
+            TradingExecutionReviewPhaseSnapshot
+        )
+        has_current_phase_snapshot = exists(
+            select(1).where(
+                current_phase_snapshot.review_id
+                == TradingExecutionReview.id,
+                current_phase_snapshot.phase
+                == case(
+                    (
+                        TradingExecutionReview.finalized_at.is_not(None),
+                        "final_review",
+                    ),
+                    else_="initial_review",
+                ),
+            )
+        )
         async with self.session_factory() as session:
             exported_v2_rule_keys = {
                 snapshot_key
@@ -1095,6 +1132,17 @@ class TradingPlaybookObsidianSyncCoordinator:
                     )
                 ).all()
             }
+            expected_v2_rule_keys = {
+                f"rule:v2:{mode_key}"
+                for mode_key in (
+                    await session.scalars(
+                        select(TradingModeRule.mode_key).where(
+                            TradingModeRule.version == 2,
+                            TradingModeRule.enabled.is_(True),
+                        )
+                    )
+                ).all()
+            }
             missing_plan_ids = tuple(
                 int(plan_id)
                 for plan_id in (
@@ -1105,7 +1153,23 @@ class TradingPlaybookObsidianSyncCoordinator:
                     )
                 ).all()
             )
-            review_rows = tuple(
+            snapshot_review_rows = tuple(
+                (int(review_id), str(phase))
+                for review_id, phase in (
+                    await session.execute(
+                        select(
+                            TradingExecutionReviewPhaseSnapshot.review_id,
+                            TradingExecutionReviewPhaseSnapshot.phase,
+                        )
+                        .where(~phase_snapshot_is_exported)
+                        .order_by(
+                            TradingExecutionReviewPhaseSnapshot.review_id,
+                            TradingExecutionReviewPhaseSnapshot.phase,
+                        )
+                    )
+                ).all()
+            )
+            legacy_review_rows = tuple(
                 (
                     int(review_id),
                     "final_review"
@@ -1119,6 +1183,7 @@ class TradingPlaybookObsidianSyncCoordinator:
                             TradingExecutionReview.finalized_at,
                         )
                         .where(
+                            ~has_current_phase_snapshot,
                             or_(
                                 (
                                     TradingExecutionReview.finalized_at.is_(None)
@@ -1133,6 +1198,17 @@ class TradingPlaybookObsidianSyncCoordinator:
                         .order_by(TradingExecutionReview.id)
                     )
                 ).all()
+            )
+            review_rows = tuple(
+                sorted(
+                    dict.fromkeys(
+                        (*snapshot_review_rows, *legacy_review_rows)
+                    ),
+                    key=lambda item: (
+                        item[0],
+                        0 if item[1] == "initial_review" else 1,
+                    ),
+                )
             )
 
         rows: list[TradingPlaybookObsidianExport] = []
@@ -1165,7 +1241,10 @@ class TradingPlaybookObsidianSyncCoordinator:
                 return
             await enqueue_one(built, label)
 
-        if len(exported_v2_rule_keys) < EXPECTED_RULE_COUNT:
+        missing_v2_rule_keys = (
+            expected_v2_rule_keys - exported_v2_rule_keys
+        )
+        if missing_v2_rule_keys:
             try:
                 rules = await self.builder.build_rule_artifacts("v2")
             except asyncio.CancelledError:
@@ -1178,7 +1257,7 @@ class TradingPlaybookObsidianSyncCoordinator:
                 )
             else:
                 for rule in rules:
-                    if rule.snapshot_key not in exported_v2_rule_keys:
+                    if rule.snapshot_key in missing_v2_rule_keys:
                         await enqueue_one(rule, rule.snapshot_key)
         for plan_id in missing_plan_ids:
             await build_one(
@@ -1842,6 +1921,26 @@ class TradingPlaybookObsidianSyncCoordinator:
                     )
                 ).all()
             )
+            phase_rows = tuple(
+                (int(review_id), phase == "final_review")
+                for review_id, phase in (
+                    await session.execute(
+                        select(
+                            TradingExecutionReviewPhaseSnapshot.review_id,
+                            TradingExecutionReviewPhaseSnapshot.phase,
+                        )
+                        .where(
+                            TradingExecutionReviewPhaseSnapshot.trade_date
+                            == trade_date
+                        )
+                        .order_by(
+                            TradingExecutionReviewPhaseSnapshot.review_id,
+                            TradingExecutionReviewPhaseSnapshot.phase,
+                        )
+                    )
+                ).all()
+            )
+            snapshot_pair = aliased(TradingExecutionReviewPhaseSnapshot)
             review_rows = tuple(
                 (int(review_id), finalized_at is not None)
                 for review_id, finalized_at in (
@@ -1850,12 +1949,35 @@ class TradingPlaybookObsidianSyncCoordinator:
                             TradingExecutionReview.id,
                             TradingExecutionReview.finalized_at,
                         )
-                        .where(TradingExecutionReview.trade_date == trade_date)
+                        .where(
+                            TradingExecutionReview.trade_date == trade_date,
+                            ~exists(
+                                select(1).where(
+                                    snapshot_pair.review_id
+                                    == TradingExecutionReview.id,
+                                    snapshot_pair.phase
+                                    == case(
+                                        (
+                                            TradingExecutionReview.finalized_at.is_not(
+                                                None
+                                            ),
+                                            "final_review",
+                                        ),
+                                        else_="initial_review",
+                                    ),
+                                )
+                            ),
+                        )
                         .order_by(TradingExecutionReview.id)
                     )
                 ).all()
             )
-        return plan_ids, review_rows
+        return plan_ids, tuple(
+            sorted(
+                dict.fromkeys((*phase_rows, *review_rows)),
+                key=lambda item: (item[0], 1 if item[1] else 0),
+            )
+        )
 
     async def _build_mutable_artifacts(
         self,

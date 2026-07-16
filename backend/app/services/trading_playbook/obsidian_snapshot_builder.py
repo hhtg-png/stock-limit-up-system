@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import re
 from collections.abc import Callable, Sequence
 from contextlib import AbstractAsyncContextManager
@@ -13,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models import (
     TradingAlertEvent,
     TradingExecutionReview,
+    TradingExecutionReviewPhaseSnapshot,
     TradingModeRule,
     TradingPlanCandidate,
     TradingPlanVersion,
@@ -279,6 +281,17 @@ class TradingPlaybookObsidianSnapshotBuilder:
             )
 
         async with self._session_factory() as db:
+            phase_snapshot = await db.scalar(
+                select(TradingExecutionReviewPhaseSnapshot).where(
+                    TradingExecutionReviewPhaseSnapshot.review_id == review_id,
+                    TradingExecutionReviewPhaseSnapshot.phase == phase,
+                )
+            )
+            if phase_snapshot is not None:
+                return self._build_review_phase_snapshot_artifact(
+                    phase_snapshot,
+                    phase=phase,
+                )
             review = await db.get(TradingExecutionReview, review_id)
             if review is None:
                 raise LookupError(f"trading execution review {review_id} was not found")
@@ -315,6 +328,162 @@ class TradingPlaybookObsidianSnapshotBuilder:
                 phase=phase,
             )
             return self._build_review_artifact(review, plan, phase=phase)
+
+    @classmethod
+    def _build_review_phase_snapshot_artifact(
+        cls,
+        phase_snapshot: TradingExecutionReviewPhaseSnapshot,
+        *,
+        phase: str,
+    ) -> ObsidianArtifact:
+        snapshot = phase_snapshot.snapshot_json
+        if type(snapshot) is not dict:
+            raise ValueError("review phase snapshot must be a JSON object")
+        required = {
+            "review_id",
+            "phase",
+            "trade_date",
+            "plan_version_id",
+            "plan_version",
+            "signal_review",
+            "manual_execution",
+            "plan_compliance",
+            "outcome_snapshot",
+            "data_quality",
+            "generated_at",
+            "finalized_at",
+        }
+        if set(snapshot) != required:
+            raise ValueError("review phase snapshot keys are invalid")
+        review_id = _positive_integer(snapshot["review_id"], "review id")
+        plan_id = _positive_integer(
+            snapshot["plan_version_id"],
+            "review plan_version_id",
+        )
+        if review_id != _positive_integer(
+            phase_snapshot.review_id,
+            "phase snapshot review_id",
+        ):
+            raise ValueError("review phase snapshot review identity mismatch")
+        if plan_id != _positive_integer(
+            phase_snapshot.plan_version_id,
+            "phase snapshot plan_version_id",
+        ):
+            raise ValueError("review phase snapshot plan identity mismatch")
+        if snapshot["phase"] != phase or phase_snapshot.phase != phase:
+            raise ValueError("review phase snapshot phase mismatch")
+        trade_date = cls._snapshot_date(snapshot["trade_date"], "trade_date")
+        if trade_date != _database_date(
+            phase_snapshot.trade_date,
+            "phase snapshot trade_date",
+        ):
+            raise ValueError("review phase snapshot trade date mismatch")
+        plan = snapshot["plan_version"]
+        if type(plan) is not dict or set(plan) != {
+            "version_no",
+            "stage",
+            "status",
+            "source_trade_date",
+            "target_trade_date",
+        }:
+            raise ValueError("review phase snapshot plan_version is invalid")
+        version_no = _positive_integer(plan["version_no"], "version_no")
+        if plan["stage"] not in _PLAN_STAGES:
+            raise ValueError("review phase snapshot plan stage is invalid")
+        if plan["status"] not in {"active", "superseded", "expired"}:
+            raise ValueError("review phase snapshot plan status is invalid")
+        source_trade_date = cls._snapshot_date(
+            plan["source_trade_date"],
+            "source_trade_date",
+        )
+        target_trade_date = cls._snapshot_date(
+            plan["target_trade_date"],
+            "target_trade_date",
+        )
+        generated_at = cls._snapshot_datetime(
+            snapshot["generated_at"],
+            "generated_at",
+        )
+        finalized_at = (
+            cls._snapshot_datetime(snapshot["finalized_at"], "finalized_at")
+            if snapshot["finalized_at"] is not None
+            else None
+        )
+        if phase == "initial_review" and finalized_at is not None:
+            raise ValueError("initial review snapshot cannot be finalized")
+        if phase == "final_review" and finalized_at is None:
+            raise ValueError("final review snapshot requires finalized_at")
+        review_fields = {}
+        for field_name in (
+            "signal_review",
+            "manual_execution",
+            "plan_compliance",
+            "outcome_snapshot",
+            "data_quality",
+        ):
+            value = snapshot[field_name]
+            if type(value) is not dict:
+                raise ValueError(
+                    f"review phase snapshot {field_name} must be an object"
+                )
+            review_fields[field_name] = copy.deepcopy(value)
+        kind = "initial" if phase == "initial_review" else "final"
+        return ObsidianArtifact(
+            snapshot_key=f"review:{review_id}:{kind}",
+            trade_date=trade_date,
+            entity_type="review",
+            entity_id=review_id,
+            phase=phase,
+            target_path=(
+                "30_TradingPlaybook/Reviews/Auto/"
+                f"{trade_date.year}/{trade_date.isoformat()}/"
+                f"{kind}-review-{plan_id}.md"
+            ),
+            immutable=True,
+            payload={
+                "type": "trading_execution_review",
+                "review_id": review_id,
+                "phase": phase,
+                "trade_date": trade_date,
+                "plan_version_id": plan_id,
+                "plan_version": {
+                    "version_no": version_no,
+                    "stage": plan["stage"],
+                    "status": plan["status"],
+                    "source_trade_date": source_trade_date,
+                    "target_trade_date": target_trade_date,
+                },
+                **review_fields,
+                "generated_at": database_datetime_to_cn(generated_at),
+                "finalized_at": database_datetime_to_cn(finalized_at),
+                "manual_required": True,
+                "auto_execute": False,
+            },
+        )
+
+    @staticmethod
+    def _snapshot_date(value: object, field_name: str) -> date:
+        if not isinstance(value, str):
+            raise ValueError(f"review phase snapshot {field_name} must be a date")
+        try:
+            return date.fromisoformat(value)
+        except ValueError as exc:
+            raise ValueError(
+                f"review phase snapshot {field_name} must be a date"
+            ) from exc
+
+    @staticmethod
+    def _snapshot_datetime(value: object, field_name: str) -> datetime:
+        if not isinstance(value, str):
+            raise ValueError(
+                f"review phase snapshot {field_name} must be a datetime"
+            )
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError(
+                f"review phase snapshot {field_name} must be a datetime"
+            ) from exc
 
     async def build_alerts_artifact(
         self,

@@ -212,6 +212,13 @@ class DatabasePostgresqlCompatTests(unittest.IsolatedAsyncioTestCase):
                 for statement in sql
             )
         )
+        self.assertIn(
+            "CREATE INDEX IF NOT EXISTS "
+            "ix_trading_playbook_obsidian_fact_lookup "
+            "ON trading_playbook_obsidian_exports "
+            "(immutable, entity_type, entity_id, phase)",
+            sql,
+        )
 
     async def test_init_db_runs_postgresql_compat_after_create_all(self):
         connection = FakeAsyncConnection()

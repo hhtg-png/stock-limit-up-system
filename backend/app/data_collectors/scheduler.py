@@ -687,11 +687,22 @@ class DataScheduler:
                 )
                 if claim_status != "completed":
                     return None
-                plan = await self._latest_stage_plan_in_session(
-                    db,
-                    target_trade_date,
-                    stage,
+                mapped_plan_ids = (
+                    await self._playbook_job_claims.get_completed_result_ids(
+                        db,
+                        job_key,
+                        "plan",
+                    )
                 )
+                plan = await self._validated_plan_result_in_session(
+                    db,
+                    mapped_plan_ids,
+                    source_trade_date=source_trade_date,
+                    target_trade_date=target_trade_date,
+                    stage=stage,
+                )
+                if plan is None:
+                    return None
             else:
                 try:
                     build_kwargs = {"degraded": degraded}
@@ -718,10 +729,13 @@ class DataScheduler:
                         logger.error("{}", exc)
                         return None
                     raise
+                plan_ids = self._persisted_entity_ids(plan)
                 completed = await self._playbook_job_claims.complete(
                     db,
                     token,
                     now=self._claim_now(),
+                    result_entity_type="plan",
+                    result_entity_ids=plan_ids,
                 )
                 if not completed:
                     logger.error("Trading playbook build claim lost before completion")
@@ -844,37 +858,97 @@ class DataScheduler:
         raise ValueError(f"invalid {field_name}: {value!r}")
 
     @staticmethod
-    async def _latest_stage_plan_in_session(db, target_trade_date, stage):
+    async def _validated_plan_result_in_session(
+        db,
+        plan_version_ids: Sequence[int],
+        *,
+        source_trade_date: date,
+        target_trade_date: date,
+        stage: str,
+    ):
         from sqlalchemy import select
         from app.models.trading_playbook import TradingPlanVersion
 
-        return (
-            await db.execute(
-                select(TradingPlanVersion)
-                .where(
-                    TradingPlanVersion.target_trade_date == target_trade_date,
-                    TradingPlanVersion.stage == stage,
-                )
-                .order_by(
-                    TradingPlanVersion.version_no.desc(),
-                    TradingPlanVersion.id.desc(),
-                )
-                .limit(1)
+        normalized_ids = tuple(
+            sorted(
+                {
+                    value
+                    for value in plan_version_ids
+                    if type(value) is int and value > 0
+                }
             )
-        ).scalar_one_or_none()
+        )
+        if len(normalized_ids) != 1:
+            return None
+        rows = list(
+            (
+                await db.scalars(
+                    select(TradingPlanVersion).where(
+                        TradingPlanVersion.id.in_(normalized_ids),
+                        TradingPlanVersion.source_trade_date
+                        == source_trade_date,
+                        TradingPlanVersion.target_trade_date
+                        == target_trade_date,
+                        TradingPlanVersion.stage == stage,
+                    )
+                )
+            ).all()
+        )
+        return rows[0] if len(rows) == 1 else None
 
     @staticmethod
-    async def _persisted_review_ids_in_session(
+    async def _validated_review_result_ids_in_session(
         db,
+        review_ids: Sequence[int],
         review_date: date,
         *,
         finalized: bool,
         plan_version_id: Optional[int] = None,
     ) -> tuple[int, ...]:
         from sqlalchemy import select
-        from app.models.trading_playbook import TradingExecutionReview
+        from app.models.trading_playbook import (
+            TradingExecutionReview,
+            TradingExecutionReviewPhaseSnapshot,
+        )
 
+        normalized_ids = tuple(
+            sorted(
+                {
+                    value
+                    for value in review_ids
+                    if type(value) is int and value > 0
+                }
+            )
+        )
+        if not normalized_ids:
+            return ()
+        phase = "final_review" if finalized else "initial_review"
+        snapshot_statement = select(
+            TradingExecutionReviewPhaseSnapshot.review_id,
+            TradingExecutionReviewPhaseSnapshot.trade_date,
+            TradingExecutionReviewPhaseSnapshot.plan_version_id,
+        ).where(
+            TradingExecutionReviewPhaseSnapshot.review_id.in_(normalized_ids),
+            TradingExecutionReviewPhaseSnapshot.phase == phase,
+        )
+        snapshot_rows = tuple((await db.execute(snapshot_statement)).all())
+        snapshot_ids = {int(row.review_id) for row in snapshot_rows}
+        matched_ids = {
+            int(row.review_id)
+            for row in snapshot_rows
+            if row.trade_date == review_date
+            and (
+                plan_version_id is None
+                or row.plan_version_id == plan_version_id
+            )
+        }
+        legacy_ids = tuple(
+            review_id
+            for review_id in normalized_ids
+            if review_id not in snapshot_ids
+        )
         statement = select(TradingExecutionReview.id).where(
+            TradingExecutionReview.id.in_(legacy_ids),
             TradingExecutionReview.trade_date == review_date,
             (
                 TradingExecutionReview.finalized_at.is_not(None)
@@ -886,8 +960,13 @@ class DataScheduler:
             statement = statement.where(
                 TradingExecutionReview.plan_version_id == plan_version_id
             )
-        values = await db.scalars(statement.order_by(TradingExecutionReview.id))
-        return tuple(int(review_id) for review_id in values.all())
+        if legacy_ids:
+            values = await db.scalars(
+                statement.order_by(TradingExecutionReview.id)
+            )
+            matched_ids.update(int(review_id) for review_id in values.all())
+        persisted_ids = tuple(sorted(matched_ids))
+        return persisted_ids if persisted_ids == normalized_ids else ()
 
     async def _notify_trading_playbook_plan(self, plan: Any):
         service = self._trading_playbook_alert_service
@@ -1075,8 +1154,18 @@ class DataScheduler:
                 )
                 if claim_status != "completed":
                     return None
-                review_ids = await self._persisted_review_ids_in_session(
+                mapped_review_ids = (
+                    await self._playbook_job_claims.get_completed_result_ids(
+                        db,
+                        job_key,
+                        "review",
+                    )
+                )
+                if not mapped_review_ids:
+                    return None
+                review_ids = await self._validated_review_result_ids_in_session(
                     db,
+                    mapped_review_ids,
                     review_date,
                     finalized=finalized,
                     plan_version_id=plan_version_id,
@@ -1103,6 +1192,8 @@ class DataScheduler:
                     db,
                     token,
                     now=self._claim_now(),
+                    result_entity_type="review",
+                    result_entity_ids=self._persisted_entity_ids(result),
                 )
                 if not completed:
                     return None

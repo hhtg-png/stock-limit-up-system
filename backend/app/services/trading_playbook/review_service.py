@@ -12,7 +12,7 @@ from collections.abc import Mapping, Sequence
 from datetime import date, datetime
 from typing import Any, Callable, Optional
 
-from sqlalchemy import and_, exists, func, or_, select, update
+from sqlalchemy import and_, exists, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import OperationalError
@@ -21,6 +21,7 @@ from app.models.market_review import MarketReviewStockDaily
 from app.models.trading_playbook import (
     TradingAlertEvent,
     TradingExecutionReview,
+    TradingExecutionReviewPhaseSnapshot,
     TradingPlanCandidate,
     TradingPlanVersion,
 )
@@ -1095,11 +1096,10 @@ class TradingPlaybookReviewService:
                     "outcome_snapshot_json": copy.deepcopy(outcome_snapshot),
                     "data_quality_json": copy.deepcopy(data_quality),
                 }
+                finalized_at = None
                 if finalized:
-                    values["finalized_at"] = func.coalesce(
-                        TradingExecutionReview.finalized_at,
-                        _db_datetime(self._now_provider()),
-                    )
+                    finalized_at = _db_datetime(self._now_provider())
+                    values["finalized_at"] = finalized_at
                 changed = await db.execute(
                     update(TradingExecutionReview)
                     .where(*predicates)
@@ -1107,6 +1107,32 @@ class TradingPlaybookReviewService:
                     .execution_options(synchronize_session=False)
                 )
                 if changed.rowcount == 1:
+                    plan = await db.get(TradingPlanVersion, plan_id)
+                    if plan is None:
+                        raise PlaybookNotFoundError("review plan not found")
+                    phase = "final_review" if finalized else "initial_review"
+                    snapshot_json = self._phase_snapshot_json(
+                        row,
+                        plan,
+                        phase=phase,
+                        signal_review=summary,
+                        manual_execution=old_manual,
+                        plan_compliance=summary["plan_compliance"],
+                        outcome_snapshot=outcome_snapshot,
+                        data_quality=data_quality,
+                        finalized_at=finalized_at,
+                    )
+                    await db.execute(
+                        self.phase_snapshot_insert_statement(
+                            db.get_bind().dialect.name,
+                            review_id=review_id,
+                            phase=phase,
+                            trade_date=trade_date,
+                            plan_version_id=plan_id,
+                            snapshot_json=snapshot_json,
+                            created_at=_db_datetime(self._now_provider()),
+                        )
+                    )
                     await db.commit()
                     refreshed = await self._fresh_review(db, review_id)
                     if refreshed is None:
@@ -1121,6 +1147,79 @@ class TradingPlaybookReviewService:
                     raise
                 await asyncio.sleep(0)
         raise InvalidTransitionError("review changed concurrently")
+
+    @staticmethod
+    def _phase_snapshot_json(
+        review: TradingExecutionReview,
+        plan: TradingPlanVersion,
+        *,
+        phase: str,
+        signal_review: Mapping[str, Any],
+        manual_execution: Mapping[str, Any],
+        plan_compliance: Mapping[str, Any],
+        outcome_snapshot: Mapping[str, Any],
+        data_quality: Mapping[str, Any],
+        finalized_at: Optional[datetime],
+    ) -> dict[str, Any]:
+        snapshot = _json_value(
+            {
+                "review_id": review.id,
+                "phase": phase,
+                "trade_date": review.trade_date,
+                "plan_version_id": review.plan_version_id,
+                "plan_version": {
+                    "version_no": plan.version_no,
+                    "stage": plan.stage,
+                    "status": plan.status,
+                    "source_trade_date": plan.source_trade_date,
+                    "target_trade_date": plan.target_trade_date,
+                },
+                "signal_review": copy.deepcopy(dict(signal_review)),
+                "manual_execution": copy.deepcopy(dict(manual_execution)),
+                "plan_compliance": copy.deepcopy(dict(plan_compliance)),
+                "outcome_snapshot": copy.deepcopy(dict(outcome_snapshot)),
+                "data_quality": copy.deepcopy(dict(data_quality)),
+                "generated_at": review.generated_at,
+                "finalized_at": finalized_at,
+            },
+            path="review_phase_snapshot",
+        )
+        if type(snapshot) is not dict:
+            raise InvalidRequestError("review phase snapshot must be an object")
+        return copy.deepcopy(snapshot)
+
+    @staticmethod
+    def phase_snapshot_insert_statement(
+        dialect_name: str,
+        *,
+        review_id: int,
+        phase: str,
+        trade_date: date,
+        plan_version_id: int,
+        snapshot_json: Mapping[str, Any],
+        created_at: datetime,
+    ):
+        values = {
+            "review_id": review_id,
+            "phase": phase,
+            "trade_date": trade_date,
+            "plan_version_id": plan_version_id,
+            "snapshot_json": copy.deepcopy(dict(snapshot_json)),
+            "created_at": created_at,
+        }
+        if dialect_name == "postgresql":
+            statement = postgresql_insert(
+                TradingExecutionReviewPhaseSnapshot
+            )
+        elif dialect_name == "sqlite":
+            statement = sqlite_insert(TradingExecutionReviewPhaseSnapshot)
+        else:
+            raise RuntimeError(
+                f"unsupported review snapshot dialect: {dialect_name}"
+            )
+        return statement.values(**values).on_conflict_do_nothing(
+            index_elements=["review_id", "phase"]
+        )
 
     async def _review_inputs(
         self,

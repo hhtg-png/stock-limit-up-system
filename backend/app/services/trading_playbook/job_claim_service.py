@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Optional
@@ -10,7 +11,10 @@ from sqlalchemy import or_, select, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-from app.models.trading_playbook import TradingPlaybookJobClaim
+from app.models.trading_playbook import (
+    TradingPlaybookJobClaim,
+    TradingPlaybookJobResult,
+)
 
 
 @dataclass(frozen=True)
@@ -112,26 +116,104 @@ class TradingPlaybookJobClaimService:
             )
         )
 
+    async def get_completed_result_ids(
+        self,
+        db,
+        job_key: str,
+        entity_type: str,
+    ) -> tuple[int, ...]:
+        """Return exact entity IDs bound to a completed job."""
+
+        normalized_key = self._required(job_key, "job_key", 255)
+        normalized_type = self._required(entity_type, "entity_type", 32)
+        values = await db.scalars(
+            select(TradingPlaybookJobResult.entity_id)
+            .join(
+                TradingPlaybookJobClaim,
+                TradingPlaybookJobClaim.job_key
+                == TradingPlaybookJobResult.job_key,
+            )
+            .where(
+                TradingPlaybookJobResult.job_key == normalized_key,
+                TradingPlaybookJobResult.entity_type == normalized_type,
+                TradingPlaybookJobClaim.status == "completed",
+            )
+            .order_by(TradingPlaybookJobResult.entity_id)
+        )
+        return tuple(int(entity_id) for entity_id in values.all())
+
     async def complete(
         self,
         db,
         token: TradingPlaybookClaimToken,
         *,
         now: datetime,
+        result_entity_type: Optional[str] = None,
+        result_entity_ids: Sequence[int] = (),
     ) -> bool:
-        result = await db.execute(
-            update(TradingPlaybookJobClaim)
-            .where(*self._token_predicates(token))
-            .values(
-                status="completed",
-                completed_at=now,
-                lease_expires_at=None,
-                last_error=None,
-                updated_at=now,
+        normalized_ids = self._result_ids(result_entity_ids)
+        if result_entity_type is None:
+            if normalized_ids:
+                raise ValueError(
+                    "result_entity_type is required when result IDs exist"
+                )
+            normalized_type = None
+        else:
+            normalized_type = self._required(
+                result_entity_type,
+                "result_entity_type",
+                32,
             )
-        )
-        await db.commit()
-        return result.rowcount == 1
+        try:
+            result = await db.execute(
+                update(TradingPlaybookJobClaim)
+                .where(*self._token_predicates(token))
+                .values(
+                    status="completed",
+                    completed_at=now,
+                    lease_expires_at=None,
+                    last_error=None,
+                    updated_at=now,
+                )
+            )
+            if result.rowcount != 1:
+                await db.rollback()
+                return False
+            if normalized_type is not None:
+                dialect = db.get_bind().dialect.name
+                for entity_id in normalized_ids:
+                    values = {
+                        "job_key": token.job_key,
+                        "entity_type": normalized_type,
+                        "entity_id": entity_id,
+                        "created_at": now,
+                    }
+                    if dialect == "sqlite":
+                        statement = sqlite_insert(
+                            TradingPlaybookJobResult
+                        ).values(**values)
+                    elif dialect == "postgresql":
+                        statement = postgresql_insert(
+                            TradingPlaybookJobResult
+                        ).values(**values)
+                    else:
+                        raise RuntimeError(
+                            f"unsupported playbook claim dialect: {dialect}"
+                        )
+                    await db.execute(
+                        statement.on_conflict_do_nothing(
+                            index_elements=[
+                                "job_key",
+                                "entity_type",
+                                "entity_id",
+                            ]
+                        )
+                    )
+            await db.commit()
+            return True
+        except BaseException:
+            await db.rollback()
+            raise
 
     async def renew(
         self,
@@ -193,6 +275,17 @@ class TradingPlaybookJobClaimService:
         if len(normalized) > limit:
             raise ValueError(f"{name} exceeds {limit} characters")
         return normalized
+
+    @staticmethod
+    def _result_ids(values: Sequence[int]) -> tuple[int, ...]:
+        if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
+            raise ValueError("result_entity_ids must be a sequence")
+        normalized: set[int] = set()
+        for value in values:
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError("result_entity_ids must contain positive integers")
+            normalized.add(value)
+        return tuple(sorted(normalized))
 
 
 __all__ = [

@@ -83,6 +83,7 @@ def ensure_sqlite_schema_compat(sync_connection) -> None:
     _ensure_trading_plan_active_unique_index(sync_connection)
     _ensure_sqlite_playbook_settings_guard(sync_connection)
     _ensure_sqlite_playbook_job_claims(sync_connection)
+    _ensure_sqlite_obsidian_fact_lookup_index(sync_connection)
 
 
 def ensure_postgresql_schema_compat(sync_connection) -> None:
@@ -147,6 +148,21 @@ def ensure_postgresql_schema_compat(sync_connection) -> None:
             "wechat_enabled = false); END IF; END $$"
         )
     _ensure_postgresql_playbook_job_claims(sync_connection)
+    _ensure_postgresql_obsidian_fact_lookup_index(sync_connection)
+
+
+def _ensure_postgresql_obsidian_fact_lookup_index(sync_connection) -> None:
+    table_name = sync_connection.exec_driver_sql(
+        "SELECT to_regclass('trading_playbook_obsidian_exports')"
+    ).scalar_one_or_none()
+    if table_name is None:
+        return
+    sync_connection.exec_driver_sql(
+        "CREATE INDEX IF NOT EXISTS "
+        "ix_trading_playbook_obsidian_fact_lookup "
+        "ON trading_playbook_obsidian_exports "
+        "(immutable, entity_type, entity_id, phase)"
+    )
 
 
 def _ensure_postgresql_playbook_job_claims(sync_connection) -> None:
@@ -250,6 +266,21 @@ def _ensure_sqlite_playbook_job_claims(sync_connection) -> None:
     sync_connection.exec_driver_sql(
         "CREATE INDEX IF NOT EXISTS ix_trading_playbook_job_claim_status_lease "
         "ON trading_playbook_job_claims (status, lease_expires_at)"
+    )
+
+
+def _ensure_sqlite_obsidian_fact_lookup_index(sync_connection) -> None:
+    table = sync_connection.exec_driver_sql(
+        "SELECT 1 FROM sqlite_master "
+        "WHERE type='table' AND name='trading_playbook_obsidian_exports'"
+    ).first()
+    if table is None:
+        return
+    sync_connection.exec_driver_sql(
+        "CREATE INDEX IF NOT EXISTS "
+        "ix_trading_playbook_obsidian_fact_lookup "
+        "ON trading_playbook_obsidian_exports "
+        "(immutable, entity_type, entity_id, phase)"
     )
 
 

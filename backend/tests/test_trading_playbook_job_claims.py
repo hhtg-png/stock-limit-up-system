@@ -18,6 +18,169 @@ class _NullAsyncSessionContext:
 
 
 class TradingPlaybookJobClaimTests(unittest.IsolatedAsyncioTestCase):
+    async def test_complete_persists_exact_result_ids_behind_the_claim_fence(self):
+        from app.database import Base
+        from app.models.trading_playbook import (
+            TradingPlaybookJobClaim,
+            TradingPlaybookJobResult,
+        )
+        from app.services.trading_playbook.job_claim_service import (
+            TradingPlaybookClaimToken,
+            TradingPlaybookJobClaimService,
+        )
+
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        service = TradingPlaybookJobClaimService(lease_seconds=30)
+        now = datetime(2026, 7, 13, 15, 30)
+        try:
+            async with maker() as db:
+                token = await service.claim(
+                    db,
+                    job_key="exact-plan-result",
+                    job_type="stage",
+                    phase="build",
+                    owner="worker-a",
+                    now=now,
+                )
+                self.assertFalse(
+                    await service.complete(
+                        db,
+                        TradingPlaybookClaimToken(
+                            token.job_key,
+                            "wrong-owner",
+                            token.attempt_no,
+                        ),
+                        now=now,
+                        result_entity_type="plan",
+                        result_entity_ids=(11,),
+                    )
+                )
+                self.assertEqual(
+                    await service.get_completed_result_ids(
+                        db,
+                        "exact-plan-result",
+                        "plan",
+                    ),
+                    (),
+                )
+                self.assertTrue(
+                    await service.complete(
+                        db,
+                        token,
+                        now=now,
+                        result_entity_type="plan",
+                        result_entity_ids=(11, 7, 11),
+                    )
+                )
+                self.assertEqual(
+                    await service.get_completed_result_ids(
+                        db,
+                        "exact-plan-result",
+                        "plan",
+                    ),
+                    (7, 11),
+                )
+                claim = await db.get(TradingPlaybookJobClaim, 1)
+                self.assertEqual(claim.status, "completed")
+                self.assertEqual(
+                    len((await db.execute(TradingPlaybookJobResult.__table__.select())).all()),
+                    2,
+                )
+        finally:
+            await engine.dispose()
+
+    async def test_complete_rolls_back_claim_when_result_insert_fails(self):
+        from sqlalchemy import event, select
+
+        from app.database import Base
+        from app.models.trading_playbook import (
+            TradingPlaybookJobClaim,
+            TradingPlaybookJobResult,
+        )
+        from app.services.trading_playbook.job_claim_service import (
+            TradingPlaybookJobClaimService,
+        )
+
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        service = TradingPlaybookJobClaimService(lease_seconds=30)
+        now = datetime(2026, 7, 13, 15, 30)
+
+        def fail_result_insert(
+            connection,
+            cursor,
+            statement,
+            parameters,
+            context,
+            executemany,
+        ):
+            if "INSERT INTO trading_playbook_job_results" in statement:
+                raise RuntimeError("result insert failed")
+
+        try:
+            async with maker() as db:
+                token = await service.claim(
+                    db,
+                    job_key="atomic-plan-result",
+                    job_type="stage",
+                    phase="build",
+                    owner="worker-a",
+                    now=now,
+                )
+                event.listen(
+                    engine.sync_engine,
+                    "before_cursor_execute",
+                    fail_result_insert,
+                )
+                try:
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "result insert failed",
+                    ):
+                        await service.complete(
+                            db,
+                            token,
+                            now=now,
+                            result_entity_type="plan",
+                            result_entity_ids=(7,),
+                        )
+                finally:
+                    event.remove(
+                        engine.sync_engine,
+                        "before_cursor_execute",
+                        fail_result_insert,
+                    )
+
+            async with maker() as db:
+                claim = (
+                    await db.execute(
+                        select(TradingPlaybookJobClaim).where(
+                            TradingPlaybookJobClaim.job_key
+                            == "atomic-plan-result"
+                        )
+                    )
+                ).scalar_one()
+                self.assertEqual(claim.status, "running")
+                self.assertIsNone(claim.completed_at)
+                self.assertEqual(
+                    (
+                        await db.execute(
+                            select(TradingPlaybookJobResult).where(
+                                TradingPlaybookJobResult.job_key
+                                == "atomic-plan-result"
+                            )
+                        )
+                    ).scalars().all(),
+                    [],
+                )
+        finally:
+            await engine.dispose()
+
     async def test_get_status_distinguishes_missing_running_and_completed(self):
         from app.models.trading_playbook import TradingPlaybookJobClaim
         from app.services.trading_playbook.job_claim_service import (
@@ -242,6 +405,191 @@ class TradingPlaybookSchedulerClaimTests(unittest.IsolatedAsyncioTestCase):
                 date(2026, 7, 14),
             ],
             today_provider=lambda: date(2026, 7, 13),
+        )
+
+    async def test_completed_jobs_replay_only_their_exact_persisted_entities(self):
+        from app.data_collectors.scheduler import DataScheduler
+        from app.database import Base
+        from app.models.trading_playbook import (
+            TradingExecutionReview,
+            TradingExecutionReviewPhaseSnapshot,
+            TradingPlanVersion,
+            TradingPlaybookJobClaim,
+            TradingPlaybookJobResult,
+        )
+        from app.utils.time_utils import CN_TZ
+
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        now = CN_TZ.localize(datetime(2026, 7, 13, 9, 26))
+        built_at = datetime(2026, 7, 13, 9, 26)
+        async with maker() as db:
+            degraded = TradingPlanVersion(
+                source_trade_date=now.date(),
+                target_trade_date=now.date(),
+                stage="auction",
+                version_no=1,
+                status="draft",
+                input_hash="degraded-v1",
+                generated_at=built_at,
+            )
+            ready = TradingPlanVersion(
+                source_trade_date=now.date(),
+                target_trade_date=now.date(),
+                stage="auction",
+                version_no=2,
+                status="draft",
+                input_hash="ready-v2",
+                generated_at=built_at + timedelta(minutes=1),
+            )
+            db.add_all([degraded, ready])
+            await db.flush()
+            initial_one = TradingExecutionReview(
+                trade_date=now.date(),
+                plan_version_id=degraded.id,
+                generated_at=datetime(2026, 7, 13, 15, 10),
+                finalized_at=datetime(2026, 7, 13, 15, 30),
+            )
+            initial_two = TradingExecutionReview(
+                trade_date=now.date(),
+                plan_version_id=ready.id,
+                generated_at=datetime(2026, 7, 13, 15, 11),
+            )
+            db.add_all([initial_one, initial_two])
+            await db.flush()
+            db.add(
+                TradingExecutionReviewPhaseSnapshot(
+                    review_id=initial_one.id,
+                    phase="initial_review",
+                    trade_date=now.date(),
+                    plan_version_id=degraded.id,
+                    snapshot_json={"phase": "initial_review"},
+                    created_at=datetime(2026, 7, 13, 15, 10),
+                )
+            )
+            plan_job_key = (
+                "playbook:build:2026-07-13:2026-07-13:auction:forced"
+            )
+            review_job_key = (
+                "playbook:initial_review:2026-07-13:original-generation"
+            )
+            for job_key, job_type, phase in (
+                (plan_job_key, "stage", "build"),
+                (review_job_key, "review", "initial_review"),
+            ):
+                db.add(
+                    TradingPlaybookJobClaim(
+                        job_key=job_key,
+                        job_type=job_type,
+                        phase=phase,
+                        owner="finished-worker",
+                        status="completed",
+                        attempt_no=1,
+                        completed_at=built_at,
+                        created_at=built_at,
+                        updated_at=built_at,
+                    )
+                )
+            db.add_all(
+                [
+                    TradingPlaybookJobResult(
+                        job_key=plan_job_key,
+                        entity_type="plan",
+                        entity_id=degraded.id,
+                        created_at=built_at,
+                    ),
+                    TradingPlaybookJobResult(
+                        job_key=review_job_key,
+                        entity_type="review",
+                        entity_id=initial_one.id,
+                        created_at=built_at,
+                    ),
+                ]
+            )
+            await db.commit()
+            degraded_id = int(degraded.id)
+            ready_id = int(ready.id)
+            initial_one_id = int(initial_one.id)
+            initial_two_id = int(initial_two.id)
+
+        orchestrator = SimpleNamespace(build_stage=AsyncMock())
+        notified_ids = []
+
+        async def notify_plan(_db, plan, *, send):
+            self.assertTrue(send)
+            notified_ids.append(plan.id)
+
+        alert = SimpleNamespace(
+            durable_delivery=True,
+            notify_plan_ready=notify_plan,
+        )
+        review = SimpleNamespace(
+            generation_key=AsyncMock(return_value="original-generation"),
+            build=AsyncMock(),
+        )
+        coordinator = SimpleNamespace(
+            enqueue_stage=AsyncMock(),
+            reconcile_committed_facts=AsyncMock(),
+            process_due=AsyncMock(),
+            startup_reconcile=AsyncMock(),
+        )
+        scheduler = DataScheduler(
+            trading_playbook_orchestrator=orchestrator,
+            trading_playbook_alert_service=alert,
+            trading_playbook_review_service=review,
+            session_factory=maker,
+            now_provider=lambda: now,
+            calendar_service=self._calendar(),
+        )
+        scheduler.install_trading_playbook_obsidian_sync(coordinator)
+        try:
+            replayed_plan = await scheduler._build_trading_playbook_plan(
+                "auction",
+                degraded=True,
+            )
+            replayed_review = await scheduler._run_trading_playbook_review_phase(
+                now.date(),
+                finalized=False,
+            )
+        finally:
+            await engine.dispose()
+
+        self.assertEqual(replayed_plan.id, degraded_id)
+        self.assertNotEqual(replayed_plan.id, ready_id)
+        self.assertEqual(notified_ids, [degraded_id])
+        self.assertIsNone(replayed_review)
+        orchestrator.build_stage.assert_not_awaited()
+        review.build.assert_not_awaited()
+        self.assertEqual(
+            coordinator.enqueue_stage.await_args_list,
+            [
+                unittest.mock.call(
+                    now.date(),
+                    "auction",
+                    plan_version_ids=(degraded_id,),
+                    review_ids=(),
+                    include_rules=True,
+                ),
+                unittest.mock.call(
+                    now.date(),
+                    "initial_review",
+                    plan_version_ids=(),
+                    review_ids=(initial_one_id,),
+                    include_rules=False,
+                ),
+            ],
+        )
+        self.assertNotIn(
+            ready_id,
+            coordinator.enqueue_stage.await_args_list[0].kwargs[
+                "plan_version_ids"
+            ],
+        )
+        self.assertNotIn(
+            initial_two_id,
+            coordinator.enqueue_stage.await_args_list[1].kwargs["review_ids"],
         )
 
     async def _notification_retry_fairness_case(self, *, valid_is_oldest):
@@ -701,6 +1049,7 @@ class TradingPlaybookSchedulerClaimTests(unittest.IsolatedAsyncioTestCase):
             TradingExecutionReview,
             TradingPlanVersion,
             TradingPlaybookJobClaim,
+            TradingPlaybookJobResult,
         )
         from app.utils.time_utils import CN_TZ
 
@@ -720,6 +1069,7 @@ class TradingPlaybookSchedulerClaimTests(unittest.IsolatedAsyncioTestCase):
                     TradingPlanVersion.__table__,
                     TradingExecutionReview.__table__,
                     TradingPlaybookJobClaim.__table__,
+                    TradingPlaybookJobResult.__table__,
                 ):
                     await connection.run_sync(table.create)
 
@@ -1083,6 +1433,7 @@ class TradingPlaybookSchedulerClaimTests(unittest.IsolatedAsyncioTestCase):
         from app.models.trading_playbook import (
             TradingPlanVersion,
             TradingPlaybookJobClaim,
+            TradingPlaybookJobResult,
         )
         from app.services.trading_playbook.job_claim_service import (
             TradingPlaybookJobClaimService,
@@ -1100,6 +1451,7 @@ class TradingPlaybookSchedulerClaimTests(unittest.IsolatedAsyncioTestCase):
             async with engines[0].begin() as connection:
                 await connection.run_sync(TradingPlanVersion.__table__.create)
                 await connection.run_sync(TradingPlaybookJobClaim.__table__.create)
+                await connection.run_sync(TradingPlaybookJobResult.__table__.create)
             build_calls = 0
 
             class SlowOrchestrator:
@@ -1217,6 +1569,7 @@ class TradingPlaybookSchedulerClaimTests(unittest.IsolatedAsyncioTestCase):
             TradingExecutionReview,
             TradingPlanVersion,
             TradingPlaybookJobClaim,
+            TradingPlaybookJobResult,
         )
         from app.utils.time_utils import CN_TZ
 
@@ -1227,6 +1580,7 @@ class TradingPlaybookSchedulerClaimTests(unittest.IsolatedAsyncioTestCase):
                 TradingPlanVersion.__table__,
                 TradingExecutionReview.__table__,
                 TradingPlaybookJobClaim.__table__,
+                TradingPlaybookJobResult.__table__,
             ):
                 await connection.run_sync(table.create)
 
