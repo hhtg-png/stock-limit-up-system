@@ -1,5 +1,6 @@
 import asyncio
 import tempfile
+import threading
 import unittest
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -10,11 +11,19 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.pool import NullPool
 
 from app.database import Base
-from app.models.trading_playbook import TradingPlaybookObsidianExport
+from app.models.trading_playbook import (
+    TradingExecutionReview,
+    TradingPlanVersion,
+    TradingPlaybookObsidianExport,
+)
+from app.services.trading_playbook.obsidian_exporter import (
+    TradingPlaybookObsidianExporter,
+)
 from app.services.trading_playbook.obsidian_sync import (
     TradingPlaybookObsidianSyncCoordinator,
 )
 from app.services.trading_playbook.obsidian_types import ObsidianArtifact
+from app.services.obsidian_vault_writer import ObsidianVaultWriter, VaultWriteResult
 
 
 FIXED_NOW = datetime(2026, 7, 16, 6, 40, tzinfo=timezone.utc)
@@ -29,9 +38,89 @@ class MutableClock:
         return self.value
 
 
+class FakeExporter:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def render(self, artifact, *, generated_at):
+        self.calls.append((artifact, generated_at, threading.get_ident()))
+        return f"{artifact.snapshot_key}|{artifact.source_hash}|{generated_at.isoformat()}"
+
+
+class FakeWriter:
+    def __init__(self, vault_path: str | Path) -> None:
+        self.enabled = True
+        self.vault_path = vault_path
+        self.auto_git_enabled = True
+        self.changed = True
+        self.write_error: BaseException | None = None
+        self.write_calls = []
+        self.commit_calls = []
+        self.commit_result = {"enabled": True, "committed": True}
+        self.after_write = None
+
+    def configured_vault(self):
+        raw = str(self.vault_path or "").strip()
+        return Path(raw) if raw else None
+
+    def write_text(self, relative_path, content, *, allowed_roots):
+        self.write_calls.append(
+            (relative_path, content, allowed_roots, threading.get_ident())
+        )
+        if self.write_error is not None:
+            raise self.write_error
+        if self.after_write is not None:
+            self.after_write()
+        return VaultWriteResult(
+            relative_path=relative_path,
+            absolute_path=Path(self.vault_path) / relative_path,
+            changed=self.changed,
+        )
+
+    def commit_paths(self, relative_paths, *, allowed_roots, message):
+        self.commit_calls.append(
+            (tuple(relative_paths), allowed_roots, message, threading.get_ident())
+        )
+        if isinstance(self.commit_result, BaseException):
+            raise self.commit_result
+        return dict(self.commit_result)
+
+
+class FakeBuilder:
+    def __init__(self, *, by_date=None, rules=()) -> None:
+        self.by_date = dict(by_date or {})
+        self.rules = tuple(rules)
+        self.calls = []
+
+    async def build_rule_artifacts(self, catalog_version="v2"):
+        self.calls.append(("rules", catalog_version))
+        return self.rules
+
+    async def build_plan_artifact(self, plan_version_id):
+        self.calls.append(("plan", plan_version_id))
+        return self.by_date[("plan", plan_version_id)]
+
+    async def build_review_artifact(self, review_id, *, phase):
+        self.calls.append(("review", review_id, phase))
+        return self.by_date[("review", review_id, phase)]
+
+    async def build_alerts_artifact(self, trade_date):
+        self.calls.append(("alerts", trade_date))
+        return self.by_date[("alerts", trade_date)]
+
+    async def build_daily_index_artifact(self, trade_date):
+        self.calls.append(("index", trade_date))
+        return self.by_date[("index", trade_date)]
+
+    async def build_dashboard_artifact(self, trade_date):
+        self.calls.append(("dashboard", trade_date))
+        return self.by_date[("dashboard", trade_date)]
+
+
 def artifact(
     marker: str,
     *,
+    trade_date: date = TRADE_DATE,
     snapshot_key: str = "daily-index:2026-07-16",
     immutable: bool = False,
     entity_type: str = "daily_index",
@@ -43,7 +132,7 @@ def artifact(
 ) -> ObsidianArtifact:
     return ObsidianArtifact(
         snapshot_key=snapshot_key,
-        trade_date=TRADE_DATE,
+        trade_date=trade_date,
         entity_type=entity_type,
         entity_id=entity_id,
         phase=phase,
@@ -55,6 +144,47 @@ def artifact(
             "manual_required": True,
             "auto_execute": False,
         },
+    )
+
+
+def plan_row(
+    *,
+    source_trade_date=TRADE_DATE,
+    target_trade_date=TRADE_DATE,
+    stage="preclose",
+    version_no=1,
+):
+    return TradingPlanVersion(
+        source_trade_date=source_trade_date,
+        target_trade_date=target_trade_date,
+        stage=stage,
+        version_no=version_no,
+        status="draft",
+        market_state_json={},
+        theme_ranking_json=[],
+        mode_radar_json=[],
+        rule_snapshot_json=[],
+        risk_settings_json={},
+        data_quality_json={},
+        change_summary_json={},
+        input_hash=f"input-{source_trade_date}-{target_trade_date}-{version_no}",
+        generated_at=datetime(2026, 7, 16, 14, 40),
+    )
+
+
+def review_row(plan_id: int, *, trade_date=TRADE_DATE, finalized=False):
+    return TradingExecutionReview(
+        trade_date=trade_date,
+        plan_version_id=plan_id,
+        signal_review_json={},
+        manual_execution_json={},
+        plan_compliance_json={},
+        outcome_snapshot_json={},
+        data_quality_json={},
+        generated_at=datetime(2026, 7, 16, 15, 10),
+        finalized_at=(
+            datetime(2026, 7, 16, 15, 30) if finalized else None
+        ),
     )
 
 
@@ -81,12 +211,20 @@ class TradingPlaybookObsidianSyncTests(unittest.IsolatedAsyncioTestCase):
         await self.engine.dispose()
         self.temporary_directory.cleanup()
 
-    def _coordinator(self, session_factory):
-        return TradingPlaybookObsidianSyncCoordinator(
+    def _coordinator(
+        self,
+        session_factory,
+        *,
+        builder=None,
+        exporter=None,
+        writer=None,
+        coordinator_class=TradingPlaybookObsidianSyncCoordinator,
+    ):
+        return coordinator_class(
             session_factory=session_factory,
-            builder=object(),
-            exporter=object(),
-            writer=object(),
+            builder=builder if builder is not None else object(),
+            exporter=exporter if exporter is not None else object(),
+            writer=writer if writer is not None else object(),
             clock=self.clock,
         )
 
@@ -572,6 +710,869 @@ class TradingPlaybookObsidianSyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(conflict.id, claimed_ids)
         self.assertNotIn(stale.id, claimed_ids)
         self.assertNotIn(future.id, claimed_ids)
+
+    async def test_disabled_and_unconfigured_writers_pause_without_failure(self):
+        for enabled, vault_path in (
+            (False, self.temporary_directory.name),
+            (True, ""),
+        ):
+            with self.subTest(enabled=enabled, vault_path=vault_path):
+                item = artifact(
+                    f"pause-{enabled}-{bool(vault_path)}",
+                    snapshot_key=f"alerts:pause:{enabled}:{bool(vault_path)}",
+                    target_path=(
+                        "30_TradingPlaybook/Alerts/Auto/2026/"
+                        f"pause-{enabled}-{bool(vault_path)}.md"
+                    ),
+                )
+                row = (await self.coordinator.enqueue_artifacts([item]))[0]
+                writer = FakeWriter(vault_path)
+                writer.enabled = enabled
+                coordinator = self._coordinator(
+                    self.session_factory,
+                    exporter=FakeExporter(),
+                    writer=writer,
+                )
+
+                result = await coordinator.process_due()
+
+                stored = (await self._rows(item.snapshot_key))[0]
+                self.assertEqual(stored.id, row.id)
+                self.assertEqual(stored.status, "paused")
+                self.assertEqual(stored.attempt_no, 0)
+                self.assertIsNone(stored.last_error)
+                self.assertEqual(result.pending_files, (item.target_path,))
+                self.assertEqual(writer.write_calls, [])
+
+                writer.enabled = True
+                writer.vault_path = self.temporary_directory.name
+                resumed = await coordinator.resume_paused()
+                self.assertEqual(resumed, 1)
+                stored = (await self._rows(item.snapshot_key))[0]
+                self.assertEqual(stored.status, "pending")
+                self.assertIsNone(stored.next_attempt_at)
+                self.assertEqual(stored.attempt_no, 0)
+                async with self.session_factory() as session:
+                    await session.execute(
+                        update(TradingPlaybookObsidianExport)
+                        .where(TradingPlaybookObsidianExport.id == row.id)
+                        .values(status="written")
+                    )
+                    await session.commit()
+
+    async def test_write_success_skip_and_file_io_use_worker_threads(self):
+        changed = artifact("changed", snapshot_key="alerts:changed")
+        unchanged = artifact(
+            "unchanged",
+            snapshot_key="alerts:unchanged",
+            target_path="30_TradingPlaybook/Alerts/Auto/2026/unchanged.md",
+        )
+        await self.coordinator.enqueue_artifacts([changed, unchanged])
+        writer = FakeWriter(self.temporary_directory.name)
+        original_write = writer.write_text
+
+        def write_by_path(relative_path, content, *, allowed_roots):
+            writer.changed = relative_path == changed.target_path
+            return original_write(
+                relative_path,
+                content,
+                allowed_roots=allowed_roots,
+            )
+
+        writer.write_text = write_by_path
+        exporter = FakeExporter()
+        coordinator = self._coordinator(
+            self.session_factory,
+            exporter=exporter,
+            writer=writer,
+        )
+        event_loop_thread = threading.get_ident()
+
+        result = await coordinator.process_due()
+
+        self.assertEqual(result.written_files, (changed.target_path,))
+        self.assertEqual(result.skipped_files, (unchanged.target_path,))
+        self.assertEqual(result.failed_files, ())
+        self.assertEqual([row.status for row in await self._rows()], ["written", "written"])
+        self.assertTrue(
+            all(call[3] != event_loop_thread for call in writer.write_calls)
+        )
+        self.assertTrue(
+            all(call[3] != event_loop_thread for call in writer.commit_calls)
+        )
+        self.assertTrue(
+            all(call[2] == event_loop_thread for call in exporter.calls)
+        )
+
+    async def test_real_exporter_and_writer_restore_the_frozen_snapshot(self):
+        vault = Path(self.temporary_directory.name) / "vault"
+        item = ObsidianArtifact(
+            snapshot_key="alerts:2026-07-16",
+            trade_date=TRADE_DATE,
+            entity_type="alerts",
+            entity_id=None,
+            phase="reconcile",
+            target_path="30_TradingPlaybook/Alerts/Auto/2026/2026-07-16.md",
+            immutable=False,
+            payload={
+                "type": "trading_alert_timeline",
+                "trade_date": TRADE_DATE,
+                "timeline": [],
+                "manual_required": True,
+                "auto_execute": False,
+            },
+        )
+        await self.coordinator.enqueue_artifacts([item])
+        coordinator = self._coordinator(
+            self.session_factory,
+            exporter=TradingPlaybookObsidianExporter(),
+            writer=ObsidianVaultWriter(
+                enabled=True,
+                vault_path=vault,
+                auto_git_enabled=False,
+            ),
+        )
+
+        result = await coordinator.process_due()
+
+        exported = vault / Path(item.target_path)
+        self.assertEqual(result.written_files, (item.target_path,))
+        self.assertTrue(exported.is_file())
+        content = exported.read_text(encoding="utf-8")
+        self.assertIn(f'source_hash: "{item.source_hash}"', content)
+        self.assertIn('generated_at: "2026-07-16T06:40:00.000000Z"', content)
+        self.assertEqual((await self._rows(item.snapshot_key))[0].status, "written")
+
+    async def test_mixed_due_batch_context_is_stable(self):
+        earlier = artifact(
+            "earlier-plan",
+            trade_date=date(2026, 7, 15),
+            snapshot_key="plan:88",
+            immutable=True,
+            entity_type="plan",
+            entity_id=88,
+            phase="preclose",
+            target_path=(
+                "30_TradingPlaybook/Daily/Auto/2026/2026-07-15/preclose-v1.md"
+            ),
+        )
+        later = artifact(
+            "later-alerts",
+            trade_date=date(2026, 7, 17),
+            snapshot_key="alerts:2026-07-17",
+            entity_type="alerts",
+            target_path="30_TradingPlaybook/Alerts/Auto/2026/2026-07-17.md",
+        )
+        await self.coordinator.enqueue_artifacts([later, earlier])
+        coordinator = self._coordinator(
+            self.session_factory,
+            exporter=FakeExporter(),
+            writer=FakeWriter(self.temporary_directory.name),
+        )
+
+        result = await coordinator.process_due()
+
+        self.assertEqual(result.trade_date, date(2026, 7, 17))
+        self.assertEqual(result.phase, "reconcile")
+
+    async def test_failures_back_off_1_5_15_15_minutes_and_truncate_errors(self):
+        item = artifact("retry", snapshot_key="alerts:retry")
+        await self.coordinator.enqueue_artifacts([item])
+        writer = FakeWriter(self.temporary_directory.name)
+        writer.write_error = RuntimeError("x" * 5000)
+        coordinator = self._coordinator(
+            self.session_factory,
+            exporter=FakeExporter(),
+            writer=writer,
+        )
+        expected_delays = (1, 5, 15, 15)
+
+        for attempt, delay in enumerate(expected_delays, start=1):
+            before = self.clock.value
+            result = await coordinator.process_due()
+            stored = (await self._rows(item.snapshot_key))[0]
+            self.assertEqual(result.failed_files, (item.target_path,))
+            self.assertEqual(stored.status, "failed")
+            self.assertEqual(stored.attempt_no, attempt)
+            self.assertEqual(len(stored.last_error), 2000)
+            self.assertEqual(
+                stored.next_attempt_at,
+                (before + timedelta(minutes=delay))
+                .astimezone(timezone(timedelta(hours=8)))
+                .replace(tzinfo=None),
+            )
+            self.clock.value += timedelta(minutes=delay)
+
+    async def test_failure_text_is_control_safe(self):
+        item = artifact("unsafe-error", snapshot_key="alerts:unsafe-error")
+        await self.coordinator.enqueue_artifacts([item])
+        writer = FakeWriter(self.temporary_directory.name)
+        writer.write_error = RuntimeError("line1\nline2\t\x00secret")
+        coordinator = self._coordinator(
+            self.session_factory,
+            exporter=FakeExporter(),
+            writer=writer,
+        )
+
+        await coordinator.process_due()
+
+        stored = (await self._rows(item.snapshot_key))[0]
+        self.assertEqual(stored.last_error, "line1 line2 �secret")
+
+    async def test_write_completion_is_fenced_when_lease_expires_during_io(self):
+        item = artifact("lease-expiry", snapshot_key="alerts:lease-expiry")
+        row = (await self.coordinator.enqueue_artifacts([item]))[0]
+        writer = FakeWriter(self.temporary_directory.name)
+        writer.after_write = lambda: setattr(
+            self.clock,
+            "value",
+            self.clock.value + timedelta(seconds=61),
+        )
+        coordinator = self._coordinator(
+            self.session_factory,
+            exporter=FakeExporter(),
+            writer=writer,
+        )
+
+        result = await coordinator.process_due()
+
+        stored = (await self._rows(item.snapshot_key))[0]
+        self.assertEqual(stored.id, row.id)
+        self.assertEqual(stored.status, "pending")
+        self.assertEqual(stored.attempt_no, 0)
+        self.assertEqual(result.pending_files, (item.target_path,))
+        self.assertEqual(result.written_files, ())
+
+    async def test_target_lock_failure_marks_only_its_live_row(self):
+        broken = artifact(
+            "broken-lock",
+            snapshot_key="alerts:lock-fail",
+            target_path="30_TradingPlaybook/Alerts/Auto/2026/lock-fail.md",
+        )
+        healthy = artifact(
+            "healthy-lock",
+            snapshot_key="alerts:lock-healthy",
+            target_path="30_TradingPlaybook/Alerts/Auto/2026/lock-healthy.md",
+        )
+        await self.coordinator.enqueue_artifacts([broken, healthy])
+
+        class OneBrokenLockCoordinator(TradingPlaybookObsidianSyncCoordinator):
+            async def _acquire_target_lock(inner_self, target_path):
+                if target_path == broken.target_path:
+                    raise OSError("lock unavailable")
+                return await super()._acquire_target_lock(target_path)
+
+        coordinator = self._coordinator(
+            self.session_factory,
+            exporter=FakeExporter(),
+            writer=FakeWriter(self.temporary_directory.name),
+            coordinator_class=OneBrokenLockCoordinator,
+        )
+
+        result = await coordinator.process_due()
+
+        self.assertEqual(result.failed_files, (broken.target_path,))
+        self.assertEqual(result.written_files, (healthy.target_path,))
+        rows = {row.snapshot_key: row for row in await self._rows()}
+        self.assertEqual(rows[broken.snapshot_key].status, "failed")
+        self.assertEqual(rows[healthy.snapshot_key].status, "written")
+
+    async def test_superseded_lease_is_rechecked_before_file_io(self):
+        old = artifact("old", snapshot_key="alerts:lease-race")
+        new = artifact("new", snapshot_key=old.snapshot_key)
+        await self.coordinator.enqueue_artifacts([old])
+        superseder = self.coordinator
+
+        class SupersedingCoordinator(TradingPlaybookObsidianSyncCoordinator):
+            checked = False
+
+            async def _lease_is_active(inner_self, row_id, lease_until):
+                if not inner_self.checked:
+                    inner_self.checked = True
+                    await superseder.enqueue_artifacts([new])
+                return await super()._lease_is_active(row_id, lease_until)
+
+        writer = FakeWriter(self.temporary_directory.name)
+        coordinator = self._coordinator(
+            self.session_factory,
+            exporter=FakeExporter(),
+            writer=writer,
+            coordinator_class=SupersedingCoordinator,
+        )
+
+        result = await coordinator.process_due()
+
+        self.assertEqual(writer.write_calls, [])
+        self.assertEqual(result.pending_files, (old.target_path,))
+        rows = await self._rows(old.snapshot_key)
+        self.assertEqual([row.status for row in rows], ["superseded", "pending"])
+
+    async def test_git_failure_does_not_rollback_files_and_retries_without_rewrite(self):
+        first = artifact("git-one", snapshot_key="alerts:git-one")
+        second = artifact(
+            "git-two",
+            snapshot_key="alerts:git-two",
+            target_path="30_TradingPlaybook/Alerts/Auto/2026/git-two.md",
+        )
+        await self.coordinator.enqueue_artifacts([first, second])
+        writer = FakeWriter(self.temporary_directory.name)
+        writer.commit_result = {
+            "enabled": True,
+            "committed": False,
+            "error": "git unavailable",
+        }
+        coordinator = self._coordinator(
+            self.session_factory,
+            exporter=FakeExporter(),
+            writer=writer,
+        )
+
+        failed_git = await coordinator.process_due()
+
+        self.assertEqual(len(writer.commit_calls), 1)
+        self.assertEqual(
+            writer.commit_calls[0][0],
+            (first.target_path, second.target_path),
+        )
+        rows = await self._rows()
+        self.assertEqual([row.status for row in rows], ["written", "written"])
+        self.assertTrue(all(row.git_status_json == failed_git.git_status_json() for row in rows))
+        write_count = len(writer.write_calls)
+
+        writer.commit_result = {"enabled": True, "committed": True}
+        retried = await coordinator.process_due()
+
+        self.assertEqual(len(writer.write_calls), write_count)
+        self.assertEqual(len(writer.commit_calls), 2)
+        self.assertEqual(retried.written_files, ())
+        self.assertEqual(retried.git_status_json(), writer.commit_result)
+        rows = await self._rows()
+        self.assertTrue(all(row.git_status_json == writer.commit_result for row in rows))
+
+    async def test_corrupt_snapshot_envelope_or_hash_fails_before_file_io(self):
+        cases = (
+            {"payload": artifact("bad").payload_json()},
+            {"payload": [], "generated_at": "2026-07-16T06:40:00Z"},
+            {"payload": artifact("bad").payload_json(), "generated_at": "naive"},
+        )
+        for index, snapshot_json in enumerate(cases):
+            with self.subTest(index=index):
+                item = artifact(
+                    f"bad-{index}",
+                    snapshot_key=f"alerts:bad:{index}",
+                    target_path=f"30_TradingPlaybook/Alerts/Auto/2026/bad-{index}.md",
+                )
+                row = (await self.coordinator.enqueue_artifacts([item]))[0]
+                async with self.session_factory() as session:
+                    values = {"snapshot_json": snapshot_json}
+                    if index == 2:
+                        values["source_hash"] = "0" * 64
+                    await session.execute(
+                        update(TradingPlaybookObsidianExport)
+                        .where(TradingPlaybookObsidianExport.id == row.id)
+                        .values(**values)
+                    )
+                    await session.commit()
+                writer = FakeWriter(self.temporary_directory.name)
+                coordinator = self._coordinator(
+                    self.session_factory,
+                    exporter=FakeExporter(),
+                    writer=writer,
+                )
+
+                result = await coordinator.process_due()
+
+                self.assertEqual(writer.write_calls, [])
+                self.assertEqual(result.failed_files, (item.target_path,))
+
+    async def test_snapshot_hash_mismatch_fails_before_file_io(self):
+        item = artifact("hash-mismatch", snapshot_key="alerts:hash-mismatch")
+        row = (await self.coordinator.enqueue_artifacts([item]))[0]
+        async with self.session_factory() as session:
+            await session.execute(
+                update(TradingPlaybookObsidianExport)
+                .where(TradingPlaybookObsidianExport.id == row.id)
+                .values(source_hash="0" * 64)
+            )
+            await session.commit()
+        writer = FakeWriter(self.temporary_directory.name)
+        coordinator = self._coordinator(
+            self.session_factory,
+            exporter=FakeExporter(),
+            writer=writer,
+        )
+
+        result = await coordinator.process_due()
+
+        self.assertEqual(writer.write_calls, [])
+        self.assertEqual(result.failed_files, (item.target_path,))
+
+    async def test_exporter_rejects_snapshot_metadata_mismatch_before_file_io(self):
+        item = ObsidianArtifact(
+            snapshot_key="alerts:2026-07-16",
+            trade_date=TRADE_DATE,
+            entity_type="alerts",
+            entity_id=None,
+            phase="reconcile",
+            target_path="30_TradingPlaybook/Alerts/Auto/2026/2026-07-16.md",
+            immutable=False,
+            payload={
+                "type": "trading_alert_timeline",
+                "trade_date": TRADE_DATE,
+                "timeline": [],
+                "manual_required": True,
+                "auto_execute": False,
+            },
+        )
+        row = (await self.coordinator.enqueue_artifacts([item]))[0]
+        async with self.session_factory() as session:
+            await session.execute(
+                update(TradingPlaybookObsidianExport)
+                .where(TradingPlaybookObsidianExport.id == row.id)
+                .values(
+                    target_path=(
+                        "30_TradingPlaybook/Alerts/Auto/2026/2026-07-17.md"
+                    )
+                )
+            )
+            await session.commit()
+        writer = FakeWriter(self.temporary_directory.name)
+        coordinator = self._coordinator(
+            self.session_factory,
+            exporter=TradingPlaybookObsidianExporter(),
+            writer=writer,
+        )
+
+        result = await coordinator.process_due()
+
+        self.assertEqual(writer.write_calls, [])
+        self.assertEqual(
+            result.failed_files,
+            ("30_TradingPlaybook/Alerts/Auto/2026/2026-07-17.md",),
+        )
+
+    async def test_blocked_writer_does_not_hold_a_sqlite_business_write_lock(self):
+        item = artifact("slow", snapshot_key="alerts:slow")
+        await self.coordinator.enqueue_artifacts([item])
+        writer = FakeWriter(self.temporary_directory.name)
+        entered = threading.Event()
+        release = threading.Event()
+        original_write = writer.write_text
+
+        def blocking_write(*args, **kwargs):
+            entered.set()
+            if not release.wait(timeout=5):
+                raise RuntimeError("test writer release timed out")
+            return original_write(*args, **kwargs)
+
+        writer.write_text = blocking_write
+        coordinator = self._coordinator(
+            self.session_factory,
+            exporter=FakeExporter(),
+            writer=writer,
+        )
+        worker = asyncio.create_task(coordinator.process_due())
+        await asyncio.to_thread(entered.wait, 5)
+        try:
+            async def write_business_row():
+                async with self.session_factory() as session:
+                    session.add(
+                        plan_row(
+                            source_trade_date=date(2026, 7, 20),
+                            target_trade_date=date(2026, 7, 21),
+                        )
+                    )
+                    await session.commit()
+
+            await asyncio.wait_for(write_business_row(), timeout=1)
+        finally:
+            release.set()
+        await worker
+
+    async def test_target_lock_prevents_expired_old_worker_from_writing_last(self):
+        old = artifact("old", snapshot_key="alerts:target-fence")
+        new = artifact("new", snapshot_key=old.snapshot_key)
+        await self.coordinator.enqueue_artifacts([old])
+        entered_old = threading.Event()
+        release_old = threading.Event()
+        writes = []
+        writer = FakeWriter(self.temporary_directory.name)
+
+        def ordered_write(relative_path, content, *, allowed_roots):
+            call_no = len(writes)
+            if call_no == 0:
+                entered_old.set()
+                if not release_old.wait(timeout=5):
+                    raise RuntimeError("old writer release timed out")
+            writes.append(content)
+            return VaultWriteResult(
+                relative_path=relative_path,
+                absolute_path=Path(writer.vault_path) / relative_path,
+                changed=True,
+            )
+
+        writer.write_text = ordered_write
+        first = self._coordinator(
+            self.session_factory,
+            exporter=FakeExporter(),
+            writer=writer,
+        )
+        waiting_for_lock = asyncio.Event()
+
+        class WaitingCoordinator(TradingPlaybookObsidianSyncCoordinator):
+            async def _acquire_target_lock(inner_self, target_path):
+                waiting_for_lock.set()
+                return await super()._acquire_target_lock(target_path)
+
+        second = self._coordinator(
+            self.session_factory,
+            exporter=FakeExporter(),
+            writer=writer,
+            coordinator_class=WaitingCoordinator,
+        )
+
+        old_task = asyncio.create_task(first.process_due())
+        await asyncio.to_thread(entered_old.wait, 5)
+        self.clock.value += timedelta(seconds=61)
+        await self.coordinator.enqueue_artifacts([new])
+        new_task = asyncio.create_task(second.process_due())
+        await asyncio.wait_for(waiting_for_lock.wait(), timeout=2)
+        self.assertFalse(new_task.done())
+        release_old.set()
+
+        old_result, new_result = await asyncio.gather(old_task, new_task)
+
+        self.assertEqual(old_result.pending_files, (old.target_path,))
+        self.assertEqual(new_result.written_files, (new.target_path,))
+        self.assertEqual(len(writes), 2)
+        self.assertIn(old.source_hash, writes[0])
+        self.assertIn(new.source_hash, writes[1])
+        rows = await self._rows(old.snapshot_key)
+        self.assertEqual([row.status for row in rows], ["superseded", "written"])
+
+    async def test_export_trade_date_rebuilds_relevant_immutable_and_mutable_facts(self):
+        async with self.session_factory() as session:
+            plan = plan_row()
+            session.add(plan)
+            await session.flush()
+            review = review_row(plan.id)
+            session.add(review)
+            await session.commit()
+            plan_id = plan.id
+            review_id = review.id
+
+        rule = artifact(
+            "rule",
+            snapshot_key="rule:v2:mode_test",
+            immutable=True,
+            entity_type="rule",
+            phase="catalog",
+            target_path="30_TradingPlaybook/Modes/Auto/v2/mode_test.md",
+        )
+        plan_artifact = artifact(
+            "plan",
+            snapshot_key=f"plan:{plan_id}",
+            immutable=True,
+            entity_type="plan",
+            entity_id=plan_id,
+            phase="preclose",
+            target_path=(
+                "30_TradingPlaybook/Daily/Auto/2026/2026-07-16/preclose-v1.md"
+            ),
+        )
+        review_artifact = artifact(
+            "review",
+            snapshot_key=f"review:{review_id}:initial",
+            immutable=True,
+            entity_type="review",
+            entity_id=review_id,
+            phase="initial_review",
+            target_path=(
+                "30_TradingPlaybook/Reviews/Auto/2026/2026-07-16/"
+                f"initial-review-{plan_id}.md"
+            ),
+        )
+        alerts = artifact(
+            "alerts",
+            snapshot_key="alerts:2026-07-16",
+            entity_type="alerts",
+            target_path=(
+                "30_TradingPlaybook/Alerts/Auto/2026/2026-07-16.md"
+            ),
+        )
+        index = artifact("index")
+        dashboard = artifact(
+            "dashboard",
+            snapshot_key="dashboard:trading-playbook",
+            entity_type="dashboard",
+            target_path="Dashboards/交易预案.md",
+        )
+        builder = FakeBuilder(
+            rules=(rule,),
+            by_date={
+                ("plan", plan_id): plan_artifact,
+                ("review", review_id, "initial_review"): review_artifact,
+                ("alerts", TRADE_DATE): alerts,
+                ("index", TRADE_DATE): index,
+                ("dashboard", TRADE_DATE): dashboard,
+            },
+        )
+        coordinator = self._coordinator(
+            self.session_factory,
+            builder=builder,
+            exporter=FakeExporter(),
+            writer=FakeWriter(self.temporary_directory.name),
+        )
+
+        result = await coordinator.export_trade_date(
+            TRADE_DATE,
+            include_rules=True,
+            force=False,
+        )
+
+        self.assertEqual(
+            builder.calls,
+            [
+                ("rules", "v2"),
+                ("plan", plan_id),
+                ("review", review_id, "initial_review"),
+                ("alerts", TRADE_DATE),
+                ("index", TRADE_DATE),
+                ("dashboard", TRADE_DATE),
+            ],
+        )
+        self.assertEqual(len(result.written_files), 6)
+        self.assertEqual(len(await self._rows()), 6)
+
+    async def test_force_reset_is_scoped_to_date_and_dashboard_export_state(self):
+        requested_failed = artifact(
+            "requested-failed",
+            snapshot_key="alerts:force-requested",
+            entity_type="alerts",
+            target_path="30_TradingPlaybook/Alerts/Auto/2026/force-requested.md",
+        )
+        dashboard_paused = artifact(
+            "dashboard-paused",
+            snapshot_key="dashboard:trading-playbook",
+            entity_type="dashboard",
+            target_path="Dashboards/交易预案.md",
+        )
+        requested_written = artifact(
+            "requested-written",
+            snapshot_key="daily-index:force-requested",
+            target_path=(
+                "30_TradingPlaybook/Daily/Auto/2026/2026-07-16/force-index.md"
+            ),
+        )
+        other_date = date(2026, 7, 18)
+        unrelated_failed = artifact(
+            "unrelated",
+            trade_date=other_date,
+            snapshot_key="alerts:force-unrelated",
+            entity_type="alerts",
+            target_path="30_TradingPlaybook/Alerts/Auto/2026/force-unrelated.md",
+        )
+        rows = await self.coordinator.enqueue_artifacts(
+            [
+                requested_failed,
+                dashboard_paused,
+                requested_written,
+                unrelated_failed,
+            ]
+        )
+        row_by_key = {row.snapshot_key: row for row in rows}
+        async with self.session_factory() as session:
+            for item, status in (
+                (requested_failed, "failed"),
+                (dashboard_paused, "paused"),
+                (requested_written, "written"),
+                (unrelated_failed, "failed"),
+            ):
+                await session.execute(
+                    update(TradingPlaybookObsidianExport)
+                    .where(
+                        TradingPlaybookObsidianExport.id
+                        == row_by_key[item.snapshot_key].id
+                    )
+                    .values(
+                        status=status,
+                        attempt_no=3,
+                        next_attempt_at=datetime(2030, 1, 1),
+                        last_error="old failure",
+                        git_status_json={"error": "old git failure"},
+                    )
+                )
+            await session.commit()
+        coordinator = self._coordinator(
+            self.session_factory,
+            writer=FakeWriter(self.temporary_directory.name),
+        )
+
+        await coordinator._reset_forced_exports(TRADE_DATE)
+
+        stored = {row.snapshot_key: row for row in await self._rows()}
+        self.assertEqual(stored[requested_failed.snapshot_key].status, "pending")
+        self.assertEqual(stored[requested_failed.snapshot_key].attempt_no, 0)
+        self.assertIsNone(stored[requested_failed.snapshot_key].last_error)
+        self.assertEqual(stored[dashboard_paused.snapshot_key].status, "pending")
+        self.assertEqual(stored[requested_written.snapshot_key].status, "written")
+        self.assertTrue(
+            all(
+                stored[item.snapshot_key].git_status_json is None
+                for item in (
+                    requested_failed,
+                    dashboard_paused,
+                    requested_written,
+                )
+            )
+        )
+        self.assertEqual(stored[unrelated_failed.snapshot_key].status, "failed")
+        self.assertEqual(stored[unrelated_failed.snapshot_key].attempt_no, 3)
+        self.assertEqual(
+            stored[unrelated_failed.snapshot_key].git_status_json,
+            {"error": "old git failure"},
+        )
+
+    async def test_startup_reconcile_uses_only_latest_source_and_target_dates(self):
+        source_latest = date(2026, 7, 15)
+        target_latest = date(2026, 7, 17)
+        async with self.session_factory() as session:
+            session.add_all(
+                [
+                    plan_row(
+                        source_trade_date=date(2026, 7, 14),
+                        target_trade_date=date(2026, 7, 16),
+                        version_no=1,
+                    ),
+                    plan_row(
+                        source_trade_date=source_latest,
+                        target_trade_date=target_latest,
+                        version_no=2,
+                    ),
+                ]
+            )
+            await session.commit()
+        immutable = artifact(
+            "resume",
+            snapshot_key="rule:v2:resume",
+            immutable=True,
+            entity_type="rule",
+            phase="catalog",
+            target_path="30_TradingPlaybook/Modes/Auto/v2/resume.md",
+        )
+        immutable_row = (await self.coordinator.enqueue_artifacts([immutable]))[0]
+        async with self.session_factory() as session:
+            await session.execute(
+                update(TradingPlaybookObsidianExport)
+                .where(TradingPlaybookObsidianExport.id == immutable_row.id)
+                .values(status="failed", attempt_no=2, next_attempt_at=datetime(2030, 1, 1))
+            )
+            await session.commit()
+
+        by_date = {}
+        for current in (source_latest, target_latest):
+            year = current.year
+            iso = current.isoformat()
+            by_date[("alerts", current)] = artifact(
+                f"alerts-{iso}",
+                trade_date=current,
+                snapshot_key=f"alerts:{iso}",
+                entity_type="alerts",
+                target_path=(
+                    f"30_TradingPlaybook/Alerts/Auto/{year}/{iso}.md"
+                ),
+            )
+            by_date[("index", current)] = artifact(
+                f"index-{iso}",
+                trade_date=current,
+                snapshot_key=f"daily-index:{iso}",
+                target_path=(
+                    f"30_TradingPlaybook/Daily/Auto/{year}/{iso}/index.md"
+                ),
+            )
+            by_date[("dashboard", current)] = artifact(
+                f"dashboard-{iso}",
+                trade_date=current,
+                snapshot_key="dashboard:trading-playbook",
+                entity_type="dashboard",
+                target_path="Dashboards/交易预案.md",
+            )
+        builder = FakeBuilder(by_date=by_date)
+        coordinator = self._coordinator(
+            self.session_factory,
+            builder=builder,
+            exporter=FakeExporter(),
+            writer=FakeWriter(self.temporary_directory.name),
+        )
+
+        await coordinator.startup_reconcile()
+
+        self.assertEqual(
+            builder.calls,
+            [
+                ("alerts", source_latest),
+                ("index", source_latest),
+                ("dashboard", source_latest),
+                ("alerts", target_latest),
+                ("index", target_latest),
+                ("dashboard", target_latest),
+            ],
+        )
+        stored_immutable = (await self._rows(immutable.snapshot_key))[0]
+        self.assertEqual(stored_immutable.status, "written")
+
+    async def test_cancelled_error_is_rethrown_and_does_not_mark_failed(self):
+        item = artifact("cancel", snapshot_key="alerts:cancel")
+        await self.coordinator.enqueue_artifacts([item])
+        writer = FakeWriter(self.temporary_directory.name)
+        writer.write_error = asyncio.CancelledError()
+        coordinator = self._coordinator(
+            self.session_factory,
+            exporter=FakeExporter(),
+            writer=writer,
+        )
+
+        with self.assertRaises(asyncio.CancelledError):
+            await coordinator.process_due()
+
+        stored = (await self._rows(item.snapshot_key))[0]
+        self.assertEqual(stored.status, "pending")
+        self.assertEqual(stored.attempt_no, 0)
+
+    async def test_external_cancellation_waits_for_io_and_releases_target_lock(self):
+        item = artifact("cancel-blocked", snapshot_key="alerts:cancel-blocked")
+        await self.coordinator.enqueue_artifacts([item])
+        writer = FakeWriter(self.temporary_directory.name)
+        entered = threading.Event()
+        release = threading.Event()
+        original_write = writer.write_text
+
+        def blocking_write(*args, **kwargs):
+            entered.set()
+            if not release.wait(timeout=5):
+                raise RuntimeError("cancel test writer release timed out")
+            return original_write(*args, **kwargs)
+
+        writer.write_text = blocking_write
+        coordinator = self._coordinator(
+            self.session_factory,
+            exporter=FakeExporter(),
+            writer=writer,
+        )
+        task = asyncio.create_task(coordinator.process_due())
+        await asyncio.to_thread(entered.wait, 5)
+
+        task.cancel()
+        release.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        stored = (await self._rows(item.snapshot_key))[0]
+        self.assertEqual(stored.status, "pending")
+        self.clock.value += timedelta(seconds=61)
+        writer.write_text = original_write
+        retried = await asyncio.wait_for(coordinator.process_due(), timeout=2)
+        self.assertEqual(retried.written_files, (item.target_path,))
 
 
 if __name__ == "__main__":
