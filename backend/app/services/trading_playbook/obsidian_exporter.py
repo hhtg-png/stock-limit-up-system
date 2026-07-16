@@ -7,6 +7,7 @@ import json
 import re
 from datetime import date, datetime, timezone
 from typing import Callable
+from zoneinfo import ZoneInfo
 
 from app.services.trading_playbook.obsidian_types import ObsidianArtifact
 from app.services.trading_playbook.rule_catalog import canonical_rule_source_refs
@@ -25,6 +26,8 @@ _SAFE_MODE_KEY = re.compile(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)*")
 _SAFE_STAGE = re.compile(r"[a-z][a-z0-9_]*")
 _SAFE_CATALOG_VERSION = re.compile(r"v[1-9][0-9]*")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+_CN_TZ = ZoneInfo("Asia/Shanghai")
+_PLAN_STAGES = {"preclose", "after_close", "overnight", "auction"}
 _EXPECTED_STAGE_SCHEDULE = (
     ("14:40", ("preclose",), "提前预案"),
     ("15:10", ("initial_review",), "初步复盘"),
@@ -95,6 +98,7 @@ class TradingPlaybookObsidianExporter:
                 f"{artifact.entity_type}"
             )
         self._validate_manual_boundary(payload)
+        self._validate_artifact_metadata(artifact, payload)
         frontmatter = self._frontmatter(
             artifact,
             payload,
@@ -109,6 +113,165 @@ class TradingPlaybookObsidianExporter:
             raise ValueError("manual_required must be true")
         if payload.get("auto_execute") is not False:
             raise ValueError("auto_execute must be false")
+
+    def _validate_artifact_metadata(
+        self,
+        artifact: ObsidianArtifact,
+        payload: dict[str, object],
+    ) -> None:
+        expected = self._expected_artifact_metadata(
+            artifact.entity_type,
+            payload,
+        )
+        actual = {
+            "snapshot_key": artifact.snapshot_key,
+            "entity_id": artifact.entity_id,
+            "phase": artifact.phase,
+            "immutable": artifact.immutable,
+            "trade_date": artifact.trade_date,
+            "target_path": artifact.target_path,
+        }
+        for field_name, expected_value in expected.items():
+            if actual[field_name] != expected_value:
+                raise ValueError(
+                    f"Obsidian artifact metadata mismatch: {field_name}"
+                )
+
+    def _expected_artifact_metadata(
+        self,
+        entity_type: str,
+        payload: dict[str, object],
+    ) -> dict[str, object]:
+        if entity_type == "rule":
+            catalog_version = self._safe_identifier(
+                payload.get("catalog_version"),
+                "catalog_version",
+                _SAFE_CATALOG_VERSION,
+            )
+            mode_key = self._safe_identifier(
+                payload.get("mode_key"),
+                "mode_key",
+                _SAFE_MODE_KEY,
+            )
+            rule_id = self._positive_int(payload.get("rule_id"), "rule_id")
+            created_at = self._canonical_aware_datetime(
+                payload.get("created_at"),
+                "rule created_at",
+            )
+            rule_date = created_at.astimezone(_CN_TZ).date()
+            return {
+                "snapshot_key": f"rule:{catalog_version}:{mode_key}",
+                "entity_id": rule_id,
+                "phase": "catalog",
+                "immutable": True,
+                "trade_date": rule_date,
+                "target_path": (
+                    "30_TradingPlaybook/Modes/Auto/"
+                    f"{catalog_version}/{mode_key}.md"
+                ),
+            }
+
+        if entity_type == "plan":
+            plan_id = self._positive_int(
+                payload.get("plan_version_id"),
+                "plan_version_id",
+            )
+            version_no = self._positive_int(
+                payload.get("version_no"),
+                "version_no",
+            )
+            stage = self._safe_identifier(
+                payload.get("stage"),
+                "plan stage",
+                _SAFE_STAGE,
+            )
+            if stage not in _PLAN_STAGES:
+                raise ValueError("plan stage is not supported")
+            target_date = self._iso_date(
+                payload.get("target_trade_date"),
+                "target_trade_date",
+            )
+            return {
+                "snapshot_key": f"plan:{plan_id}",
+                "entity_id": plan_id,
+                "phase": stage,
+                "immutable": True,
+                "trade_date": date.fromisoformat(target_date),
+                "target_path": (
+                    "30_TradingPlaybook/Daily/Auto/"
+                    f"{target_date[:4]}/{target_date}/{stage}-v{version_no}.md"
+                ),
+            }
+
+        if entity_type == "review":
+            review_id = self._positive_int(
+                payload.get("review_id"),
+                "review_id",
+            )
+            plan_id = self._positive_int(
+                payload.get("plan_version_id"),
+                "plan_version_id",
+            )
+            phase = payload.get("phase")
+            kinds = {
+                "initial_review": "initial",
+                "final_review": "final",
+            }
+            if not isinstance(phase, str) or phase not in kinds:
+                raise ValueError("review phase is not supported")
+            review_date = self._iso_date(
+                payload.get("trade_date"),
+                "review trade_date",
+            )
+            kind = kinds[phase]
+            return {
+                "snapshot_key": f"review:{review_id}:{kind}",
+                "entity_id": review_id,
+                "phase": phase,
+                "immutable": True,
+                "trade_date": date.fromisoformat(review_date),
+                "target_path": (
+                    "30_TradingPlaybook/Reviews/Auto/"
+                    f"{review_date[:4]}/{review_date}/"
+                    f"{kind}-review-{plan_id}.md"
+                ),
+            }
+
+        trade_date = self._iso_date(
+            payload.get("trade_date"),
+            f"{entity_type} trade_date",
+        )
+        common = {
+            "entity_id": None,
+            "phase": "reconcile",
+            "immutable": False,
+            "trade_date": date.fromisoformat(trade_date),
+        }
+        if entity_type == "alerts":
+            return {
+                "snapshot_key": f"alerts:{trade_date}",
+                **common,
+                "target_path": (
+                    "30_TradingPlaybook/Alerts/Auto/"
+                    f"{trade_date[:4]}/{trade_date}.md"
+                ),
+            }
+        if entity_type == "daily_index":
+            return {
+                "snapshot_key": f"daily-index:{trade_date}",
+                **common,
+                "target_path": (
+                    "30_TradingPlaybook/Daily/Auto/"
+                    f"{trade_date[:4]}/{trade_date}/index.md"
+                ),
+            }
+        if entity_type == "dashboard":
+            return {
+                "snapshot_key": "dashboard:trading-playbook",
+                **common,
+                "target_path": "Dashboards/交易预案.md",
+            }
+        raise ValueError(f"Unsupported Obsidian entity type: {entity_type}")
 
     def _frontmatter(
         self,
@@ -323,6 +486,36 @@ class TradingPlaybookObsidianExporter:
         if parsed.isoformat() != value:
             raise ValueError(f"{field_name} must be an ISO date")
         return value
+
+    @staticmethod
+    def _canonical_aware_datetime(
+        value: object,
+        field_name: str,
+    ) -> datetime:
+        if not isinstance(value, str) or not value.endswith("Z"):
+            raise ValueError(
+                f"{field_name} must be a canonical timezone-aware datetime"
+            )
+        try:
+            parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+        except ValueError as exc:
+            raise ValueError(
+                f"{field_name} must be a canonical timezone-aware datetime"
+            ) from exc
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError(
+                f"{field_name} must be a canonical timezone-aware datetime"
+            )
+        canonical = (
+            parsed.astimezone(timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+        if canonical != value:
+            raise ValueError(
+                f"{field_name} must be a canonical timezone-aware datetime"
+            )
+        return parsed
 
     @staticmethod
     def _safe_identifier(

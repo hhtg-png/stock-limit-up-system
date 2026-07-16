@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import re
 import unittest
-from datetime import date, datetime, timezone
+from dataclasses import replace
+from datetime import date, datetime, timedelta, timezone
+from unittest.mock import patch
 
 from app.services.trading_playbook.obsidian_exporter import (
     TradingPlaybookObsidianExporter,
@@ -32,6 +34,7 @@ class TradingPlaybookObsidianExporterContractTests(unittest.TestCase):
         rule_version: int = 2,
         content_hash: str = "b" * 64,
         source_refs: list[dict[str, object]] | None = None,
+        created_at: datetime | str = UTC_CREATED,
     ) -> ObsidianArtifact:
         target_mode = (
             mode_key
@@ -87,7 +90,7 @@ class TradingPlaybookObsidianExporterContractTests(unittest.TestCase):
                 ],
                 "content_hash": content_hash,
                 "enabled": True,
-                "created_at": UTC_CREATED,
+                "created_at": created_at,
                 "manual_required": True,
                 "auto_execute": False,
             },
@@ -549,6 +552,107 @@ class TradingPlaybookObsidianExporterContractTests(unittest.TestCase):
                 self._rule_artifact(payload_type="wrong"),
                 generated_at=self.generated_at,
             )
+
+    def test_all_entities_bind_exact_snapshot_metadata_before_body_render(self) -> None:
+        artifacts = (
+            self._rule_artifact(),
+            self._plan_artifact(),
+            self._review_artifact(),
+            self._alerts_artifact(),
+            self._daily_index_artifact([]),
+            self._dashboard_artifact(),
+        )
+        wrong_targets = {
+            "rule": "30_TradingPlaybook/Modes/Auto/v2/mode_02.md",
+            "plan": (
+                "30_TradingPlaybook/Daily/Auto/2026/2026-07-16/"
+                "preclose-v99.md"
+            ),
+            "review": (
+                "30_TradingPlaybook/Reviews/Auto/2026/2026-07-16/"
+                "final-review-101.md"
+            ),
+            "alerts": "30_TradingPlaybook/Alerts/Auto/2026/2026-07-17.md",
+            "daily_index": (
+                "30_TradingPlaybook/Daily/Auto/2026/2026-07-16/other.md"
+            ),
+            "dashboard": "30_TradingPlaybook/Alerts/Auto/2026/wrong.md",
+        }
+
+        for artifact in artifacts:
+            alternate_phase = (
+                "catalog" if artifact.phase == "reconcile" else "reconcile"
+            )
+            alternate_entity_id = (
+                999
+                if artifact.entity_id is None
+                else artifact.entity_id + 999
+            )
+            mismatches = {
+                "snapshot_key": replace(
+                    artifact,
+                    snapshot_key=f"{artifact.snapshot_key}:mismatch",
+                ),
+                "entity_id": replace(
+                    artifact,
+                    entity_id=alternate_entity_id,
+                ),
+                "phase": replace(artifact, phase=alternate_phase),
+                "immutable": replace(
+                    artifact,
+                    immutable=not artifact.immutable,
+                ),
+                "trade_date": replace(
+                    artifact,
+                    trade_date=artifact.trade_date + timedelta(days=1),
+                ),
+                "target_path": replace(
+                    artifact,
+                    target_path=wrong_targets[artifact.entity_type],
+                ),
+            }
+            renderer_name = f"_render_{artifact.entity_type}"
+            for field_name, mismatched in mismatches.items():
+                with self.subTest(
+                    entity_type=artifact.entity_type,
+                    field_name=field_name,
+                ):
+                    with patch.object(
+                        self.exporter,
+                        renderer_name,
+                        side_effect=AssertionError("body renderer was called"),
+                    ):
+                        with self.assertRaisesRegex(
+                            ValueError,
+                            f"metadata mismatch: {field_name}",
+                        ):
+                            self.exporter.render(
+                                mismatched,
+                                generated_at=self.generated_at,
+                            )
+
+    def test_rule_metadata_uses_aware_created_at_in_china_time(self) -> None:
+        crossing_utc_midnight = datetime(
+            2026,
+            7,
+            14,
+            17,
+            0,
+            tzinfo=timezone.utc,
+        )
+        rendered = self.exporter.render(
+            self._rule_artifact(created_at=crossing_utc_midnight),
+            generated_at=self.generated_at,
+        )
+        self.assertIn('date: "2026-07-15"', rendered)
+
+        for created_at in ("not-a-datetime", "2026-07-15T06:00:00"):
+            with self.subTest(created_at=created_at):
+                with self.assertRaisesRegex(ValueError, "created_at"):
+                    self.exporter.render(
+                        self._rule_artifact(created_at=created_at),
+                        generated_at=self.generated_at,
+                    )
 
     def test_plan_page_contains_core_facts_candidates_provenance_and_links(self) -> None:
         rendered = self.exporter.render(
