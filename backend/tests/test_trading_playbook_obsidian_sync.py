@@ -457,6 +457,9 @@ class TradingPlaybookObsidianSyncTests(unittest.IsolatedAsyncioTestCase):
             ("failed opening '/srv/private/vault/file.md'", "srv"),
             ("failed(/home/admin/private/file.md)", "home"),
             ("failed=/opt/private/file.md", "opt"),
+            ("failed='//server/share/private/file.md'", "server"),
+            (r"failed=(\Users\Admin\secret.md)", "Users"),
+            ("failed=file:///srv/private/file.md", "srv"),
         )
         for error, private_fragment in errors:
             with self.subTest(error=error):

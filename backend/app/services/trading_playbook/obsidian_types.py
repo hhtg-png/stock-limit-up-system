@@ -66,7 +66,22 @@ ReadOnlyJSONMapping: TypeAlias = Mapping[str, ReadOnlyJSONValue]
 
 _MAX_NESTING_DEPTH = 64
 _ABSOLUTE_PATH_FRAGMENT = re.compile(
-    r"(?i)(?<![\w./\\])(?:[a-z]:[\\/]|\\\\[^\\/\s]+[\\/]|/(?![/\s]))"
+    r"""
+    (?:
+        (?<![\w+.-]) file:/{2,3} (?![/\s])
+        |
+        (?<![\w./\\:]) // (?![/\s])
+        |
+        (?<![\w./\\])
+        (?:
+            [a-z]:[\\/]
+            | \\\\[^\\/\s]+[\\/]
+            | \\(?![\\\s])
+            | /(?![/\s])
+        )
+    )
+    """,
+    re.IGNORECASE | re.VERBOSE,
 )
 
 
