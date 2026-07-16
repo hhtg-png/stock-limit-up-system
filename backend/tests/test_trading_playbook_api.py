@@ -2,6 +2,7 @@ import asyncio
 import json
 import unittest
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 from zoneinfo import ZoneInfo
 
@@ -30,6 +31,7 @@ from app.models.trading_playbook import (
     TradingPlanCandidate,
     TradingPlanVersion,
     TradingPlaybookSettings,
+    TradingRuleSource,
 )
 from app.services.trading_playbook.runtime import trading_playbook_runtime
 from app.services.trading_playbook import plan_service as plan_service_module
@@ -39,6 +41,10 @@ from app.services.trading_playbook.errors import (
     InvalidTransitionError,
     PlaybookNotFoundError,
     UpstreamUnavailableError,
+)
+from app.services.trading_playbook.rule_catalog import (
+    RuleCatalog,
+    canonical_rule_source_refs,
 )
 
 
@@ -156,6 +162,15 @@ class TradingPlaybookApiTests(unittest.TestCase):
     async def _seed(self):
         async with self.engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+        catalog = RuleCatalog(
+            Path(__file__).resolve().parents[1]
+            / "app"
+            / "data"
+            / "trading_playbook_rules_v2.json"
+        ).load()
+        catalog_sources = {
+            source["source_key"]: source for source in catalog["sources"]
+        }
         async with self.Session() as db:
             enabled_rule = TradingModeRule(
                 mode_key="z_mode",
@@ -241,6 +256,18 @@ class TradingPlaybookApiTests(unittest.TestCase):
                     disabled_rule,
                 ]
             )
+            db.add_all(
+                [
+                    TradingRuleSource(
+                        source_key=source["source_key"],
+                        source_path=source["source_path"],
+                        source_title=source["source_title"],
+                        content_hash=source["content_hash"],
+                        status="ready",
+                    )
+                    for source in catalog_sources.values()
+                ]
+            )
             plan = TradingPlanVersion(
                 source_trade_date=date(2026, 7, 10),
                 target_trade_date=date(2026, 7, 13),
@@ -252,6 +279,26 @@ class TradingPlaybookApiTests(unittest.TestCase):
                     "confirmed": 30.0,
                     "hard_stop": 5.0,
                     "max_candidates": 3,
+                    "source_refs": canonical_rule_source_refs(
+                        {
+                            "source_refs": [
+                                {
+                                    "source_key": "03-loss-qa",
+                                    "excerpt": "候选不超过三只，开仓和退出条件必须预先写清，并执行刚性止损",
+                                    "source_content_hash": catalog_sources[
+                                        "03-loss-qa"
+                                    ]["content_hash"],
+                                },
+                                {
+                                    "source_key": "04-trading-plan",
+                                    "excerpt": "交易前形成书面计划，盘后区分信号、执行与结果",
+                                    "source_content_hash": catalog_sources[
+                                        "04-trading-plan"
+                                    ]["content_hash"],
+                                },
+                            ]
+                        }
+                    ),
                 },
                 data_quality_json={"status": "ready"},
                 input_hash="seed",

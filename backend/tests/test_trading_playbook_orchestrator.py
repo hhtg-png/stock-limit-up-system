@@ -18,7 +18,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.database import Base
 from app.models.stock import Stock
-from app.models.trading_playbook import TradingPlanVersion
+from app.models.trading_playbook import TradingPlanVersion, TradingRuleSource
 from app.services.trading_playbook.domain import (
     CandidateSnapshot,
     DataQuality,
@@ -915,6 +915,26 @@ class TradingPlaybookOrchestratorIntegrationTests(
         self.Session = async_sessionmaker(self.engine, expire_on_commit=False)
         async with self.engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
+        catalog = RuleCatalog(
+            Path("app/data/trading_playbook_rules_v2.json")
+        ).load()
+        self.catalog_sources = {
+            source["source_key"]: source for source in catalog["sources"]
+        }
+        async with self.Session() as db:
+            db.add_all(
+                [
+                    TradingRuleSource(
+                        source_key=source["source_key"],
+                        source_path=source["source_path"],
+                        source_title=source["source_title"],
+                        content_hash=source["content_hash"],
+                        status="ready",
+                    )
+                    for source in self.catalog_sources.values()
+                ]
+            )
+            await db.commit()
 
     async def asyncTearDown(self):
         await self.engine.dispose()
@@ -1048,6 +1068,16 @@ class TradingPlaybookOrchestratorIntegrationTests(
         )
         self.assertGreaterEqual(len(result["candidates"]), 1)
         self.assertLessEqual(len(result["candidates"]), 3)
+        self.assertEqual(
+            {
+                ref["source_key"]: ref["source_content_hash"]
+                for ref in result["risk_settings_json"]["source_refs"]
+            },
+            {
+                source_key: self.catalog_sources[source_key]["content_hash"]
+                for source_key in ("03-loss-qa", "04-trading-plan")
+            },
+        )
 
     async def test_candidate_missing_one_catalog_mode_is_rejected_before_plan_write(self):
         catalog = RuleCatalog(
