@@ -216,6 +216,7 @@ test('Obsidian export result helper reports every count and warns on partial res
       skipped_files: ['same.md'],
       pending_files: [],
       failed_files: [],
+      git_status: { state: 'git_complete', enabled: true, committed: true },
       error_summary: null
     })
     assert.equal(complete.level, 'success')
@@ -223,18 +224,69 @@ test('Obsidian export result helper reports every count and warns on partial res
     assert.match(complete.message, /跳过 1/)
     assert.match(complete.message, /待重试 0/)
     assert.match(complete.message, /失败 0/)
+    assert.match(complete.message, /Git.*提交完成/)
 
     const partial = view.describeObsidianExportResult({
       written_files: ['a.md'],
       skipped_files: [],
       pending_files: ['retry.md'],
       failed_files: ['failed.md'],
+      git_status: { state: 'git_complete', enabled: true, committed: true },
       error_summary: 'Dashboard 写入失败'
     })
     assert.equal(partial.level, 'warning')
     assert.match(partial.message, /写入 1.*跳过 0.*待重试 1.*失败 1/)
     assert.match(partial.message, /错误摘要：Dashboard 写入失败/)
     assert.doesNotMatch(partial.message, /完整成功|全部成功/)
+
+    for (const git_status of [
+      { state: 'not_attempted', enabled: false, committed: false, reason: 'no_written_files' },
+      { state: 'not_needed', enabled: true, committed: false, reason: 'content_identical' }
+    ]) {
+      const result = view.describeObsidianExportResult({
+        written_files: [],
+        skipped_files: ['same.md'],
+        pending_files: [],
+        failed_files: [],
+        git_status,
+        error_summary: null
+      })
+      assert.equal(result.level, 'success', `${git_status.state} should be an allowed terminal Git state`)
+      assert.match(result.message, /Git/)
+    }
+
+    for (const [git_status, detail] of [
+      [{ state: 'git_error', enabled: true, committed: false, error: 'push failed' }, /Git.*失败.*push failed/],
+      [{ state: 'git_pending', enabled: true, committed: false, reason: 'content_changed' }, /Git.*待处理/],
+      [{ state: 'git_store_pending', enabled: true, committed: false }, /Git.*待保存.*重试/],
+      [{ state: 'write_in_progress', enabled: true, committed: false }, /Git.*写入处理中/],
+      [{ state: 'write_failed', enabled: true, committed: false }, /Git.*写入失败/],
+      [{ state: 'lease_claimed', enabled: true, committed: false }, /Git.*任务处理中/],
+      [{ state: 'future_state', enabled: true, committed: false }, /Git.*未知状态.*future_state/],
+      [{}, /Git.*状态缺失/]
+    ]) {
+      const result = view.describeObsidianExportResult({
+        written_files: ['a.md'],
+        skipped_files: [],
+        pending_files: [],
+        failed_files: [],
+        git_status,
+        error_summary: null
+      })
+      assert.equal(result.level, 'warning', `${git_status.state || 'missing'} Git state must fail closed`)
+      assert.match(result.message, detail)
+      assert.doesNotMatch(result.message, /完整成功|全部成功/)
+    }
+
+    const missing = view.describeObsidianExportResult({
+      written_files: ['a.md'],
+      skipped_files: [],
+      pending_files: [],
+      failed_files: [],
+      error_summary: null
+    })
+    assert.equal(missing.level, 'warning')
+    assert.match(missing.message, /Git.*状态缺失/)
   })
 })
 

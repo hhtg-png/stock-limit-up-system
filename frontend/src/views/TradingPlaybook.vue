@@ -677,6 +677,7 @@ interface ObsidianExportResultSummary {
   skipped_files: string[]
   pending_files: string[]
   failed_files: string[]
+  git_status: Record<string, unknown> | null
   error_summary: string | null
 }
 
@@ -721,17 +722,72 @@ export function buildObsidianDashboardUri(
 }
 
 export function describeObsidianExportResult(result: ObsidianExportResultSummary) {
-  const message = [
+  const counts = [
     `写入 ${result.written_files.length}`,
     `跳过 ${result.skipped_files.length}`,
     `待重试 ${result.pending_files.length}`,
     `失败 ${result.failed_files.length}`
   ].join('，')
-  const partial = result.pending_files.length > 0 || result.failed_files.length > 0 || Boolean(result.error_summary)
+  const git = describeObsidianGitStatus(result.git_status)
+  const partial = result.pending_files.length > 0 ||
+    result.failed_files.length > 0 ||
+    Boolean(result.error_summary) ||
+    git.warning
+  const message = [counts, git.message]
+  if (result.error_summary) message.push(`错误摘要：${result.error_summary}`)
   return {
     level: partial ? 'warning' as const : 'success' as const,
-    message: result.error_summary ? `${message}。错误摘要：${result.error_summary}` : message
+    message: message.join('。')
   }
+}
+
+function describeObsidianGitStatus(status: Record<string, unknown> | null | undefined) {
+  if (!status || typeof status !== 'object' || Array.isArray(status)) {
+    return { warning: true, message: 'Git：状态缺失' }
+  }
+  const state = typeof status.state === 'string' ? status.state.trim() : ''
+  if (!state) return { warning: true, message: 'Git：状态缺失' }
+
+  const rawDetail = typeof status.error === 'string' && status.error.trim()
+    ? status.error.trim()
+    : typeof status.reason === 'string' && status.reason.trim()
+      ? status.reason.trim()
+      : ''
+  const reasonLabels: Record<string, string> = {
+    no_written_files: '没有新增文件',
+    content_identical: '内容未变化',
+    content_changed: '内容已变化，等待提交',
+    previous_write_uncertain: '上次写入状态不确定'
+  }
+  const detail = reasonLabels[rawDetail] || rawDetail
+  const withDetail = (message: string) => detail ? `${message}（${detail}）` : message
+
+  if (status.error) {
+    return { warning: true, message: withDetail('Git：处理失败') }
+  }
+  if (state === 'git_complete') {
+    if (status.committed === true) return { warning: false, message: 'Git：提交完成' }
+    if (status.enabled === false) return { warning: false, message: withDetail('Git：处理完成，自动提交未启用') }
+    return { warning: false, message: withDetail('Git：处理完成，未产生新提交') }
+  }
+  if (state === 'not_attempted') {
+    const message = status.enabled === false ? 'Git：未执行，自动提交未启用' : 'Git：未执行'
+    return { warning: false, message: withDetail(message) }
+  }
+  if (state === 'not_needed') {
+    return { warning: false, message: withDetail('Git：无需提交') }
+  }
+  const warningLabels: Record<string, string> = {
+    git_error: 'Git：提交失败',
+    git_pending: 'Git：待处理',
+    git_store_pending: 'Git：状态待保存并重试',
+    write_in_progress: 'Git：写入处理中',
+    write_failed: 'Git：写入失败',
+    lease_claimed: 'Git：任务处理中'
+  }
+  const warning = warningLabels[state]
+  if (warning) return { warning: true, message: withDetail(warning) }
+  return { warning: true, message: `Git：未知状态 ${state}` }
 }
 </script>
 
