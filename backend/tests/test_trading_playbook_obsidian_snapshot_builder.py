@@ -1500,6 +1500,100 @@ class TradingPlaybookObsidianSnapshotBuilderTests(
         with self.assertRaisesRegex(ValueError, "triggered_at"):
             self.builder._alert_payload(corrupt_timestamp)
 
+    async def test_confirmation_alert_terminal_failures_never_remain_pending(self):
+        for index, channel_status in enumerate(
+            ("failed", "uncertain", "skipped"),
+            start=1,
+        ):
+            with self.subTest(channel_status=channel_status):
+                event = TradingAlertEvent(
+                    id=620 + index,
+                    plan_version_id=202,
+                    event_type="confirmation_required",
+                    severity="warning",
+                    dedup_key=f"event:62{index}",
+                    triggered_at=datetime(2026, 7, 16, 10, index),
+                    market_snapshot_json={
+                        "source_trade_date": "2026-07-14",
+                        "target_trade_date": "2026-07-16",
+                        "stage": "after_close",
+                        "status": "confirmed",
+                    },
+                    message="等待人工确认",
+                    channel_status_json={
+                        "in_app": {
+                            "status": channel_status,
+                            "attempts": 1,
+                        }
+                    },
+                )
+                payload = self.builder._alert_payload(event)
+                self.assertEqual(payload["timeline_state"], "failed")
+                self.assertIn(
+                    payload["timeline_state"],
+                    {
+                        "delivered",
+                        "pending_confirmation",
+                        "confirmed",
+                        "failed",
+                    },
+                )
+
+    async def test_alert_privacy_preserves_legitimate_business_text(self):
+        event = TradingAlertEvent(
+            id=630,
+            plan_version_id=202,
+            candidate_id=2021,
+            event_type="entry_triggered",
+            severity="action",
+            dedup_key="event:630",
+            triggered_at=datetime(2026, 7, 16, 10, 30),
+            market_snapshot_json={
+                "trade_date": "2026-07-16",
+                "stock_code": "600001",
+                "mode_key": "trend_core_pullback",
+                "condition_version": "condition-v1",
+                "occurrence_no": 1,
+                "quote": {
+                    "code": "600001",
+                    "name": "微信生态概念 Token经济",
+                    "price": 20.1,
+                    "change_pct": 3.2,
+                    "sealed": False,
+                    "open_count": 1,
+                    "datetime": "2026-07-16T10:30:00+08:00",
+                    "captured_at": "2026-07-16T10:30:00+08:00",
+                    "nested": {"secret": "structurally omitted"},
+                },
+                "webhook": "structurally omitted",
+            },
+            message="微信生态概念与 token economy 触发提醒",
+            channel_status_json={
+                "in_app": {
+                    "status": "delivered",
+                    "attempts": 1,
+                    "receipt": {"secret": "structurally omitted"},
+                    "owner": "structurally omitted",
+                },
+                "wechat": {"output": "structurally omitted"},
+            },
+        )
+
+        payload = self.builder._alert_payload(event)
+        self.assertEqual(
+            payload["message"],
+            "微信生态概念与 token economy 触发提醒",
+        )
+        self.assertEqual(
+            payload["market_facts"]["quote"]["name"],
+            "微信生态概念 Token经济",
+        )
+        encoded = canonical_json_bytes(payload).decode("utf-8")
+        self.assertNotIn("structurally omitted", encoded)
+        self.assertNotIn("webhook", encoded)
+        self.assertNotIn("receipt", encoded)
+        self.assertNotIn("owner", encoded)
+
     async def test_daily_index_lists_all_versions_and_distinguishes_three_dates(self):
         async with self.session_factory() as session:
             active = await session.get(TradingPlanVersion, 204)

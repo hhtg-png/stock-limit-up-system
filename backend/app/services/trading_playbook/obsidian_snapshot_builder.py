@@ -101,10 +101,6 @@ _PLAN_ALERT_EVENT_TYPES = frozenset(
 _ACTION_ALERT_EVENT_TYPES = frozenset(
     {"entry_triggered", "invalidated", "exit_triggered"}
 )
-_SENSITIVE_EXPORT_TEXT = re.compile(
-    r"wechat|微信|webhook|token|secret|password|api_key|bearer",
-    re.IGNORECASE,
-)
 _STAGE_SCHEDULE = (
     {
         "phases": ("preclose",),
@@ -912,6 +908,8 @@ class TradingPlaybookObsidianSnapshotBuilder:
 
         if acknowledged_at is not None:
             timeline_state = "confirmed"
+        elif channel_status in {"uncertain", "failed", "skipped"}:
+            timeline_state = "failed"
         elif (
             event.event_type == "confirmation_required"
             or channel_status in {"pending", "sending"}
@@ -919,8 +917,6 @@ class TradingPlaybookObsidianSnapshotBuilder:
             timeline_state = "pending_confirmation"
         elif channel_status == "delivered":
             timeline_state = "delivered"
-        elif channel_status in {"uncertain", "failed", "skipped"}:
-            timeline_state = "failed"
         else:
             raise ValueError(
                 f"alert {alert_id} cannot map in_app status to timeline state"
@@ -938,7 +934,6 @@ class TradingPlaybookObsidianSnapshotBuilder:
             "in_app_status": safe_status,
             "acknowledged_at": database_datetime_to_cn(acknowledged_at),
         }
-        cls._reject_sensitive_export_value(payload, alert_id=alert_id)
         return payload
 
     @staticmethod
@@ -987,41 +982,6 @@ class TradingPlaybookObsidianSnapshotBuilder:
                 safe_quote[field_name] = value
             result["quote"] = safe_quote
         return result
-
-    @classmethod
-    def _reject_sensitive_export_value(
-        cls,
-        value: object,
-        *,
-        alert_id: int,
-    ) -> None:
-        if isinstance(value, str):
-            if _SENSITIVE_EXPORT_TEXT.search(value):
-                raise ValueError(
-                    f"alert {alert_id} contains sensitive export text"
-                )
-            return
-        if type(value) is dict:
-            for key, item in value.items():
-                if not isinstance(key, str):
-                    raise ValueError(
-                        f"alert {alert_id} export field names must be strings"
-                    )
-                if _SENSITIVE_EXPORT_TEXT.search(key):
-                    raise ValueError(
-                        f"alert {alert_id} contains a sensitive export field"
-                    )
-                cls._reject_sensitive_export_value(
-                    item,
-                    alert_id=alert_id,
-                )
-            return
-        if isinstance(value, (list, tuple)):
-            for item in value:
-                cls._reject_sensitive_export_value(
-                    item,
-                    alert_id=alert_id,
-                )
 
     @staticmethod
     def _current_effective_plan_id(
