@@ -2,17 +2,22 @@ import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 import {
   ackTradingAlert,
+  exportToObsidian as requestObsidianExport,
+  getObsidianStatus as getTradingObsidianStatus,
   getTradingAlerts,
   getTradingPlans,
   getTradingPlaybookSettings,
   getTradingReviews
 } from '@/api/trading-playbook'
+import { getObsidianStatus as getObsidianVaultStatus } from '@/api/intelligence'
 import type {
   TradingAlertEvent,
   TradingExecutionReview,
   TradingPlanVersion,
+  TradingPlaybookObsidianStatus,
   TradingPlaybookSettings
 } from '@/types/trading-playbook'
+import type { ObsidianStatus } from '@/types/intelligence'
 
 function requestErrorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error)
@@ -91,6 +96,17 @@ export const useTradingPlaybookStore = defineStore('trading-playbook', () => {
   const settingsRequestId = ref(0)
   const settingsLoading = ref(false)
   const settingsError = ref<string | null>(null)
+
+  const obsidianStatus = ref<TradingPlaybookObsidianStatus | null>(null)
+  const obsidianVaultStatus = ref<ObsidianStatus | null>(null)
+  const obsidianStatusRequestId = ref(0)
+  const obsidianExportRequestId = ref(0)
+  const obsidianStatusLoading = ref(false)
+  const obsidianExporting = ref(false)
+  const obsidianError = ref<string | null>(null)
+  let obsidianErrorRequestId = 0
+  let obsidianExportsInFlight = 0
+
   const unreadCount = computed(() => alerts.value.filter(item => !item.acknowledged_at).length)
 
   function receiveAlert(alert: TradingAlertEvent) {
@@ -203,6 +219,75 @@ export const useTradingPlaybookStore = defineStore('trading-playbook', () => {
     }
   }
 
+  async function loadObsidianStatus(preserveError = false) {
+    const requestId = obsidianStatusRequestId.value + 1
+    obsidianStatusRequestId.value = requestId
+    const errorRequestId = preserveError
+      ? obsidianErrorRequestId
+      : obsidianErrorRequestId + 1
+    if (!preserveError) {
+      obsidianErrorRequestId = errorRequestId
+      obsidianError.value = null
+    }
+    obsidianStatusLoading.value = true
+    try {
+      const [status, vaultStatus] = await Promise.all([
+        getTradingObsidianStatus(),
+        getObsidianVaultStatus()
+      ])
+      if (requestId !== obsidianStatusRequestId.value) return
+      obsidianStatus.value = status
+      obsidianVaultStatus.value = vaultStatus
+    } catch (error) {
+      if (
+        !preserveError &&
+        requestId === obsidianStatusRequestId.value &&
+        errorRequestId === obsidianErrorRequestId
+      ) {
+        obsidianError.value = requestErrorMessage(error)
+      }
+      throw error
+    } finally {
+      if (requestId === obsidianStatusRequestId.value) {
+        obsidianStatusLoading.value = false
+      }
+    }
+  }
+
+  async function exportToObsidian(
+    tradeDate: string,
+    includeRules = false,
+    force = false
+  ) {
+    const requestId = obsidianExportRequestId.value + 1
+    obsidianExportRequestId.value = requestId
+    const errorRequestId = obsidianErrorRequestId + 1
+    obsidianErrorRequestId = errorRequestId
+    obsidianExportsInFlight += 1
+    obsidianExporting.value = true
+    obsidianError.value = null
+    try {
+      const result = await requestObsidianExport({
+        trade_date: tradeDate,
+        include_rules: includeRules,
+        force
+      })
+      await loadObsidianStatus(requestId !== obsidianExportRequestId.value)
+      return result
+    } catch (error) {
+      if (
+        requestId === obsidianExportRequestId.value &&
+        errorRequestId === obsidianErrorRequestId
+      ) {
+        obsidianError.value = requestErrorMessage(error)
+      }
+      throw error
+    } finally {
+      obsidianExportsInFlight = Math.max(0, obsidianExportsInFlight - 1)
+      obsidianExporting.value = obsidianExportsInFlight > 0
+    }
+  }
+
   return {
     plans,
     activePlan,
@@ -230,11 +315,20 @@ export const useTradingPlaybookStore = defineStore('trading-playbook', () => {
     settingsRequestId,
     settingsLoading,
     settingsError,
+    obsidianStatus,
+    obsidianVaultStatus,
+    obsidianStatusRequestId,
+    obsidianExportRequestId,
+    obsidianStatusLoading,
+    obsidianExporting,
+    obsidianError,
     receiveAlert,
     loadPlans,
     loadReviews,
     loadAlerts,
     acknowledgeAlert,
-    loadSettings
+    loadSettings,
+    loadObsidianStatus,
+    exportToObsidian
   }
 })

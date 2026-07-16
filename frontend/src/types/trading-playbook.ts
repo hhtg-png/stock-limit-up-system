@@ -152,3 +152,60 @@ export interface TradingExecutionReviewUpdate {
 export type TradingPlaybookSettingsUpdate = Partial<
   Omit<TradingPlaybookSettings, 'wechat_enabled'>
 > & { wechat_enabled?: false }
+
+export type TradingPlaybookObsidianPhase =
+  | 'catalog'
+  | 'preclose'
+  | 'initial_review'
+  | 'after_close'
+  | 'final_review'
+  | 'overnight'
+  | 'auction'
+  | 'reconcile'
+
+export type TradingPlaybookObsidianJsonValue =
+  | string
+  | number
+  | boolean
+  | null
+  | TradingPlaybookObsidianJsonValue[]
+  | { [key: string]: TradingPlaybookObsidianJsonValue }
+
+export type TradingPlaybookObsidianGitStatus = Record<
+  string,
+  TradingPlaybookObsidianJsonValue
+>
+
+export interface TradingPlaybookObsidianStatus {
+  enabled: boolean
+  configured: boolean
+  vault_exists: boolean
+  auto_git_enabled: boolean
+  last_success_at: string | null
+  last_trade_date: string | null
+  last_phase: string | null
+  pending_count: number
+  paused_count: number
+  failed_count: number
+  last_error: string | null
+  recent_files: string[]
+  dashboard_path: string
+  dashboard_openable: boolean
+}
+
+export interface TradingPlaybookObsidianExportRequest {
+  trade_date: string
+  include_rules?: boolean
+  force?: boolean
+}
+
+export interface TradingPlaybookObsidianExportResponse {
+  trade_date: string
+  phase: TradingPlaybookObsidianPhase
+  written_files: string[]
+  skipped_files: string[]
+  pending_files: string[]
+  failed_files: string[]
+  git_status: TradingPlaybookObsidianGitStatus
+  error_summary: string | null
+}

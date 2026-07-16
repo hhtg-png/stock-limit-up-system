@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import axios from 'axios'
 import { createPinia, setActivePinia } from 'pinia'
 import { createServer } from 'vite'
 
@@ -21,6 +22,52 @@ function axiosResponse(config, data) {
   return { data, status: 200, statusText: 'OK', headers: {}, config }
 }
 
+function obsidianSyncStatus(marker, overrides = {}) {
+  return {
+    enabled: true,
+    configured: true,
+    vault_exists: true,
+    auto_git_enabled: false,
+    last_success_at: '2026-07-16T15:31:00+08:00',
+    last_trade_date: '2026-07-16',
+    last_phase: 'after_close',
+    pending_count: 0,
+    paused_count: 0,
+    failed_count: 0,
+    last_error: null,
+    recent_files: [`30_TradingPlaybook/Daily/Auto/${marker}.md`],
+    dashboard_path: 'Dashboards/交易预案.md',
+    dashboard_openable: true,
+    ...overrides
+  }
+}
+
+function obsidianVaultStatus(marker, overrides = {}) {
+  return {
+    enabled: true,
+    vault_configured: true,
+    vault_exists: true,
+    vault_path: `D:/vault-${marker}`,
+    auto_git_enabled: false,
+    web_research_enabled: false,
+    web_research_allowlist: [],
+    ...overrides
+  }
+}
+
+function obsidianExportResult(tradeDate) {
+  return {
+    trade_date: tradeDate,
+    phase: 'reconcile',
+    written_files: [`30_TradingPlaybook/Daily/Auto/${tradeDate}.md`],
+    skipped_files: [],
+    pending_files: [],
+    failed_files: [],
+    git_status: { state: 'git_complete', committed: true },
+    error_summary: null
+  }
+}
+
 async function withFrontendModules(run) {
   const server = await createServer({
     configFile: false,
@@ -34,6 +81,27 @@ async function withFrontendModules(run) {
   } finally {
     await server.close()
   }
+}
+
+async function withObsidianStore(run) {
+  await withFrontendModules(async server => {
+    const originalAdapter = axios.defaults.adapter
+    const requests = []
+    axios.defaults.adapter = config => {
+      const request = deferred()
+      requests.push({ config, request })
+      return request.promise
+    }
+    try {
+      const { useTradingPlaybookStore } = await server.ssrLoadModule(
+        '/src/stores/trading-playbook.ts'
+      )
+      const store = useTradingPlaybookStore(createPinia())
+      await run({ requests, store })
+    } finally {
+      axios.defaults.adapter = originalAdapter
+    }
+  })
 }
 
 function alert(id, dedupKey, acknowledgedAt = null) {
@@ -403,6 +471,233 @@ test('settings loader exposes standalone reminder settings', async () => {
 
     assert.equal(store.settings?.in_app_enabled, true)
     assert.equal(store.settings?.wechat_enabled, false)
+  })
+})
+
+test('Obsidian status loads both APIs in parallel and supports unconfigured vaults', async () => {
+  await withObsidianStore(async ({ requests, store }) => {
+    const load = store.loadObsidianStatus()
+
+    assert.equal(store.obsidianStatusLoading, true)
+    assert.equal(store.obsidianError, null)
+    assert.equal(store.obsidianStatus, null)
+    assert.equal(store.obsidianVaultStatus, null)
+    assert.equal(store.obsidianStatusRequestId, 1)
+    assert.deepEqual(requests.map(item => [item.config.method, item.config.url]), [
+      ['get', '/trading-playbook/obsidian/status'],
+      ['get', '/intelligence/obsidian/status']
+    ])
+
+    requests[0].request.resolve(
+      axiosResponse(requests[0].config, obsidianSyncStatus('ready'))
+    )
+    await Promise.resolve()
+    assert.equal(store.obsidianStatus, null)
+    assert.equal(store.obsidianVaultStatus, null)
+    assert.equal(store.obsidianStatusLoading, true)
+
+    requests[1].request.resolve(
+      axiosResponse(requests[1].config, obsidianVaultStatus('ready'))
+    )
+    await load
+    assert.equal(store.obsidianStatus.recent_files[0], '30_TradingPlaybook/Daily/Auto/ready.md')
+    assert.equal(store.obsidianVaultStatus.vault_path, 'D:/vault-ready')
+    assert.equal(store.obsidianStatusLoading, false)
+    assert.equal(store.obsidianError, null)
+
+    const unconfiguredLoad = store.loadObsidianStatus()
+    requests[2].request.resolve(axiosResponse(requests[2].config, obsidianSyncStatus(
+      'unconfigured',
+      { enabled: false, configured: false, vault_exists: false, dashboard_openable: false }
+    )))
+    requests[3].request.resolve(axiosResponse(requests[3].config, obsidianVaultStatus(
+      'unconfigured',
+      { enabled: false, vault_configured: false, vault_exists: false, vault_path: '' }
+    )))
+    await unconfiguredLoad
+
+    assert.equal(store.obsidianStatus.enabled, false)
+    assert.equal(store.obsidianStatus.configured, false)
+    assert.equal(store.obsidianVaultStatus.vault_configured, false)
+    assert.equal(store.obsidianVaultStatus.vault_path, '')
+    assert.equal(store.obsidianStatusRequestId, 2)
+    assert.equal(store.obsidianStatusLoading, false)
+    assert.equal(store.obsidianError, null)
+  })
+})
+
+test('Obsidian status partial failure preserves the last complete pair', async () => {
+  await withObsidianStore(async ({ requests, store }) => {
+    const initialLoad = store.loadObsidianStatus()
+    requests[0].request.resolve(
+      axiosResponse(requests[0].config, obsidianSyncStatus('previous'))
+    )
+    requests[1].request.resolve(
+      axiosResponse(requests[1].config, obsidianVaultStatus('previous'))
+    )
+    await initialLoad
+
+    const failedLoad = store.loadObsidianStatus()
+    requests[2].request.resolve(
+      axiosResponse(requests[2].config, obsidianSyncStatus('partial-new'))
+    )
+    requests[3].request.reject(new Error('vault network unavailable'))
+    await assert.rejects(failedLoad, /vault network unavailable/)
+
+    assert.equal(store.obsidianStatus.recent_files[0], '30_TradingPlaybook/Daily/Auto/previous.md')
+    assert.equal(store.obsidianVaultStatus.vault_path, 'D:/vault-previous')
+    assert.equal(store.obsidianStatusLoading, false)
+    assert.equal(store.obsidianError, 'vault network unavailable')
+  })
+})
+
+test('latest Obsidian status pair wins over stale success and stale failure', async () => {
+  await withObsidianStore(async ({ requests, store }) => {
+    const staleSuccess = store.loadObsidianStatus()
+    const latestSuccess = store.loadObsidianStatus()
+    requests[2].request.resolve(
+      axiosResponse(requests[2].config, obsidianSyncStatus('latest'))
+    )
+    requests[3].request.resolve(
+      axiosResponse(requests[3].config, obsidianVaultStatus('latest'))
+    )
+    await latestSuccess
+    requests[0].request.resolve(
+      axiosResponse(requests[0].config, obsidianSyncStatus('stale'))
+    )
+    requests[1].request.resolve(
+      axiosResponse(requests[1].config, obsidianVaultStatus('stale'))
+    )
+    await staleSuccess
+
+    assert.equal(store.obsidianStatus.recent_files[0], '30_TradingPlaybook/Daily/Auto/latest.md')
+    assert.equal(store.obsidianVaultStatus.vault_path, 'D:/vault-latest')
+    assert.equal(store.obsidianStatusLoading, false)
+    assert.equal(store.obsidianError, null)
+
+    const staleFailure = store.loadObsidianStatus()
+    const newestSuccess = store.loadObsidianStatus()
+    requests[6].request.resolve(
+      axiosResponse(requests[6].config, obsidianSyncStatus('newest'))
+    )
+    requests[7].request.resolve(
+      axiosResponse(requests[7].config, obsidianVaultStatus('newest'))
+    )
+    await newestSuccess
+    requests[4].request.reject(new Error('stale status failed'))
+    requests[5].request.resolve(
+      axiosResponse(requests[5].config, obsidianVaultStatus('ignored'))
+    )
+    await assert.rejects(staleFailure, /stale status failed/)
+
+    assert.equal(store.obsidianStatus.recent_files[0], '30_TradingPlaybook/Daily/Auto/newest.md')
+    assert.equal(store.obsidianVaultStatus.vault_path, 'D:/vault-newest')
+    assert.equal(store.obsidianStatusRequestId, 4)
+    assert.equal(store.obsidianStatusLoading, false)
+    assert.equal(store.obsidianError, null)
+  })
+})
+
+test('manual Obsidian export posts strict payload, refreshes both statuses, and preserves them on failure', async () => {
+  await withObsidianStore(async ({ requests, store }) => {
+    const exported = store.exportToObsidian('2026-07-16', true, true)
+    assert.equal(store.obsidianExporting, true)
+    assert.equal(store.obsidianError, null)
+    assert.equal(requests.length, 1)
+    assert.equal(requests[0].config.method, 'post')
+    assert.equal(requests[0].config.url, '/trading-playbook/obsidian/export')
+    assert.deepEqual(JSON.parse(requests[0].config.data), {
+      trade_date: '2026-07-16',
+      include_rules: true,
+      force: true
+    })
+
+    const exportResponse = obsidianExportResult('2026-07-16')
+    requests[0].request.resolve(axiosResponse(requests[0].config, exportResponse))
+    await new Promise(resolvePromise => setImmediate(resolvePromise))
+    assert.equal(requests.length, 3)
+    assert.equal(store.obsidianExporting, true)
+    assert.equal(store.obsidianStatusLoading, true)
+    requests[1].request.resolve(
+      axiosResponse(requests[1].config, obsidianSyncStatus('after-export'))
+    )
+    requests[2].request.resolve(
+      axiosResponse(requests[2].config, obsidianVaultStatus('after-export'))
+    )
+
+    assert.deepEqual(await exported, exportResponse)
+    assert.equal(store.obsidianStatus.recent_files[0], '30_TradingPlaybook/Daily/Auto/after-export.md')
+    assert.equal(store.obsidianVaultStatus.vault_path, 'D:/vault-after-export')
+    assert.equal(store.obsidianStatusLoading, false)
+    assert.equal(store.obsidianExporting, false)
+    assert.equal(store.obsidianError, null)
+
+    const failedExport = store.exportToObsidian('2026-07-17')
+    assert.deepEqual(JSON.parse(requests[3].config.data), {
+      trade_date: '2026-07-17',
+      include_rules: false,
+      force: false
+    })
+    requests[3].request.reject(new Error('manual export unavailable'))
+    await assert.rejects(failedExport, /manual export unavailable/)
+
+    assert.equal(store.obsidianStatus.recent_files[0], '30_TradingPlaybook/Daily/Auto/after-export.md')
+    assert.equal(store.obsidianVaultStatus.vault_path, 'D:/vault-after-export')
+    assert.equal(store.obsidianExporting, false)
+    assert.equal(store.obsidianError, 'manual export unavailable')
+  })
+})
+
+test('concurrent Obsidian exports keep loading and errors owned by the newest request', async () => {
+  await withObsidianStore(async ({ requests, store }) => {
+    const staleFailure = store.exportToObsidian('2026-07-14')
+    const latestSuccess = store.exportToObsidian('2026-07-15')
+    requests[0].request.reject(new Error('stale export failed'))
+    await assert.rejects(staleFailure, /stale export failed/)
+    assert.equal(store.obsidianExporting, true)
+    assert.equal(store.obsidianError, null)
+
+    requests[1].request.resolve(
+      axiosResponse(requests[1].config, obsidianExportResult('2026-07-15'))
+    )
+    await new Promise(resolvePromise => setImmediate(resolvePromise))
+    requests[2].request.resolve(
+      axiosResponse(requests[2].config, obsidianSyncStatus('latest-export'))
+    )
+    requests[3].request.resolve(
+      axiosResponse(requests[3].config, obsidianVaultStatus('latest-export'))
+    )
+    await latestSuccess
+    assert.equal(store.obsidianExporting, false)
+    assert.equal(store.obsidianError, null)
+
+    const staleSuccess = store.exportToObsidian('2026-07-16')
+    const latestFailure = store.exportToObsidian('2026-07-17')
+    requests[5].request.reject(new Error('latest export failed'))
+    await assert.rejects(latestFailure, /latest export failed/)
+    assert.equal(store.obsidianExporting, true)
+    assert.equal(store.obsidianError, 'latest export failed')
+
+    requests[4].request.resolve(
+      axiosResponse(requests[4].config, obsidianExportResult('2026-07-16'))
+    )
+    await new Promise(resolvePromise => setImmediate(resolvePromise))
+    assert.equal(requests.length, 8)
+    assert.equal(store.obsidianExporting, true)
+    requests[6].request.resolve(
+      axiosResponse(requests[6].config, obsidianSyncStatus('stale-export-refresh'))
+    )
+    requests[7].request.resolve(
+      axiosResponse(requests[7].config, obsidianVaultStatus('stale-export-refresh'))
+    )
+    await staleSuccess
+    assert.equal(store.obsidianExporting, false)
+    assert.equal(store.obsidianError, 'latest export failed')
+    assert.equal(
+      store.obsidianStatus.recent_files[0],
+      '30_TradingPlaybook/Daily/Auto/stale-export-refresh.md'
+    )
+    assert.equal(store.obsidianVaultStatus.vault_path, 'D:/vault-stale-export-refresh')
   })
 })
 
