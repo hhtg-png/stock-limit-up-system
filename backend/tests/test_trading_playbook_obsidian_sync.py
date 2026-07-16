@@ -244,7 +244,10 @@ class TradingPlaybookObsidianSyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second.snapshot_version, 2)
         rows = await self._rows(first.snapshot_key)
         self.assertEqual([row.status for row in rows], ["superseded", "pending"])
-        self.assertIsNone(rows[0].next_attempt_at)
+        self.assertEqual(
+            rows[0].next_attempt_at,
+            datetime(2026, 7, 16, 14, 41),
+        )
         self.assertEqual(rows[0].last_error, "disk unavailable")
 
     async def test_mutable_new_hash_preserves_written_history(self):
@@ -321,23 +324,44 @@ class TradingPlaybookObsidianSyncTests(unittest.IsolatedAsyncioTestCase):
             ["superseded", "superseded", "pending"],
         )
 
-    async def test_integrity_error_rolls_back_and_rereads_the_winning_row(self):
-        class CommitThenSignalIntegritySession(AsyncSession):
+    async def test_integrity_error_before_commit_rolls_back_and_rereads_winner(self):
+        base_factory = self.session_factory
+
+        class UniqueFailureBeforeCommitSession(AsyncSession):
             should_signal = True
+            rollback_calls = 0
 
             async def commit(inner_self) -> None:
-                await super(CommitThenSignalIntegritySession, inner_self).commit()
-                if CommitThenSignalIntegritySession.should_signal:
-                    CommitThenSignalIntegritySession.should_signal = False
+                if UniqueFailureBeforeCommitSession.should_signal:
+                    pending = next(
+                        row
+                        for row in inner_self.new
+                        if isinstance(row, TradingPlaybookObsidianExport)
+                    )
+                    values = {
+                        column.name: getattr(pending, column.name)
+                        for column in TradingPlaybookObsidianExport.__table__.columns
+                        if column.name != "id"
+                    }
+                    UniqueFailureBeforeCommitSession.should_signal = False
+                    await inner_self.rollback()
+                    async with base_factory() as winning_session:
+                        winning_session.add(TradingPlaybookObsidianExport(**values))
+                        await winning_session.commit()
                     raise IntegrityError(
                         "simulated concurrent unique winner",
                         {},
                         RuntimeError("unique constraint"),
                     )
+                await super(UniqueFailureBeforeCommitSession, inner_self).commit()
+
+            async def rollback(inner_self) -> None:
+                UniqueFailureBeforeCommitSession.rollback_calls += 1
+                await super(UniqueFailureBeforeCommitSession, inner_self).rollback()
 
         signaling_factory = async_sessionmaker(
             self.engine,
-            class_=CommitThenSignalIntegritySession,
+            class_=UniqueFailureBeforeCommitSession,
             expire_on_commit=False,
         )
         coordinator = self._coordinator(signaling_factory)
@@ -345,11 +369,114 @@ class TradingPlaybookObsidianSyncTests(unittest.IsolatedAsyncioTestCase):
 
         row = (await coordinator.enqueue_artifacts([item]))[0]
 
-        self.assertFalse(CommitThenSignalIntegritySession.should_signal)
+        self.assertFalse(UniqueFailureBeforeCommitSession.should_signal)
+        self.assertGreaterEqual(UniqueFailureBeforeCommitSession.rollback_calls, 2)
         self.assertEqual(row.snapshot_version, 1)
         rows = await self._rows(item.snapshot_key)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0].id, row.id)
+
+    async def test_new_mutable_claim_waits_for_superseded_live_lease(self):
+        old_lease_acquired = asyncio.Event()
+        release_old_worker = asyncio.Event()
+
+        async def old_worker():
+            claimed = await self.coordinator._claim_due(limit=1)
+            old_lease_acquired.set()
+            await release_old_worker.wait()
+            return claimed
+
+        async def superseding_worker():
+            await asyncio.wait_for(old_lease_acquired.wait(), timeout=5)
+            try:
+                new_row = (
+                    await self.coordinator.enqueue_artifacts([artifact("new")])
+                )[0]
+                blocked = await self.coordinator._claim_due(limit=1)
+                return new_row, blocked
+            finally:
+                release_old_worker.set()
+
+        old_row = (await self.coordinator.enqueue_artifacts([artifact("old")]))[0]
+        old_claim, (new_row, blocked_claim) = await asyncio.gather(
+            old_worker(),
+            superseding_worker(),
+        )
+
+        self.assertEqual([row.id for row in old_claim], [old_row.id])
+        self.assertEqual(blocked_claim, ())
+        rows = await self._rows(old_row.snapshot_key)
+        self.assertEqual(rows[0].status, "superseded")
+        self.assertEqual(rows[0].next_attempt_at, datetime(2026, 7, 16, 14, 41))
+        self.assertEqual(rows[1].id, new_row.id)
+        self.assertEqual(rows[1].status, "pending")
+
+        self.clock.value += timedelta(seconds=61)
+        after_expiry = await self.coordinator._claim_due(limit=2)
+        self.assertEqual([row.id for row in after_expiry], [new_row.id])
+
+    async def test_claim_reload_drops_row_superseded_after_claim_commit(self):
+        claim_committed = asyncio.Event()
+        release_reload = asyncio.Event()
+
+        class CommitBarrierSession(AsyncSession):
+            async def commit(inner_self) -> None:
+                await super(CommitBarrierSession, inner_self).commit()
+                claim_committed.set()
+                await release_reload.wait()
+
+        claim_factory = async_sessionmaker(
+            self.engine,
+            class_=CommitBarrierSession,
+            expire_on_commit=False,
+        )
+        claim_coordinator = self._coordinator(claim_factory)
+        old_row = (await self.coordinator.enqueue_artifacts([artifact("old")]))[0]
+
+        claim_task = asyncio.create_task(claim_coordinator._claim_due(limit=1))
+        await asyncio.wait_for(claim_committed.wait(), timeout=5)
+        new_row = (
+            await self.coordinator.enqueue_artifacts([artifact("new")])
+        )[0]
+        release_reload.set()
+        claimed = await claim_task
+
+        self.assertEqual(claimed, ())
+        rows = await self._rows(old_row.snapshot_key)
+        self.assertEqual(rows[0].status, "superseded")
+        self.assertEqual(rows[0].next_attempt_at, datetime(2026, 7, 16, 14, 41))
+        self.assertEqual(rows[1].id, new_row.id)
+
+    async def test_claim_reload_requires_the_exact_lease_token(self):
+        claim_committed = asyncio.Event()
+        release_reload = asyncio.Event()
+
+        class CommitBarrierSession(AsyncSession):
+            async def commit(inner_self) -> None:
+                await super(CommitBarrierSession, inner_self).commit()
+                claim_committed.set()
+                await release_reload.wait()
+
+        claim_factory = async_sessionmaker(
+            self.engine,
+            class_=CommitBarrierSession,
+            expire_on_commit=False,
+        )
+        claim_coordinator = self._coordinator(claim_factory)
+        row = (await self.coordinator.enqueue_artifacts([artifact("lease")]))[0]
+
+        claim_task = asyncio.create_task(claim_coordinator._claim_due(limit=1))
+        await asyncio.wait_for(claim_committed.wait(), timeout=5)
+        async with self.session_factory() as session:
+            await session.execute(
+                update(TradingPlaybookObsidianExport)
+                .where(TradingPlaybookObsidianExport.id == row.id)
+                .values(next_attempt_at=datetime(2026, 7, 16, 14, 42))
+            )
+            await session.commit()
+        release_reload.set()
+
+        self.assertEqual(await claim_task, ())
 
     async def test_claim_is_atomic_without_adding_a_persistent_status(self):
         row = (await self.coordinator.enqueue_artifacts([artifact("claim")]))[0]

@@ -7,7 +7,7 @@ from collections.abc import Callable, Sequence
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import desc, exists, or_, select, text, update
+from sqlalchemy import case, desc, exists, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import aliased
@@ -125,6 +125,7 @@ class TradingPlaybookObsidianSyncCoordinator:
                 )
                 is_conflict = artifact.immutable and bool(existing)
                 if existing and not artifact.immutable:
+                    lease_cap = database_now + self.CLAIM_LEASE
                     await session.execute(
                         update(TradingPlaybookObsidianExport)
                         .where(
@@ -136,7 +137,19 @@ class TradingPlaybookObsidianSyncCoordinator:
                         )
                         .values(
                             status="superseded",
-                            next_attempt_at=None,
+                            next_attempt_at=case(
+                                (
+                                    TradingPlaybookObsidianExport.next_attempt_at
+                                    <= database_now,
+                                    None,
+                                ),
+                                (
+                                    TradingPlaybookObsidianExport.next_attempt_at
+                                    > lease_cap,
+                                    lease_cap,
+                                ),
+                                else_=TradingPlaybookObsidianExport.next_attempt_at,
+                            ),
                             updated_at=database_now,
                         )
                     )
@@ -232,13 +245,19 @@ class TradingPlaybookObsidianSyncCoordinator:
                 (
                     await session.execute(
                         select(TradingPlaybookObsidianExport).where(
-                            TradingPlaybookObsidianExport.id.in_(claimed_ids)
+                            TradingPlaybookObsidianExport.id.in_(claimed_ids),
+                            *self._active_lease_predicates(
+                                now=now,
+                                lease_until=lease_until,
+                            ),
                         )
                     )
                 ).scalars()
             )
             by_id = {int(row.id): row for row in rows}
-            return tuple(by_id[row_id] for row_id in claimed_ids)
+            return tuple(
+                by_id[row_id] for row_id in claimed_ids if row_id in by_id
+            )
 
     @classmethod
     def _due_select_statement(cls, *, now: datetime, limit: int):
@@ -270,9 +289,39 @@ class TradingPlaybookObsidianSyncCoordinator:
             .values(next_attempt_at=lease_until, updated_at=now)
         )
 
-    @staticmethod
-    def _claim_predicates(*, now: datetime) -> tuple[Any, ...]:
+    @classmethod
+    def _claim_predicates(cls, *, now: datetime) -> tuple[Any, ...]:
+        return (
+            *cls._current_writer_predicates(now=now),
+            or_(
+                TradingPlaybookObsidianExport.next_attempt_at.is_(None),
+                TradingPlaybookObsidianExport.next_attempt_at <= now,
+            ),
+        )
+
+    @classmethod
+    def _active_lease_predicates(
+        cls,
+        *,
+        now: datetime,
+        lease_until: datetime,
+    ) -> tuple[Any, ...]:
+        """Conditions Task 8 must keep on any lease-completion update."""
+
+        return (
+            *cls._current_writer_predicates(now=now),
+            TradingPlaybookObsidianExport.next_attempt_at == lease_until,
+            TradingPlaybookObsidianExport.next_attempt_at > now,
+        )
+
+    @classmethod
+    def _current_writer_predicates(
+        cls,
+        *,
+        now: datetime,
+    ) -> tuple[Any, ...]:
         newer = aliased(TradingPlaybookObsidianExport)
+        older = aliased(TradingPlaybookObsidianExport)
         has_newer_version = exists(
             select(1).where(
                 newer.snapshot_key
@@ -281,12 +330,19 @@ class TradingPlaybookObsidianSyncCoordinator:
                 > TradingPlaybookObsidianExport.snapshot_version,
             )
         )
+        has_older_live_lease = exists(
+            select(1).where(
+                older.snapshot_key
+                == TradingPlaybookObsidianExport.snapshot_key,
+                older.snapshot_version
+                < TradingPlaybookObsidianExport.snapshot_version,
+                older.status == "superseded",
+                older.next_attempt_at.is_not(None),
+                older.next_attempt_at > now,
+            )
+        )
         return (
             TradingPlaybookObsidianExport.status.in_(("pending", "failed")),
-            or_(
-                TradingPlaybookObsidianExport.next_attempt_at.is_(None),
-                TradingPlaybookObsidianExport.next_attempt_at <= now,
-            ),
             or_(
                 TradingPlaybookObsidianExport.last_error.is_(None),
                 TradingPlaybookObsidianExport.last_error != _IMMUTABLE_CONFLICT,
@@ -298,6 +354,10 @@ class TradingPlaybookObsidianSyncCoordinator:
             or_(
                 TradingPlaybookObsidianExport.immutable.is_(True),
                 ~has_newer_version,
+            ),
+            or_(
+                TradingPlaybookObsidianExport.immutable.is_(True),
+                ~has_older_live_lease,
             ),
         )
 
