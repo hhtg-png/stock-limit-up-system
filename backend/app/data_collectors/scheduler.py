@@ -567,6 +567,55 @@ class DataScheduler:
                 entity_ids.append(raw_id)
         return tuple(entity_ids)
 
+    @staticmethod
+    def _strict_completion_entity_ids(
+        result: Any,
+        *,
+        entity_type: str,
+    ) -> tuple[int, ...]:
+        """Validate every entity returned before recording job completion."""
+
+        if entity_type not in {"plan", "review"}:
+            raise ValueError(
+                f"unsupported completion entity type: {entity_type}"
+            )
+        is_sequence = isinstance(result, Sequence) and not isinstance(
+            result,
+            (str, bytes, bytearray),
+        )
+        if is_sequence:
+            values = tuple(result)
+            if not values:
+                if entity_type == "review":
+                    return ()
+                raise ValueError("plan build must return exactly one entity")
+        else:
+            if result is None:
+                raise ValueError(
+                    f"{entity_type} build result must not be None"
+                )
+            values = (result,)
+        if entity_type == "plan" and len(values) != 1:
+            raise ValueError("plan build must return exactly one entity")
+
+        entity_ids: list[int] = []
+        for value in values:
+            if isinstance(value, Mapping):
+                raw_id = value.get("id")
+            else:
+                raw_id = getattr(value, "id", None)
+            if type(raw_id) is not int or raw_id <= 0:
+                raise ValueError(
+                    f"{entity_type} build returned an entity without a "
+                    "positive persisted integer id"
+                )
+            if raw_id in entity_ids:
+                raise ValueError(
+                    f"{entity_type} build returned duplicate entity id {raw_id}"
+                )
+            entity_ids.append(raw_id)
+        return tuple(entity_ids)
+
     async def _sync_trading_playbook_obsidian_after_commit(
         self,
         trade_date: date,
@@ -732,7 +781,10 @@ class DataScheduler:
                         return None
                     raise
                 try:
-                    plan_ids = self._persisted_entity_ids(plan)
+                    plan_ids = self._strict_completion_entity_ids(
+                        plan,
+                        entity_type="plan",
+                    )
                     persisted_plan = await self._validated_plan_result_in_session(
                         db,
                         plan_ids,
@@ -1222,7 +1274,10 @@ class DataScheduler:
                     logger.error("Trading playbook {} failed: {}", phase, exc)
                     return None
                 try:
-                    built_review_ids = self._persisted_entity_ids(result)
+                    built_review_ids = self._strict_completion_entity_ids(
+                        result,
+                        entity_type="review",
+                    )
                     if built_review_ids:
                         review_ids = (
                             await self._validated_review_result_ids_in_session(

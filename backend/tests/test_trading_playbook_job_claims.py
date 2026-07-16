@@ -821,7 +821,13 @@ class TradingPlaybookSchedulerClaimTests(unittest.IsolatedAsyncioTestCase):
         )
         from app.utils.time_utils import CN_TZ
 
-        for invalid_kind in ("missing", "multiple", "mismatch"):
+        for invalid_kind in (
+            "missing",
+            "multiple",
+            "mismatch",
+            "valid-plus-bad",
+            "duplicate",
+        ):
             with self.subTest(invalid_kind=invalid_kind):
                 engine = create_async_engine("sqlite+aiosqlite:///:memory:")
                 maker = async_sessionmaker(engine, expire_on_commit=False)
@@ -840,14 +846,17 @@ class TradingPlaybookSchedulerClaimTests(unittest.IsolatedAsyncioTestCase):
                     ):
                         if invalid_kind == "missing":
                             return SimpleNamespace(id=999)
-                        targets = (
-                            (source_trade_date, source_trade_date)
-                            if invalid_kind == "multiple"
-                            else (
+                        if invalid_kind in {
+                            "multiple",
+                            "valid-plus-bad",
+                            "duplicate",
+                        }:
+                            targets = (source_trade_date, source_trade_date)
+                        else:
+                            targets = (
                                 source_trade_date,
                                 source_trade_date + timedelta(days=1),
                             )
-                        )
                         rows = [
                             TradingPlanVersion(
                                 source_trade_date=targets[0],
@@ -866,6 +875,10 @@ class TradingPlaybookSchedulerClaimTests(unittest.IsolatedAsyncioTestCase):
                         ]
                         db.add_all(rows)
                         await db.commit()
+                        if invalid_kind == "valid-plus-bad":
+                            return [rows[0], {"id": "bad"}]
+                        if invalid_kind == "duplicate":
+                            return [rows[0], rows[0]]
                         return rows if len(rows) > 1 else rows[0]
 
                 alert = SimpleNamespace(
@@ -933,7 +946,15 @@ class TradingPlaybookSchedulerClaimTests(unittest.IsolatedAsyncioTestCase):
         )
         from app.utils.time_utils import CN_TZ
 
-        for invalid_kind in ("missing", "wrong-date"):
+        for invalid_kind in (
+            "missing",
+            "wrong-date",
+            "bad-string",
+            "mixed-valid-and-invalid",
+            "duplicate",
+            "none",
+            "empty-dict",
+        ):
             with self.subTest(invalid_kind=invalid_kind):
                 engine = create_async_engine("sqlite+aiosqlite:///:memory:")
                 maker = async_sessionmaker(engine, expire_on_commit=False)
@@ -948,6 +969,12 @@ class TradingPlaybookSchedulerClaimTests(unittest.IsolatedAsyncioTestCase):
                     async def build(self, db, trade_date, **_kwargs):
                         if invalid_kind == "missing":
                             return [SimpleNamespace(id=999)]
+                        if invalid_kind == "bad-string":
+                            return [{"id": "bad"}]
+                        if invalid_kind == "none":
+                            return None
+                        if invalid_kind == "empty-dict":
+                            return {}
                         plan = TradingPlanVersion(
                             source_trade_date=trade_date,
                             target_trade_date=trade_date,
@@ -960,12 +987,24 @@ class TradingPlaybookSchedulerClaimTests(unittest.IsolatedAsyncioTestCase):
                         db.add(plan)
                         await db.flush()
                         review = TradingExecutionReview(
-                            trade_date=trade_date + timedelta(days=1),
+                            trade_date=(
+                                trade_date + timedelta(days=1)
+                                if invalid_kind == "wrong-date"
+                                else trade_date
+                            ),
                             plan_version_id=plan.id,
                             generated_at=now.replace(tzinfo=None),
                         )
                         db.add(review)
                         await db.commit()
+                        if invalid_kind == "mixed-valid-and-invalid":
+                            return [
+                                review,
+                                {"id": "bad"},
+                                {"missing": 8},
+                            ]
+                        if invalid_kind == "duplicate":
+                            return [review, review]
                         return [review]
 
                 coordinator = SimpleNamespace(
@@ -1592,7 +1631,7 @@ class TradingPlaybookSchedulerClaimTests(unittest.IsolatedAsyncioTestCase):
 
             alert = SimpleNamespace(notify_plan_ready=AsyncMock())
             review = SimpleNamespace(
-                build=AsyncMock(),
+                build=AsyncMock(return_value=[]),
                 generation_key=AsyncMock(return_value="stable-plan-set"),
             )
             now = CN_TZ.localize(datetime(2026, 7, 13, 15, 30))
@@ -1824,7 +1863,7 @@ class TradingPlaybookSchedulerClaimTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_monitor_retries_failed_finalization_without_rebuild_or_renotify(self):
         scheduler, engine, orchestrator, alert, review = await self._scheduler_fixture(
-            review_side_effect=[RuntimeError("review offline"), None]
+            review_side_effect=[RuntimeError("review offline"), []]
         )
         try:
             await scheduler._build_trading_playbook_after_close()
@@ -2135,7 +2174,11 @@ class TradingPlaybookSchedulerClaimTests(unittest.IsolatedAsyncioTestCase):
             monitor=AsyncMock(),
         )
         review = SimpleNamespace(
-            build=AsyncMock(side_effect=review_side_effect),
+            build=(
+                AsyncMock(return_value=[])
+                if review_side_effect is None
+                else AsyncMock(side_effect=review_side_effect)
+            ),
             generation_key=AsyncMock(
                 side_effect=lambda _db, _trade_date, *, plan_version_id=None: (
                     f"fixture-plan-set:{plan_version_id or 'all'}"

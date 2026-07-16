@@ -358,6 +358,36 @@ class TradingPlaybookSchedulerStageTests(unittest.IsolatedAsyncioTestCase):
         )
         self.scheduler._playbook_review_exists = AsyncMock(return_value=False)
 
+    def test_completion_entity_id_extraction_is_strict(self):
+        extract = self.scheduler._strict_completion_entity_ids
+        self.assertEqual(
+            extract({"id": 7}, entity_type="plan"),
+            (7,),
+        )
+        self.assertEqual(
+            extract(
+                [{"id": 7}, SimpleNamespace(id=8)],
+                entity_type="review",
+            ),
+            (7, 8),
+        )
+        self.assertEqual(extract([], entity_type="review"), ())
+        invalid_cases = (
+            (None, "review"),
+            ({}, "review"),
+            ([{"id": "7"}], "review"),
+            ([{"id": True}], "review"),
+            ([{"id": 0}], "review"),
+            ([{"id": -1}], "review"),
+            ([{"id": 7}, {"id": 7}], "review"),
+            ([], "plan"),
+            ([{"id": 7}, {"id": 8}], "plan"),
+        )
+        for result, entity_type in invalid_cases:
+            with self.subTest(result=result, entity_type=entity_type):
+                with self.assertRaises(ValueError):
+                    extract(result, entity_type=entity_type)
+
     async def test_build_plan_uses_aware_china_now_same_session_and_notifies_when_installed(self):
         alert_service = SimpleNamespace(
             durable_delivery=True,
@@ -425,7 +455,7 @@ class TradingPlaybookSchedulerStageTests(unittest.IsolatedAsyncioTestCase):
             await self.scheduler._monitor_trading_playbook()
 
     async def test_configured_review_and_monitor_services_receive_same_db_and_now(self):
-        review = SimpleNamespace(build=AsyncMock())
+        review = SimpleNamespace(build=AsyncMock(return_value=[]))
         alert = SimpleNamespace(durable_delivery=True, monitor=AsyncMock())
         self.scheduler.install_trading_playbook_review_service(review)
         self.scheduler.install_trading_playbook_alert_service(alert)
@@ -448,7 +478,7 @@ class TradingPlaybookSchedulerStageTests(unittest.IsolatedAsyncioTestCase):
         alert.monitor.assert_awaited_once_with(self.db, self.now)
 
     async def test_existing_finalized_row_does_not_hide_incomplete_multi_plan_retry(self):
-        review = SimpleNamespace(build=AsyncMock())
+        review = SimpleNamespace(build=AsyncMock(return_value=[]))
         self.scheduler.install_trading_playbook_review_service(review)
         self.scheduler._playbook_review_exists.return_value = True
 
@@ -682,8 +712,6 @@ class TradingPlaybookObsidianStageHookTests(unittest.IsolatedAsyncioTestCase):
                                 return_value=[
                                     {"id": entity_id},
                                     SimpleNamespace(id=entity_id + 100),
-                                    {"id": True},
-                                    {"id": 0},
                                 ]
                             )
                         )
@@ -1531,7 +1559,7 @@ class TradingPlaybookForcedUpgradeTests(unittest.IsolatedAsyncioTestCase):
                 notify_plan_ready=AsyncMock(),
                 monitor=AsyncMock(),
             )
-            review_service = SimpleNamespace(build=AsyncMock())
+            review_service = SimpleNamespace(build=AsyncMock(return_value=[]))
             barrier_elapsed = [0.0]
 
             async def advance_barrier(seconds):
@@ -1641,7 +1669,7 @@ class TradingPlaybookForcedUpgradeTests(unittest.IsolatedAsyncioTestCase):
         plan = SimpleNamespace(id=2)
         orchestrator = SimpleNamespace(build_stage=AsyncMock(return_value=plan))
         alert_service = SimpleNamespace(notify_plan_ready=AsyncMock())
-        review_service = SimpleNamespace(build=AsyncMock())
+        review_service = SimpleNamespace(build=AsyncMock(return_value=[]))
         scheduler = DataScheduler(
             trading_playbook_orchestrator=orchestrator,
             trading_playbook_alert_service=alert_service,
