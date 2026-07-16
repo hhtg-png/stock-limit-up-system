@@ -478,6 +478,40 @@ class TradingPlaybookObsidianSyncTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(await claim_task, ())
 
+    async def test_claim_reload_rejects_a_token_that_expired_after_commit(self):
+        claim_committed = asyncio.Event()
+        release_reload = asyncio.Event()
+
+        class CommitBarrierSession(AsyncSession):
+            async def commit(inner_self) -> None:
+                await super(CommitBarrierSession, inner_self).commit()
+                claim_committed.set()
+                await release_reload.wait()
+
+        claim_factory = async_sessionmaker(
+            self.engine,
+            class_=CommitBarrierSession,
+            expire_on_commit=False,
+        )
+        first_worker = self._coordinator(claim_factory)
+        second_worker = self._coordinator(self.session_factory)
+        row = (await self.coordinator.enqueue_artifacts([artifact("expiry")]))[0]
+
+        first_task = asyncio.create_task(first_worker._claim_due(limit=1))
+        await asyncio.wait_for(claim_committed.wait(), timeout=5)
+        self.clock.value = datetime(2026, 7, 16, 6, 41, 1, tzinfo=timezone.utc)
+        release_reload.set()
+        first_claim = await first_task
+
+        second_claim = await second_worker._claim_due(limit=1)
+
+        self.assertEqual(first_claim, ())
+        self.assertEqual([claimed.id for claimed in second_claim], [row.id])
+        self.assertEqual(
+            second_claim[0].next_attempt_at,
+            datetime(2026, 7, 16, 14, 42, 1),
+        )
+
     async def test_claim_is_atomic_without_adding_a_persistent_status(self):
         row = (await self.coordinator.enqueue_artifacts([artifact("claim")]))[0]
         second = self._coordinator(self.session_factory)

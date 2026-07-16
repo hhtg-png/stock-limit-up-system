@@ -240,6 +240,7 @@ class TradingPlaybookObsidianSyncCoordinator:
 
         if not claimed_ids:
             return ()
+        reload_now = self._database_datetime(self._aware_now())
         async with self.session_factory() as session:
             rows = list(
                 (
@@ -247,7 +248,7 @@ class TradingPlaybookObsidianSyncCoordinator:
                         select(TradingPlaybookObsidianExport).where(
                             TradingPlaybookObsidianExport.id.in_(claimed_ids),
                             *self._active_lease_predicates(
-                                now=now,
+                                now=reload_now,
                                 lease_until=lease_until,
                             ),
                         )
@@ -306,7 +307,12 @@ class TradingPlaybookObsidianSyncCoordinator:
         now: datetime,
         lease_until: datetime,
     ) -> tuple[Any, ...]:
-        """Conditions Task 8 must keep on any lease-completion update."""
+        """Validate a token against a freshly read clock and current row.
+
+        Task 8 must reuse these predicates immediately before file I/O and
+        again for its conditional completion update, passing a newly sampled
+        database wall clock rather than the original claim time.
+        """
 
         return (
             *cls._current_writer_predicates(now=now),
