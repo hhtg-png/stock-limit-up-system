@@ -94,6 +94,150 @@ test('page exposes loading, error, and empty states and keeps WeChat unavailable
   assert.match(view, /disabled[\s\S]*微信|微信[\s\S]*disabled/, 'WeChat control should be disabled')
 })
 
+test('page exposes compact Obsidian sync controls without weakening manual boundaries', () => {
+  const view = read('src/views/TradingPlaybook.vue')
+
+  for (const text of [
+    'Obsidian 同步',
+    '导出到 Obsidian',
+    '打开交易预案 Dashboard',
+    '只导出、不会从 Obsidian 回写',
+    '需要人工确认',
+    '不会自动交易',
+    '待重试',
+    '已暂停',
+    '失败',
+    '最近导出文件'
+  ]) {
+    assert.match(view, new RegExp(text), `Obsidian card should expose ${text}`)
+  }
+  for (const binding of [
+    'store.obsidianStatusLoading',
+    'store.obsidianExporting',
+    'store.obsidianError',
+    'store.obsidianStatus.pending_count',
+    'store.obsidianStatus.paused_count',
+    'store.obsidianStatus.failed_count',
+    'store.obsidianStatus.last_trade_date',
+    'store.obsidianStatus.last_phase',
+    'store.obsidianStatus.last_success_at',
+    'store.obsidianStatus.recent_files',
+    'canExportObsidian',
+    'obsidianDashboardUri'
+  ]) {
+    assert.match(view, new RegExp(binding.replaceAll('.', '\\.')), `Obsidian card should bind ${binding}`)
+  }
+  for (const readiness of [
+    'store.obsidianVaultStatus.enabled',
+    'store.obsidianVaultStatus.vault_configured',
+    'store.obsidianVaultStatus.vault_exists'
+  ]) {
+    assert.match(view, new RegExp(readiness.replaceAll('.', '\\.')), `readiness should use intelligence ${readiness}`)
+  }
+  const readinessBlock = view.slice(
+    view.indexOf('const canExportObsidian'),
+    view.indexOf('const obsidianDashboardUri')
+  )
+  assert.doesNotMatch(
+    readinessBlock,
+    /store\.obsidianStatus\.(?:enabled|configured|vault_exists)/,
+    'export readiness must not use trading status configuration fields'
+  )
+  assert.match(view, /store\.exportToObsidian\(targetPlanDate\.value/, 'manual export should use the selected target date')
+  assert.match(view, /if \(!canExportObsidian\.value \|\| store\.obsidianExporting\) return/, 'manual export should reject disabled and duplicate submissions')
+  assert.match(view, /Promise\.allSettled\([\s\S]*store\.loadObsidianStatus\(\)/, 'initial and manual refresh should load both Obsidian statuses in parallel')
+})
+
+test('Obsidian dashboard helper permits only a safe relative trading dashboard path', async () => {
+  await withFrontendModules(async server => {
+    const view = await server.ssrLoadModule('/src/views/TradingPlaybook.vue')
+    const tradingStatus = {
+      dashboard_openable: true,
+      dashboard_path: '交易预案/Dashboard.md'
+    }
+    const vaultStatus = {
+      enabled: true,
+      vault_configured: true,
+      vault_exists: true,
+      vault_path: 'C:\\Users\\Administrator\\Documents\\交易 Vault'
+    }
+
+    assert.equal(
+      view.buildObsidianDashboardUri(tradingStatus, vaultStatus),
+      `obsidian://open?vault=${encodeURIComponent('交易 Vault')}&file=${encodeURIComponent('交易预案/Dashboard.md')}`
+    )
+    for (const path of [
+      '',
+      '/交易预案/Dashboard.md',
+      '\\交易预案\\Dashboard.md',
+      'C:/交易预案/Dashboard.md',
+      'C:\\交易预案\\Dashboard.md',
+      '.',
+      '..',
+      '交易预案/../Dashboard.md',
+      '交易预案/./Dashboard.md',
+      '交易预案//Dashboard.md',
+      '交易预案\\Dashboard.md',
+      '交易预案/\u0000Dashboard.md'
+    ]) {
+      assert.equal(
+        view.buildObsidianDashboardUri({ ...tradingStatus, dashboard_path: path }, vaultStatus),
+        null,
+        `unsafe dashboard path ${JSON.stringify(path)} must be rejected`
+      )
+    }
+    for (const patch of [
+      { dashboard_openable: false },
+      { vault: { enabled: false } },
+      { vault: { vault_configured: false } },
+      { vault: { vault_exists: false } },
+      { vault: { vault_path: 'C:\\' } },
+      { vault: { vault_path: 'C:\\Vault\\..' } },
+      { vault: { vault_path: 'C:\\Vault\\bad\u0001name' } }
+    ]) {
+      assert.equal(
+        view.buildObsidianDashboardUri(
+          { ...tradingStatus, ...(patch.dashboard_openable === undefined ? {} : { dashboard_openable: patch.dashboard_openable }) },
+          { ...vaultStatus, ...patch.vault }
+        ),
+        null
+      )
+    }
+    const uri = view.buildObsidianDashboardUri(tradingStatus, vaultStatus)
+    assert.doesNotMatch(uri, /Users|Administrator|Documents|C%3A/, 'absolute vault path must never enter the URI')
+  })
+})
+
+test('Obsidian export result helper reports every count and warns on partial results', async () => {
+  await withFrontendModules(async server => {
+    const view = await server.ssrLoadModule('/src/views/TradingPlaybook.vue')
+    const complete = view.describeObsidianExportResult({
+      written_files: ['a.md', 'b.md'],
+      skipped_files: ['same.md'],
+      pending_files: [],
+      failed_files: [],
+      error_summary: null
+    })
+    assert.equal(complete.level, 'success')
+    assert.match(complete.message, /写入 2/)
+    assert.match(complete.message, /跳过 1/)
+    assert.match(complete.message, /待重试 0/)
+    assert.match(complete.message, /失败 0/)
+
+    const partial = view.describeObsidianExportResult({
+      written_files: ['a.md'],
+      skipped_files: [],
+      pending_files: ['retry.md'],
+      failed_files: ['failed.md'],
+      error_summary: 'Dashboard 写入失败'
+    })
+    assert.equal(partial.level, 'warning')
+    assert.match(partial.message, /写入 1.*跳过 0.*待重试 1.*失败 1/)
+    assert.match(partial.message, /错误摘要：Dashboard 写入失败/)
+    assert.doesNotMatch(partial.message, /完整成功|全部成功/)
+  })
+})
+
 test('review and revision editors freeze every captured input while saving', () => {
   const view = read('src/views/TradingPlaybook.vue')
   const reviewSection = view.slice(view.indexOf('<section class="panel review-panel"'), view.indexOf('<section class="panel settings-panel"'))

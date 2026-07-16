@@ -438,6 +438,95 @@
       <el-empty v-else-if="!store.settingsLoading && !store.settingsError" description="暂无设置数据" />
     </section>
 
+    <section class="panel obsidian-panel" v-loading="store.obsidianStatusLoading">
+      <div class="section-header">
+        <div>
+          <h4>Obsidian 同步</h4>
+          <span>只导出、不会从 Obsidian 回写；交易预案仍需要人工确认，也不会自动交易。</span>
+        </div>
+        <div class="section-actions">
+          <el-button
+            type="primary"
+            plain
+            :loading="store.obsidianExporting"
+            :disabled="!canExportObsidian || store.obsidianExporting"
+            @click="exportObsidian"
+          >
+            导出到 Obsidian
+          </el-button>
+          <el-button
+            :disabled="!obsidianDashboardUri"
+            @click="openObsidianDashboard"
+          >
+            打开交易预案 Dashboard
+          </el-button>
+        </div>
+      </div>
+      <el-alert
+        v-if="store.obsidianError"
+        class="obsidian-alert"
+        type="error"
+        :title="`Obsidian 同步失败：${store.obsidianError}`"
+        :closable="false"
+        show-icon
+      />
+      <template v-if="store.obsidianStatus">
+        <div v-if="store.obsidianVaultStatus" class="obsidian-readiness">
+          <el-tag :type="store.obsidianVaultStatus.enabled ? 'success' : 'info'">
+            导出服务：{{ store.obsidianVaultStatus.enabled ? '已启用' : '未启用' }}
+          </el-tag>
+          <el-tag :type="store.obsidianVaultStatus.vault_configured ? 'success' : 'warning'">
+            导出配置：{{ store.obsidianVaultStatus.vault_configured ? '就绪' : '未配置' }}
+          </el-tag>
+          <el-tag :type="store.obsidianVaultStatus.vault_exists ? 'success' : 'warning'">
+            Vault：{{ store.obsidianVaultStatus.vault_exists ? '可用' : '不存在' }}
+          </el-tag>
+        </div>
+        <el-descriptions class="obsidian-history" :column="3" border>
+          <el-descriptions-item label="上次交易日">
+            {{ store.obsidianStatus.last_trade_date || '-' }}
+          </el-descriptions-item>
+          <el-descriptions-item label="上次阶段">
+            {{ store.obsidianStatus.last_phase || '-' }}
+          </el-descriptions-item>
+          <el-descriptions-item label="上次成功">
+            {{ formatChinaDateTime(store.obsidianStatus.last_success_at) }}
+          </el-descriptions-item>
+        </el-descriptions>
+        <div class="obsidian-queue-counts" aria-label="Obsidian 导出队列状态">
+          <div>
+            <strong>{{ store.obsidianStatus.pending_count }}</strong>
+            <span>待重试</span>
+          </div>
+          <div>
+            <strong>{{ store.obsidianStatus.paused_count }}</strong>
+            <span>已暂停</span>
+          </div>
+          <div>
+            <strong>{{ store.obsidianStatus.failed_count }}</strong>
+            <span>失败</span>
+          </div>
+        </div>
+        <div class="obsidian-files">
+          <strong>最近导出文件</strong>
+          <ul v-if="store.obsidianStatus.recent_files.length">
+            <li v-for="file in store.obsidianStatus.recent_files" :key="file">{{ file }}</li>
+          </ul>
+          <span v-else>暂无导出记录</span>
+        </div>
+        <p v-if="!canExportObsidian" class="obsidian-hint">
+          导出不可用：请先启用并配置 Obsidian，确认 Vault 已存在。
+        </p>
+        <p v-if="!obsidianDashboardUri" class="obsidian-hint">
+          Dashboard 打开不可用：请检查 Vault 状态与安全的相对 Dashboard 路径。
+        </p>
+      </template>
+      <el-empty
+        v-else-if="!store.obsidianStatusLoading && !store.obsidianError"
+        description="暂无 Obsidian 同步状态"
+      />
+    </section>
+
     <section class="panel rules-panel" v-loading="rulesLoading">
       <div class="section-header">
         <div>
@@ -569,6 +658,82 @@
     </el-dialog>
   </div>
 </template>
+
+<script lang="ts">
+interface TradingDashboardStatus {
+  dashboard_openable: boolean
+  dashboard_path: string
+}
+
+interface IntelligenceVaultStatus {
+  enabled: boolean
+  vault_configured: boolean
+  vault_exists: boolean
+  vault_path: string
+}
+
+interface ObsidianExportResultSummary {
+  written_files: string[]
+  skipped_files: string[]
+  pending_files: string[]
+  failed_files: string[]
+  error_summary: string | null
+}
+
+const OBSIDIAN_CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/
+
+function safeDashboardPath(path: string) {
+  if (
+    !path ||
+    OBSIDIAN_CONTROL_CHARACTERS.test(path) ||
+    path.startsWith('/') ||
+    path.startsWith('\\') ||
+    /^[a-zA-Z]:/.test(path) ||
+    path.includes('\\')
+  ) return null
+  const segments = path.split('/')
+  if (segments.some(segment => !segment || segment === '.' || segment === '..')) return null
+  return path
+}
+
+function vaultNameFromPath(path: string) {
+  if (!path || OBSIDIAN_CONTROL_CHARACTERS.test(path)) return null
+  const normalized = path.replace(/[\\/]+$/, '')
+  const name = normalized.split(/[\\/]/).at(-1) || ''
+  if (!name || name === '.' || name === '..' || /^[a-zA-Z]:$/.test(name)) return null
+  return name
+}
+
+export function buildObsidianDashboardUri(
+  status: TradingDashboardStatus | null | undefined,
+  vaultStatus: IntelligenceVaultStatus | null | undefined
+) {
+  if (
+    !status?.dashboard_openable ||
+    !vaultStatus?.enabled ||
+    !vaultStatus.vault_configured ||
+    !vaultStatus.vault_exists
+  ) return null
+  const vault = vaultNameFromPath(vaultStatus.vault_path)
+  const file = safeDashboardPath(status.dashboard_path)
+  if (!vault || !file) return null
+  return `obsidian://open?vault=${encodeURIComponent(vault)}&file=${encodeURIComponent(file)}`
+}
+
+export function describeObsidianExportResult(result: ObsidianExportResultSummary) {
+  const message = [
+    `写入 ${result.written_files.length}`,
+    `跳过 ${result.skipped_files.length}`,
+    `待重试 ${result.pending_files.length}`,
+    `失败 ${result.failed_files.length}`
+  ].join('，')
+  const partial = result.pending_files.length > 0 || result.failed_files.length > 0 || Boolean(result.error_summary)
+  return {
+    level: partial ? 'warning' as const : 'success' as const,
+    message: result.error_summary ? `${message}。错误摘要：${result.error_summary}` : message
+  }
+}
+</script>
 
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
@@ -715,6 +880,15 @@ const reviewEditorReady = computed(() => canEditReview(
 const planState = computed(() => collectionState(store.plansLoading, store.plansError, plans.value))
 const reviewState = computed(() => collectionState(store.reviewsLoading, store.reviewsError, reviewRows.value))
 const rulesState = computed(() => collectionState(rulesLoading.value, rulesError.value, rules.value))
+const canExportObsidian = computed(() => Boolean(
+  store.obsidianVaultStatus?.enabled &&
+  store.obsidianVaultStatus.vault_configured &&
+  store.obsidianVaultStatus.vault_exists
+))
+const obsidianDashboardUri = computed(() => buildObsidianDashboardUri(
+  store.obsidianStatus,
+  store.obsidianVaultStatus
+))
 
 const reviewController = createReviewDomainController<TradingExecutionReview, TradingPlanVersion>({
   async loadReviews(tradeDate) {
@@ -1099,6 +1273,30 @@ async function saveSettings() {
   }
 }
 
+async function exportObsidian() {
+  if (!canExportObsidian.value || store.obsidianExporting) return
+  try {
+    const result = await store.exportToObsidian(targetPlanDate.value)
+    const feedback = describeObsidianExportResult(result)
+    if (feedback.level === 'warning') {
+      ElMessage.warning(`Obsidian 导出部分完成：${feedback.message}`)
+    } else {
+      ElMessage.success(`Obsidian 导出完成：${feedback.message}`)
+    }
+  } catch (error) {
+    ElMessage.error(`导出到 Obsidian 失败：${store.obsidianError || errorMessage(error)}`)
+  }
+}
+
+function openObsidianDashboard() {
+  const uri = obsidianDashboardUri.value
+  if (!uri) {
+    ElMessage.warning('Dashboard 暂不可打开，请检查 Obsidian 与 Vault 配置。')
+    return
+  }
+  window.location.href = uri
+}
+
 async function loadAll() {
   refreshing.value = true
   await Promise.allSettled([
@@ -1106,7 +1304,8 @@ async function loadAll() {
     loadReviewDomain(),
     loadInbox(),
     loadSettings(),
-    loadRules()
+    loadRules(),
+    store.loadObsidianStatus()
   ])
   refreshing.value = false
 }
@@ -1362,6 +1561,73 @@ h5 {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 0 22px;
+}
+
+.obsidian-alert {
+  margin-bottom: 12px;
+}
+
+.obsidian-readiness {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+.obsidian-history {
+  margin-bottom: 12px;
+}
+
+.obsidian-queue-counts {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 12px;
+
+  div {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    padding: 10px 12px;
+    border-radius: 8px;
+    background: #f8fafc;
+  }
+
+  strong {
+    font-size: 20px;
+  }
+
+  span {
+    color: var(--muted);
+    font-size: 12px;
+  }
+}
+
+.obsidian-files {
+  display: grid;
+  gap: 6px;
+  color: #334155;
+  font-size: 12px;
+
+  ul {
+    display: grid;
+    gap: 4px;
+    margin: 0;
+    padding-left: 18px;
+  }
+
+  li,
+  span {
+    color: var(--muted);
+    overflow-wrap: anywhere;
+  }
+}
+
+.obsidian-hint {
+  margin-top: 9px;
+  color: #a16207;
+  font-size: 12px;
+  line-height: 1.5;
 }
 
 .wechat-setting {
