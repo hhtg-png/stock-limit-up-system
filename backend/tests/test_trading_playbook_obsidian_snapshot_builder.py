@@ -12,6 +12,8 @@ from sqlalchemy.pool import StaticPool
 
 from app.database import Base
 from app.models import (
+    TradingAlertEvent,
+    TradingExecutionReview,
     TradingModeRule,
     TradingPlanCandidate,
     TradingPlanVersion,
@@ -1055,6 +1057,468 @@ class TradingPlaybookObsidianSnapshotBuilderTests(
                 source = await session.get(TradingRuleSource, source_row.id)
                 source.status = "ready"
                 await session.commit()
+
+    @staticmethod
+    def _review_row(
+        review_id=501,
+        *,
+        plan_version_id=202,
+        finalized_at=None,
+    ):
+        return TradingExecutionReview(
+            id=review_id,
+            trade_date=date(2026, 7, 16),
+            plan_version_id=plan_version_id,
+            signal_review_json={
+                "candidates": {"600001": {"triggered": True}},
+                "alert_audit": {"delivered": 1, "acknowledged": 0},
+            },
+            manual_execution_json={
+                "600001": {"executed": True, "note": "initial"}
+            },
+            plan_compliance_json={"status": "disciplined"},
+            outcome_snapshot_json={"600001": {"close": 21.2}},
+            data_quality_json={"status": "ready", "warnings": []},
+            generated_at=datetime(2026, 7, 16, 15, 10, 1, 123456),
+            finalized_at=finalized_at,
+        )
+
+    async def test_review_builder_freezes_initial_and_final_same_row_independently(self):
+        async with self.session_factory() as session:
+            session.add(self._review_row())
+            await session.commit()
+
+        initial = await self.builder.build_review_artifact(
+            501,
+            phase="initial_review",
+        )
+        initial_payload = initial.payload_json()
+        initial_hash = initial.source_hash
+
+        async with self.session_factory() as session:
+            review = await session.get(TradingExecutionReview, 501)
+            review.signal_review_json = {
+                "candidates": {"600001": {"triggered": False}},
+                "alert_audit": {"delivered": 1, "acknowledged": 1},
+            }
+            review.manual_execution_json = {
+                "600001": {"executed": False, "note": "final correction"}
+            }
+            review.outcome_snapshot_json = {"600001": {"close": 19.8}}
+            review.finalized_at = datetime(2026, 7, 16, 15, 30, 2, 654321)
+            await session.commit()
+
+        final = await self.builder.build_review_artifact(
+            501,
+            phase="final_review",
+        )
+
+        self.assertEqual(initial.snapshot_key, "review:501:initial")
+        self.assertEqual(final.snapshot_key, "review:501:final")
+        self.assertEqual(
+            initial.target_path,
+            "30_TradingPlaybook/Reviews/Auto/2026/2026-07-16/initial-review-202.md",
+        )
+        self.assertEqual(
+            final.target_path,
+            "30_TradingPlaybook/Reviews/Auto/2026/2026-07-16/final-review-202.md",
+        )
+        self.assertTrue(initial.immutable)
+        self.assertTrue(final.immutable)
+        self.assertNotEqual(initial.source_hash, final.source_hash)
+        self.assertEqual(initial.source_hash, initial_hash)
+        self.assertEqual(initial.payload_json(), initial_payload)
+        self.assertEqual(
+            initial.payload_json()["manual_execution"]["600001"]["note"],
+            "initial",
+        )
+        self.assertEqual(
+            final.payload_json()["manual_execution"]["600001"]["note"],
+            "final correction",
+        )
+        self.assertIsNone(initial.payload_json()["finalized_at"])
+        self.assertEqual(
+            final.payload_json()["finalized_at"],
+            "2026-07-16T07:30:02.654321Z",
+        )
+        self.assertEqual(initial.entity_type, "review")
+        self.assertEqual(final.phase, "final_review")
+
+    async def test_review_builder_rejects_invalid_identity_phase_state_and_json(self):
+        with self.assertRaisesRegex(ValueError, "review_id"):
+            await self.builder.build_review_artifact(0, phase="initial_review")
+        with self.assertRaisesRegex(LookupError, "999999"):
+            await self.builder.build_review_artifact(
+                999999,
+                phase="initial_review",
+            )
+
+        async with self.session_factory() as session:
+            session.add(self._review_row())
+            await session.commit()
+        with self.assertRaisesRegex(ValueError, "phase"):
+            await self.builder.build_review_artifact(501, phase="after_close")
+        with self.assertRaisesRegex(ValueError, "finalized_at"):
+            await self.builder.build_review_artifact(501, phase="final_review")
+
+        async with self.session_factory() as session:
+            review = await session.get(TradingExecutionReview, 501)
+            review.signal_review_json = []
+            await session.commit()
+        with self.assertRaisesRegex(ValueError, "signal_review"):
+            await self.builder.build_review_artifact(
+                501,
+                phase="initial_review",
+            )
+
+    async def test_alerts_builder_exports_cn_timeline_states_and_excludes_wechat(self):
+        alert_specs = (
+            (
+                601,
+                "plan_ready",
+                "info",
+                datetime(2026, 7, 16, 9, 0),
+                None,
+                {"status": "delivered", "attempts": 1, "delivered_at": "2026-07-16T09:00:01+08:00", "receipt": {"output": "private"}},
+                None,
+            ),
+            (
+                602,
+                "confirmation_required",
+                "warning",
+                datetime(2026, 7, 16, 9, 1),
+                2021,
+                {"status": "pending", "attempts": 0},
+                None,
+            ),
+            (
+                603,
+                "confirmation_required",
+                "warning",
+                datetime(2026, 7, 16, 9, 2),
+                2022,
+                {"status": "delivered", "attempts": 1, "delivered_at": "2026-07-16T09:02:01+08:00"},
+                datetime(2026, 7, 16, 9, 3),
+            ),
+            (
+                604,
+                "invalidated",
+                "warning",
+                datetime(2026, 7, 16, 9, 4),
+                2021,
+                {"status": "failed", "attempts": 2, "error": "delivery failed", "failed_at": "2026-07-16T09:04:01+08:00"},
+                None,
+            ),
+        )
+        async with self.session_factory() as session:
+            for event_id, event_type, severity, triggered_at, candidate_id, in_app, acknowledged_at in alert_specs:
+                session.add(
+                    TradingAlertEvent(
+                        id=event_id,
+                        plan_version_id=202,
+                        candidate_id=candidate_id,
+                        event_type=event_type,
+                        severity=severity,
+                        dedup_key=f"event:{event_id}",
+                        triggered_at=triggered_at,
+                        market_snapshot_json={
+                            "trade_date": "2026-07-16",
+                            "last_price": 20 + event_id / 1000,
+                        },
+                        message=f"alert {event_id}",
+                        channel_status_json={
+                            "in_app": in_app,
+                            "wechat": {
+                                "status": "delivered",
+                                "secret": "must-not-export",
+                                "config": {"webhook": "private"},
+                                "output": "private response",
+                            },
+                        },
+                        acknowledged_at=acknowledged_at,
+                    )
+                )
+            # Same UTC-looking clock value on another CN date must not leak in.
+            session.add(
+                TradingAlertEvent(
+                    id=605,
+                    plan_version_id=202,
+                    event_type="plan_ready",
+                    severity="info",
+                    dedup_key="event:605",
+                    triggered_at=datetime(2026, 7, 15, 23, 59, 59),
+                    market_snapshot_json={},
+                    message="previous day",
+                    channel_status_json={"in_app": {"status": "delivered", "attempts": 1}},
+                )
+            )
+            await session.commit()
+
+        artifact = await self.builder.build_alerts_artifact(date(2026, 7, 16))
+        payload = artifact.payload_json()
+        self.assertEqual(artifact.snapshot_key, "alerts:2026-07-16")
+        self.assertEqual(
+            artifact.target_path,
+            "30_TradingPlaybook/Alerts/Auto/2026/2026-07-16.md",
+        )
+        self.assertFalse(artifact.immutable)
+        self.assertEqual([row["alert_id"] for row in payload["timeline"]], [601, 602, 603, 604])
+        self.assertEqual(
+            [row["in_app_status"]["status"] for row in payload["timeline"]],
+            ["delivered", "pending", "delivered", "failed"],
+        )
+        self.assertEqual(
+            [row["timeline_state"] for row in payload["timeline"]],
+            ["delivered", "pending_confirmation", "confirmed", "failed"],
+        )
+        self.assertEqual(
+            payload["timeline"][0]["triggered_at"],
+            "2026-07-16T01:00:00Z",
+        )
+        self.assertEqual(payload["timeline"][2]["candidate_id"], 2022)
+        self.assertEqual(
+            payload["timeline"][2]["acknowledged_at"],
+            "2026-07-16T01:03:00Z",
+        )
+        self.assertEqual(
+            payload["timeline"][0]["market_facts"]["trade_date"],
+            "2026-07-16",
+        )
+        encoded = canonical_json_bytes(payload).decode("utf-8")
+        for forbidden in ("wechat", "must-not-export", "webhook", "private response", "receipt", "private"):
+            self.assertNotIn(forbidden, encoded.lower())
+
+    async def test_alerts_builder_rejects_invalid_date_and_corrupt_roots_or_links(self):
+        with self.assertRaisesRegex(ValueError, "trade_date"):
+            await self.builder.build_alerts_artifact(
+                datetime(2026, 7, 16),  # type: ignore[arg-type]
+            )
+        async with self.session_factory() as session:
+            session.add(
+                TradingAlertEvent(
+                    id=610,
+                    plan_version_id=202,
+                    candidate_id=2021,
+                    event_type="plan_ready",
+                    severity="info",
+                    dedup_key="event:610",
+                    triggered_at=datetime(2026, 7, 16, 10),
+                    market_snapshot_json=[],
+                    message="corrupt",
+                    channel_status_json={"in_app": {"status": "delivered"}},
+                )
+            )
+            await session.commit()
+        with self.assertRaisesRegex(ValueError, "market_snapshot"):
+            await self.builder.build_alerts_artifact(date(2026, 7, 16))
+
+        corrupt_timestamp = TradingAlertEvent(
+            id=611,
+            plan_version_id=202,
+            event_type="plan_ready",
+            severity="info",
+            dedup_key="event:611",
+            triggered_at="not-a-datetime",
+            market_snapshot_json={},
+            message="corrupt timestamp",
+            channel_status_json={
+                "in_app": {"status": "delivered", "attempts": 1}
+            },
+        )
+        with self.assertRaisesRegex(ValueError, "triggered_at"):
+            self.builder._alert_payload(corrupt_timestamp)
+
+    async def test_daily_index_lists_all_versions_and_distinguishes_three_dates(self):
+        async with self.session_factory() as session:
+            active = await session.get(TradingPlanVersion, 204)
+            active.status = "active"
+            await session.commit()
+
+        artifact = await self.builder.build_daily_index_artifact(
+            date(2026, 7, 16)
+        )
+        payload = artifact.payload_json()
+        self.assertEqual(artifact.snapshot_key, "daily-index:2026-07-16")
+        self.assertEqual(
+            artifact.target_path,
+            "30_TradingPlaybook/Daily/Auto/2026/2026-07-16/index.md",
+        )
+        self.assertFalse(artifact.immutable)
+        self.assertEqual(
+            {row["plan_version_id"] for row in payload["plan_versions"]},
+            {201, 202, 203, 204},
+        )
+        self.assertEqual(payload["current_effective_plan_version_id"], 204)
+        effective = [row for row in payload["plan_versions"] if row["current_effective"]]
+        self.assertEqual([row["plan_version_id"] for row in effective], [204])
+        for row in payload["plan_versions"]:
+            self.assertEqual(row["source_trade_date"], "2026-07-14")
+            self.assertEqual(row["target_trade_date"], "2026-07-16")
+            self.assertEqual(
+                [item["action_trade_date"] for item in row["candidates"]],
+                ["2026-07-14", "2026-07-16"],
+            )
+            self.assertEqual(row["generated_at"], "2026-07-15T10:05:06.123456Z")
+        self.assertEqual(
+            [item["time_cn"] for item in payload["stage_schedule"]],
+            ["14:40", "15:10", "15:30", "08:50", "09:26"],
+        )
+        self.assertEqual(
+            payload["stage_schedule"][2]["phases"],
+            ["after_close", "final_review"],
+        )
+
+    async def test_daily_index_rejects_invalid_date_and_more_than_three_candidates(self):
+        with self.assertRaisesRegex(ValueError, "trade_date"):
+            await self.builder.build_daily_index_artifact(
+                datetime(2026, 7, 16),  # type: ignore[arg-type]
+            )
+        async with self.session_factory() as session:
+            for index in (3, 4):
+                session.add(
+                    TradingPlanCandidate(
+                        id=2010 + index,
+                        plan_version_id=201,
+                        stock_code=f"60000{index}",
+                        stock_name=f"overflow {index}",
+                        action_trade_date=date(2026, 7, 16),
+                        theme_name="overflow",
+                        primary_mode_key=f"overflow_mode_{index}",
+                        supporting_mode_keys_json=[],
+                        role="overflow",
+                        rank=index,
+                        recognition_json={},
+                        entry_trigger_json={},
+                        invalidation_json={},
+                        exit_trigger_json={},
+                        risk_level="high",
+                        position_reference=0,
+                        evidence_json=[],
+                        manual_overrides_json={},
+                        status="waiting",
+                    )
+                )
+            await session.commit()
+        with self.assertRaisesRegex(ValueError, "more than 3 candidates"):
+            await self.builder.build_daily_index_artifact(date(2026, 7, 16))
+
+    async def test_dashboard_has_only_auto_navigation_queries_and_notes_link(self):
+        artifact = await self.builder.build_dashboard_artifact(date(2026, 7, 16))
+        payload = artifact.payload_json()
+        self.assertEqual(artifact.snapshot_key, "dashboard:trading-playbook")
+        self.assertEqual(artifact.target_path, "Dashboards/交易预案.md")
+        self.assertEqual(artifact.entity_type, "dashboard")
+        self.assertFalse(artifact.immutable)
+        self.assertEqual(
+            payload["navigation"]["notes"],
+            "[[30_TradingPlaybook/Notes/2026/2026-07-16]]",
+        )
+        self.assertTrue(payload["dataview_queries"])
+        for query in payload["dataview_queries"]:
+            self.assertIn("Auto", query)
+            self.assertNotIn("Notes", query)
+        self.assertEqual(
+            set(payload),
+            {
+                "type",
+                "trade_date",
+                "navigation",
+                "dataview_queries",
+                "manual_required",
+                "auto_execute",
+            },
+        )
+
+        with self.assertRaisesRegex(ValueError, "trade_date"):
+            await self.builder.build_dashboard_artifact(
+                datetime(2026, 7, 16),  # type: ignore[arg-type]
+            )
+
+    async def test_stage_builder_sorts_deduplicates_and_sets_mutability(self):
+        async with self.session_factory() as session:
+            session.add_all(
+                [
+                    self._review_row(501, plan_version_id=201),
+                    self._review_row(502, plan_version_id=202),
+                ]
+            )
+            await session.commit()
+
+        artifacts = await self.builder.build_stage_artifacts(
+            trade_date=date(2026, 7, 16),
+            phase="initial_review",
+            plan_version_ids=[202, 201, 202],
+            review_ids=[502, 501, 502],
+        )
+        self.assertEqual(
+            [artifact.snapshot_key for artifact in artifacts],
+            [
+                "plan:201",
+                "plan:202",
+                "review:501:initial",
+                "review:502:initial",
+                "alerts:2026-07-16",
+                "daily-index:2026-07-16",
+                "dashboard:trading-playbook",
+            ],
+        )
+        self.assertEqual(
+            [artifact.immutable for artifact in artifacts],
+            [True, True, True, True, False, False, False],
+        )
+        self.assertFalse(any(artifact.entity_type == "notes" for artifact in artifacts))
+        self.assertFalse(any("/Notes/" in artifact.target_path for artifact in artifacts))
+
+        with self.assertRaisesRegex(ValueError, "phase"):
+            await self.builder.build_stage_artifacts(
+                trade_date=date(2026, 7, 16),
+                phase="invalid",
+            )
+        with self.assertRaisesRegex(ValueError, "plan_version_ids"):
+            await self.builder.build_stage_artifacts(
+                trade_date=date(2026, 7, 16),
+                phase="preclose",
+                plan_version_ids=[0],
+            )
+        with self.assertRaisesRegex(ValueError, "review_ids"):
+            await self.builder.build_stage_artifacts(
+                trade_date=date(2026, 7, 16),
+                phase="initial_review",
+                review_ids=[True],  # type: ignore[list-item]
+            )
+
+        with_rules = await self.builder.build_stage_artifacts(
+            trade_date=date(2026, 7, 16),
+            phase="preclose",
+            include_rules=True,
+        )
+        self.assertEqual(len(with_rules), 22)
+        self.assertTrue(
+            all(artifact.entity_type == "rule" for artifact in with_rules[:19])
+        )
+        self.assertEqual(
+            [artifact.entity_type for artifact in with_rules[-3:]],
+            ["alerts", "daily_index", "dashboard"],
+        )
+
+    async def test_review_and_index_reject_corrupt_database_timestamps(self):
+        corrupt_review = self._review_row()
+        corrupt_review.generated_at = "not-a-datetime"
+        with self.assertRaisesRegex(ValueError, "generated_at"):
+            self.builder._validate_review_data(
+                corrupt_review,
+                phase="initial_review",
+            )
+
+        corrupt_plan, _ = self._plan_row(701, "preclose", 1, False)
+        corrupt_plan.generated_at = "not-a-datetime"
+        candidates, _ = self._candidate_rows(701)
+        with self.assertRaisesRegex(ValueError, "generated_at"):
+            self.builder._daily_plan_payload(
+                corrupt_plan,
+                candidates,
+                current_effective_id=None,
+            )
 
 
 if __name__ == "__main__":

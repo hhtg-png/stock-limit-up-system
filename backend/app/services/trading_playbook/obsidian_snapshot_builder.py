@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import AbstractAsyncContextManager
-from datetime import date, datetime
+from datetime import date, datetime, time, timedelta
 
 from sqlalchemy import select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import (
+    TradingAlertEvent,
+    TradingExecutionReview,
     TradingModeRule,
     TradingPlanCandidate,
     TradingPlanVersion,
@@ -18,6 +20,7 @@ from app.models import (
 )
 from app.services.trading_playbook.errors import UnsafePlanDataError
 from app.services.trading_playbook.obsidian_types import (
+    OBSIDIAN_PHASES,
     ObsidianArtifact,
     database_datetime_to_cn,
 )
@@ -34,6 +37,65 @@ _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _STOCK_CODE = re.compile(r"[0-9]{6}\Z")
 _PLAN_STAGES = ("preclose", "after_close", "overnight", "auction")
 _CANDIDATE_STATUSES = {"waiting", "triggered", "invalidated", "exit"}
+_REVIEW_PHASES = {"initial_review", "final_review"}
+_IN_APP_CHANNEL_STATUSES = {
+    "pending",
+    "sending",
+    "delivered",
+    "skipped",
+    "uncertain",
+    "failed",
+}
+_ALERT_EVENT_SEVERITIES = {
+    "plan_ready": "info",
+    "confirmation_required": "warning",
+    "review_ready": "info",
+    "invalidated": "warning",
+    "exit_triggered": "warning",
+    "entry_triggered": "action",
+}
+_IN_APP_EXPORT_FIELDS = (
+    "status",
+    "attempts",
+    "reason",
+    "error",
+    "pre_send_error",
+    "accepted",
+    "skipped_at",
+    "sending_at",
+    "channel_started_at",
+    "recovered_at",
+    "delivered_at",
+    "uncertain_at",
+    "failed_at",
+)
+_STAGE_SCHEDULE = (
+    {
+        "phases": ("preclose",),
+        "time_cn": "14:40",
+        "label": "提前预案",
+    },
+    {
+        "phases": ("initial_review",),
+        "time_cn": "15:10",
+        "label": "初步复盘",
+    },
+    {
+        "phases": ("after_close", "final_review"),
+        "time_cn": "15:30",
+        "label": "正式预案与最终复盘",
+    },
+    {
+        "phases": ("overnight",),
+        "time_cn": "08:50",
+        "label": "隔夜刷新",
+    },
+    {
+        "phases": ("auction",),
+        "time_cn": "09:26",
+        "label": "竞价最终版本",
+    },
+)
 _MAX_DATABASE_INTEGER = (1 << 63) - 1
 
 
@@ -169,6 +231,620 @@ class TradingPlaybookObsidianSnapshotBuilder:
             self._validate_plan_data(plan, candidates)
             await self._validate_plan_rule_provenance(db, plan, candidates)
             return self._build_plan_artifact(plan, candidates)
+
+    async def build_review_artifact(
+        self,
+        review_id: int,
+        *,
+        phase: str,
+    ) -> ObsidianArtifact:
+        review_id = _positive_integer(review_id, "review_id")
+        if review_id > _MAX_DATABASE_INTEGER:
+            raise ValueError("review_id is outside the database integer range")
+        if phase not in _REVIEW_PHASES:
+            raise ValueError(
+                "review phase must be initial_review or final_review"
+            )
+
+        async with self._session_factory() as db:
+            review = await db.get(TradingExecutionReview, review_id)
+            if review is None:
+                raise LookupError(f"trading execution review {review_id} was not found")
+            plan_id = _positive_integer(
+                review.plan_version_id,
+                f"review {review_id} plan_version_id",
+            )
+            plan = await db.get(TradingPlanVersion, plan_id)
+            if plan is None:
+                raise ValueError(
+                    f"review {review_id} references missing plan {plan_id}"
+                )
+            candidates = list(
+                (
+                    await db.scalars(
+                        select(TradingPlanCandidate)
+                        .where(TradingPlanCandidate.plan_version_id == plan_id)
+                        .order_by(
+                            TradingPlanCandidate.rank,
+                            TradingPlanCandidate.id,
+                        )
+                    )
+                ).all()
+            )
+            if len(candidates) > 3:
+                raise ValueError(
+                    f"trading plan version {plan_id} has more than 3 candidates"
+                )
+            self._validate_plan_data(plan, candidates)
+            self._validate_review_data(review, phase=phase)
+            return self._build_review_artifact(review, plan, phase=phase)
+
+    async def build_alerts_artifact(
+        self,
+        trade_date: date,
+    ) -> ObsidianArtifact:
+        trade_date = _database_date(trade_date, "trade_date")
+        day_start = datetime.combine(trade_date, time.min)
+        day_end = day_start + timedelta(days=1)
+        async with self._session_factory() as db:
+            events = list(
+                (
+                    await db.scalars(
+                        select(TradingAlertEvent)
+                        .where(
+                            TradingAlertEvent.triggered_at >= day_start,
+                            TradingAlertEvent.triggered_at < day_end,
+                        )
+                        .order_by(
+                            TradingAlertEvent.triggered_at,
+                            TradingAlertEvent.id,
+                        )
+                    )
+                ).all()
+            )
+            plan_ids = {
+                _positive_integer(event.plan_version_id, "alert plan_version_id")
+                for event in events
+            }
+            candidate_ids = {
+                _positive_integer(event.candidate_id, "alert candidate_id")
+                for event in events
+                if event.candidate_id is not None
+            }
+            persisted_plan_ids: set[int] = set()
+            if plan_ids:
+                persisted_plan_ids = set(
+                    await db.scalars(
+                        select(TradingPlanVersion.id).where(
+                            TradingPlanVersion.id.in_(sorted(plan_ids))
+                        )
+                    )
+                )
+            if plan_ids - persisted_plan_ids:
+                missing = min(plan_ids - persisted_plan_ids)
+                raise ValueError(f"alert references missing plan {missing}")
+            candidate_owners: dict[int, int] = {}
+            if candidate_ids:
+                candidate_owners = dict(
+                    (
+                        await db.execute(
+                            select(
+                                TradingPlanCandidate.id,
+                                TradingPlanCandidate.plan_version_id,
+                            ).where(
+                                TradingPlanCandidate.id.in_(
+                                    sorted(candidate_ids)
+                                )
+                            )
+                        )
+                    ).all()
+                )
+            for event in events:
+                if event.candidate_id is None:
+                    continue
+                owner_id = candidate_owners.get(event.candidate_id)
+                if owner_id is None:
+                    raise ValueError(
+                        f"alert {event.id} references missing candidate {event.candidate_id}"
+                    )
+                if owner_id != event.plan_version_id:
+                    raise ValueError(
+                        f"alert {event.id} candidate does not belong to its plan"
+                    )
+            timeline = [self._alert_payload(event) for event in events]
+
+        return ObsidianArtifact(
+            snapshot_key=f"alerts:{trade_date.isoformat()}",
+            trade_date=trade_date,
+            entity_type="alerts",
+            entity_id=None,
+            phase="reconcile",
+            target_path=(
+                "30_TradingPlaybook/Alerts/Auto/"
+                f"{trade_date.year}/{trade_date.isoformat()}.md"
+            ),
+            immutable=False,
+            payload={
+                "type": "trading_alert_timeline",
+                "trade_date": trade_date,
+                "timeline": timeline,
+                "manual_required": True,
+                "auto_execute": False,
+            },
+        )
+
+    async def build_daily_index_artifact(
+        self,
+        trade_date: date,
+    ) -> ObsidianArtifact:
+        trade_date = _database_date(trade_date, "trade_date")
+        async with self._session_factory() as db:
+            plans = list(
+                (
+                    await db.scalars(
+                        select(TradingPlanVersion)
+                        .where(
+                            TradingPlanVersion.target_trade_date == trade_date
+                        )
+                        .order_by(
+                            TradingPlanVersion.generated_at,
+                            TradingPlanVersion.version_no,
+                            TradingPlanVersion.id,
+                        )
+                    )
+                ).all()
+            )
+            plan_ids = [
+                _positive_integer(plan.id, "plan id") for plan in plans
+            ]
+            candidates_by_plan: dict[int, list[TradingPlanCandidate]] = {
+                plan_id: [] for plan_id in plan_ids
+            }
+            if plan_ids:
+                candidates = list(
+                    (
+                        await db.scalars(
+                            select(TradingPlanCandidate)
+                            .where(
+                                TradingPlanCandidate.plan_version_id.in_(
+                                    plan_ids
+                                )
+                            )
+                            .order_by(
+                                TradingPlanCandidate.plan_version_id,
+                                TradingPlanCandidate.rank,
+                                TradingPlanCandidate.id,
+                            )
+                        )
+                    ).all()
+                )
+                for candidate in candidates:
+                    candidates_by_plan[candidate.plan_version_id].append(
+                        candidate
+                    )
+
+            active_ids = [plan.id for plan in plans if plan.status == "active"]
+            if len(active_ids) > 1:
+                raise ValueError(
+                    f"trade date {trade_date} has multiple active plan versions"
+                )
+            current_effective_id = active_ids[0] if active_ids else None
+            plan_payloads: list[dict[str, object]] = []
+            for plan in plans:
+                candidates = candidates_by_plan[plan.id]
+                if len(candidates) > 3:
+                    raise ValueError(
+                        f"trading plan version {plan.id} has more than 3 candidates"
+                    )
+                self._validate_plan_data(plan, candidates)
+                plan_payloads.append(
+                    self._daily_plan_payload(
+                        plan,
+                        candidates,
+                        current_effective_id=current_effective_id,
+                    )
+                )
+
+        return ObsidianArtifact(
+            snapshot_key=f"daily-index:{trade_date.isoformat()}",
+            trade_date=trade_date,
+            entity_type="daily_index",
+            entity_id=None,
+            phase="reconcile",
+            target_path=(
+                "30_TradingPlaybook/Daily/Auto/"
+                f"{trade_date.year}/{trade_date.isoformat()}/index.md"
+            ),
+            immutable=False,
+            payload={
+                "type": "trading_daily_index",
+                "trade_date": trade_date,
+                "current_effective_plan_version_id": current_effective_id,
+                "plan_versions": plan_payloads,
+                "stage_schedule": _STAGE_SCHEDULE,
+                "manual_required": True,
+                "auto_execute": False,
+            },
+        )
+
+    async def build_dashboard_artifact(
+        self,
+        trade_date: date,
+    ) -> ObsidianArtifact:
+        trade_date = _database_date(trade_date, "trade_date")
+        iso_date = trade_date.isoformat()
+        year = trade_date.year
+        return ObsidianArtifact(
+            snapshot_key="dashboard:trading-playbook",
+            trade_date=trade_date,
+            entity_type="dashboard",
+            entity_id=None,
+            phase="reconcile",
+            target_path="Dashboards/交易预案.md",
+            immutable=False,
+            payload={
+                "type": "trading_playbook_dashboard",
+                "trade_date": trade_date,
+                "navigation": {
+                    "daily_index": (
+                        "[[30_TradingPlaybook/Daily/Auto/"
+                        f"{year}/{iso_date}/index]]"
+                    ),
+                    "alerts": (
+                        "[[30_TradingPlaybook/Alerts/Auto/"
+                        f"{year}/{iso_date}]]"
+                    ),
+                    "notes": (
+                        "[[30_TradingPlaybook/Notes/"
+                        f"{year}/{iso_date}]]"
+                    ),
+                },
+                "dataview_queries": [
+                    'TABLE stage, status, source_trade_date, target_trade_date FROM "30_TradingPlaybook/Daily/Auto" SORT generated_at DESC',
+                    'TABLE event_type, severity, triggered_at FROM "30_TradingPlaybook/Alerts/Auto" SORT triggered_at DESC',
+                    'TABLE phase, plan_version_id, finalized_at FROM "30_TradingPlaybook/Reviews/Auto" SORT date DESC',
+                ],
+                "manual_required": True,
+                "auto_execute": False,
+            },
+        )
+
+    async def build_stage_artifacts(
+        self,
+        *,
+        trade_date: date,
+        phase: str,
+        plan_version_ids: Sequence[int] = (),
+        review_ids: Sequence[int] = (),
+        include_rules: bool = False,
+    ) -> tuple[ObsidianArtifact, ...]:
+        trade_date = _database_date(trade_date, "trade_date")
+        if phase not in OBSIDIAN_PHASES:
+            raise ValueError(f"phase must be one of {OBSIDIAN_PHASES}")
+        if type(include_rules) is not bool:
+            raise ValueError("include_rules must be a boolean")
+        plan_ids = self._normalized_ids(
+            plan_version_ids,
+            field_name="plan_version_ids",
+        )
+        normalized_review_ids = self._normalized_ids(
+            review_ids,
+            field_name="review_ids",
+        )
+
+        artifacts: list[ObsidianArtifact] = []
+        if include_rules:
+            artifacts.extend(await self.build_rule_artifacts("v2"))
+        for plan_version_id in plan_ids:
+            artifacts.append(await self.build_plan_artifact(plan_version_id))
+        for review_id in normalized_review_ids:
+            artifacts.append(
+                await self.build_review_artifact(review_id, phase=phase)
+            )
+        artifacts.append(await self.build_alerts_artifact(trade_date))
+        artifacts.append(await self.build_daily_index_artifact(trade_date))
+        artifacts.append(await self.build_dashboard_artifact(trade_date))
+        return tuple(artifacts)
+
+    @staticmethod
+    def _normalized_ids(
+        values: Sequence[int],
+        *,
+        field_name: str,
+    ) -> tuple[int, ...]:
+        if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
+            raise ValueError(f"{field_name} must be a sequence of positive integers")
+        normalized: set[int] = set()
+        for value in values:
+            normalized_value = _positive_integer(value, field_name)
+            if normalized_value > _MAX_DATABASE_INTEGER:
+                raise ValueError(
+                    f"{field_name} contains an id outside the database integer range"
+                )
+            normalized.add(normalized_value)
+        return tuple(sorted(normalized))
+
+    @classmethod
+    def _validate_review_data(
+        cls,
+        review: TradingExecutionReview,
+        *,
+        phase: str,
+    ) -> None:
+        review_id = _positive_integer(review.id, "review id")
+        _database_date(review.trade_date, "review trade_date")
+        _positive_integer(
+            review.plan_version_id,
+            f"review {review_id} plan_version_id",
+        )
+        generated_at = _database_datetime(
+            review.generated_at,
+            f"review {review_id} generated_at",
+        )
+        finalized_at = (
+            _database_datetime(
+                review.finalized_at,
+                f"review {review_id} finalized_at",
+            )
+            if review.finalized_at is not None
+            else None
+        )
+        if phase == "initial_review" and finalized_at is not None:
+            raise ValueError(
+                f"review {review_id} initial_review cannot use a finalized row"
+            )
+        if phase == "final_review" and finalized_at is None:
+            raise ValueError(
+                f"review {review_id} final_review requires finalized_at"
+            )
+        if (
+            finalized_at is not None
+            and database_datetime_to_cn(finalized_at)
+            < database_datetime_to_cn(generated_at)
+        ):
+            raise ValueError(
+                f"review {review_id} finalized_at cannot precede generated_at"
+            )
+        for field_name, value in (
+            ("signal_review", review.signal_review_json),
+            ("manual_execution", review.manual_execution_json),
+            ("plan_compliance", review.plan_compliance_json),
+            ("outcome_snapshot", review.outcome_snapshot_json),
+            ("data_quality", review.data_quality_json),
+        ):
+            if type(value) is not dict:
+                raise ValueError(
+                    f"review {review_id} {field_name} must be a JSON object"
+                )
+
+    @staticmethod
+    def _build_review_artifact(
+        review: TradingExecutionReview,
+        plan: TradingPlanVersion,
+        *,
+        phase: str,
+    ) -> ObsidianArtifact:
+        review_id = _positive_integer(review.id, "review id")
+        plan_id = _positive_integer(review.plan_version_id, "review plan_version_id")
+        trade_date = _database_date(review.trade_date, "review trade_date")
+        generated_at = _database_datetime(
+            review.generated_at,
+            "review generated_at",
+        )
+        finalized_at = (
+            _database_datetime(review.finalized_at, "review finalized_at")
+            if review.finalized_at is not None
+            else None
+        )
+        kind = "initial" if phase == "initial_review" else "final"
+        return ObsidianArtifact(
+            snapshot_key=f"review:{review_id}:{kind}",
+            trade_date=trade_date,
+            entity_type="review",
+            entity_id=review_id,
+            phase=phase,
+            target_path=(
+                "30_TradingPlaybook/Reviews/Auto/"
+                f"{trade_date.year}/{trade_date.isoformat()}/"
+                f"{kind}-review-{plan_id}.md"
+            ),
+            immutable=True,
+            payload={
+                "type": "trading_execution_review",
+                "review_id": review_id,
+                "phase": phase,
+                "trade_date": trade_date,
+                "plan_version_id": plan_id,
+                "plan_version": {
+                    "version_no": _positive_integer(
+                        plan.version_no,
+                        "review plan version_no",
+                    ),
+                    "stage": plan.stage,
+                    "status": plan.status,
+                    "source_trade_date": _database_date(
+                        plan.source_trade_date,
+                        "review plan source_trade_date",
+                    ),
+                    "target_trade_date": _database_date(
+                        plan.target_trade_date,
+                        "review plan target_trade_date",
+                    ),
+                },
+                "signal_review": review.signal_review_json,
+                "manual_execution": review.manual_execution_json,
+                "plan_compliance": review.plan_compliance_json,
+                "outcome_snapshot": review.outcome_snapshot_json,
+                "data_quality": review.data_quality_json,
+                "generated_at": database_datetime_to_cn(generated_at),
+                "finalized_at": database_datetime_to_cn(finalized_at),
+                "manual_required": True,
+                "auto_execute": False,
+            },
+        )
+
+    @classmethod
+    def _alert_payload(cls, event: TradingAlertEvent) -> dict[str, object]:
+        alert_id = _positive_integer(event.id, "alert id")
+        plan_id = _positive_integer(
+            event.plan_version_id,
+            f"alert {alert_id} plan_version_id",
+        )
+        candidate_id = (
+            _positive_integer(
+                event.candidate_id,
+                f"alert {alert_id} candidate_id",
+            )
+            if event.candidate_id is not None
+            else None
+        )
+        for field_name, value in (
+            ("event_type", event.event_type),
+            ("severity", event.severity),
+            ("message", event.message),
+        ):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"alert {alert_id} {field_name} must be nonempty")
+        expected_severity = _ALERT_EVENT_SEVERITIES.get(event.event_type)
+        if expected_severity is None:
+            raise ValueError(f"alert {alert_id} event_type is unsupported")
+        if event.severity != expected_severity:
+            raise ValueError(
+                f"alert {alert_id} severity does not match event_type"
+            )
+        triggered_at = _database_datetime(
+            event.triggered_at,
+            f"alert {alert_id} triggered_at",
+        )
+        acknowledged_at = (
+            _database_datetime(
+                event.acknowledged_at,
+                f"alert {alert_id} acknowledged_at",
+            )
+            if event.acknowledged_at is not None
+            else None
+        )
+        if (
+            acknowledged_at is not None
+            and database_datetime_to_cn(acknowledged_at)
+            < database_datetime_to_cn(triggered_at)
+        ):
+            raise ValueError(
+                f"alert {alert_id} acknowledged_at cannot precede triggered_at"
+            )
+        if type(event.market_snapshot_json) is not dict:
+            raise ValueError(
+                f"alert {alert_id} market_snapshot must be a JSON object"
+            )
+        if type(event.channel_status_json) is not dict:
+            raise ValueError(
+                f"alert {alert_id} channel_status must be a JSON object"
+            )
+        in_app = event.channel_status_json.get("in_app")
+        if type(in_app) is not dict:
+            raise ValueError(
+                f"alert {alert_id} in_app channel status must be a JSON object"
+            )
+        channel_status = in_app.get("status")
+        if channel_status not in _IN_APP_CHANNEL_STATUSES:
+            raise ValueError(
+                f"alert {alert_id} in_app channel status is malformed"
+            )
+        attempts = in_app.get("attempts")
+        if attempts is not None and (
+            isinstance(attempts, bool)
+            or not isinstance(attempts, int)
+            or attempts < 0
+        ):
+            raise ValueError(f"alert {alert_id} in_app attempts is malformed")
+        safe_status: dict[str, object] = {}
+        for field_name in _IN_APP_EXPORT_FIELDS:
+            if field_name not in in_app:
+                continue
+            value = in_app[field_name]
+            if not isinstance(value, (str, bool, int)):
+                raise ValueError(
+                    f"alert {alert_id} in_app {field_name} is malformed"
+                )
+            safe_status[field_name] = value
+
+        if acknowledged_at is not None:
+            timeline_state = "confirmed"
+        elif (
+            event.event_type == "confirmation_required"
+            and channel_status in {"pending", "sending"}
+        ):
+            timeline_state = "pending_confirmation"
+        elif channel_status == "delivered":
+            timeline_state = "delivered"
+        elif channel_status in {"uncertain", "failed"}:
+            timeline_state = "failed"
+        else:
+            timeline_state = channel_status
+        return {
+            "alert_id": alert_id,
+            "event_type": event.event_type,
+            "severity": event.severity,
+            "timeline_state": timeline_state,
+            "triggered_at": database_datetime_to_cn(triggered_at),
+            "plan_version_id": plan_id,
+            "candidate_id": candidate_id,
+            "message": event.message,
+            "market_facts": event.market_snapshot_json,
+            "in_app_status": safe_status,
+            "acknowledged_at": database_datetime_to_cn(acknowledged_at),
+        }
+
+    @staticmethod
+    def _daily_plan_payload(
+        plan: TradingPlanVersion,
+        candidates: list[TradingPlanCandidate],
+        *,
+        current_effective_id: int | None,
+    ) -> dict[str, object]:
+        plan_id = _positive_integer(plan.id, "plan id")
+        generated_at = _database_datetime(plan.generated_at, "plan generated_at")
+        confirmed_at = (
+            _database_datetime(plan.confirmed_at, "plan confirmed_at")
+            if plan.confirmed_at is not None
+            else None
+        )
+        return {
+            "plan_version_id": plan_id,
+            "version_no": _positive_integer(plan.version_no, "version_no"),
+            "stage": plan.stage,
+            "status": plan.status,
+            "source_trade_date": _database_date(
+                plan.source_trade_date,
+                "source_trade_date",
+            ),
+            "target_trade_date": _database_date(
+                plan.target_trade_date,
+                "target_trade_date",
+            ),
+            "generated_at": database_datetime_to_cn(generated_at),
+            "confirmed_at": database_datetime_to_cn(confirmed_at),
+            "current_effective": plan_id == current_effective_id,
+            "candidates": [
+                {
+                    "candidate_id": _positive_integer(
+                        candidate.id,
+                        "candidate id",
+                    ),
+                    "rank": _positive_integer(
+                        candidate.rank,
+                        "candidate rank",
+                    ),
+                    "stock_code": candidate.stock_code,
+                    "stock_name": candidate.stock_name,
+                    "action_trade_date": _database_date(
+                        candidate.action_trade_date,
+                        "action_trade_date",
+                    ),
+                }
+                for candidate in candidates
+            ],
+        }
 
     @staticmethod
     def _require_json_root(
