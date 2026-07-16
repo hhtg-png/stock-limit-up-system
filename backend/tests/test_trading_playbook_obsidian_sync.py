@@ -7,6 +7,8 @@ import threading
 import unittest
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
@@ -270,6 +272,32 @@ class TradingPlaybookObsidianSyncTests(unittest.IsolatedAsyncioTestCase):
                 "generated_at": "2026-07-16T06:40:00Z",
             },
         )
+
+    async def test_enqueue_stage_builds_strict_stage_batch_before_persisting(self):
+        artifacts = (artifact("stage"),)
+        builder = SimpleNamespace(
+            build_stage_artifacts=AsyncMock(return_value=artifacts)
+        )
+        coordinator = self._coordinator(self.session_factory, builder=builder)
+        coordinator.enqueue_artifacts = AsyncMock(return_value=("row",))
+
+        rows = await coordinator.enqueue_stage(
+            date(2026, 7, 16),
+            "auction",
+            plan_version_ids=(17,),
+            review_ids=(),
+            include_rules=True,
+        )
+
+        self.assertEqual(rows, ("row",))
+        builder.build_stage_artifacts.assert_awaited_once_with(
+            trade_date=date(2026, 7, 16),
+            phase="auction",
+            plan_version_ids=(17,),
+            review_ids=(),
+            include_rules=True,
+        )
+        coordinator.enqueue_artifacts.assert_awaited_once_with(artifacts)
 
     async def test_batch_freezes_one_generated_at_and_complete_payload(self):
         calls = 0

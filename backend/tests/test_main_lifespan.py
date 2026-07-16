@@ -121,6 +121,7 @@ class LifecycleScheduler:
         self.orchestrator = None
         self.alert_service = None
         self.review_service = None
+        self.obsidian_sync = None
         self.start_calls = 0
         self.stop_calls = 0
         self.reset_calls = 0
@@ -139,11 +140,15 @@ class LifecycleScheduler:
     def install_trading_playbook_review_service(self, review_service):
         self.review_service = review_service
 
+    def install_trading_playbook_obsidian_sync(self, coordinator):
+        self.obsidian_sync = coordinator
+
     def reset_trading_playbook_services(self):
         self.reset_calls += 1
         self.orchestrator = None
         self.alert_service = None
         self.review_service = None
+        self.obsidian_sync = None
 
     def get_trading_calendar_service(self):
         return self.calendar
@@ -164,6 +169,8 @@ class MainLifespanTests(unittest.IsolatedAsyncioTestCase):
             delattr(app_main.app.state, "trading_playbook_orchestrator")
         if hasattr(app_main.app.state, "trading_playbook_review_service"):
             delattr(app_main.app.state, "trading_playbook_review_service")
+        if hasattr(app_main.app.state, "trading_playbook_obsidian_sync"):
+            delattr(app_main.app.state, "trading_playbook_obsidian_sync")
 
     def tearDown(self):
         trading_playbook_runtime.reset()
@@ -171,6 +178,8 @@ class MainLifespanTests(unittest.IsolatedAsyncioTestCase):
             delattr(app_main.app.state, "trading_playbook_orchestrator")
         if hasattr(app_main.app.state, "trading_playbook_review_service"):
             delattr(app_main.app.state, "trading_playbook_review_service")
+        if hasattr(app_main.app.state, "trading_playbook_obsidian_sync"):
+            delattr(app_main.app.state, "trading_playbook_obsidian_sync")
 
     @staticmethod
     def _lifecycle_patches(scheduler):
@@ -247,7 +256,19 @@ class MainLifespanTests(unittest.IsolatedAsyncioTestCase):
             app_main,
             "build_production_trading_playbook_orchestrator",
             return_value=sentinel,
-        ) as factory:
+        ) as factory, patch.object(
+            app_main.settings,
+            "OBSIDIAN_ENABLED",
+            True,
+        ), patch.object(
+            app_main.settings,
+            "OBSIDIAN_VAULT_PATH",
+            "C:/temporary-test-vault",
+        ), patch.object(
+            app_main.settings,
+            "OBSIDIAN_AUTO_GIT_ENABLED",
+            True,
+        ):
             async with app_main.lifespan(app_main.app):
                 self.assertIs(scheduler.orchestrator, sentinel)
                 self.assertIs(
@@ -275,6 +296,26 @@ class MainLifespanTests(unittest.IsolatedAsyncioTestCase):
                     scheduler.alert_service.realtime_limit_up_loader,
                     app_main.load_production_realtime_limit_up,
                 )
+                coordinator = scheduler.obsidian_sync
+                self.assertIs(
+                    app_main.app.state.trading_playbook_obsidian_sync,
+                    coordinator,
+                )
+                self.assertIs(
+                    coordinator.session_factory,
+                    app_main.async_session_maker,
+                )
+                self.assertIs(
+                    coordinator.builder._session_factory,
+                    app_main.async_session_maker,
+                )
+                self.assertIs(coordinator.clock, app_main.now_cn)
+                self.assertTrue(coordinator.writer.enabled)
+                self.assertEqual(
+                    coordinator.writer.vault_path,
+                    "C:/temporary-test-vault",
+                )
+                self.assertTrue(coordinator.writer.auto_git_enabled)
                 transport = httpx.ASGITransport(app=app_main.app)
                 async with httpx.AsyncClient(
                     transport=transport,
@@ -304,6 +345,10 @@ class MainLifespanTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(trading_playbook_runtime.get_orchestrator())
         self.assertFalse(
             hasattr(app_main.app.state, "trading_playbook_orchestrator")
+        )
+        self.assertIsNone(scheduler.obsidian_sync)
+        self.assertFalse(
+            hasattr(app_main.app.state, "trading_playbook_obsidian_sync")
         )
 
     async def test_shutdown_closes_shared_tencent_after_scheduler_and_isolates_failure(self):
@@ -400,6 +445,10 @@ class MainLifespanTests(unittest.IsolatedAsyncioTestCase):
         review_factory.assert_called_once()
         self.assertIsNone(scheduler.review_service)
         self.assertIsNone(trading_playbook_runtime.get_review_service())
+        self.assertIsNone(scheduler.obsidian_sync)
+        self.assertFalse(
+            hasattr(app_main.app.state, "trading_playbook_obsidian_sync")
+        )
         self.assertFalse(
             hasattr(app_main.app.state, "trading_playbook_review_service")
         )
@@ -440,6 +489,10 @@ class MainLifespanTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(trading_playbook_runtime.get_orchestrator())
         self.assertIsNone(scheduler.review_service)
         self.assertIsNone(trading_playbook_runtime.get_review_service())
+        self.assertIsNone(scheduler.obsidian_sync)
+        self.assertFalse(
+            hasattr(app_main.app.state, "trading_playbook_obsidian_sync")
+        )
 
     async def test_calendar_warm_failure_is_logged_and_startup_continues(self):
         scheduler = LifecycleScheduler(
@@ -491,6 +544,10 @@ class MainLifespanTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(scheduler.stop_calls, 1)
         self.assertEqual(scheduler.reset_calls, 2)
         self.assertIsNone(trading_playbook_runtime.get_orchestrator())
+        self.assertIsNone(scheduler.obsidian_sync)
+        self.assertFalse(
+            hasattr(app_main.app.state, "trading_playbook_obsidian_sync")
+        )
         stop_bus.assert_awaited_once()
         close_db.assert_awaited_once()
 

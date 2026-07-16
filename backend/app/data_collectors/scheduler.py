@@ -3,6 +3,7 @@
 """
 import asyncio
 import uuid
+from collections.abc import Mapping, Sequence
 from datetime import datetime, time, date, timedelta
 from typing import Any, Awaitable, Callable, List, Dict, Tuple, Optional
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -116,6 +117,8 @@ class DataScheduler:
         self._trading_playbook_orchestrator = trading_playbook_orchestrator
         self._trading_playbook_alert_service = trading_playbook_alert_service
         self._trading_playbook_review_service = trading_playbook_review_service
+        self._trading_playbook_obsidian_sync = None
+        self._trading_playbook_obsidian_rules_enqueued = False
         self._playbook_session_factory = session_factory
         self._playbook_now_provider = now_provider or (
             lambda: datetime.now(CN_TZ)
@@ -313,6 +316,9 @@ class DataScheduler:
         if settings.TRADING_PLAYBOOK_ENABLED:
             self._register_trading_playbook_jobs()
 
+        if self._trading_playbook_obsidian_sync is not None:
+            self._register_trading_playbook_obsidian_jobs()
+
         self.scheduler.add_job(
             self._run_after_close_catchup,
             DateTrigger(
@@ -400,6 +406,29 @@ class DataScheduler:
             misfire_grace_time=60,
             coalesce=True,
         )
+
+    def _register_trading_playbook_obsidian_jobs(self) -> None:
+        self.scheduler.add_job(
+            self._reconcile_trading_playbook_obsidian,
+            IntervalTrigger(seconds=60, timezone=CN_TZ),
+            id="trading_playbook_obsidian_reconcile",
+            name="交易作战手册 Obsidian 补偿同步",
+            max_instances=1,
+            coalesce=True,
+        )
+        self.scheduler.add_job(
+            self._startup_reconcile_trading_playbook_obsidian,
+            DateTrigger(
+                run_date=self._playbook_now() + timedelta(seconds=7),
+                timezone=CN_TZ,
+            ),
+            id="trading_playbook_obsidian_startup_reconcile",
+            name="交易作战手册 Obsidian 启动恢复",
+            max_instances=1,
+            replace_existing=True,
+            misfire_grace_time=60,
+            coalesce=True,
+        )
     
     def stop(self):
         """停止调度器"""
@@ -459,10 +488,22 @@ class DataScheduler:
             raise TypeError("review service must provide build")
         self._trading_playbook_review_service = service
 
+    def install_trading_playbook_obsidian_sync(self, coordinator: Any) -> None:
+        required = ("enqueue_stage", "process_due", "startup_reconcile")
+        if any(not callable(getattr(coordinator, name, None)) for name in required):
+            raise TypeError(
+                "Obsidian coordinator must provide enqueue_stage, process_due, "
+                "and startup_reconcile"
+            )
+        self._trading_playbook_obsidian_sync = coordinator
+        self._trading_playbook_obsidian_rules_enqueued = False
+
     def reset_trading_playbook_services(self) -> None:
         self._trading_playbook_orchestrator = None
         self._trading_playbook_alert_service = None
         self._trading_playbook_review_service = None
+        self._trading_playbook_obsidian_sync = None
+        self._trading_playbook_obsidian_rules_enqueued = False
 
     def get_trading_playbook_orchestrator(self) -> Any:
         return self._trading_playbook_orchestrator
@@ -498,6 +539,83 @@ class DataScheduler:
 
     def get_trading_calendar_service(self) -> TradingCalendarService:
         return self._playbook_calendar
+
+    @staticmethod
+    def _persisted_entity_ids(result: Any) -> tuple[int, ...]:
+        """Extract only top-level persisted IDs from dict/ORM/list results."""
+
+        if isinstance(result, Sequence) and not isinstance(
+            result,
+            (str, bytes, bytearray),
+        ):
+            values = result
+        else:
+            values = (result,)
+        entity_ids: list[int] = []
+        for value in values:
+            raw_id = (
+                value.get("id")
+                if isinstance(value, Mapping)
+                else getattr(value, "id", None)
+            )
+            if type(raw_id) is int and raw_id > 0 and raw_id not in entity_ids:
+                entity_ids.append(raw_id)
+        return tuple(entity_ids)
+
+    async def _sync_trading_playbook_obsidian_after_commit(
+        self,
+        trade_date: date,
+        phase: str,
+        *,
+        plan_version_ids: Sequence[int] = (),
+        review_ids: Sequence[int] = (),
+    ) -> None:
+        coordinator = self._trading_playbook_obsidian_sync
+        if coordinator is None:
+            return
+        include_rules = not self._trading_playbook_obsidian_rules_enqueued
+        try:
+            await coordinator.enqueue_stage(
+                trade_date,
+                phase,
+                plan_version_ids=tuple(plan_version_ids),
+                review_ids=tuple(review_ids),
+                include_rules=include_rules,
+            )
+            if include_rules:
+                self._trading_playbook_obsidian_rules_enqueued = True
+            await coordinator.process_due()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(
+                "Trading playbook Obsidian sync failed for {} {}: {}",
+                trade_date,
+                phase,
+                exc,
+            )
+
+    async def _reconcile_trading_playbook_obsidian(self) -> None:
+        coordinator = self._trading_playbook_obsidian_sync
+        if coordinator is None:
+            return
+        try:
+            await coordinator.process_due()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("Trading playbook Obsidian compensation failed: {}", exc)
+
+    async def _startup_reconcile_trading_playbook_obsidian(self) -> None:
+        coordinator = self._trading_playbook_obsidian_sync
+        if coordinator is None:
+            return
+        try:
+            await coordinator.startup_reconcile()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("Trading playbook Obsidian startup recovery failed: {}", exc)
 
     async def _build_trading_playbook_plan(
         self,
@@ -588,6 +706,13 @@ class DataScheduler:
                 if not completed:
                     logger.error("Trading playbook build claim lost before completion")
                     return None
+        plan_ids = self._persisted_entity_ids(plan)
+        if plan_ids:
+            await self._sync_trading_playbook_obsidian_after_commit(
+                source_trade_date,
+                stage,
+                plan_version_ids=plan_ids,
+            )
         if send_notifications and plan is not None:
             await self._notify_trading_playbook_plan(plan)
         return plan
@@ -861,6 +986,7 @@ class DataScheduler:
             logger.info("Trading playbook review service is not installed")
             return None
         phase = "finalize" if finalized else "initial_review"
+        result = None
         async with self._playbook_sessions() as db:
             generation = getattr(service, "generation_key", None)
             if callable(generation):
@@ -918,7 +1044,15 @@ class DataScheduler:
                 token,
                 now=self._claim_now(),
             )
-            return result if completed else None
+            if not completed:
+                return None
+        review_ids = self._persisted_entity_ids(result)
+        await self._sync_trading_playbook_obsidian_after_commit(
+            review_date,
+            "final_review" if finalized else "initial_review",
+            review_ids=review_ids,
+        )
+        return result
 
     async def _monitor_trading_playbook(self):
         now = self._playbook_now()

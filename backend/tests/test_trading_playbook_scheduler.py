@@ -38,6 +38,13 @@ class FakeScheduler:
         self.shutdown_called = True
 
 
+class FakeObsidianCoordinator:
+    def __init__(self, *, enqueue_error=None, process_error=None, startup_error=None):
+        self.enqueue_stage = AsyncMock(side_effect=enqueue_error)
+        self.process_due = AsyncMock(side_effect=process_error)
+        self.startup_reconcile = AsyncMock(side_effect=startup_error)
+
+
 class LifecycleFakeScheduler(FakeScheduler):
     def __init__(self, *, fail_start=False):
         super().__init__()
@@ -238,6 +245,57 @@ class TradingPlaybookSchedulerRegistrationTests(unittest.TestCase):
         ids = [job["id"] for job in scheduler.scheduler.jobs]
         self.assertEqual(len(ids), len(set(ids)))
 
+    def test_obsidian_coordinator_registers_reconcile_and_startup_jobs_once(self):
+        created = []
+
+        def factory():
+            instance = LifecycleFakeScheduler()
+            created.append(instance)
+            return instance
+
+        scheduler = DataScheduler(scheduler_factory=factory)
+        scheduler.install_trading_playbook_obsidian_sync(
+            FakeObsidianCoordinator()
+        )
+
+        scheduler.start()
+        jobs = {job["id"]: job for job in scheduler.scheduler.jobs}
+        reconcile = jobs["trading_playbook_obsidian_reconcile"]
+        self.assertEqual(reconcile["trigger"].interval.total_seconds(), 60)
+        self.assertEqual(reconcile["max_instances"], 1)
+        self.assertTrue(reconcile["coalesce"])
+        startup = jobs["trading_playbook_obsidian_startup_reconcile"]
+        self.assertEqual(startup["max_instances"], 1)
+        self.assertTrue(startup["coalesce"])
+        self.assertTrue(startup["replace_existing"])
+
+        scheduler.start()
+        ids = [job["id"] for job in scheduler.scheduler.jobs]
+        self.assertEqual(len(ids), len(set(ids)))
+        scheduler.stop()
+        scheduler.start()
+        restarted_ids = [job["id"] for job in scheduler.scheduler.jobs]
+        self.assertEqual(len(restarted_ids), len(set(restarted_ids)))
+        self.assertIn("trading_playbook_obsidian_reconcile", restarted_ids)
+
+    def test_obsidian_install_validates_contract_and_reset_preserves_all_members(self):
+        scheduler = self._scheduler()
+        coordinator = FakeObsidianCoordinator()
+
+        for missing in ("enqueue_stage", "process_due", "startup_reconcile"):
+            invalid = FakeObsidianCoordinator()
+            setattr(invalid, missing, None)
+            with self.subTest(missing=missing), self.assertRaises(TypeError):
+                scheduler.install_trading_playbook_obsidian_sync(invalid)
+
+        scheduler.install_trading_playbook_obsidian_sync(coordinator)
+        self.assertIs(scheduler._trading_playbook_obsidian_sync, coordinator)
+        scheduler.reset_trading_playbook_services()
+        self.assertIsNone(scheduler._trading_playbook_orchestrator)
+        self.assertIsNone(scheduler._trading_playbook_alert_service)
+        self.assertIsNone(scheduler._trading_playbook_review_service)
+        self.assertIsNone(scheduler._trading_playbook_obsidian_sync)
+
 
 class TradingPlaybookSchedulerStageTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -358,6 +416,330 @@ class TradingPlaybookSchedulerStageTests(unittest.IsolatedAsyncioTestCase):
             self.now.date(),
             finalized=True,
         )
+
+
+class TradingPlaybookObsidianStageHookTests(unittest.IsolatedAsyncioTestCase):
+    def _scheduler(self, *, now, plan=None, coordinator=None, claim_service=None):
+        db = MagicMock()
+        orchestrator = SimpleNamespace(
+            build_stage=AsyncMock(return_value=plan or {"id": 9})
+        )
+        scheduler = DataScheduler(
+            trading_playbook_orchestrator=orchestrator,
+            session_factory=lambda: AsyncSessionContext(db),
+            now_provider=lambda: now,
+            sleep=AsyncMock(),
+            job_claim_service=claim_service or InMemoryClaimService(),
+        )
+        if coordinator is not None:
+            scheduler.install_trading_playbook_obsidian_sync(coordinator)
+        return scheduler, orchestrator, db
+
+    async def test_preclose_syncs_source_date_and_plan_id_despite_notification_failure(self):
+        now = datetime(2026, 7, 15, 14, 40, tzinfo=CN_TZ)
+        coordinator = FakeObsidianCoordinator()
+        call_order = []
+
+        async def enqueue(*_args, **_kwargs):
+            call_order.append("enqueue")
+
+        async def process():
+            call_order.append("process")
+
+        async def notify(*_args, **_kwargs):
+            call_order.append("notify")
+            raise RuntimeError("outbox failed")
+
+        coordinator.enqueue_stage.side_effect = enqueue
+        coordinator.process_due.side_effect = process
+        scheduler, _orchestrator, db = self._scheduler(
+            now=now,
+            plan={"id": 41, "target_trade_date": date(2026, 7, 16)},
+            coordinator=coordinator,
+        )
+        alert_service = SimpleNamespace(
+            durable_delivery=True,
+            notify_plan_ready=AsyncMock(side_effect=notify),
+        )
+        scheduler.install_trading_playbook_alert_service(alert_service)
+
+        with patch(
+            "app.data_collectors.scheduler._get_cn_trading_dates",
+            return_value=[date(2026, 7, 15), date(2026, 7, 16)],
+        ):
+            result = await scheduler._build_trading_playbook_preclose()
+
+        self.assertEqual(result["id"], 41)
+        coordinator.enqueue_stage.assert_awaited_once_with(
+            date(2026, 7, 15),
+            "preclose",
+            plan_version_ids=(41,),
+            review_ids=(),
+            include_rules=True,
+        )
+        coordinator.process_due.assert_awaited_once_with()
+        alert_service.notify_plan_ready.assert_awaited_once_with(
+            db,
+            result,
+            send=True,
+        )
+        self.assertEqual(call_order, ["enqueue", "process", "notify"])
+
+    async def test_existing_persisted_plan_syncs_when_build_claim_is_already_complete(self):
+        now = datetime(2026, 7, 16, 9, 26, tzinfo=CN_TZ)
+        coordinator = FakeObsidianCoordinator()
+        claims = InMemoryClaimService()
+        claims.completed.add(
+            "playbook:build:2026-07-16:2026-07-16:auction:ready"
+        )
+        scheduler, orchestrator, db = self._scheduler(
+            now=now,
+            coordinator=coordinator,
+            claim_service=claims,
+        )
+        persisted = SimpleNamespace(id=45)
+        db.execute = AsyncMock(return_value=ScalarResult(persisted))
+
+        with patch(
+            "app.data_collectors.scheduler._get_cn_trading_dates",
+            return_value=[date(2026, 7, 16), date(2026, 7, 17)],
+        ):
+            result = await scheduler._build_trading_playbook_auction()
+
+        self.assertIs(result, persisted)
+        orchestrator.build_stage.assert_not_awaited()
+        coordinator.enqueue_stage.assert_awaited_once_with(
+            date(2026, 7, 16),
+            "auction",
+            plan_version_ids=(45,),
+            review_ids=(),
+            include_rules=True,
+        )
+
+    async def test_after_close_and_final_review_enqueue_as_independent_phases(self):
+        now = datetime(2026, 7, 15, 15, 30, tzinfo=CN_TZ)
+        coordinator = FakeObsidianCoordinator()
+        scheduler, _orchestrator, _db = self._scheduler(
+            now=now,
+            plan=SimpleNamespace(id=51),
+            coordinator=coordinator,
+        )
+        review = SimpleNamespace(build=AsyncMock(return_value=[{"id": 61}]))
+        scheduler.install_trading_playbook_review_service(review)
+        scheduler._wait_for_trading_playbook_data = AsyncMock(return_value=True)
+
+        with patch(
+            "app.data_collectors.scheduler._get_cn_trading_dates",
+            return_value=[date(2026, 7, 15), date(2026, 7, 16)],
+        ):
+            result = await scheduler._build_trading_playbook_after_close(
+                send_notifications=False
+            )
+
+        self.assertEqual(result.id, 51)
+        self.assertEqual(
+            coordinator.enqueue_stage.await_args_list,
+            [
+                unittest.mock.call(
+                    date(2026, 7, 15),
+                    "after_close",
+                    plan_version_ids=(51,),
+                    review_ids=(),
+                    include_rules=True,
+                ),
+                unittest.mock.call(
+                    date(2026, 7, 15),
+                    "final_review",
+                    plan_version_ids=(),
+                    review_ids=(61,),
+                    include_rules=False,
+                ),
+            ],
+        )
+        self.assertEqual(coordinator.process_due.await_count, 2)
+
+    async def test_initial_overnight_and_auction_use_exact_phase_entity_ids(self):
+        cases = (
+            (datetime(2026, 7, 15, 15, 10, tzinfo=CN_TZ), "initial_review", 71),
+            (datetime(2026, 7, 16, 8, 50, tzinfo=CN_TZ), "overnight", 72),
+            (datetime(2026, 7, 16, 9, 26, tzinfo=CN_TZ), "auction", 73),
+        )
+        for now, phase, entity_id in cases:
+            with self.subTest(phase=phase):
+                coordinator = FakeObsidianCoordinator()
+                scheduler, orchestrator, _db = self._scheduler(
+                    now=now,
+                    plan={"id": entity_id},
+                    coordinator=coordinator,
+                )
+                if phase == "initial_review":
+                    scheduler.install_trading_playbook_review_service(
+                        SimpleNamespace(
+                            build=AsyncMock(
+                                return_value=[
+                                    {"id": entity_id},
+                                    SimpleNamespace(id=entity_id + 100),
+                                    {"id": True},
+                                    {"id": 0},
+                                ]
+                            )
+                        )
+                    )
+                    operation = scheduler._review_trading_playbook
+                elif phase == "overnight":
+                    operation = scheduler._build_trading_playbook_overnight
+                else:
+                    operation = scheduler._build_trading_playbook_auction
+                with patch(
+                    "app.data_collectors.scheduler._get_cn_trading_dates",
+                    return_value=[now.date(), now.date() + timedelta(days=1)],
+                ):
+                    await operation()
+
+                coordinator.enqueue_stage.assert_awaited_once_with(
+                    now.date(),
+                    phase,
+                    plan_version_ids=(
+                        () if phase == "initial_review" else (entity_id,)
+                    ),
+                    review_ids=(
+                        (entity_id, entity_id + 100)
+                        if phase == "initial_review"
+                        else ()
+                    ),
+                    include_rules=True,
+                )
+                if phase != "initial_review":
+                    orchestrator.build_stage.assert_awaited_once()
+
+    async def test_completed_empty_review_still_syncs_mutable_stage_artifacts(self):
+        now = datetime(2026, 7, 15, 15, 10, tzinfo=CN_TZ)
+        coordinator = FakeObsidianCoordinator()
+        scheduler, _orchestrator, _db = self._scheduler(
+            now=now,
+            coordinator=coordinator,
+        )
+        scheduler.install_trading_playbook_review_service(
+            SimpleNamespace(build=AsyncMock(return_value=[]))
+        )
+
+        with patch(
+            "app.data_collectors.scheduler._get_cn_trading_dates",
+            return_value=[date(2026, 7, 15), date(2026, 7, 16)],
+        ):
+            result = await scheduler._review_trading_playbook()
+
+        self.assertEqual(result, [])
+        coordinator.enqueue_stage.assert_awaited_once_with(
+            date(2026, 7, 15),
+            "initial_review",
+            plan_version_ids=(),
+            review_ids=(),
+            include_rules=True,
+        )
+        coordinator.process_due.assert_awaited_once_with()
+
+    async def test_sync_failures_preserve_committed_business_result_and_claim(self):
+        for failure_at in ("enqueue", "process"):
+            with self.subTest(failure_at=failure_at):
+                coordinator = FakeObsidianCoordinator(
+                    enqueue_error=(
+                        RuntimeError("enqueue unavailable")
+                        if failure_at == "enqueue"
+                        else None
+                    ),
+                    process_error=(
+                        RuntimeError("vault unavailable")
+                        if failure_at == "process"
+                        else None
+                    ),
+                )
+                claims = InMemoryClaimService()
+                scheduler, _orchestrator, _db = self._scheduler(
+                    now=datetime(2026, 7, 16, 9, 26, tzinfo=CN_TZ),
+                    plan={"id": 81},
+                    coordinator=coordinator,
+                    claim_service=claims,
+                )
+                alert_service = SimpleNamespace(
+                    durable_delivery=True,
+                    notify_plan_ready=AsyncMock(return_value={"queued": True}),
+                )
+                scheduler.install_trading_playbook_alert_service(alert_service)
+                with patch(
+                    "app.data_collectors.scheduler._get_cn_trading_dates",
+                    return_value=[date(2026, 7, 16), date(2026, 7, 17)],
+                ):
+                    result = await scheduler._build_trading_playbook_auction()
+
+                self.assertEqual(result, {"id": 81})
+                alert_service.notify_plan_ready.assert_awaited_once()
+                self.assertIn(
+                    "playbook:build:2026-07-16:2026-07-16:auction:ready",
+                    claims.completed,
+                )
+                if failure_at == "enqueue":
+                    self.assertFalse(
+                        scheduler._trading_playbook_obsidian_rules_enqueued
+                    )
+                else:
+                    self.assertTrue(
+                        scheduler._trading_playbook_obsidian_rules_enqueued
+                    )
+                    coordinator.process_due.side_effect = None
+                    await scheduler._reconcile_trading_playbook_obsidian()
+                    self.assertEqual(coordinator.process_due.await_count, 2)
+                    self.assertEqual(coordinator.enqueue_stage.await_count, 1)
+
+    async def test_business_failure_or_lost_claim_never_enqueues_uncommitted_entity(self):
+        coordinator = FakeObsidianCoordinator()
+        now = datetime(2026, 7, 16, 9, 26, tzinfo=CN_TZ)
+        scheduler, orchestrator, _db = self._scheduler(
+            now=now,
+            coordinator=coordinator,
+        )
+        orchestrator.build_stage.side_effect = RuntimeError("business failed")
+        with patch(
+            "app.data_collectors.scheduler._get_cn_trading_dates",
+            return_value=[date(2026, 7, 16), date(2026, 7, 17)],
+        ), self.assertRaisesRegex(RuntimeError, "business failed"):
+            await scheduler._build_trading_playbook_auction()
+        coordinator.enqueue_stage.assert_not_awaited()
+
+        claims = InMemoryClaimService()
+        claims.complete = AsyncMock(return_value=False)
+        fresh_coordinator = FakeObsidianCoordinator()
+        scheduler, _orchestrator, _db = self._scheduler(
+            now=now,
+            coordinator=fresh_coordinator,
+            claim_service=claims,
+        )
+        with patch(
+            "app.data_collectors.scheduler._get_cn_trading_dates",
+            return_value=[date(2026, 7, 16), date(2026, 7, 17)],
+        ):
+            result = await scheduler._build_trading_playbook_auction()
+        self.assertIsNone(result)
+        fresh_coordinator.enqueue_stage.assert_not_awaited()
+
+    async def test_reconcile_jobs_isolate_failures_but_propagate_cancellation(self):
+        coordinator = FakeObsidianCoordinator(
+            process_error=RuntimeError("retry failed"),
+            startup_error=RuntimeError("startup failed"),
+        )
+        scheduler, _orchestrator, _db = self._scheduler(
+            now=datetime(2026, 7, 16, 9, 26, tzinfo=CN_TZ),
+            coordinator=coordinator,
+        )
+
+        await scheduler._reconcile_trading_playbook_obsidian()
+        await scheduler._startup_reconcile_trading_playbook_obsidian()
+        coordinator.process_due.assert_awaited_once_with()
+        coordinator.startup_reconcile.assert_awaited_once_with()
+
+        coordinator.process_due.side_effect = asyncio.CancelledError()
+        with self.assertRaises(asyncio.CancelledError):
+            await scheduler._reconcile_trading_playbook_obsidian()
 
 
 class TradingPlaybookDataReadyBarrierTests(unittest.IsolatedAsyncioTestCase):

@@ -302,6 +302,25 @@ class TradingPlaybookObsidianSyncCoordinator:
             )
         return tuple(rows)
 
+    async def enqueue_stage(
+        self,
+        trade_date: date,
+        phase: str,
+        plan_version_ids: Sequence[int] = (),
+        review_ids: Sequence[int] = (),
+        include_rules: bool = False,
+    ) -> tuple[TradingPlaybookObsidianExport, ...]:
+        """Freeze and persist one committed business phase as one batch."""
+
+        artifacts = await self.builder.build_stage_artifacts(
+            trade_date=trade_date,
+            phase=phase,
+            plan_version_ids=plan_version_ids,
+            review_ids=review_ids,
+            include_rules=include_rules,
+        )
+        return await self.enqueue_artifacts(artifacts)
+
     async def _enqueue_one(
         self,
         artifact: ObsidianArtifact,
