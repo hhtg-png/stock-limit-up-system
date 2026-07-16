@@ -1,5 +1,7 @@
 import asyncio
 import json
+import os
+import stat
 import tempfile
 import threading
 import unittest
@@ -674,6 +676,13 @@ class TradingPlaybookObsidianSyncTests(unittest.IsolatedAsyncioTestCase):
         stored = (await self._rows(row.snapshot_key))[0]
         self.assertEqual(stored.status, "pending")
         self.assertEqual(stored.next_attempt_at, datetime(2026, 7, 16, 14, 41))
+        self.assertEqual(stored.git_status_json["state"], "lease_claimed")
+        self.assertEqual(
+            stored.git_status_json["lease_token"],
+            self.coordinator._canonical_datetime(
+                FIXED_NOW + timedelta(minutes=1)
+            ),
+        )
 
         self.assertEqual(await self.coordinator._claim_due(limit=1), ())
         self.clock.value += timedelta(seconds=61)
@@ -872,6 +881,68 @@ class TradingPlaybookObsidianSyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(len(lock_files), 2)
         self.assertTrue(all(path.suffix == ".lock" for path in lock_files))
         self.assertEqual(list(lock_root.glob("*.md")), [])
+        if os.name != "nt":
+            self.assertEqual(stat.S_IMODE(lock_root.stat().st_mode), 0o770)
+            self.assertTrue(
+                all(stat.S_IMODE(path.stat().st_mode) == 0o660 for path in lock_files)
+            )
+
+    async def test_lock_root_rejects_a_lexical_symlink_inside_the_vault(self):
+        vault = Path(self.temporary_directory.name) / "symlink-vault"
+        auto_root = vault / "30_TradingPlaybook" / "Daily" / "Auto"
+        real_root = auto_root / "real-locks"
+        real_root.mkdir(parents=True)
+        lock_root = auto_root / ".sync-locks"
+        try:
+            lock_root.symlink_to(real_root, target_is_directory=True)
+        except OSError as exc:
+            self.skipTest(f"directory symlinks unavailable: {exc}")
+        coordinator = self._coordinator(
+            self.session_factory,
+            exporter=FakeExporter(),
+            writer=ObsidianVaultWriter(
+                enabled=True,
+                vault_path=vault,
+                auto_git_enabled=False,
+            ),
+        )
+
+        with self.assertRaises((OSError, ValueError)):
+            await coordinator._acquire_named_lock("target:symlink")
+
+        self.assertEqual(list(real_root.glob("*.lock")), [])
+
+    @unittest.skipIf(os.name == "nt", "POSIX permission semantics")
+    async def test_lock_root_rejects_world_writable_existing_state(self):
+        vault = Path(self.temporary_directory.name) / "permission-vault"
+        lock_root = (
+            vault
+            / "30_TradingPlaybook"
+            / "Daily"
+            / "Auto"
+            / ".sync-locks"
+        )
+        lock_root.mkdir(parents=True)
+        lock_root.chmod(0o777)
+        coordinator = self._coordinator(
+            self.session_factory,
+            exporter=FakeExporter(),
+            writer=ObsidianVaultWriter(
+                enabled=True,
+                vault_path=vault,
+                auto_git_enabled=False,
+            ),
+        )
+
+        with self.assertRaises(PermissionError):
+            await coordinator._acquire_named_lock("target:world-directory")
+
+        lock_root.chmod(0o770)
+        lock_path = vault / coordinator._lock_relative_path("target:world-file")
+        lock_path.write_bytes(b"\0")
+        lock_path.chmod(0o666)
+        with self.assertRaises(PermissionError):
+            await coordinator._acquire_named_lock("target:world-file")
 
     async def test_lock_identity_is_case_normalized_inside_the_vault(self):
         coordinator = self._coordinator(
@@ -1203,6 +1274,46 @@ class TradingPlaybookObsidianSyncTests(unittest.IsolatedAsyncioTestCase):
         stored = (await self._rows(item.snapshot_key))[0]
         self.assertEqual(stored.git_status_json["state"], "git_complete")
 
+    async def test_repeated_git_cancellation_waits_for_commit_and_keeps_lock(self):
+        item = artifact("git-double-cancel", snapshot_key="alerts:git-double-cancel")
+        await self.coordinator.enqueue_artifacts([item])
+        writer = FakeWriter(self.temporary_directory.name)
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocking_commit(relative_paths, *, allowed_roots, message):
+            entered.set()
+            if not release.wait(timeout=5):
+                raise RuntimeError("double cancel Git release timed out")
+            return {"enabled": True, "committed": True}
+
+        writer.commit_paths = blocking_commit
+        coordinator = self._coordinator(
+            self.session_factory,
+            exporter=FakeExporter(),
+            writer=writer,
+        )
+        task = asyncio.create_task(coordinator.process_due())
+        self.assertTrue(await asyncio.to_thread(entered.wait, 5))
+
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        contender = asyncio.create_task(
+            coordinator._acquire_named_lock("git:vault")
+        )
+        await asyncio.sleep(0.05)
+        task_finished_early = task.done()
+        lock_released_early = contender.done()
+        release.set()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        contender_lock = await asyncio.wait_for(contender, timeout=2)
+        await coordinator._to_thread_fenced(contender_lock.release)
+        self.assertFalse(task_finished_early)
+        self.assertFalse(lock_released_early)
+
     async def test_git_status_store_failure_keeps_pending_intent_for_retry(self):
         item = artifact("git-store", snapshot_key="alerts:git-store")
         await self.coordinator.enqueue_artifacts([item])
@@ -1328,11 +1439,14 @@ class TradingPlaybookObsidianSyncTests(unittest.IsolatedAsyncioTestCase):
         writer.commit_result = {
             "enabled": True,
             "committed": False,
-            "error": "bad\n\t\x00" + ("x" * 10_000),
-            "stderr": [
-                {"line": "secret\r" + ("y" * 2_000)}
-                for _ in range(100)
-            ],
+            "error": "bad\n\t\x00\x7f\x85\ud800" + ("x" * 10_000),
+            "stderr": {
+                f"branch-{outer}": {
+                    f"leaf-{inner}": ["y" * 2_000 for _ in range(20)]
+                    for inner in range(20)
+                }
+                for outer in range(20)
+            },
         }
         coordinator = self._coordinator(
             self.session_factory,
@@ -1343,13 +1457,17 @@ class TradingPlaybookObsidianSyncTests(unittest.IsolatedAsyncioTestCase):
         result = await coordinator.process_due()
 
         status = result.git_status_json()
-        encoded = json.dumps(status, ensure_ascii=False)
+        encoded = json.dumps(status, ensure_ascii=False).encode("utf-8")
         self.assertEqual(status["state"], "git_error")
         self.assertLessEqual(len(status["error"]), 2000)
         self.assertNotIn("\n", status["error"])
         self.assertNotIn("\t", status["error"])
         self.assertNotIn("\x00", status["error"])
-        self.assertLess(len(encoded), 12_000)
+        self.assertNotIn("\x7f", status["error"])
+        self.assertNotIn("\x85", status["error"])
+        self.assertNotIn("\ud800", status["error"])
+        self.assertLessEqual(len(encoded), 32 * 1024)
+        self.assertTrue(coordinator._git_needs_retry(status))
         stored = (await self._rows(item.snapshot_key))[0]
         self.assertEqual(stored.git_status_json, status)
 
@@ -1757,6 +1875,9 @@ class TradingPlaybookObsidianSyncTests(unittest.IsolatedAsyncioTestCase):
         )
         by_key = {row.snapshot_key: row for row in rows}
         live_until = datetime(2026, 7, 16, 14, 41)
+        live_token = self.coordinator._canonical_datetime(
+            FIXED_NOW + timedelta(minutes=1)
+        )
         async with self.session_factory() as session:
             await session.execute(
                 update(TradingPlaybookObsidianExport)
@@ -1783,7 +1904,7 @@ class TradingPlaybookObsidianSyncTests(unittest.IsolatedAsyncioTestCase):
                     next_attempt_at=live_until,
                     git_status_json={
                         "state": "write_in_progress",
-                        "lease_token": "active-token",
+                        "lease_token": live_token,
                     },
                 )
             )
@@ -1845,6 +1966,87 @@ class TradingPlaybookObsidianSyncTests(unittest.IsolatedAsyncioTestCase):
             stored[dashboard.snapshot_key].git_status_json["state"],
             "git_complete",
         )
+
+    async def test_force_resets_failed_backoff_after_a_real_write_failure(self):
+        item = artifact(
+            "force-after-write-failure",
+            snapshot_key="alerts:force-after-write-failure",
+        )
+        row = (await self.coordinator.enqueue_artifacts([item]))[0]
+        writer = FakeWriter(self.temporary_directory.name)
+        writer.write_error = RuntimeError("disk unavailable")
+        coordinator = self._coordinator(
+            self.session_factory,
+            exporter=FakeExporter(),
+            writer=writer,
+        )
+
+        failed = await coordinator.process_due()
+
+        self.assertEqual(failed.failed_files, (item.target_path,))
+        stored = (await self._rows(item.snapshot_key))[0]
+        self.assertEqual(stored.status, "failed")
+        self.assertGreater(stored.next_attempt_at, datetime(2026, 7, 16, 14, 40))
+        self.assertEqual(stored.git_status_json["state"], "write_failed")
+
+        await coordinator._reset_forced_exports([int(row.id)])
+
+        reset = (await self._rows(item.snapshot_key))[0]
+        self.assertEqual(reset.status, "pending")
+        self.assertEqual(reset.attempt_no, 0)
+        self.assertIsNone(reset.next_attempt_at)
+        self.assertIsNone(reset.last_error)
+        self.assertEqual(reset.git_status_json["state"], "git_pending")
+
+    async def test_force_preserves_failed_row_claimed_before_lease_renewal(self):
+        item = artifact(
+            "force-claimed-failed",
+            snapshot_key="alerts:force-claimed-failed",
+        )
+        row = (await self.coordinator.enqueue_artifacts([item]))[0]
+        async with self.session_factory() as session:
+            await session.execute(
+                update(TradingPlaybookObsidianExport)
+                .where(TradingPlaybookObsidianExport.id == row.id)
+                .values(
+                    status="failed",
+                    attempt_no=1,
+                    next_attempt_at=None,
+                    last_error="old failure",
+                    git_status_json={
+                        "state": "write_failed",
+                        "error": "old failure",
+                    },
+                )
+            )
+            await session.commit()
+
+        claimed = await self.coordinator._claim_due(limit=1)
+
+        self.assertEqual([int(item.id) for item in claimed], [int(row.id)])
+        claimed_row = claimed[0]
+        expected_token = self.coordinator._canonical_datetime(
+            FIXED_NOW + timedelta(minutes=1)
+        )
+        self.assertEqual(claimed_row.status, "failed")
+        self.assertEqual(claimed_row.git_status_json["state"], "lease_claimed")
+        self.assertEqual(
+            claimed_row.git_status_json["lease_token"],
+            expected_token,
+        )
+        self.assertEqual(
+            claimed_row.git_status_json["previous"]["state"],
+            "write_failed",
+        )
+
+        await self.coordinator._reset_forced_exports([int(row.id)])
+
+        preserved = (await self._rows(item.snapshot_key))[0]
+        self.assertEqual(preserved.status, "failed")
+        self.assertEqual(preserved.attempt_no, 1)
+        self.assertEqual(preserved.next_attempt_at, claimed_row.next_attempt_at)
+        self.assertEqual(preserved.last_error, "old failure")
+        self.assertEqual(preserved.git_status_json, claimed_row.git_status_json)
 
     async def test_force_reset_is_scoped_to_date_and_dashboard_export_state(self):
         requested_failed = artifact(
@@ -2116,12 +2318,24 @@ class TradingPlaybookObsidianSyncTests(unittest.IsolatedAsyncioTestCase):
             writer=writer,
         )
         task = asyncio.create_task(coordinator.process_due())
-        await asyncio.to_thread(entered.wait, 5)
+        self.assertTrue(await asyncio.to_thread(entered.wait, 5))
 
         task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        contender = asyncio.create_task(
+            coordinator._acquire_target_lock(item.target_path)
+        )
+        await asyncio.sleep(0.05)
+        task_finished_early = task.done()
+        lock_released_early = contender.done()
         release.set()
         with self.assertRaises(asyncio.CancelledError):
             await task
+        contender_lock = await asyncio.wait_for(contender, timeout=2)
+        await coordinator._to_thread_fenced(contender_lock.release)
+        self.assertFalse(task_finished_early)
+        self.assertFalse(lock_released_early)
 
         stored = (await self._rows(item.snapshot_key))[0]
         self.assertEqual(stored.status, "pending")
@@ -2129,6 +2343,35 @@ class TradingPlaybookObsidianSyncTests(unittest.IsolatedAsyncioTestCase):
         writer.write_text = original_write
         retried = await asyncio.wait_for(coordinator.process_due(), timeout=2)
         self.assertEqual(retried.written_files, (item.target_path,))
+
+    async def test_repeated_cancellation_while_waiting_for_lock_cleans_up(self):
+        coordinator = self._coordinator(
+            self.session_factory,
+            exporter=FakeExporter(),
+            writer=FakeWriter(self.temporary_directory.name),
+        )
+        target_path = "30_TradingPlaybook/Alerts/Auto/2026/wait-cancel.md"
+        holder = await coordinator._acquire_target_lock(target_path)
+        waiting = asyncio.create_task(
+            coordinator._acquire_target_lock(target_path)
+        )
+        await asyncio.sleep(0.05)
+
+        waiting.cancel()
+        await asyncio.sleep(0)
+        waiting.cancel()
+        await asyncio.sleep(0.05)
+        finished_early = waiting.done()
+        await coordinator._to_thread_fenced(holder.release)
+
+        with self.assertRaises(asyncio.CancelledError):
+            await waiting
+        self.assertFalse(finished_early)
+        probe = await asyncio.wait_for(
+            coordinator._acquire_target_lock(target_path),
+            timeout=2,
+        )
+        await coordinator._to_thread_fenced(probe.release)
 
 
 if __name__ == "__main__":

@@ -7,9 +7,12 @@ import hashlib
 import json
 import math
 import os
+import stat
+import unicodedata
 from collections.abc import Callable, Sequence
 from datetime import date, datetime, timedelta
 from functools import partial
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy import case, desc, exists, func, or_, select, text, update
@@ -43,16 +46,20 @@ _MAX_ERROR_LENGTH = 2000
 _MAX_GIT_JSON_DEPTH = 4
 _MAX_GIT_JSON_ITEMS = 16
 _MAX_GIT_JSON_STRING = 512
+_MAX_GIT_JSON_BYTES = 32 * 1024
 _LOCK_ROOT = "30_TradingPlaybook/Daily/Auto/.sync-locks"
 
 
 class _TargetFileLock:
     """A crash-released lock stored inside the shared Vault.
 
-    This coordinates processes and hosts only when the shared filesystem
-    honors POSIX/Windows advisory byte-range locks (for example a correctly
-    configured SMB share).  It does not claim correctness for filesystems
-    that ignore network advisory locks.
+    POSIX lock state is group-shareable (0770 directories and 0660 files).
+    This coordinates same-group accounts and hosts only when the shared
+    filesystem honors POSIX/Windows advisory byte-range locks (for example a
+    correctly configured SMB share).  It fails closed on lexical symlinks and
+    untrusted existing state, but cannot claim cross-host correctness for a
+    filesystem that ignores advisory locks or changes path components outside
+    the operating system's open-time protections.
     """
 
     def __init__(self, handle) -> None:
@@ -64,22 +71,37 @@ class _TargetFileLock:
         writer: ObsidianVaultWriter,
         relative_path: str,
     ) -> _TargetFileLock:
-        target = writer.resolve_target(
+        resolved_target = writer.resolve_target(
             relative_path,
             allowed_roots=TRADING_PLAYBOOK_ALLOWED_ROOTS,
         )
-        target.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
-        target = writer.resolve_target(
-            relative_path,
-            allowed_roots=TRADING_PLAYBOOK_ALLOWED_ROOTS,
-        )
-        if target.is_symlink():
-            raise ValueError("Obsidian sync lock cannot be a symlink")
-        flags = os.O_RDWR | os.O_CREAT
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        descriptor = os.open(target, flags, 0o600)
+        vault = writer.configured_vault()
+        if vault is None:
+            raise ValueError("Obsidian Vault path is not configured")
+        vault_path = Path(vault)
+        lexical_target = vault_path.joinpath(*relative_path.split("/"))
+        cls._reject_lexical_symlinks(vault_path, lexical_target.parent)
+        if os.name == "nt":
+            lexical_target.parent.mkdir(parents=True, mode=0o770, exist_ok=True)
+            cls._reject_lexical_symlinks(vault_path, lexical_target.parent)
+            cls._validate_trusted_path(lexical_target.parent, directory=True)
+            if lexical_target.exists():
+                cls._validate_trusted_path(lexical_target, directory=False)
+            descriptor = os.open(lexical_target, os.O_RDWR | os.O_CREAT, 0o660)
+        else:
+            vault_path.mkdir(parents=True, mode=0o770, exist_ok=True)
+            descriptor = cls._open_posix_descriptor(vault_path, lexical_target)
         try:
+            target = writer.resolve_target(
+                relative_path,
+                allowed_roots=TRADING_PLAYBOOK_ALLOWED_ROOTS,
+            )
+            cls._reject_lexical_symlinks(vault_path, lexical_target)
+            if (
+                target != resolved_target
+                or target != lexical_target.resolve(strict=False)
+            ):
+                raise ValueError("Obsidian sync lock path changed during validation")
             handle = os.fdopen(descriptor, "r+b", buffering=0)
         except BaseException:
             os.close(descriptor)
@@ -108,6 +130,110 @@ class _TargetFileLock:
             handle.close()
             raise
         return cls(handle)
+
+    @staticmethod
+    def _reject_lexical_symlinks(vault: Path, target: Path) -> None:
+        current = vault
+        if current.is_symlink():
+            raise ValueError("Obsidian Vault lock path cannot contain a symlink")
+        try:
+            relative_parts = target.relative_to(vault).parts
+        except ValueError as exc:
+            raise ValueError("Obsidian sync lock escapes the Vault") from exc
+        for part in relative_parts:
+            current = current / part
+            if current.is_symlink():
+                raise ValueError("Obsidian Vault lock path cannot contain a symlink")
+
+    @classmethod
+    def _open_posix_descriptor(cls, vault: Path, target: Path) -> int:
+        required_flags = ("O_DIRECTORY", "O_NOFOLLOW")
+        if any(not hasattr(os, name) for name in required_flags):
+            raise OSError("secure openat locking is unavailable")
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        current = os.open(vault, directory_flags)
+        try:
+            cls._validate_descriptor(current, directory=True)
+            parent_parts = target.parent.relative_to(vault).parts
+            for index, part in enumerate(parent_parts):
+                created = False
+                try:
+                    following = os.open(
+                        part,
+                        directory_flags,
+                        dir_fd=current,
+                    )
+                except FileNotFoundError:
+                    os.mkdir(part, 0o770, dir_fd=current)
+                    created = True
+                    following = os.open(
+                        part,
+                        directory_flags,
+                        dir_fd=current,
+                    )
+                try:
+                    cls._validate_descriptor(following, directory=True)
+                    info = os.fstat(following)
+                    if created or (
+                        index == len(parent_parts) - 1
+                        and info.st_uid == os.geteuid()
+                    ):
+                        os.fchmod(following, 0o770)
+                except BaseException:
+                    os.close(following)
+                    raise
+                os.close(current)
+                current = following
+            descriptor = os.open(
+                target.name,
+                os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+                0o660,
+                dir_fd=current,
+            )
+            try:
+                cls._validate_descriptor(descriptor, directory=False)
+                if os.fstat(descriptor).st_uid == os.geteuid():
+                    os.fchmod(descriptor, 0o660)
+            except BaseException:
+                os.close(descriptor)
+                raise
+            return descriptor
+        finally:
+            os.close(current)
+
+    @staticmethod
+    def _validate_trusted_path(path: Path, *, directory: bool) -> None:
+        if os.name == "nt":
+            if directory and not path.is_dir():
+                raise ValueError("Obsidian sync lock parent is not a directory")
+            if not directory and not path.is_file():
+                raise ValueError("Obsidian sync lock is not a regular file")
+            return
+        info = os.lstat(path)
+        expected = stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
+        if not expected:
+            raise ValueError("Obsidian sync lock state has an invalid file type")
+        if info.st_mode & stat.S_IWOTH:
+            raise PermissionError("Obsidian sync lock state is world-writable")
+        trusted_groups = set(os.getgroups()) | {os.getegid()}
+        if info.st_uid != os.geteuid() and info.st_gid not in trusted_groups:
+            raise PermissionError("Obsidian sync lock state has untrusted ownership")
+
+    @classmethod
+    def _validate_descriptor(cls, descriptor: int, *, directory: bool) -> None:
+        if os.name == "nt":
+            return
+        info = os.fstat(descriptor)
+        expected = stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(
+            info.st_mode
+        )
+        if not expected:
+            raise ValueError("Obsidian sync lock state has an invalid file type")
+        if info.st_mode & stat.S_IWOTH:
+            raise PermissionError("Obsidian sync lock state is world-writable")
+        trusted_groups = set(os.getgroups()) | {os.getegid()}
+        if info.st_uid != os.geteuid() and info.st_gid not in trusted_groups:
+            raise PermissionError("Obsidian sync lock state has untrusted ownership")
 
     def release(self) -> None:
         handle = self._handle
@@ -325,11 +451,27 @@ class TradingPlaybookObsidianSyncCoordinator:
             )
             claimed_ids: list[int] = []
             for row_id in candidate_ids:
+                selected = (
+                    await session.execute(
+                        select(
+                            TradingPlaybookObsidianExport.git_status_json
+                        ).where(
+                            TradingPlaybookObsidianExport.id == int(row_id),
+                            *self._claim_predicates(now=now),
+                        )
+                    )
+                ).first()
+                if selected is None:
+                    continue
                 claimed = await session.execute(
                     self._claim_statement(
                         row_id=int(row_id),
                         now=now,
                         lease_until=lease_until,
+                        git_status=self._lease_claimed_intent(
+                            lease_until=lease_until,
+                            previous_git_status=selected[0],
+                        ),
                     )
                 )
                 if claimed.rowcount == 1:
@@ -370,11 +512,27 @@ class TradingPlaybookObsidianSyncCoordinator:
         claimed_ids: list[int] = []
         async with self.session_factory() as session:
             for row_id in normalized_ids:
+                selected = (
+                    await session.execute(
+                        select(
+                            TradingPlaybookObsidianExport.git_status_json
+                        ).where(
+                            TradingPlaybookObsidianExport.id == row_id,
+                            *self._claim_predicates(now=now),
+                        )
+                    )
+                ).first()
+                if selected is None:
+                    continue
                 claimed = await session.execute(
                     self._claim_statement(
                         row_id=row_id,
                         now=now,
                         lease_until=lease_until,
+                        git_status=self._lease_claimed_intent(
+                            lease_until=lease_until,
+                            previous_git_status=selected[0],
+                        ),
                     )
                 )
                 if claimed.rowcount == 1:
@@ -440,6 +598,7 @@ class TradingPlaybookObsidianSyncCoordinator:
         row_id: int,
         now: datetime,
         lease_until: datetime,
+        git_status: dict[str, Any],
     ):
         return (
             update(TradingPlaybookObsidianExport)
@@ -447,7 +606,11 @@ class TradingPlaybookObsidianSyncCoordinator:
                 TradingPlaybookObsidianExport.id == row_id,
                 *cls._claim_predicates(now=now),
             )
-            .values(next_attempt_at=lease_until, updated_at=now)
+            .values(
+                next_attempt_at=lease_until,
+                git_status_json=git_status,
+                updated_at=now,
+            )
         )
 
     @classmethod
@@ -1072,8 +1235,19 @@ class TradingPlaybookObsidianSyncCoordinator:
             ).first()
             if selected is None:
                 return None
-            previous_git_status = self._bounded_git_mapping(selected[1])
-            lease_token = self._canonical_datetime(CN_TZ.localize(renewed_until))
+            previous_git_status = self._active_git_previous(
+                selected[1],
+                lease_until=lease_until,
+                active_states={"lease_claimed"},
+            )
+            lease_token = self._lease_token(renewed_until)
+            write_in_progress = self._fit_git_mapping(
+                {
+                    "state": "write_in_progress",
+                    "lease_token": lease_token,
+                    "previous": previous_git_status,
+                }
+            )
             renewed = await session.execute(
                 update(TradingPlaybookObsidianExport)
                 .where(
@@ -1085,11 +1259,7 @@ class TradingPlaybookObsidianSyncCoordinator:
                 )
                 .values(
                     next_attempt_at=renewed_until,
-                    git_status_json={
-                        "state": "write_in_progress",
-                        "lease_token": lease_token,
-                        "previous": previous_git_status,
-                    },
+                    git_status_json=write_in_progress,
                     updated_at=now,
                 )
             )
@@ -1097,6 +1267,48 @@ class TradingPlaybookObsidianSyncCoordinator:
             if renewed.rowcount != 1:
                 return None
             return renewed_until, previous_git_status
+
+    @classmethod
+    def _lease_claimed_intent(
+        cls,
+        *,
+        lease_until: datetime,
+        previous_git_status: object,
+    ) -> dict[str, Any]:
+        previous = cls._bounded_git_mapping(previous_git_status)
+        if previous is not None and previous.get("state") == "lease_claimed":
+            previous = cls._bounded_git_mapping(previous.get("previous"))
+        return cls._fit_git_mapping(
+            {
+                "state": "lease_claimed",
+                "lease_token": cls._lease_token(lease_until),
+                "previous": previous,
+            }
+        )
+
+    @classmethod
+    def _active_git_previous(
+        cls,
+        status: object,
+        *,
+        lease_until: datetime,
+        active_states: set[str],
+    ) -> dict[str, Any] | None:
+        bounded = cls._bounded_git_mapping(status)
+        if (
+            bounded is not None
+            and bounded.get("state") in active_states
+            and bounded.get("lease_token") == cls._lease_token(lease_until)
+        ):
+            return cls._bounded_git_mapping(bounded.get("previous"))
+        return bounded
+
+    @classmethod
+    def _lease_token(cls, lease_until: datetime) -> str:
+        aware = lease_until
+        if aware.tzinfo is None or aware.utcoffset() is None:
+            aware = CN_TZ.localize(aware)
+        return cls._canonical_datetime(aware)
 
     async def _mark_written(
         self,
@@ -1145,19 +1357,22 @@ class TradingPlaybookObsidianSyncCoordinator:
                 relative_path,
             )
         )
-        try:
-            return await asyncio.shield(task)
-        except asyncio.CancelledError as cancelled:
-            # If cancellation arrived while the OS lock was blocked, wait for
-            # acquisition and release it before propagating cancellation.
-            try:
-                lock = await task
-            except BaseException:
-                raise cancelled
-            try:
-                await self._to_thread_fenced(lock.release)
-            finally:
-                raise cancelled
+        result, error, cancellation = await self._drain_fenced_task(task)
+        if cancellation is not None:
+            if isinstance(result, _TargetFileLock):
+                release_task = asyncio.create_task(
+                    asyncio.to_thread(result.release)
+                )
+                await self._drain_fenced_task(
+                    release_task,
+                    cancellation=cancellation,
+                )
+            raise cancellation
+        if error is not None:
+            raise error
+        if not isinstance(result, _TargetFileLock):
+            raise TypeError("Obsidian lock acquisition returned an invalid value")
+        return result
 
     @staticmethod
     def _lock_relative_path(identity: str) -> str:
@@ -1196,6 +1411,33 @@ class TradingPlaybookObsidianSyncCoordinator:
         now = self._database_datetime(self._aware_now())
         next_attempt_no = attempt_no + 1
         delay = self.RETRY_DELAYS[min(next_attempt_no - 1, len(self.RETRY_DELAYS) - 1)]
+        selected = (
+            await session.execute(
+                select(
+                    TradingPlaybookObsidianExport.git_status_json
+                ).where(
+                    TradingPlaybookObsidianExport.id == row_id,
+                    *self._active_lease_predicates(
+                        now=now,
+                        lease_until=lease_until,
+                    ),
+                )
+            )
+        ).first()
+        if selected is None:
+            return False
+        safe_error = self._safe_error(error)
+        git_status = self._fit_git_mapping(
+            {
+                "state": "write_failed",
+                "error": safe_error,
+                "previous": self._active_git_previous(
+                    selected[0],
+                    lease_until=lease_until,
+                    active_states={"lease_claimed", "write_in_progress"},
+                ),
+            }
+        )
         result = await session.execute(
             update(TradingPlaybookObsidianExport)
             .where(
@@ -1209,7 +1451,8 @@ class TradingPlaybookObsidianSyncCoordinator:
                 status="failed",
                 attempt_no=next_attempt_no,
                 next_attempt_at=now + delay,
-                last_error=self._safe_error(error),
+                last_error=safe_error,
+                git_status_json=git_status,
                 updated_at=now,
             )
         )
@@ -1251,6 +1494,12 @@ class TradingPlaybookObsidianSyncCoordinator:
         unique_ids = tuple(dict.fromkeys(int(row_id) for row_id in row_ids))
         if not unique_ids:
             return
+        bounded_status = self._bounded_git_mapping(status)
+        if bounded_status is None:
+            bounded_status = {
+                "state": "git_error",
+                "error": "empty Git status",
+            }
         now = self._database_datetime(self._aware_now())
         async with self.session_factory() as session:
             await session.execute(
@@ -1259,7 +1508,7 @@ class TradingPlaybookObsidianSyncCoordinator:
                     TradingPlaybookObsidianExport.id.in_(unique_ids),
                     TradingPlaybookObsidianExport.status == "written",
                 )
-                .values(git_status_json=status, updated_at=now)
+                .values(git_status_json=bounded_status, updated_at=now)
             )
             await session.commit()
 
@@ -1347,11 +1596,13 @@ class TradingPlaybookObsidianSyncCoordinator:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                return rows, {
-                    "state": "git_store_pending",
-                    "error": self._safe_error(exc),
-                    "result": status,
-                }
+                return rows, self._fit_git_mapping(
+                    {
+                        "state": "git_store_pending",
+                        "error": self._safe_error(exc),
+                        "result": status,
+                    }
+                )
             return rows, status
         except asyncio.CancelledError:
             raise
@@ -1458,8 +1709,24 @@ class TradingPlaybookObsidianSyncCoordinator:
                     isinstance(row.next_attempt_at, datetime)
                     and row.next_attempt_at > now
                 )
+                marker_state = git_state in {
+                    "lease_claimed",
+                    "write_in_progress",
+                }
+                marker_matches = bool(
+                    marker_state
+                    and isinstance(row.next_attempt_at, datetime)
+                    and type(row.git_status_json) is dict
+                    and row.git_status_json.get("lease_token")
+                    == self._lease_token(row.next_attempt_at)
+                )
+                is_legacy_pending_lease = bool(
+                    has_future_token
+                    and status == "pending"
+                    and not marker_state
+                )
                 is_active = has_future_token and (
-                    status == "pending" or git_state == "write_in_progress"
+                    marker_matches or is_legacy_pending_lease
                 )
                 if is_active or status == "superseded":
                     continue
@@ -1478,7 +1745,7 @@ class TradingPlaybookObsidianSyncCoordinator:
                     },
                     "updated_at": now,
                 }
-                if status in {"failed", "paused"}:
+                if status in {"failed", "paused", "pending"}:
                     values.update(
                         status="pending",
                         attempt_no=0,
@@ -1512,17 +1779,34 @@ class TradingPlaybookObsidianSyncCoordinator:
         task = asyncio.create_task(
             asyncio.to_thread(partial(function, *args, **kwargs))
         )
-        try:
-            return await asyncio.shield(task)
-        except asyncio.CancelledError:
-            # A cancelled await does not stop its worker thread.  Wait until
-            # the filesystem/Git call really exits before releasing the
-            # target resource, then preserve cancellation for the caller.
+        result, error, cancellation = await self._drain_fenced_task(task)
+        if cancellation is not None:
+            raise cancellation
+        if error is not None:
+            raise error
+        return result
+
+    @staticmethod
+    async def _drain_fenced_task(
+        task: asyncio.Task,
+        *,
+        cancellation: asyncio.CancelledError | None = None,
+    ) -> tuple[Any, BaseException | None, asyncio.CancelledError | None]:
+        """Drain an uninterruptible resource task under repeated cancellation."""
+
+        first_cancellation = cancellation
+        while not task.done():
             try:
-                await task
+                await asyncio.shield(task)
+            except asyncio.CancelledError as exc:
+                if first_cancellation is None:
+                    first_cancellation = exc
             except BaseException:
-                pass
-            raise
+                break
+        try:
+            return task.result(), None, first_cancellation
+        except BaseException as exc:
+            return None, exc, first_cancellation
 
     async def _writer_available(self) -> bool:
         if not bool(getattr(self.writer, "enabled", False)):
@@ -1592,12 +1876,15 @@ class TradingPlaybookObsidianSyncCoordinator:
 
     @staticmethod
     def _safe_text(value: str, *, limit: int) -> str:
-        safe_text = "".join(
-            " " if character in "\r\n\t" else character
-            if ord(character) >= 32
-            else "�"
-            for character in value
-        )
+        safe_characters: list[str] = []
+        for character in value:
+            if character in "\r\n\t":
+                safe_characters.append(" ")
+            elif unicodedata.category(character) in {"Cc", "Cs"}:
+                safe_characters.append("�")
+            else:
+                safe_characters.append(character)
+        safe_text = "".join(safe_characters)
         return safe_text[:limit]
 
     @classmethod
@@ -1614,7 +1901,46 @@ class TradingPlaybookObsidianSyncCoordinator:
             }
         bounded = cls._bounded_json_value(status, depth=0)
         assert type(bounded) is dict
-        return bounded
+        return cls._fit_git_mapping(bounded)
+
+    @classmethod
+    def _fit_git_mapping(cls, status: dict[str, Any]) -> dict[str, Any]:
+        encoded = json.dumps(
+            status,
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+        if len(encoded) <= _MAX_GIT_JSON_BYTES:
+            return status
+        state = status.get("state")
+        overflow = {
+            "state": "git_error",
+            "error": "Git status exceeded the 32768-byte storage limit",
+            "retryable": True,
+        }
+        if state in {"lease_claimed", "write_in_progress"}:
+            return {
+                "state": state,
+                "lease_token": cls._safe_text(
+                    str(status.get("lease_token", "")),
+                    limit=_MAX_GIT_JSON_STRING,
+                ),
+                "previous": overflow,
+            }
+        if state == "write_failed":
+            return {
+                "state": "write_failed",
+                "error": cls._safe_text(
+                    str(status.get("error", overflow["error"])),
+                    limit=_MAX_ERROR_LENGTH,
+                ),
+                "previous": overflow,
+            }
+        return {
+            **overflow,
+            "enabled": bool(status.get("enabled", True)),
+            "committed": False,
+        }
 
     @classmethod
     def _bounded_json_value(cls, value: object, *, depth: int) -> Any:
@@ -1660,22 +1986,26 @@ class TradingPlaybookObsidianSyncCoordinator:
             bounded = {"error": "empty Git status"}
         raw_error = bounded.get("error")
         if raw_error:
-            return {
-                "state": "git_error",
-                "enabled": bool(bounded.get("enabled", True)),
-                "committed": False,
-                "error": cls._safe_text(
-                    str(raw_error),
-                    limit=_MAX_ERROR_LENGTH,
-                ),
+            return cls._fit_git_mapping(
+                {
+                    "state": "git_error",
+                    "enabled": bool(bounded.get("enabled", True)),
+                    "committed": False,
+                    "error": cls._safe_text(
+                        str(raw_error),
+                        limit=_MAX_ERROR_LENGTH,
+                    ),
+                    "result": bounded,
+                }
+            )
+        return cls._fit_git_mapping(
+            {
+                "state": "git_complete",
+                "enabled": bool(bounded.get("enabled", False)),
+                "committed": bool(bounded.get("committed", False)),
                 "result": bounded,
             }
-        return {
-            "state": "git_complete",
-            "enabled": bool(bounded.get("enabled", False)),
-            "committed": bool(bounded.get("committed", False)),
-            "result": bounded,
-        }
+        )
 
     @staticmethod
     def _git_needs_retry(status: object) -> bool:
@@ -1687,6 +2017,7 @@ class TradingPlaybookObsidianSyncCoordinator:
             "git_pending",
             "git_error",
             "write_in_progress",
+            "write_failed",
         } or bool(status.get("error"))
 
     @classmethod
