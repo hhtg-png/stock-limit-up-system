@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import stat
 import unicodedata
 from collections.abc import Callable, Sequence
@@ -40,6 +41,7 @@ from app.services.trading_playbook.obsidian_types import (
     ObsidianSyncBatchResult,
     TRADING_PLAYBOOK_ALLOWED_ROOTS,
     canonical_json_bytes,
+    database_datetime_to_cn,
 )
 from app.utils.time_utils import CN_TZ
 
@@ -51,6 +53,10 @@ _MAX_GIT_JSON_ITEMS = 16
 _MAX_GIT_JSON_STRING = 512
 _MAX_GIT_JSON_BYTES = 32 * 1024
 _LOCK_ROOT = "30_TradingPlaybook/Daily/Auto/.sync-locks"
+_DASHBOARD_PATH = "Dashboards/交易预案.md"
+_ABSOLUTE_PATH_FRAGMENT = re.compile(
+    r"(?i)(?:[a-z]:[\\/]|\\\\[^\\\s]+[\\/]|(?:^|[\s:])/(?:[^\s]+))"
+)
 
 
 class _TargetFileLock:
@@ -282,6 +288,192 @@ class TradingPlaybookObsidianSyncCoordinator:
         self.exporter = exporter
         self.writer = writer
         self.clock = clock
+
+    async def get_status(self) -> dict[str, Any]:
+        """Return a read-only, path-safe snapshot of export health."""
+
+        enabled = bool(getattr(self.writer, "enabled", False))
+        auto_git_enabled = bool(
+            getattr(self.writer, "auto_git_enabled", False)
+        )
+        configured_vault = self.writer.configured_vault()
+        configured = configured_vault is not None
+        vault_path = Path(configured_vault) if configured else None
+        vault_exists = bool(
+            vault_path is not None
+            and await self._to_thread_fenced(vault_path.is_dir)
+        )
+        dashboard_openable = False
+        if enabled and configured and vault_exists:
+            try:
+                dashboard_target = await self._to_thread_fenced(
+                    self.writer.resolve_target,
+                    _DASHBOARD_PATH,
+                    allowed_roots=TRADING_PLAYBOOK_ALLOWED_ROOTS,
+                )
+                dashboard_openable = bool(
+                    await self._to_thread_fenced(
+                        Path(dashboard_target).is_file
+                    )
+                )
+            except asyncio.CancelledError:
+                raise
+            except (OSError, TypeError, ValueError):
+                dashboard_openable = False
+
+        async with self.session_factory() as session:
+            counts = (
+                await session.execute(
+                    select(
+                        func.sum(
+                            case(
+                                (
+                                    TradingPlaybookObsidianExport.status
+                                    == "pending",
+                                    1,
+                                ),
+                                else_=0,
+                            )
+                        ).label("pending_count"),
+                        func.sum(
+                            case(
+                                (
+                                    TradingPlaybookObsidianExport.status
+                                    == "paused",
+                                    1,
+                                ),
+                                else_=0,
+                            )
+                        ).label("paused_count"),
+                        func.sum(
+                            case(
+                                (
+                                    TradingPlaybookObsidianExport.status
+                                    == "failed",
+                                    1,
+                                ),
+                                else_=0,
+                            )
+                        ).label("failed_count"),
+                    )
+                )
+            ).one()
+            last_success = (
+                await session.execute(
+                    select(
+                        TradingPlaybookObsidianExport.exported_at,
+                        TradingPlaybookObsidianExport.trade_date,
+                        TradingPlaybookObsidianExport.phase,
+                    )
+                    .where(
+                        TradingPlaybookObsidianExport.status == "written",
+                        TradingPlaybookObsidianExport.exported_at.is_not(None),
+                    )
+                    .order_by(
+                        TradingPlaybookObsidianExport.exported_at.desc(),
+                        TradingPlaybookObsidianExport.id.desc(),
+                    )
+                    .limit(1)
+                )
+            ).first()
+            raw_last_error = await session.scalar(
+                select(TradingPlaybookObsidianExport.last_error)
+                .where(
+                    TradingPlaybookObsidianExport.last_error.is_not(None),
+                    TradingPlaybookObsidianExport.last_error != "",
+                )
+                .order_by(
+                    TradingPlaybookObsidianExport.updated_at.desc(),
+                    TradingPlaybookObsidianExport.id.desc(),
+                )
+                .limit(1)
+            )
+            latest_exported = func.max(
+                TradingPlaybookObsidianExport.exported_at
+            ).label("latest_exported")
+            latest_id = func.max(
+                TradingPlaybookObsidianExport.id
+            ).label("latest_id")
+            recent_rows = (
+                await session.execute(
+                    select(
+                        TradingPlaybookObsidianExport.target_path,
+                        latest_exported,
+                        latest_id,
+                    )
+                    .where(
+                        TradingPlaybookObsidianExport.status == "written",
+                        TradingPlaybookObsidianExport.exported_at.is_not(None),
+                    )
+                    .group_by(TradingPlaybookObsidianExport.target_path)
+                    .order_by(latest_exported.desc(), latest_id.desc())
+                    .limit(100)
+                )
+            ).all()
+
+        recent_files: list[str] = []
+        for row in recent_rows:
+            safe_path = self._status_relative_path(row.target_path)
+            if safe_path is not None:
+                recent_files.append(safe_path)
+            if len(recent_files) >= 20:
+                break
+        last_success_at = (
+            database_datetime_to_cn(last_success.exported_at)
+            if last_success is not None
+            else None
+        )
+        return {
+            "enabled": enabled,
+            "configured": configured,
+            "vault_exists": vault_exists,
+            "auto_git_enabled": auto_git_enabled,
+            "last_success_at": last_success_at,
+            "last_trade_date": (
+                last_success.trade_date if last_success is not None else None
+            ),
+            "last_phase": (
+                str(last_success.phase) if last_success is not None else None
+            ),
+            "pending_count": int(counts.pending_count or 0),
+            "paused_count": int(counts.paused_count or 0),
+            "failed_count": int(counts.failed_count or 0),
+            "last_error": self._public_status_error(raw_last_error),
+            "recent_files": recent_files,
+            "dashboard_path": _DASHBOARD_PATH,
+            "dashboard_openable": dashboard_openable,
+        }
+
+    @staticmethod
+    def _status_relative_path(value: object) -> str | None:
+        if type(value) is not str or not value or "\\" in value:
+            return None
+        if value.startswith("/") or re.match(r"^[A-Za-z]:", value):
+            return None
+        parts = value.split("/")
+        if any(
+            not part
+            or part in {".", ".."}
+            or any(ord(character) < 32 for character in part)
+            for part in parts
+        ):
+            return None
+        normalized = "/".join(parts)
+        if not any(
+            normalized == root or normalized.startswith(f"{root}/")
+            for root in TRADING_PLAYBOOK_ALLOWED_ROOTS
+        ):
+            return None
+        return normalized
+
+    @classmethod
+    def _public_status_error(cls, value: object) -> str | None:
+        if type(value) is not str or not value:
+            return None
+        safe = cls._safe_text(value, limit=_MAX_ERROR_LENGTH)
+        if _ABSOLUTE_PATH_FRAGMENT.search(safe):
+            return "Obsidian export failed"
+        return safe
 
     async def enqueue_artifacts(
         self,

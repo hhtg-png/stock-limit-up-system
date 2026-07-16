@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from datetime import date, datetime
-from typing import Annotated, Literal, Optional
+from typing import Annotated, Any, Literal, Optional
 
 from pydantic import (
     BaseModel,
@@ -115,6 +115,44 @@ class StrictRequest(BaseModel):
 class PlanGenerateRequest(StrictRequest):
     source_trade_date: JsonDate
     stage: PlanStage
+
+
+class TradingPlaybookObsidianExportRequest(StrictRequest):
+    trade_date: JsonDate
+    include_rules: StrictBool = False
+    force: StrictBool = False
+
+
+class TradingPlaybookObsidianStatusResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    enabled: StrictBool
+    configured: StrictBool
+    vault_exists: StrictBool
+    auto_git_enabled: StrictBool
+    last_success_at: datetime | None
+    last_trade_date: date | None
+    last_phase: str | None
+    pending_count: Annotated[StrictInt, Field(ge=0)]
+    paused_count: Annotated[StrictInt, Field(ge=0)]
+    failed_count: Annotated[StrictInt, Field(ge=0)]
+    last_error: str | None
+    recent_files: list[str]
+    dashboard_path: str
+    dashboard_openable: StrictBool
+
+
+class TradingPlaybookObsidianExportResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    trade_date: date
+    phase: str
+    written_files: list[str]
+    skipped_files: list[str]
+    pending_files: list[str]
+    failed_files: list[str]
+    git_status: dict[str, Any]
+    error_summary: str | None
 
 
 class PlanConfirmRequest(StrictRequest):
@@ -283,5 +321,8 @@ __all__ = [
     "PlanStatus",
     "RiskLevel",
     "TradingPlaybookSettingsUpdate",
+    "TradingPlaybookObsidianExportRequest",
+    "TradingPlaybookObsidianExportResponse",
+    "TradingPlaybookObsidianStatusResponse",
     "TriggerOverride",
 ]

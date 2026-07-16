@@ -3,6 +3,7 @@ import json
 import unittest
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 from zoneinfo import ZoneInfo
 
@@ -46,6 +47,7 @@ from app.services.trading_playbook.rule_catalog import (
     RuleCatalog,
     canonical_rule_source_refs,
 )
+from app.services.trading_playbook.obsidian_types import ObsidianSyncBatchResult
 
 
 CN = ZoneInfo("Asia/Shanghai")
@@ -157,6 +159,50 @@ class TradingPlaybookApiTests(unittest.TestCase):
         )
         app.dependency_overrides[get_trading_playbook_now] = lambda: FIXED_NOW
         self.app = app
+        self.obsidian_sync = SimpleNamespace(
+            get_status=AsyncMock(
+                return_value={
+                    "enabled": True,
+                    "configured": True,
+                    "vault_exists": True,
+                    "auto_git_enabled": False,
+                    "last_success_at": datetime(2026, 7, 16, 15, 31),
+                    "last_trade_date": date(2026, 7, 16),
+                    "last_phase": "after_close",
+                    "pending_count": 1,
+                    "paused_count": 0,
+                    "failed_count": 1,
+                    "last_error": "safe export failure",
+                    "recent_files": [
+                        "30_TradingPlaybook/Daily/Auto/2026/2026-07-16/index.md"
+                    ],
+                    "dashboard_path": "Dashboards/交易预案.md",
+                    "dashboard_openable": True,
+                }
+            ),
+            export_trade_date=AsyncMock(
+                return_value=ObsidianSyncBatchResult(
+                    trade_date=date(2026, 7, 16),
+                    phase="reconcile",
+                    written_files=(
+                        "30_TradingPlaybook/Daily/Auto/2026/2026-07-16/index.md",
+                    ),
+                    skipped_files=("Dashboards/交易预案.md",),
+                    pending_files=(
+                        "30_TradingPlaybook/Alerts/Auto/2026/2026-07-16.md",
+                    ),
+                    failed_files=(
+                        "30_TradingPlaybook/Reviews/Auto/2026/review-7.md",
+                    ),
+                    git_status={
+                        "state": "git_error",
+                        "enabled": False,
+                        "committed": False,
+                    },
+                )
+            ),
+        )
+        self.app.state.trading_playbook_obsidian_sync = self.obsidian_sync
         self.client = TestClient(app)
 
     async def _seed(self):
@@ -365,6 +411,8 @@ class TradingPlaybookApiTests(unittest.TestCase):
 
     def tearDown(self):
         self.client.close()
+        if hasattr(self.app.state, "trading_playbook_obsidian_sync"):
+            del self.app.state.trading_playbook_obsidian_sync
         asyncio.run(self.engine.dispose())
         trading_playbook_runtime.reset()
 
@@ -2052,6 +2100,254 @@ class TradingPlaybookApiTests(unittest.TestCase):
         )
         self.assertNotIn("secret", response.text)
 
+    def test_obsidian_status_uses_app_coordinator_and_explicit_contract(self):
+        response = self.client.get("/trading-playbook/obsidian/status")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            response.json(),
+            {
+                "enabled": True,
+                "configured": True,
+                "vault_exists": True,
+                "auto_git_enabled": False,
+                "last_success_at": "2026-07-16T15:31:00",
+                "last_trade_date": "2026-07-16",
+                "last_phase": "after_close",
+                "pending_count": 1,
+                "paused_count": 0,
+                "failed_count": 1,
+                "last_error": "safe export failure",
+                "recent_files": [
+                    "30_TradingPlaybook/Daily/Auto/2026/2026-07-16/index.md"
+                ],
+                "dashboard_path": "Dashboards/交易预案.md",
+                "dashboard_openable": True,
+            },
+        )
+        self.obsidian_sync.get_status.assert_awaited_once_with()
+
+    def test_obsidian_export_defaults_and_partial_result_contract(self):
+        response = self.client.post(
+            "/trading-playbook/obsidian/export",
+            json={"trade_date": "2026-07-16"},
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.obsidian_sync.export_trade_date.assert_awaited_once_with(
+            date(2026, 7, 16),
+            include_rules=False,
+            force=False,
+        )
+        self.assertEqual(
+            response.json(),
+            {
+                "trade_date": "2026-07-16",
+                "phase": "reconcile",
+                "written_files": [
+                    "30_TradingPlaybook/Daily/Auto/2026/2026-07-16/index.md"
+                ],
+                "skipped_files": ["Dashboards/交易预案.md"],
+                "pending_files": [
+                    "30_TradingPlaybook/Alerts/Auto/2026/2026-07-16.md"
+                ],
+                "failed_files": [
+                    "30_TradingPlaybook/Reviews/Auto/2026/review-7.md"
+                ],
+                "git_status": {
+                    "state": "git_error",
+                    "enabled": False,
+                    "committed": False,
+                },
+                "error_summary": "1 failed, 1 pending",
+            },
+        )
+
+    def test_obsidian_export_forwards_explicit_strict_flags(self):
+        response = self.client.post(
+            "/trading-playbook/obsidian/export",
+            json={
+                "trade_date": "2026-07-16",
+                "include_rules": True,
+                "force": True,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.obsidian_sync.export_trade_date.assert_awaited_once_with(
+            date(2026, 7, 16),
+            include_rules=True,
+            force=True,
+        )
+
+    def test_obsidian_export_request_is_strict(self):
+        invalid_payloads = (
+            {},
+            {"trade_date": None},
+            {"trade_date": "2026-7-16"},
+            {"trade_date": "2026-07-16T00:00:00"},
+            {"trade_date": "2026-02-30"},
+            {"trade_date": "2026-07-16", "extra": True},
+            {"trade_date": "2026-07-16", "include_rules": 1},
+            {"trade_date": "2026-07-16", "include_rules": "true"},
+            {"trade_date": "2026-07-16", "include_rules": None},
+            {"trade_date": "2026-07-16", "force": 1},
+            {"trade_date": "2026-07-16", "force": "false"},
+            {"trade_date": "2026-07-16", "force": None},
+        )
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload):
+                response = self.client.post(
+                    "/trading-playbook/obsidian/export",
+                    json=payload,
+                )
+                self.assertEqual(response.status_code, 422, response.text)
+        self.obsidian_sync.export_trade_date.assert_not_awaited()
+
+    def test_obsidian_unconfigured_status_is_a_normal_paused_response(self):
+        self.obsidian_sync.get_status.return_value = {
+            "enabled": True,
+            "configured": False,
+            "vault_exists": False,
+            "auto_git_enabled": False,
+            "last_success_at": None,
+            "last_trade_date": None,
+            "last_phase": None,
+            "pending_count": 0,
+            "paused_count": 3,
+            "failed_count": 0,
+            "last_error": None,
+            "recent_files": [],
+            "dashboard_path": "Dashboards/交易预案.md",
+            "dashboard_openable": False,
+        }
+
+        response = self.client.get("/trading-playbook/obsidian/status")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertFalse(response.json()["configured"])
+        self.assertEqual(response.json()["paused_count"], 3)
+
+    def test_obsidian_dependency_and_failures_use_fixed_503(self):
+        cases = (
+            None,
+            SimpleNamespace(get_status=AsyncMock()),
+            SimpleNamespace(
+                get_status=AsyncMock(side_effect=RuntimeError("C:\\secret\\vault")),
+                export_trade_date=AsyncMock(),
+            ),
+        )
+        for coordinator in cases:
+            with self.subTest(coordinator=coordinator):
+                if coordinator is None:
+                    del self.app.state.trading_playbook_obsidian_sync
+                else:
+                    self.app.state.trading_playbook_obsidian_sync = coordinator
+                with TestClient(
+                    self.app,
+                    raise_server_exceptions=False,
+                ) as client:
+                    response = client.get(
+                        "/trading-playbook/obsidian/status"
+                    )
+                self.assertEqual(response.status_code, 503, response.text)
+                self.assertEqual(
+                    response.json(),
+                    {"detail": "Trading playbook service is unavailable"},
+                )
+                self.assertNotIn("secret", response.text)
+        self.app.state.trading_playbook_obsidian_sync = self.obsidian_sync
+
+    def test_obsidian_export_rejects_unsafe_response_without_path_leak(self):
+        unsafe_results = (
+            ObsidianSyncBatchResult(
+                trade_date=date(2026, 7, 16),
+                phase="reconcile",
+                written_files=("C:\\secret\\vault\\plan.md",),
+                skipped_files=(),
+                pending_files=(),
+                failed_files=(),
+                git_status={"state": "not_attempted"},
+            ),
+            ObsidianSyncBatchResult(
+                trade_date=date(2026, 7, 16),
+                phase="reconcile",
+                written_files=(),
+                skipped_files=(),
+                pending_files=(),
+                failed_files=(),
+                git_status={"C:\\secret\\vault": "unsafe-key"},
+            ),
+        )
+        for result in unsafe_results:
+            with self.subTest(result=result):
+                self.obsidian_sync.export_trade_date.return_value = result
+                with TestClient(
+                    self.app,
+                    raise_server_exceptions=False,
+                ) as client:
+                    response = client.post(
+                        "/trading-playbook/obsidian/export",
+                        json={"trade_date": "2026-07-16"},
+                    )
+
+                self.assertEqual(response.status_code, 503, response.text)
+                self.assertNotIn("secret", response.text)
+
+    def test_obsidian_api_does_not_mutate_trading_business_tables(self):
+        async def business_state():
+            async with self.Session() as db:
+                state = []
+                for model in (
+                    TradingPlanVersion,
+                    TradingPlanCandidate,
+                    TradingAlertEvent,
+                    TradingExecutionReview,
+                    TradingPlaybookSettings,
+                ):
+                    rows = (
+                        await db.execute(
+                            model.__table__.select().order_by(model.id)
+                        )
+                    ).mappings().all()
+                    state.append(tuple(dict(row) for row in rows))
+                return tuple(state)
+
+        before = asyncio.run(business_state())
+        status = self.client.get("/trading-playbook/obsidian/status")
+        exported = self.client.post(
+            "/trading-playbook/obsidian/export",
+            json={"trade_date": "2026-07-16"},
+        )
+        after = asyncio.run(business_state())
+
+        self.assertEqual(status.status_code, 200, status.text)
+        self.assertEqual(exported.status_code, 200, exported.text)
+        self.assertEqual(after, before)
+
+    def test_obsidian_cancelled_error_propagates_from_handlers(self):
+        coordinator = SimpleNamespace(
+            get_status=AsyncMock(side_effect=asyncio.CancelledError()),
+            export_trade_date=AsyncMock(side_effect=asyncio.CancelledError()),
+        )
+        with self.assertRaises(asyncio.CancelledError):
+            asyncio.run(
+                trading_playbook_api.get_obsidian_status(
+                    coordinator=coordinator
+                )
+            )
+        with self.assertRaises(asyncio.CancelledError):
+            asyncio.run(
+                trading_playbook_api.export_obsidian_trade_date(
+                    request=SimpleNamespace(
+                        trade_date=date(2026, 7, 16),
+                        include_rules=False,
+                        force=False,
+                    ),
+                    coordinator=coordinator,
+                )
+            )
+
     def test_router_is_mounted_once_under_api_v1_prefix(self):
         from app.api.v1 import api_router
 
@@ -2061,8 +2357,8 @@ class TradingPlaybookApiTests(unittest.TestCase):
             if route.path.startswith("/trading-playbook")
             for method in route.methods
         ]
-        self.assertEqual(len(operations), 13)
-        self.assertEqual(len(set(operations)), 13)
+        self.assertEqual(len(operations), 15)
+        self.assertEqual(len(set(operations)), 15)
 
 
 if __name__ == "__main__":

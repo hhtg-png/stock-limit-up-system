@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import math
+import re
 from collections.abc import Mapping
 from datetime import date, datetime
 from typing import Any
@@ -27,6 +29,9 @@ from app.schemas.trading_playbook import (
     PlanConfirmRequest,
     PlanGenerateRequest,
     PlanRevisionRequest,
+    TradingPlaybookObsidianExportRequest,
+    TradingPlaybookObsidianExportResponse,
+    TradingPlaybookObsidianStatusResponse,
     TradingPlaybookSettingsUpdate,
 )
 from app.services.trading_playbook.errors import (
@@ -35,6 +40,11 @@ from app.services.trading_playbook.errors import (
     PlaybookNotFoundError,
     UnsafePlanDataError,
     UpstreamUnavailableError,
+)
+from app.services.trading_playbook.obsidian_types import (
+    OBSIDIAN_PHASES,
+    ObsidianSyncBatchResult,
+    TRADING_PLAYBOOK_ALLOWED_ROOTS,
 )
 from app.services.trading_playbook.plan_service import TradingPlanService
 from app.services.trading_playbook.runtime import trading_playbook_runtime
@@ -54,6 +64,10 @@ INVALID_REQUEST_DETAIL = "Invalid trading playbook request"
 STATE_CONFLICT_DETAIL = "Trading plan state conflict"
 NOT_FOUND_DETAIL = "Trading plan not found"
 SERVICE_UNAVAILABLE_DETAIL = "Trading playbook service is unavailable"
+_OBSIDIAN_DASHBOARD_PATH = "Dashboards/交易预案.md"
+_ABSOLUTE_PATH_FRAGMENT = re.compile(
+    r"(?i)(?:[a-z]:[\\/]|\\\\[^\\\s]+[\\/]|(?:^|[\s:])/(?:[^\s]+))"
+)
 
 
 def _service_unavailable() -> HTTPException:
@@ -115,6 +129,226 @@ def get_trading_playbook_review_service(request: Request):
             detail=SERVICE_UNAVAILABLE_DETAIL,
         )
     return service
+
+
+def get_trading_playbook_obsidian_sync(request: Request):
+    """Return only the application-owned Obsidian coordinator."""
+
+    try:
+        coordinator = getattr(
+            request.app.state,
+            "trading_playbook_obsidian_sync",
+            None,
+        )
+    except Exception as exc:
+        raise _service_unavailable() from exc
+    if coordinator is None or any(
+        not callable(getattr(coordinator, method, None))
+        for method in ("get_status", "export_trade_date")
+    ):
+        raise _service_unavailable()
+    return coordinator
+
+
+def _obsidian_relative_path(value: object) -> str:
+    if type(value) is not str or not value or "\\" in value:
+        raise ValueError("Obsidian response path is unsafe")
+    if value.startswith("/") or re.match(r"^[A-Za-z]:", value):
+        raise ValueError("Obsidian response path is unsafe")
+    parts = value.split("/")
+    if any(
+        not part
+        or part in {".", ".."}
+        or any(ord(character) < 32 for character in part)
+        for part in parts
+    ):
+        raise ValueError("Obsidian response path is unsafe")
+    normalized = "/".join(parts)
+    if not any(
+        normalized == root or normalized.startswith(f"{root}/")
+        for root in TRADING_PLAYBOOK_ALLOWED_ROOTS
+    ):
+        raise ValueError("Obsidian response path is outside its allowlist")
+    return normalized
+
+
+def _public_json(value: object, *, depth: int = 0) -> Any:
+    if depth > 8:
+        raise ValueError("Obsidian response JSON is too deeply nested")
+    if value is None or type(value) in {bool, int}:
+        return value
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError("Obsidian response JSON must be finite")
+        return value
+    if type(value) is str:
+        safe = "".join(
+            " " if character in "\r\n\t" else character
+            for character in value
+            if ord(character) >= 32
+        )[:2000]
+        return (
+            "redacted"
+            if _ABSOLUTE_PATH_FRAGMENT.search(safe)
+            else safe
+        )
+    if isinstance(value, Mapping):
+        if len(value) > 64:
+            raise ValueError("Obsidian response JSON has too many items")
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            if (
+                type(key) is not str
+                or not key
+                or len(key) > 128
+                or any(ord(character) < 32 for character in key)
+                or _ABSOLUTE_PATH_FRAGMENT.search(key)
+            ):
+                raise ValueError("Obsidian response JSON key is unsafe")
+            result[key] = _public_json(item, depth=depth + 1)
+        return result
+    if type(value) in {list, tuple}:
+        if len(value) > 64:
+            raise ValueError("Obsidian response JSON has too many items")
+        return [_public_json(item, depth=depth + 1) for item in value]
+    raise ValueError("Obsidian response JSON contains an unsupported value")
+
+
+def _serialize_obsidian_status(
+    value: object,
+) -> TradingPlaybookObsidianStatusResponse:
+    if not isinstance(value, Mapping):
+        raise ValueError("Obsidian status must be a mapping")
+    payload = dict(value)
+    recent = payload.get("recent_files")
+    if type(recent) is not list:
+        raise ValueError("Obsidian recent files must be a list")
+    payload["recent_files"] = [
+        _obsidian_relative_path(item) for item in recent
+    ]
+    if payload.get("dashboard_path") != _OBSIDIAN_DASHBOARD_PATH:
+        raise ValueError("Obsidian dashboard path is unsafe")
+    last_error = payload.get("last_error")
+    if last_error is not None:
+        if type(last_error) is not str or _ABSOLUTE_PATH_FRAGMENT.search(
+            last_error
+        ):
+            raise ValueError("Obsidian status error is unsafe")
+    return TradingPlaybookObsidianStatusResponse.model_validate(
+        payload,
+        strict=True,
+    )
+
+
+def _serialize_obsidian_export(
+    value: object,
+) -> TradingPlaybookObsidianExportResponse:
+    if isinstance(value, ObsidianSyncBatchResult):
+        payload = {
+            "trade_date": value.trade_date,
+            "phase": value.phase,
+            "written_files": value.written_files,
+            "skipped_files": value.skipped_files,
+            "pending_files": value.pending_files,
+            "failed_files": value.failed_files,
+            "git_status": value.git_status_json(),
+        }
+    elif isinstance(value, Mapping):
+        required = {
+            "trade_date",
+            "phase",
+            "written_files",
+            "skipped_files",
+            "pending_files",
+            "failed_files",
+            "git_status",
+        }
+        if set(value) != required:
+            raise ValueError("Obsidian export result has an invalid structure")
+        payload = dict(value)
+    else:
+        raise ValueError("Obsidian export result has an invalid type")
+    if type(payload["trade_date"]) is not date:
+        raise ValueError("Obsidian export trade date is invalid")
+    if payload["phase"] not in OBSIDIAN_PHASES:
+        raise ValueError("Obsidian export phase is invalid")
+    serialized: dict[str, Any] = {
+        "trade_date": payload["trade_date"],
+        "phase": payload["phase"],
+    }
+    for field in (
+        "written_files",
+        "skipped_files",
+        "pending_files",
+        "failed_files",
+    ):
+        files = payload[field]
+        if type(files) not in {list, tuple}:
+            raise ValueError("Obsidian export files must be a list or tuple")
+        serialized[field] = [
+            _obsidian_relative_path(item) for item in files
+        ]
+    git_status = _public_json(payload["git_status"])
+    if type(git_status) is not dict:
+        raise ValueError("Obsidian Git status must be an object")
+    serialized["git_status"] = git_status
+    failed_count = len(serialized["failed_files"])
+    pending_count = len(serialized["pending_files"])
+    if failed_count and pending_count:
+        error_summary = f"{failed_count} failed, {pending_count} pending"
+    elif failed_count:
+        error_summary = f"{failed_count} failed"
+    elif pending_count:
+        error_summary = f"{pending_count} pending"
+    else:
+        error_summary = None
+    serialized["error_summary"] = error_summary
+    return TradingPlaybookObsidianExportResponse.model_validate(
+        serialized,
+        strict=True,
+    )
+
+
+@router.get(
+    "/obsidian/status",
+    response_model=TradingPlaybookObsidianStatusResponse,
+    summary="查询交易预案 Obsidian 同步状态",
+)
+async def get_obsidian_status(
+    coordinator: Any = Depends(get_trading_playbook_obsidian_sync),
+):
+    try:
+        return _serialize_obsidian_status(await coordinator.get_status())
+    except HTTPException:
+        raise
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        raise _service_unavailable() from exc
+
+
+@router.post(
+    "/obsidian/export",
+    response_model=TradingPlaybookObsidianExportResponse,
+    summary="手动导出交易预案到 Obsidian",
+)
+async def export_obsidian_trade_date(
+    request: TradingPlaybookObsidianExportRequest,
+    coordinator: Any = Depends(get_trading_playbook_obsidian_sync),
+):
+    try:
+        result = await coordinator.export_trade_date(
+            request.trade_date,
+            include_rules=request.include_rules,
+            force=request.force,
+        )
+        return _serialize_obsidian_export(result)
+    except HTTPException:
+        raise
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        raise _service_unavailable() from exc
 
 
 def _china_iso(value: datetime | None) -> str | None:

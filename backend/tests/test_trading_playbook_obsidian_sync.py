@@ -256,6 +256,188 @@ class TradingPlaybookObsidianSyncTests(unittest.IsolatedAsyncioTestCase):
                 )
             return list((await session.execute(statement)).scalars())
 
+    async def test_status_is_stable_when_empty_disabled_or_unconfigured(self):
+        missing_vault = Path(self.temporary_directory.name) / "missing-vault"
+        writers = (
+            FakeWriter(""),
+            FakeWriter(missing_vault),
+        )
+        writers[0].enabled = False
+        for writer in writers:
+            with self.subTest(writer=writer):
+                coordinator = self._coordinator(
+                    self.session_factory,
+                    writer=writer,
+                )
+
+                status = await coordinator.get_status()
+
+                self.assertEqual(
+                    status,
+                    {
+                        "enabled": bool(writer.enabled),
+                        "configured": bool(str(writer.vault_path).strip()),
+                        "vault_exists": False,
+                        "auto_git_enabled": True,
+                        "last_success_at": None,
+                        "last_trade_date": None,
+                        "last_phase": None,
+                        "pending_count": 0,
+                        "paused_count": 0,
+                        "failed_count": 0,
+                        "last_error": None,
+                        "recent_files": [],
+                        "dashboard_path": "Dashboards/交易预案.md",
+                        "dashboard_openable": False,
+                    },
+                )
+        self.assertFalse(missing_vault.exists())
+
+    async def test_status_aggregates_rows_and_only_exposes_relative_paths(self):
+        vault = Path(self.temporary_directory.name) / "vault"
+        dashboard = vault / "Dashboards" / "交易预案.md"
+        dashboard.parent.mkdir(parents=True)
+        dashboard.write_text("dashboard", encoding="utf-8")
+        writer = FakeWriter(vault)
+        coordinator = self._coordinator(
+            self.session_factory,
+            writer=writer,
+        )
+        repeated = "30_TradingPlaybook/Daily/Auto/2026/repeated.md"
+        now = datetime(2026, 7, 16, 15, 30)
+
+        def row(
+            marker,
+            *,
+            status,
+            target_path,
+            trade_date=TRADE_DATE,
+            phase="reconcile",
+            exported_at=None,
+            last_error=None,
+            updated_at=now,
+        ):
+            return TradingPlaybookObsidianExport(
+                snapshot_key=f"status:{marker}",
+                snapshot_version=1,
+                trade_date=trade_date,
+                entity_type="daily_index",
+                entity_id=None,
+                phase=phase,
+                target_path=target_path,
+                source_hash=f"{marker:0>64}"[-64:],
+                snapshot_json={"payload": {"marker": marker}},
+                immutable=False,
+                status=status,
+                attempt_no=0,
+                next_attempt_at=None,
+                last_error=last_error,
+                git_status_json={"internal": "must-not-leak"},
+                exported_at=exported_at,
+                created_at=now,
+                updated_at=updated_at,
+            )
+
+        async with self.session_factory() as session:
+            session.add_all(
+                [
+                    row(
+                        "old-repeat",
+                        status="written",
+                        target_path=repeated,
+                        exported_at=now - timedelta(hours=3),
+                    ),
+                    row(
+                        "dashboard",
+                        status="written",
+                        target_path="Dashboards/交易预案.md",
+                        exported_at=now - timedelta(hours=2),
+                        phase="after_close",
+                    ),
+                    row(
+                        "new-repeat",
+                        status="written",
+                        target_path=repeated,
+                        trade_date=date(2026, 7, 17),
+                        phase="auction",
+                        exported_at=now - timedelta(hours=1),
+                    ),
+                    row(
+                        "pending",
+                        status="pending",
+                        target_path=(
+                            "30_TradingPlaybook/Alerts/Auto/2026/pending.md"
+                        ),
+                    ),
+                    row(
+                        "paused",
+                        status="paused",
+                        target_path=(
+                            "30_TradingPlaybook/Daily/Auto/2026/paused.md"
+                        ),
+                    ),
+                    row(
+                        "failed",
+                        status="failed",
+                        target_path=(
+                            "30_TradingPlaybook/Reviews/Auto/2026/failed.md"
+                        ),
+                        last_error="write failed at C:\\secret\\vault\\plan.md",
+                        updated_at=now + timedelta(minutes=1),
+                    ),
+                ]
+            )
+            await session.commit()
+        before = [
+            (item.id, item.status, item.updated_at) for item in await self._rows()
+        ]
+
+        status = await coordinator.get_status()
+
+        self.assertTrue(status["enabled"])
+        self.assertTrue(status["configured"])
+        self.assertTrue(status["vault_exists"])
+        self.assertTrue(status["auto_git_enabled"])
+        self.assertEqual(status["pending_count"], 1)
+        self.assertEqual(status["paused_count"], 1)
+        self.assertEqual(status["failed_count"], 1)
+        self.assertEqual(
+            status["last_success_at"],
+            datetime(2026, 7, 16, 14, 30, tzinfo=timezone(timedelta(hours=8))),
+        )
+        self.assertEqual(status["last_trade_date"], date(2026, 7, 17))
+        self.assertEqual(status["last_phase"], "auction")
+        self.assertEqual(
+            status["recent_files"],
+            [repeated, "Dashboards/交易预案.md"],
+        )
+        self.assertNotIn("secret", status["last_error"])
+        self.assertEqual(status["dashboard_path"], "Dashboards/交易预案.md")
+        self.assertTrue(status["dashboard_openable"])
+        self.assertEqual(
+            [(item.id, item.status, item.updated_at) for item in await self._rows()],
+            before,
+        )
+
+    async def test_status_propagates_writer_errors_and_cancellation(self):
+        for error in (
+            RuntimeError("configured status unavailable"),
+            asyncio.CancelledError(),
+        ):
+            writer = FakeWriter(self.temporary_directory.name)
+
+            def fail(error=error):
+                raise error
+
+            writer.configured_vault = fail
+            coordinator = self._coordinator(
+                self.session_factory,
+                writer=writer,
+            )
+            with self.subTest(error=error):
+                with self.assertRaises(type(error)):
+                    await coordinator.get_status()
+
     async def test_same_key_and_hash_reuses_the_current_row(self):
         item = artifact("same")
 
