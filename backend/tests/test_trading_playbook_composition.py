@@ -93,7 +93,11 @@ class TradingPlaybookProductionCompositionTests(unittest.IsolatedAsyncioTestCase
         self.assertTrue(callable(orchestrator.market_data.kline_loader))
         self.assertTrue(callable(orchestrator.market_data.realtime_limit_up_loader))
         self.assertTrue(callable(orchestrator.market_data.full_market_context_loader))
-        self.assertEqual(orchestrator.market_data.max_concurrency, 16)
+        self.assertEqual(orchestrator.market_data.max_concurrency, 8)
+        self.assertEqual(
+            orchestrator.market_data.kline_stage_timeout_seconds,
+            55.0,
+        )
 
     async def test_kline_adapter_reuses_existing_fetcher_without_changing_contract(self):
         from app.services.trading_playbook.composition import load_production_kline
