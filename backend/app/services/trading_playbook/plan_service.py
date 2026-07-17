@@ -1337,11 +1337,8 @@ class TradingPlanService:
                     WITH extracted AS (
                         SELECT
                             json_extract(value, '$.mode_key') AS mode_key,
-                            json_extract(value, '$.stock_code') AS stock_code,
                             json_extract(value, '$.status') AS status,
                             CAST(json_extract(value, '$.score') AS REAL) AS score,
-                            json_extract(value, '$.role') AS role,
-                            json_extract(value, '$.risk_level') AS risk_level,
                             json_extract(value, '$.rule_version') AS rule_version,
                             json_extract(value, '$.rule_hash') AS rule_hash,
                             json_extract(value, '$.action_scope') AS action_scope
@@ -1351,43 +1348,25 @@ class TradingPlanService:
                             WHERE id = :plan_id
                         ))
                         WHERE json_type(value) = 'object'
-                    ), ranked AS (
-                        SELECT
-                            *,
-                            ROW_NUMBER() OVER (
-                                PARTITION BY mode_key
-                                ORDER BY
-                                    CASE status
-                                        WHEN 'matched' THEN 0
-                                        WHEN 'waiting' THEN 1
-                                        WHEN 'manual_review' THEN 2
-                                        WHEN 'not_matched' THEN 3
-                                        ELSE 4
-                                    END,
-                                    score DESC,
-                                    stock_code
-                            ) AS display_rank,
-                            COUNT(*) OVER (
-                                PARTITION BY mode_key
-                            ) AS scanned_count,
-                            SUM(CASE WHEN status = 'matched' THEN 1 ELSE 0 END)
-                                OVER (PARTITION BY mode_key) AS matched_count,
-                            SUM(CASE WHEN status = 'waiting' THEN 1 ELSE 0 END)
-                                OVER (PARTITION BY mode_key) AS waiting_count,
-                            SUM(
-                                CASE WHEN status = 'manual_review' THEN 1 ELSE 0 END
-                            )
-                                OVER (PARTITION BY mode_key) AS manual_review_count,
-                            SUM(
-                                CASE WHEN status = 'not_matched' THEN 1 ELSE 0 END
-                            )
-                                OVER (PARTITION BY mode_key) AS not_matched_count
-                        FROM extracted
-                        WHERE mode_key IS NOT NULL AND trim(mode_key) <> ''
                     )
-                    SELECT *
-                    FROM ranked
-                    WHERE display_rank = 1
+                    SELECT
+                        mode_key,
+                        MAX(score) AS score,
+                        MAX(rule_version) AS rule_version,
+                        MAX(rule_hash) AS rule_hash,
+                        MAX(action_scope) AS action_scope,
+                        COUNT(*) AS scanned_count,
+                        SUM(CASE WHEN status = 'matched' THEN 1 ELSE 0 END)
+                            AS matched_count,
+                        SUM(CASE WHEN status = 'waiting' THEN 1 ELSE 0 END)
+                            AS waiting_count,
+                        SUM(CASE WHEN status = 'manual_review' THEN 1 ELSE 0 END)
+                            AS manual_review_count,
+                        SUM(CASE WHEN status = 'not_matched' THEN 1 ELSE 0 END)
+                            AS not_matched_count
+                    FROM extracted
+                    WHERE mode_key IS NOT NULL AND trim(mode_key) <> ''
+                    GROUP BY mode_key
                     ORDER BY mode_key
                     """
                 ),
@@ -1403,14 +1382,22 @@ class TradingPlanService:
                 "manual_review": int(row["manual_review_count"] or 0),
                 "not_matched": int(row["not_matched_count"] or 0),
             }
+            status = next(
+                (
+                    name
+                    for name in _RADAR_STATUS_PRIORITY
+                    if summary_counts[name]
+                ),
+                "not_matched",
+            )
             result.append(
                 {
                     "mode_key": str(row["mode_key"]),
-                    "stock_code": str(row["stock_code"] or ""),
-                    "status": str(row["status"] or "not_matched"),
+                    "stock_code": "",
+                    "status": status,
                     "score": float(row["score"] or 0),
-                    "role": str(row["role"] or ""),
-                    "risk_level": str(row["risk_level"] or "avoid"),
+                    "role": "summary",
+                    "risk_level": "avoid",
                     "entry_trigger": {},
                     "invalidation": {},
                     "exit_trigger": {},
