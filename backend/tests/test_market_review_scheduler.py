@@ -175,6 +175,11 @@ class MarketReviewSchedulerTests(unittest.IsolatedAsyncioTestCase):
             "Asia/Shanghai",
         )
         self.assertIn("after_close_catchup", job_ids)
+        self.assertEqual(
+            jobs_by_id["after_close_catchup"]["misfire_grace_time"],
+            60,
+        )
+        self.assertTrue(jobs_by_id["after_close_catchup"]["coalesce"])
 
     def test_start_registers_l2_collect_when_enabled(self):
         scheduler = self._create_scheduler()

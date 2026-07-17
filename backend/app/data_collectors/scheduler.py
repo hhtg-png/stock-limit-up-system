@@ -341,6 +341,8 @@ class DataScheduler:
             name="收盘后启动补跑",
             max_instances=1,
             replace_existing=True,
+            misfire_grace_time=60,
+            coalesce=True,
         )
         
         self.scheduler.start()
