@@ -771,13 +771,28 @@ class DataScheduler:
                     build_kwargs = {"degraded": degraded}
                     if degradation_reason is not None:
                         build_kwargs["degradation_reason"] = degradation_reason
+                    build_now = now
+                    prepare_realtime = getattr(
+                        orchestrator,
+                        "prepare_realtime_snapshot",
+                        None,
+                    )
+                    if stage == "auction" and callable(prepare_realtime):
+                        prepared_realtime = await prepare_realtime(
+                            source_trade_date
+                        )
+                        build_now = self._playbook_now()
+                        if prepared_realtime is not None:
+                            build_kwargs["prepared_realtime_snapshot"] = (
+                                prepared_realtime
+                            )
                     plan = await self._run_with_playbook_claim(
                         token,
                         lambda: orchestrator.build_stage(
                             db,
                             source_trade_date,
                             stage,
-                            now,
+                            build_now,
                             **build_kwargs,
                         ),
                     )

@@ -93,6 +93,7 @@ class TradingPlaybookProductionCompositionTests(unittest.IsolatedAsyncioTestCase
         self.assertTrue(callable(orchestrator.market_data.kline_loader))
         self.assertTrue(callable(orchestrator.market_data.realtime_limit_up_loader))
         self.assertTrue(callable(orchestrator.market_data.full_market_context_loader))
+        self.assertEqual(orchestrator.market_data.max_concurrency, 16)
 
     async def test_kline_adapter_reuses_existing_fetcher_without_changing_contract(self):
         from app.services.trading_playbook.composition import load_production_kline
@@ -253,6 +254,45 @@ class TradingPlaybookProductionCompositionTests(unittest.IsolatedAsyncioTestCase
 
         self.assertEqual(result["prior_window"], "first_divergence")
         self.assertEqual(result["divergence_days"], 2)
+
+    async def test_non_divergence_prior_window_recovers_missing_legacy_counter(self):
+        from app.services.trading_playbook.composition import (
+            load_production_full_market_context,
+        )
+
+        friday = date(2026, 7, 10)
+        thursday = date(2026, 7, 9)
+        monday = date(2026, 7, 13)
+        async with self.Session() as db:
+            db.add_all(
+                [
+                    self._metric(friday),
+                    self._metric(thursday, limit_up_count=43),
+                    TradingPlanVersion(
+                        source_trade_date=friday,
+                        target_trade_date=monday,
+                        stage="after_close",
+                        version_no=1,
+                        status="draft",
+                        market_state_json={"window": "decline"},
+                        input_hash="legacy-decline-plan",
+                        generated_at=datetime(2026, 7, 10, 15, 30),
+                    ),
+                ]
+            )
+            await db.commit()
+
+        result = await load_production_full_market_context(
+            monday,
+            "auction",
+            CN_TZ.localize(datetime(2026, 7, 13, 9, 26)),
+            session_factory=self.Session,
+        )
+
+        self.assertEqual(result["prior_window"], "decline")
+        self.assertEqual(result["divergence_days"], 0)
+        self.assertEqual(result["field_quality"]["prior_window"], "ready")
+        self.assertEqual(result["field_quality"]["divergence_days"], "ready")
 
     async def test_partial_previous_metric_cannot_supply_previous_comparisons(self):
         from app.services.trading_playbook.composition import (

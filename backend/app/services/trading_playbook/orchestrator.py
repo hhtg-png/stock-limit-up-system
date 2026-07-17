@@ -51,6 +51,13 @@ class TradingPlaybookOrchestrator:
         if callable(close):
             await close()
 
+    async def prepare_realtime_snapshot(self, trade_date: date) -> Any:
+        """Collect live pool evidence before fixing the stage's as-of time."""
+        prepare = getattr(self.market_data, "prepare_realtime_snapshot", None)
+        if not callable(prepare):
+            return None
+        return await prepare(trade_date)
+
     async def build_stage(
         self,
         db: Any,
@@ -59,6 +66,7 @@ class TradingPlaybookOrchestrator:
         as_of: datetime,
         degraded: bool = False,
         degradation_reason: str | None = None,
+        prepared_realtime_snapshot: Any = None,
     ) -> Any:
         self._validate_request(source_trade_date, stage, as_of, degraded)
         target_trade_date = self._target_trade_date(source_trade_date, stage)
@@ -71,6 +79,10 @@ class TradingPlaybookOrchestrator:
             as_of=as_of,
             force_degraded=degraded,
         )
+        if prepared_realtime_snapshot is not None:
+            market_data_kwargs["prepared_realtime_snapshot"] = (
+                prepared_realtime_snapshot
+            )
         if degradation_reason is not None:
             if not degraded or not str(degradation_reason).strip():
                 raise InvalidRequestError(
@@ -333,6 +345,7 @@ def build_default_orchestrator(
     realtime_limit_up_loader: Callable[..., Any],
     full_market_context_loader: Callable[..., Any],
     next_trade_date: Callable[[date], date],
+    market_data_max_concurrency: int = 4,
 ) -> TradingPlaybookOrchestrator:
     """Build the sole production pipeline from explicit market dependencies."""
     catalog_path = (
@@ -346,6 +359,7 @@ def build_default_orchestrator(
         kline_loader=kline_loader,
         realtime_limit_up_loader=realtime_limit_up_loader,
         full_market_context_loader=full_market_context_loader,
+        max_concurrency=market_data_max_concurrency,
     )
     return TradingPlaybookOrchestrator(
         market_data=market_data,

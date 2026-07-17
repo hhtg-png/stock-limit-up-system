@@ -155,26 +155,49 @@ class ProductionMarketContextService:
         if prior_plan is not None:
             state = prior_plan.market_state_json or {}
             candidate_window = state.get("window")
-            if isinstance(candidate_window, str) and candidate_window != "unknown":
+            valid_prior_windows = {
+                "",
+                "outbreak",
+                "first_divergence",
+                "divergence_exhaustion",
+                "divergence_to_consensus",
+                "stronger_confirmation",
+                "second_divergence",
+                "stage_three",
+                "decline",
+            }
+            if (
+                isinstance(candidate_window, str)
+                and candidate_window.strip() in valid_prior_windows
+            ):
                 prior_window = candidate_window.strip()
                 previous_divergence = state.get("divergence_days")
-                if isinstance(previous_divergence, int) and previous_divergence >= 0:
+                divergence_windows = {
+                    "first_divergence",
+                    "divergence_exhaustion",
+                    "second_divergence",
+                }
+                if (
+                    not isinstance(previous_divergence, bool)
+                    and isinstance(previous_divergence, int)
+                    and previous_divergence >= 0
+                ):
                     divergence_days = (
                         previous_divergence + 1
-                        if candidate_window
-                        in {
-                            "first_divergence",
-                            "divergence_exhaustion",
-                            "second_divergence",
-                        }
+                        if prior_window in divergence_windows
                         else 0
                     )
-                    publish(
-                        "prior_window",
-                        prior_window,
-                        "trading_plan_market_state",
-                        prior_plan.source_trade_date,
-                    )
+                elif prior_window not in divergence_windows:
+                    divergence_days = 0
+                else:
+                    divergence_days = None
+                publish(
+                    "prior_window",
+                    prior_window,
+                    "trading_plan_market_state",
+                    prior_plan.source_trade_date,
+                )
+                if divergence_days is not None:
                     publish(
                         "divergence_days",
                         divergence_days,

@@ -2070,6 +2070,7 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
         as_of = datetime(2026, 7, 13, 9, 30)
         regular_codes = [f"{index:06d}" for index in range(206)]
         eligible_codes = regular_codes + ["830001"]
+        quote_retired_code = "600003"
 
         async with self.session_factory() as db:
             stocks = [
@@ -2088,6 +2089,22 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
                     market="SH",
                     is_st=0,
                 )
+            )
+            stocks.extend(
+                [
+                    Stock(
+                        stock_code="600002",
+                        stock_name="退市测试",
+                        market="SH",
+                        is_st=0,
+                    ),
+                    Stock(
+                        stock_code=quote_retired_code,
+                        stock_name="Former Name",
+                        market="SH",
+                        is_st=0,
+                    ),
+                ]
             )
             db.add_all(stocks)
             await db.flush()
@@ -2228,8 +2245,9 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
 
             payload = {
                 code: _quote_payload(code, 10, "20260713093000")
-                for code in eligible_codes
+                for code in [*eligible_codes, quote_retired_code]
             }
+            payload[quote_retired_code]["name"] = "测试退"
             payload["000001"]["change_pct"] = 5
             payload["000002"]["change_pct"] = 5
             payload["000003"]["change_pct"] = 6
@@ -2284,13 +2302,22 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
         requested_quotes = {
             code for call in quote_api.calls for code in call
         }
-        self.assertEqual(requested_quotes, set(eligible_codes))
+        self.assertEqual(
+            requested_quotes,
+            set(eligible_codes) | {quote_retired_code},
+        )
         self.assertNotIn("600001", requested_quotes)
+        self.assertNotIn("600002", requested_quotes)
         self.assertEqual(
             set(kline_calls),
             set(regular_codes[:200]) | {"000200", "000202", "830001"},
         )
         candidates = {item.stock_code: item for item in snapshot.candidates}
+        self.assertNotIn(quote_retired_code, candidates)
+        self.assertEqual(
+            snapshot.market_features["quote_requested_count"],
+            len(eligible_codes),
+        )
         self.assertNotIn("000201", candidates)
         self.assertNotIn("000203", candidates)
         self.assertNotIn("000204", candidates)
@@ -2456,6 +2483,10 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(kline_evidence["quality"], "missing")
         self.assertEqual(kline_evidence["reason"], "kline stage deadline exceeded")
+        self.assertNotIn(
+            f"missing kline features for {review_only_code}",
+            snapshot.quality.warnings,
+        )
         self.assertEqual(active_loads, set())
 
     async def test_kline_stage_cleanup_is_bounded_when_loader_suppresses_cancel(
@@ -3244,6 +3275,85 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             realtime_fact["nested_quality"],
             {"valid_ratio": 1.0},
+        )
+
+    async def test_prepared_realtime_snapshot_is_used_without_refetch(self):
+        from app.services.realtime_limit_up_service import RealtimeLimitUpSnapshot
+        from app.services.trading_playbook.market_data import (
+            TradingPlaybookMarketDataProvider,
+        )
+
+        trade_date = date(2026, 7, 14)
+        as_of = datetime(2026, 7, 14, 9, 30)
+        code = "000001"
+        live_calls = []
+
+        async def live_loader(requested_date):
+            live_calls.append(requested_date)
+            return RealtimeLimitUpSnapshot(
+                items=[],
+                authoritative=True,
+                complete=True,
+                evidence_trade_date=requested_date,
+            )
+
+        async def kline_loader(*args, **kwargs):
+            return [
+                {
+                    "date": trade_date - timedelta(days=6 - index),
+                    "close": close,
+                }
+                for index, close in enumerate([10, 10.1, 10.2, 10.3, 10.4, 10.5])
+            ]
+
+        prepared = RealtimeLimitUpSnapshot(
+            items=[
+                {
+                    "stock_code": code,
+                    "reason_category": "robotics",
+                    "_collected_at": as_of - timedelta(seconds=1),
+                }
+            ],
+            authoritative=True,
+            complete=True,
+            evidence_trade_date=trade_date,
+        )
+        async with self.session_factory() as db:
+            db.add(
+                Stock(
+                    stock_code=code,
+                    stock_name="Prepared Snapshot",
+                    market="SZ",
+                    is_st=0,
+                )
+            )
+            await db.commit()
+            snapshot = await TradingPlaybookMarketDataProvider(
+                quote_api=_FakeQuoteAPI(
+                    {code: _quote_payload(code, 10.5, "20260714093000")}
+                ),
+                kline_loader=kline_loader,
+                realtime_limit_up_loader=live_loader,
+            ).build_market_snapshot(
+                db=db,
+                source_trade_date=trade_date,
+                target_trade_date=trade_date,
+                stage="close",
+                as_of=as_of,
+                prepared_realtime_snapshot=prepared,
+            )
+
+        self.assertEqual(live_calls, [])
+        self.assertFalse(
+            any(
+                "future realtime row" in warning
+                for warning in snapshot.quality.warnings
+            )
+        )
+        candidate = next(row for row in snapshot.candidates if row.stock_code == code)
+        self.assertEqual(
+            candidate.features["realtime_limit_up_fact"]["reason_category"],
+            "robotics",
         )
 
     async def test_failed_refresh_with_30_minute_cache_is_discovery_only(self):

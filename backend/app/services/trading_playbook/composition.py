@@ -6,6 +6,7 @@ from datetime import date, datetime
 from functools import partial
 from typing import Any, Callable, Optional
 
+from app.config import settings
 from app.data_collectors.tencent_api import tencent_api
 from app.services.realtime_limit_up_service import (
     RealtimeLimitUpSnapshot,
@@ -83,6 +84,9 @@ def build_production_trading_playbook_orchestrator(
         realtime_limit_up_loader=load_production_realtime_limit_up,
         full_market_context_loader=full_market_loader,
         next_trade_date=next_trade_date,
+        market_data_max_concurrency=(
+            settings.TRADING_PLAYBOOK_MARKET_DATA_MAX_CONCURRENCY
+        ),
     )
 
 

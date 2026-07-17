@@ -234,6 +234,7 @@ class TradingPlaybookMarketDataProvider:
 
         quotes: Dict[str, QuotePoint] = {}
         field_quality: QuoteFieldQuality = {}
+        excluded_codes = set()
         stale_codes = []
         future_quote_found = False
         invalid_price_found = False
@@ -241,6 +242,15 @@ class TradingPlaybookMarketDataProvider:
             raw_quote = raw_quotes.get(code)
             if raw_quote is None:
                 warnings.append(f"missing quote for {code}")
+                continue
+
+            stock_name = str(
+                self._pick(raw_quote, "name", "stock_name", "security_name")
+                or ""
+            )
+            if self._is_delisted_name(stock_name):
+                field_quality[code] = {"eligibility": "excluded"}
+                excluded_codes.add(code)
                 continue
 
             captured_at, valid_timestamp = self._parse_quote_datetime(
@@ -417,10 +427,7 @@ class TradingPlaybookMarketDataProvider:
             )
             quotes[code] = QuotePoint(
                 stock_code=code,
-                stock_name=str(
-                    self._pick(raw_quote, "name", "stock_name", "security_name")
-                    or ""
-                ),
+                stock_name=stock_name,
                 price=price,
                 pre_close=pre_close if pre_close is not None else math.nan,
                 open_price=open_price if open_price is not None else math.nan,
@@ -448,7 +455,12 @@ class TradingPlaybookMarketDataProvider:
                     f"missing quote fields for {code}: {','.join(missing_fields)}"
                 )
 
-        coverage = len(quotes) / len(requested_codes)
+        eligible_requested_count = len(requested_codes) - len(excluded_codes)
+        coverage = (
+            len(quotes) / eligible_requested_count
+            if eligible_requested_count
+            else 1.0
+        )
         status = (
             "degraded"
             if (
@@ -683,6 +695,7 @@ class TradingPlaybookMarketDataProvider:
         as_of: datetime,
         force_degraded: bool = False,
         force_degraded_reason: Optional[str] = None,
+        prepared_realtime_snapshot: Optional[RealtimeLimitUpSnapshot] = None,
     ) -> MarketSnapshot:
         local_as_of = self._china_datetime(as_of)
         database_as_of = local_as_of.replace(tzinfo=None)
@@ -704,7 +717,7 @@ class TradingPlaybookMarketDataProvider:
         eligible_stocks = [
             stock
             for stock in stock_result.scalars().all()
-            if not self._is_st_stock(stock)
+            if not self._is_ineligible_stock(stock)
         ]
         stock_by_code = {
             self._normalize_code(stock.stock_code): stock
@@ -718,6 +731,18 @@ class TradingPlaybookMarketDataProvider:
             stage=stage,
             evidence_trade_date=evidence_trade_date,
         )
+        quote_excluded_codes = {
+            code
+            for code, quality in quote_field_quality.items()
+            if quality.get("eligibility") == "excluded"
+        }
+        if quote_excluded_codes:
+            stock_by_code = {
+                code: stock
+                for code, stock in stock_by_code.items()
+                if code not in quote_excluded_codes
+            }
+            universe_codes = sorted(stock_by_code)
 
         change_order = sorted(
             (
@@ -794,7 +819,13 @@ class TradingPlaybookMarketDataProvider:
             evidence_trade_date if stage == "overnight" else pool_trade_date
         )
         try:
-            realtime_snapshot = await self._load_realtime_limit_up(pool_trade_date)
+            realtime_snapshot = (
+                prepared_realtime_snapshot
+                if prepared_realtime_snapshot is not None
+                else await self._load_realtime_limit_up(pool_trade_date)
+            )
+            if not isinstance(realtime_snapshot, RealtimeLimitUpSnapshot):
+                raise TypeError("invalid prepared realtime snapshot")
             realtime_rows = list(realtime_snapshot.items)
             if realtime_snapshot.warning:
                 warnings.append(realtime_snapshot.warning)
@@ -1192,7 +1223,6 @@ class TradingPlaybookMarketDataProvider:
             }
             if kline_quality != "ready":
                 warning = f"missing kline features for {code}"
-                warnings.append(warning)
                 kline_evidence["warning"] = warning
                 if kline_result.reason:
                     kline_evidence["reason"] = kline_result.reason
@@ -1945,6 +1975,13 @@ class TradingPlaybookMarketDataProvider:
 
         return await realtime_limit_up_service.get_fast_limit_up_snapshot(trade_date)
 
+    async def prepare_realtime_snapshot(
+        self,
+        trade_date: date,
+    ) -> RealtimeLimitUpSnapshot:
+        """Freeze one pool snapshot before a live stage fixes its as-of time."""
+        return await self._load_realtime_limit_up(trade_date)
+
     @classmethod
     def _normalize_realtime_row(
         cls,
@@ -2684,14 +2721,24 @@ class TradingPlaybookMarketDataProvider:
         return None
 
     @staticmethod
-    def _is_st_stock(stock: Stock) -> bool:
+    def _is_ineligible_stock(stock: Stock) -> bool:
         is_st = stock.is_st
         flagged = (
             is_st.strip().lower() in {"1", "true", "yes"}
             if isinstance(is_st, str)
             else bool(is_st)
         )
-        return flagged or "ST" in (stock.stock_name or "").upper()
+        stock_name = stock.stock_name or ""
+        return (
+            flagged
+            or "ST" in stock_name.upper()
+            or TradingPlaybookMarketDataProvider._is_delisted_name(stock_name)
+        )
+
+    @staticmethod
+    def _is_delisted_name(stock_name: str) -> bool:
+        normalized = str(stock_name or "").strip()
+        return "退市" in normalized or normalized.endswith("退")
 
     @staticmethod
     def _infer_market(stock_code: str, market: Any) -> str:
