@@ -316,6 +316,66 @@ class MarketReviewMetricsServiceTests(unittest.TestCase):
         self.assertEqual(metric["gem_board_height"], 2)
         self.assertEqual(metric["continuous_count"], 2)
 
+    def test_aggregate_daily_metrics_excludes_delisting_period_stocks(self):
+        rows = [
+            {
+                "stock_code": "920305",
+                "stock_name": "云创退",
+                "board_type": "bj",
+                "yesterday_limit_up": True,
+                "yesterday_continuous_days": 4,
+                "today_touched_limit_up": True,
+                "today_sealed_close": True,
+                "today_opened_close": False,
+                "today_continuous_days": 5,
+                "change_pct": 29.49,
+                "amount": 10000.0,
+            },
+            {
+                "stock_code": "603580",
+                "stock_name": "艾艾精工",
+                "board_type": "main",
+                "yesterday_limit_up": True,
+                "yesterday_continuous_days": 3,
+                "today_touched_limit_up": True,
+                "today_sealed_close": True,
+                "today_opened_close": False,
+                "today_continuous_days": 4,
+                "change_pct": 9.99,
+                "amount": 20000.0,
+            },
+            {
+                "stock_code": "000676",
+                "stock_name": "智度股份",
+                "board_type": "main",
+                "yesterday_limit_up": True,
+                "yesterday_continuous_days": 2,
+                "today_touched_limit_up": True,
+                "today_sealed_close": True,
+                "today_opened_close": False,
+                "today_continuous_days": 3,
+                "change_pct": 10.0,
+                "amount": 30000.0,
+            },
+        ]
+
+        metric = self.service.aggregate_daily_metrics(
+            trade_date=date(2026, 7, 17),
+            stock_rows=rows,
+            limit_down_count=323,
+            market_turnover=26710.2,
+            up_count_ex_st=461,
+            down_count_ex_st=4812,
+        )
+
+        self.assertEqual(metric["limit_up_count"], 2)
+        self.assertEqual(metric["continuous_count"], 2)
+        self.assertEqual(metric["max_board_height"], 4)
+        self.assertEqual(metric["second_board_height"], 3)
+        self.assertAlmostEqual(metric["continuous_promotion_rate"], 100.0)
+        self.assertAlmostEqual(metric["seal_rate"], 100.0)
+        self.assertAlmostEqual(metric["limit_up_amount"], 50000.0)
+
 
 if __name__ == "__main__":
     unittest.main()
