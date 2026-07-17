@@ -18,11 +18,6 @@ class MarketReviewMetricsService:
         up_count_ex_st: int,
         down_count_ex_st: int,
     ) -> Dict:
-        stock_rows = [
-            row
-            for row in stock_rows
-            if not self._is_delisted_name(row.get("stock_name"))
-        ]
         touched_rows = [row for row in stock_rows if row.get("today_touched_limit_up")]
         sealed_rows = [row for row in touched_rows if row.get("today_sealed_close")]
         opened_rows = [row for row in touched_rows if row.get("today_opened_close")]
@@ -121,10 +116,6 @@ class MarketReviewMetricsService:
             price=row.get("close_price") or row.get("current_price"),
             amount=row.get("amount"),
         )
-
-    def _is_delisted_name(self, stock_name: object) -> bool:
-        name = str(stock_name or "").strip()
-        return "退市" in name or name.endswith("退")
 
 
 market_review_metrics_service = MarketReviewMetricsService()

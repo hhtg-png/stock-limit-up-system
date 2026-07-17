@@ -92,29 +92,6 @@ class MarketReviewSourceService:
             except Exception as exc:
                 logger.warning(f"Market review quote fetch failed for {trade_date}: {exc}")
 
-        delisting_codes = self._find_delisting_codes(today_rows, yesterday_pool, quotes)
-        if delisting_codes:
-            logger.info(
-                "Market review excluded delisting-period stocks for {}: {}",
-                trade_date,
-                ",".join(sorted(delisting_codes)),
-            )
-            today_rows = [
-                item
-                for item in today_rows
-                if item.get("stock_code", "") not in delisting_codes
-            ]
-            yesterday_pool = [
-                item
-                for item in yesterday_pool
-                if item.get("c", "") not in delisting_codes
-            ]
-            quotes = {
-                stock_code: quote
-                for stock_code, quote in quotes.items()
-                if stock_code not in delisting_codes
-            }
-
         stock_meta = self._build_stock_meta(today_rows, yesterday_pool, quotes)
         stock_ids = await self._ensure_stock_ids(stock_meta)
         stock_rows = self._build_stock_rows(
@@ -328,9 +305,7 @@ class MarketReviewSourceService:
         stock_rows = [
             row
             for row in stock_rows
-            if row["code"]
-            and row["code"].startswith(("0", "3", "6"))
-            and not self._is_delisted_name(row["name"])
+            if row["code"] and row["code"].startswith(("0", "3", "6"))
         ]
 
         window_stats: Dict[date, Dict[str, Any]] = {}
@@ -476,16 +451,13 @@ class MarketReviewSourceService:
         if names is None or codes is None:
             return {}
 
-        normalized_names = names.astype(str)
-        delisting_mask = normalized_names.map(self._is_delisted_name)
-        non_st_mask = ~normalized_names.str.contains("ST", na=False) & ~delisting_mask
+        non_st_mask = ~names.astype(str).str.contains("ST", na=False)
         limit_down_count = 0
         for raw_code, raw_name, raw_change in zip(codes.tolist(), names.tolist(), changes.tolist()):
             stock_code = self._normalize_code(raw_code)
-            stock_name = str(raw_name or "")
-            if not stock_code or self._is_delisted_name(stock_name):
+            if not stock_code:
                 continue
-            if self._is_limit_down(self._to_float(raw_change), stock_code, stock_name):
+            if self._is_limit_down(self._to_float(raw_change), stock_code, str(raw_name or "")):
                 limit_down_count += 1
 
         return {
@@ -581,31 +553,6 @@ class MarketReviewSourceService:
 
         return meta
 
-    def _find_delisting_codes(
-        self,
-        today_rows: Iterable[Dict[str, Any]],
-        yesterday_pool: Iterable[Dict[str, Any]],
-        quotes: Dict[str, Dict[str, Any]],
-    ) -> set[str]:
-        names_by_code: Dict[str, list[Any]] = {}
-        for item in today_rows:
-            stock_code = str(item.get("stock_code") or "")
-            if stock_code:
-                names_by_code.setdefault(stock_code, []).append(item.get("stock_name"))
-        for item in yesterday_pool:
-            stock_code = str(item.get("c") or "")
-            if stock_code:
-                names_by_code.setdefault(stock_code, []).append(item.get("n"))
-        for stock_code, quote in quotes.items():
-            if stock_code:
-                names_by_code.setdefault(stock_code, []).append(quote.get("name"))
-
-        return {
-            stock_code
-            for stock_code, names in names_by_code.items()
-            if any(self._is_delisted_name(name) for name in names)
-        }
-
     async def _ensure_stock_ids(self, stock_meta: Dict[str, Dict[str, Any]]) -> Dict[str, int]:
         if not stock_meta:
             return {}
@@ -620,23 +567,6 @@ class MarketReviewSourceService:
             existing_map = {row.stock_code: row for row in existing_rows}
 
             missing_codes = [code for code in codes if code not in existing_map]
-            has_updates = False
-            for code, row in existing_map.items():
-                meta = stock_meta[code]
-                stock_name = str(meta.get("stock_name") or "").strip()
-                desired_values = {
-                    "market": meta["market"],
-                    "is_st": int(meta["is_st"]),
-                    "is_kc": int(meta["is_kc"]),
-                    "is_cy": int(meta["is_cy"]),
-                }
-                if stock_name and stock_name != code:
-                    desired_values["stock_name"] = stock_name
-                for field, desired_value in desired_values.items():
-                    if getattr(row, field) != desired_value:
-                        setattr(row, field, desired_value)
-                        has_updates = True
-
             if missing_codes:
                 for code in missing_codes:
                     meta = stock_meta[code]
@@ -650,11 +580,8 @@ class MarketReviewSourceService:
                             is_cy=int(meta["is_cy"]),
                         )
                     )
-
-            if missing_codes or has_updates:
                 await session.commit()
 
-            if missing_codes:
                 existing_rows = (
                     await session.execute(
                         select(Stock).where(Stock.stock_code.in_(codes))
@@ -933,10 +860,10 @@ class MarketReviewSourceService:
         }
 
     def _detect_market(self, stock_code: str) -> str:
-        if self._is_bj_code(stock_code):
-            return "BJ"
         if stock_code.startswith(("5", "6", "9")):
             return "SH"
+        if stock_code.startswith("8"):
+            return "BJ"
         return "SZ"
 
     def _detect_board_type(self, stock_code: str) -> str:
@@ -944,12 +871,9 @@ class MarketReviewSourceService:
             return "star"
         if self._is_gem_code(stock_code):
             return "gem"
-        if self._is_bj_code(stock_code):
+        if stock_code.startswith("8"):
             return "bj"
         return "main"
-
-    def _is_bj_code(self, stock_code: str) -> bool:
-        return stock_code.startswith(("4", "8", "92"))
 
     def _is_gem_code(self, stock_code: str) -> bool:
         return stock_code.startswith(("300", "301"))
@@ -965,7 +889,7 @@ class MarketReviewSourceService:
             return False
         if self._is_st_name(stock_name):
             return change_pct <= -4.8
-        if self._is_bj_code(stock_code):
+        if stock_code.startswith("8"):
             return change_pct <= -29.5
         if self._is_twenty_percent_code(stock_code):
             return change_pct <= -19.5
@@ -974,7 +898,7 @@ class MarketReviewSourceService:
     def _limit_ratio(self, stock_code: str, stock_name: str) -> float:
         if self._is_st_name(stock_name):
             return 0.05
-        if self._is_bj_code(stock_code):
+        if stock_code.startswith("8"):
             return 0.30
         if self._is_twenty_percent_code(stock_code):
             return 0.20
@@ -1018,10 +942,6 @@ class MarketReviewSourceService:
     def _is_st_name(self, stock_name: Any) -> bool:
         name = str(stock_name or "")
         return "ST" in name.upper()
-
-    def _is_delisted_name(self, stock_name: Any) -> bool:
-        name = str(stock_name or "").strip()
-        return "退市" in name or name.endswith("退")
 
     def _to_int(self, value: Any) -> int:
         try:

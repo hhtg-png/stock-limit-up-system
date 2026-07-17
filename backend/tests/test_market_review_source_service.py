@@ -235,117 +235,6 @@ class MarketReviewSourceServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(stock.is_cy, 1)
 
-    async def test_collect_for_date_excludes_delisting_period_stocks(self):
-        async def today_fetcher(_trade_date):
-            return [
-                {
-                    "stock_code": "920305",
-                    "stock_name": "云创退",
-                    "continuous_limit_up_days": 5,
-                    "is_sealed": True,
-                    "change_pct": 29.49,
-                },
-                {
-                    "stock_code": "603580",
-                    "stock_name": "艾艾精工",
-                    "continuous_limit_up_days": 4,
-                    "is_sealed": True,
-                    "change_pct": 9.99,
-                },
-            ]
-
-        async def yesterday_pool_fetcher(_trade_date):
-            return [
-                {"c": "920305", "n": "云创退", "ylbc": 4, "zdp": 29.49},
-                {"c": "603580", "n": "艾艾精工", "ylbc": 3, "zdp": 9.99},
-            ]
-
-        async def quote_fetcher(codes):
-            self.assertEqual(set(codes), {"920305", "603580"})
-            return {
-                "920305": {"name": "云创退", "price": 3.38, "change_pct": 29.49},
-                "603580": {"name": "艾艾精工", "price": 28.52, "change_pct": 9.99},
-            }
-
-        async def market_stats_fetcher(_trade_date):
-            return {
-                "limit_down_count": 10,
-                "market_turnover": 26710.2,
-                "up_count_ex_st": 461,
-                "down_count_ex_st": 4812,
-            }
-
-        service = MarketReviewSourceService(
-            session_factory=self.session_factory,
-            today_limit_up_fetcher=today_fetcher,
-            yesterday_pool_fetcher=yesterday_pool_fetcher,
-            quote_fetcher=quote_fetcher,
-            market_stats_fetcher=market_stats_fetcher,
-            current_date_provider=lambda: date(2026, 7, 17),
-        )
-
-        payload = await service.collect_for_date(date(2026, 7, 17))
-
-        self.assertEqual(
-            [row["stock_code"] for row in payload["stock_rows"]],
-            ["603580"],
-        )
-        self.assertEqual(
-            {row["stock_code"] for row in payload["event_rows"]},
-            {"603580"},
-        )
-        async with self.session_factory() as session:
-            delisting_stock = (
-                await session.execute(
-                    select(Stock).where(Stock.stock_code == "920305")
-                )
-            ).scalar_one_or_none()
-        self.assertIsNone(delisting_stock)
-
-    async def test_ensure_stock_ids_refreshes_existing_classification(self):
-        async with self.session_factory() as session:
-            session.add(
-                Stock(
-                    stock_code="300577",
-                    stock_name="旧名称",
-                    market="SH",
-                    is_st=1,
-                    is_kc=1,
-                    is_cy=0,
-                )
-            )
-            await session.commit()
-
-        service = MarketReviewSourceService(
-            session_factory=self.session_factory,
-            current_date_provider=lambda: date(2026, 7, 17),
-        )
-        stock_ids = await service._ensure_stock_ids(
-            {
-                "300577": {
-                    "stock_code": "300577",
-                    "stock_name": "开润股份",
-                    "market": "SZ",
-                    "is_st": 0,
-                    "is_kc": 0,
-                    "is_cy": 1,
-                }
-            }
-        )
-
-        self.assertIn("300577", stock_ids)
-        async with self.session_factory() as session:
-            stock = (
-                await session.execute(
-                    select(Stock).where(Stock.stock_code == "300577")
-                )
-            ).scalar_one()
-        self.assertEqual(stock.stock_name, "开润股份")
-        self.assertEqual(stock.market, "SZ")
-        self.assertEqual(stock.is_st, 0)
-        self.assertEqual(stock.is_kc, 0)
-        self.assertEqual(stock.is_cy, 1)
-
     async def test_collect_for_date_derives_opened_continuation_from_yesterday_pool(self):
         async def today_fetcher(trade_date):
             self.assertEqual(trade_date, date(2026, 6, 16))
@@ -667,9 +556,6 @@ class MarketReviewSourceServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(service._limit_ratio("830001", "北交样本"), 0.30)
         self.assertTrue(service._is_limit_down(-29.6, "830001", "北交样本"))
         self.assertFalse(service._is_limit_down(-19.8, "830001", "北交样本"))
-        self.assertEqual(service._detect_market("920305"), "BJ")
-        self.assertEqual(service._detect_board_type("920305"), "bj")
-        self.assertAlmostEqual(service._limit_ratio("920305", "北交样本"), 0.30)
 
 
 if __name__ == "__main__":
