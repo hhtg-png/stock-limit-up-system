@@ -235,7 +235,7 @@ class TradingPlaybookMarketDataProvider:
         quotes: Dict[str, QuotePoint] = {}
         field_quality: QuoteFieldQuality = {}
         excluded_codes = set()
-        future_quote_found = False
+        future_quote_count = 0
         invalid_price_found = False
         for code in requested_codes:
             raw_quote = raw_quotes.get(code)
@@ -272,10 +272,13 @@ class TradingPlaybookMarketDataProvider:
             else:
                 age_seconds = self._age_seconds(as_of, captured_at)
                 if age_seconds < 0:
-                    future_quote_found = True
-                    warnings.append(
-                        f"future quote for {code} at {captured_at.isoformat()}"
-                    )
+                    future_quote_count += 1
+                    field_quality[code] = {
+                        "timestamp": "invalid",
+                        "_rejection_reason": (
+                            f"future quote for {code} at {captured_at.isoformat()}"
+                        ),
+                    }
                     continue
                 quality["timestamp"] = "ready"
                 baseline_ready = self._quote_baseline_ready(
@@ -473,12 +476,16 @@ class TradingPlaybookMarketDataProvider:
             if eligible_requested_count
             else 1.0
         )
+        if future_quote_count and coverage < 0.9:
+            warnings.append(
+                "future quote coverage gap: "
+                f"{future_quote_count}/{eligible_requested_count}"
+            )
         status = (
             "degraded"
             if (
                 coverage < 0.9
                 or chunk_failed
-                or future_quote_found
                 or invalid_price_found
             )
             else "ready"
@@ -1182,12 +1189,21 @@ class TradingPlaybookMarketDataProvider:
                     )
                 evidence.append(quote_evidence)
             else:
+                quote_quality = quote_field_quality.get(code, {})
                 evidence.append(
                     {
                         "source": "tencent",
                         "as_of": as_of,
                         "quality": "missing",
-                        "warning": f"missing quote for {code}",
+                        "field_quality": {
+                            "captured_at": quote_quality.get(
+                                "timestamp",
+                                "missing",
+                            ),
+                            "price": "missing",
+                        },
+                        "warning": quote_quality.get("_rejection_reason")
+                        or f"missing quote for {code}",
                     }
                 )
             if code in change_ranks:

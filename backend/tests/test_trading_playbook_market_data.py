@@ -658,7 +658,7 @@ class TradingPlaybookQuoteSnapshotTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(snapshot.quality.stale)
 
-    async def test_future_quote_is_rejected_and_degrades_even_at_90_percent_coverage(self):
+    async def test_future_quote_is_rejected_and_isolated_at_90_percent_coverage(self):
         from app.services.trading_playbook.market_data import (
             TradingPlaybookMarketDataProvider,
         )
@@ -675,18 +675,18 @@ class TradingPlaybookQuoteSnapshotTests(unittest.IsolatedAsyncioTestCase):
             datetime(2026, 7, 13, 1, 30, 1, tzinfo=timezone.utc),
         )
 
-        snapshot = await TradingPlaybookMarketDataProvider(
+        snapshot, field_quality = await TradingPlaybookMarketDataProvider(
             quote_api=_FakeQuoteAPI(payload)
-        ).quote_snapshot(codes, as_of.date(), as_of)
+        )._quote_snapshot_with_quality(codes, as_of.date(), as_of)
 
         self.assertNotIn(codes[-1], snapshot.quotes)
-        self.assertEqual(snapshot.quality.status, "degraded")
-        self.assertTrue(
-            any(
-                codes[-1] in warning and "future quote" in warning
-                for warning in snapshot.quality.warnings
-            )
+        self.assertEqual(snapshot.quality.status, "ready")
+        self.assertEqual(field_quality[codes[-1]]["timestamp"], "invalid")
+        self.assertIn(
+            "future quote",
+            field_quality[codes[-1]]["_rejection_reason"],
         )
+        self.assertEqual(snapshot.quality.warnings, [])
 
     async def test_missing_numeric_fields_are_unavailable_not_fake_zero(self):
         from app.services.trading_playbook.market_data import (
@@ -2786,12 +2786,22 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
             snapshot.market_features["full_market_change_ranks"],
         )
         self.assertTrue(
-            any("future quote" in warning for warning in snapshot.quality.warnings)
+            any(
+                warning.startswith("future quote coverage gap")
+                for warning in snapshot.quality.warnings
+            )
         )
         self.assertTrue(
             any(
                 evidence["source"] == "auction"
                 and evidence["quality"] == "missing"
+                for evidence in invalid.evidence
+            )
+        )
+        self.assertTrue(
+            any(
+                evidence["source"] == "tencent"
+                and "future quote" in evidence.get("warning", "")
                 for evidence in invalid.evidence
             )
         )
