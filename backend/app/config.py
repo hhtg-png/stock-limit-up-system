@@ -12,7 +12,7 @@ class Settings(BaseSettings):
     # 应用基础配置
     APP_NAME: str = "股票涨停统计分析系统"
     APP_VERSION: str = "1.0.0"
-    DEBUG: bool = True
+    DEBUG: bool = False
     
     # 数据库配置
     DATABASE_URL: str = "sqlite+aiosqlite:///./data/stock_limit_up.db"

@@ -15,6 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import defer
 
 from app.database import get_db
 from app.models.trading_playbook import (
@@ -586,6 +587,12 @@ async def list_plans(
                 await db.scalars(
                     select(TradingPlanVersion)
                     .where(TradingPlanVersion.target_trade_date == trade_date)
+                    .options(
+                        defer(
+                            TradingPlanVersion.mode_radar_json,
+                            raiseload=True,
+                        )
+                    )
                     .order_by(
                         TradingPlanVersion.generated_at.desc(),
                         TradingPlanVersion.id.desc(),

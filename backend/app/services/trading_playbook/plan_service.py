@@ -13,8 +13,9 @@ from datetime import date, datetime
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import func, select, tuple_, update
+from sqlalchemy import func, select, text, tuple_, update
 from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.orm import defer
 
 from app.config import settings as app_settings
 from app.models.trading_playbook import (
@@ -49,6 +50,14 @@ _RISK_LEVELS = {"avoid", "watch", "trial", "confirmed"}
 _ACTION_SCOPES = {"target", "tail"}
 _RULE_HASH = re.compile(r"[0-9a-f]{64}")
 _STAGE_SEQUENCE = ("preclose", "after_close", "overnight", "auction")
+_RADAR_RESPONSE_ROW_LIMIT = 500
+_RADAR_STORAGE_ROWS_PER_MODE = 10
+_RADAR_STATUS_PRIORITY = {
+    "matched": 0,
+    "waiting": 1,
+    "manual_review": 2,
+    "not_matched": 3,
+}
 _RISK_SOURCE_EXCERPTS = {
     "03-loss-qa": "候选不超过三只，开仓和退出条件必须预先写清，并执行刚性止损",
     "04-trading-plan": "交易前形成书面计划，盘后区分信号、执行与结果",
@@ -162,6 +171,7 @@ class TradingPlanService:
     ) -> Dict[str, Any]:
         snapshot_payload, candidate_sources = self._snapshot_payload(snapshot)
         radar = self._normalize_radar(evaluations)
+        stored_radar = self._compact_radar_for_storage(radar)
         normalized_rules = self._normalize_rule_snapshot(rule_snapshot, radar)
         normalized_names = self._stock_names(stock_names, radar)
         self._validate_rule_coverage(normalized_rules, radar)
@@ -236,7 +246,7 @@ class TradingPlanService:
                         theme_ranking_json=copy.deepcopy(
                             snapshot_payload["theme_rankings"]
                         ),
-                        mode_radar_json=copy.deepcopy(radar),
+                        mode_radar_json=copy.deepcopy(stored_radar),
                         rule_snapshot_json=copy.deepcopy(normalized_rules),
                         risk_settings_json=copy.deepcopy(risk_settings),
                         data_quality_json=copy.deepcopy(snapshot_payload["quality"]),
@@ -463,6 +473,47 @@ class TradingPlanService:
             )
         )
         return rows
+
+    @classmethod
+    def _compact_radar_for_storage(
+        cls,
+        radar: Sequence[Mapping[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Keep every mode visible without persisting every stock/mode miss."""
+        if len(radar) <= _RADAR_RESPONSE_ROW_LIMIT:
+            return [copy.deepcopy(dict(row)) for row in radar]
+
+        by_mode: Dict[str, List[Mapping[str, Any]]] = {}
+        for row in radar:
+            by_mode.setdefault(str(row["mode_key"]), []).append(row)
+
+        compacted: List[Dict[str, Any]] = []
+        for mode_key in sorted(by_mode):
+            mode_rows = by_mode[mode_key]
+            counts = {
+                status: sum(row.get("status") == status for row in mode_rows)
+                for status in _RADAR_STATUS_PRIORITY
+            }
+            ranked = sorted(
+                mode_rows,
+                key=lambda row: (
+                    _RADAR_STATUS_PRIORITY.get(str(row.get("status")), 99),
+                    -float(row.get("score") or 0),
+                    str(row.get("stock_code") or ""),
+                ),
+            )
+            for index, row in enumerate(
+                ranked[:_RADAR_STORAGE_ROWS_PER_MODE]
+            ):
+                item = copy.deepcopy(dict(row))
+                item["compacted"] = True
+                if index == 0:
+                    item["summary_counts"] = {
+                        "scanned": len(mode_rows),
+                        **counts,
+                    }
+                compacted.append(item)
+        return compacted
 
     @staticmethod
     def _normalize_rule_snapshot(
@@ -1224,7 +1275,16 @@ class TradingPlanService:
     async def serialize(self, db, plan_or_id) -> Optional[Dict[str, Any]]:
         plan = plan_or_id
         if not isinstance(plan, TradingPlanVersion):
-            plan = await db.get(TradingPlanVersion, plan_or_id)
+            plan = await db.scalar(
+                select(TradingPlanVersion)
+                .where(TradingPlanVersion.id == plan_or_id)
+                .options(
+                    defer(
+                        TradingPlanVersion.mode_radar_json,
+                        raiseload=True,
+                    )
+                )
+            )
         if plan is None:
             return None
         candidates = (
@@ -1238,13 +1298,139 @@ class TradingPlanService:
                 )
             )
         ).all()
-        return self._serialize_loaded(plan, candidates)
+        radar = await self._load_response_radar(db, plan.id)
+        return self._serialize_loaded(
+            plan,
+            candidates,
+            mode_radar=radar,
+        )
+
+    @classmethod
+    async def _load_response_radar(
+        cls,
+        db,
+        plan_id: int,
+    ) -> List[Dict[str, Any]]:
+        count = await db.scalar(
+            select(func.json_array_length(TradingPlanVersion.mode_radar_json))
+            .where(TradingPlanVersion.id == plan_id)
+        )
+        if not isinstance(count, int) or count <= _RADAR_RESPONSE_ROW_LIMIT:
+            radar = await db.scalar(
+                select(TradingPlanVersion.mode_radar_json)
+                .where(TradingPlanVersion.id == plan_id)
+            )
+            return copy.deepcopy(radar or [])
+
+        bind = db.get_bind()
+        if bind.dialect.name != "sqlite":
+            radar = await db.scalar(
+                select(TradingPlanVersion.mode_radar_json)
+                .where(TradingPlanVersion.id == plan_id)
+            )
+            return cls._compact_radar_for_storage(radar or [])
+
+        rows = (
+            await db.execute(
+                text(
+                    """
+                    WITH extracted AS (
+                        SELECT
+                            json_extract(value, '$.mode_key') AS mode_key,
+                            json_extract(value, '$.stock_code') AS stock_code,
+                            json_extract(value, '$.status') AS status,
+                            CAST(json_extract(value, '$.score') AS REAL) AS score,
+                            json_extract(value, '$.role') AS role,
+                            json_extract(value, '$.risk_level') AS risk_level,
+                            json_extract(value, '$.rule_version') AS rule_version,
+                            json_extract(value, '$.rule_hash') AS rule_hash,
+                            json_extract(value, '$.action_scope') AS action_scope
+                        FROM json_each((
+                            SELECT mode_radar_json
+                            FROM trading_plan_versions
+                            WHERE id = :plan_id
+                        ))
+                        WHERE json_type(value) = 'object'
+                    ), ranked AS (
+                        SELECT
+                            *,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY mode_key
+                                ORDER BY
+                                    CASE status
+                                        WHEN 'matched' THEN 0
+                                        WHEN 'waiting' THEN 1
+                                        WHEN 'manual_review' THEN 2
+                                        WHEN 'not_matched' THEN 3
+                                        ELSE 4
+                                    END,
+                                    score DESC,
+                                    stock_code
+                            ) AS display_rank,
+                            COUNT(*) OVER (
+                                PARTITION BY mode_key
+                            ) AS scanned_count,
+                            SUM(CASE WHEN status = 'matched' THEN 1 ELSE 0 END)
+                                OVER (PARTITION BY mode_key) AS matched_count,
+                            SUM(CASE WHEN status = 'waiting' THEN 1 ELSE 0 END)
+                                OVER (PARTITION BY mode_key) AS waiting_count,
+                            SUM(
+                                CASE WHEN status = 'manual_review' THEN 1 ELSE 0 END
+                            )
+                                OVER (PARTITION BY mode_key) AS manual_review_count,
+                            SUM(
+                                CASE WHEN status = 'not_matched' THEN 1 ELSE 0 END
+                            )
+                                OVER (PARTITION BY mode_key) AS not_matched_count
+                        FROM extracted
+                        WHERE mode_key IS NOT NULL AND trim(mode_key) <> ''
+                    )
+                    SELECT *
+                    FROM ranked
+                    WHERE display_rank = 1
+                    ORDER BY mode_key
+                    """
+                ),
+                {"plan_id": plan_id},
+            )
+        ).mappings().all()
+        result: List[Dict[str, Any]] = []
+        for row in rows:
+            summary_counts = {
+                "scanned": int(row["scanned_count"] or 0),
+                "matched": int(row["matched_count"] or 0),
+                "waiting": int(row["waiting_count"] or 0),
+                "manual_review": int(row["manual_review_count"] or 0),
+                "not_matched": int(row["not_matched_count"] or 0),
+            }
+            result.append(
+                {
+                    "mode_key": str(row["mode_key"]),
+                    "stock_code": str(row["stock_code"] or ""),
+                    "status": str(row["status"] or "not_matched"),
+                    "score": float(row["score"] or 0),
+                    "role": str(row["role"] or ""),
+                    "risk_level": str(row["risk_level"] or "avoid"),
+                    "entry_trigger": {},
+                    "invalidation": {},
+                    "exit_trigger": {},
+                    "evidence": [{"radar_summary": summary_counts}],
+                    "rule_version": int(row["rule_version"] or 1),
+                    "rule_hash": str(row["rule_hash"] or ""),
+                    "action_scope": str(row["action_scope"] or "target"),
+                    "compacted": True,
+                    "summary_counts": summary_counts,
+                }
+            )
+        return result
 
     @classmethod
     def _serialize_loaded(
         cls,
         plan: TradingPlanVersion,
         candidates: Sequence[TradingPlanCandidate],
+        *,
+        mode_radar: Optional[Sequence[Mapping[str, Any]]] = None,
     ) -> Dict[str, Any]:
         payload = {
             "id": plan.id,
@@ -1256,7 +1442,11 @@ class TradingPlanService:
             "status": plan.status,
             "market_state_json": copy.deepcopy(plan.market_state_json or {}),
             "theme_ranking_json": copy.deepcopy(plan.theme_ranking_json or []),
-            "mode_radar_json": copy.deepcopy(plan.mode_radar_json or []),
+            "mode_radar_json": copy.deepcopy(
+                plan.mode_radar_json or []
+                if mode_radar is None
+                else list(mode_radar)
+            ),
             "rule_snapshot_json": copy.deepcopy(plan.rule_snapshot_json or []),
             "risk_settings_json": copy.deepcopy(plan.risk_settings_json or {}),
             "data_quality_json": copy.deepcopy(plan.data_quality_json or {}),

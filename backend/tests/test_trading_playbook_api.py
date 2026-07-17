@@ -721,6 +721,48 @@ class TradingPlaybookApiTests(unittest.TestCase):
             "Infinity",
         )
 
+    def test_large_historical_radar_is_summarized_without_loading_every_row(self):
+        async def expand_radar():
+            async with self.Session() as db:
+                plan = await db.get(TradingPlanVersion, 1)
+                plan.mode_radar_json = [
+                    {
+                        "mode_key": f"mode_{index % 2}",
+                        "stock_code": f"{index:06d}",
+                        "status": "matched" if index in {0, 1} else "not_matched",
+                        "score": float(1000 - index),
+                        "role": "leader",
+                        "risk_level": "watch",
+                        "rule_version": 1,
+                        "rule_hash": "a" * 64,
+                        "action_scope": "target",
+                    }
+                    for index in range(501)
+                ]
+                await db.commit()
+
+        asyncio.run(expand_radar())
+        responses = (
+            self.client.get(
+                "/trading-playbook/plans",
+                params={"trade_date": "2026-07-13"},
+            ).json()["items"][0],
+            self.client.get("/trading-playbook/plans/1").json(),
+        )
+        for payload in responses:
+            radar = payload["mode_radar_json"]
+            self.assertEqual(len(radar), 2)
+            self.assertEqual(
+                {row["mode_key"] for row in radar},
+                {"mode_0", "mode_1"},
+            )
+            self.assertTrue(all(row["compacted"] for row in radar))
+            self.assertEqual(
+                sum(row["summary_counts"]["scanned"] for row in radar),
+                501,
+            )
+            self.assertEqual(payload["mode_radar"], radar)
+
     def test_every_plan_endpoint_rejects_nonfinite_strong_history_with_fixed_503(self):
         async def add_bad_plan(index: int):
             target = date(2026, 7, 20 + index)

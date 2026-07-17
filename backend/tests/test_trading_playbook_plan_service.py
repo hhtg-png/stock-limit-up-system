@@ -395,6 +395,35 @@ class TradingPlaybookPlanServiceTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(settings_count, 1)
 
+    def test_large_radar_storage_keeps_all_modes_with_bounded_rows(self):
+        evaluations = [
+            _evaluation(
+                f"mode_{index % 2}",
+                f"{index:06d}",
+                status="matched" if index in {0, 1} else "not_matched",
+                score=float(1000 - index),
+                risk_level="watch",
+            )
+            for index in range(501)
+        ]
+
+        radar = self.service._normalize_radar(evaluations)
+        compacted = self.service._compact_radar_for_storage(radar)
+
+        self.assertEqual(len(compacted), 20)
+        self.assertEqual(
+            {row["mode_key"] for row in compacted},
+            {"mode_0", "mode_1"},
+        )
+        self.assertTrue(all(row["compacted"] for row in compacted))
+        summaries = [
+            row["summary_counts"]
+            for row in compacted
+            if "summary_counts" in row
+        ]
+        self.assertEqual(len(summaries), 2)
+        self.assertEqual(sum(item["scanned"] for item in summaries), 501)
+
     async def test_generate_does_not_serialize_after_successful_commit(self):
         async with self.Session() as db:
             with patch.object(
