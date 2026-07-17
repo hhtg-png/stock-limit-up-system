@@ -50,7 +50,8 @@ _RISK_LEVELS = {"avoid", "watch", "trial", "confirmed"}
 _ACTION_SCOPES = {"target", "tail"}
 _RULE_HASH = re.compile(r"[0-9a-f]{64}")
 _STAGE_SEQUENCE = ("preclose", "after_close", "overnight", "auction")
-_RADAR_RESPONSE_ROW_LIMIT = 500
+_RADAR_RESPONSE_ROW_LIMIT = 50
+_RADAR_STORAGE_ROW_LIMIT = 500
 _RADAR_STORAGE_ROWS_PER_MODE = 10
 _RADAR_STATUS_PRIORITY = {
     "matched": 0,
@@ -480,7 +481,7 @@ class TradingPlanService:
         radar: Sequence[Mapping[str, Any]],
     ) -> List[Dict[str, Any]]:
         """Keep every mode visible without persisting every stock/mode miss."""
-        if len(radar) <= _RADAR_RESPONSE_ROW_LIMIT:
+        if len(radar) <= _RADAR_STORAGE_ROW_LIMIT:
             return [copy.deepcopy(dict(row)) for row in radar]
 
         by_mode: Dict[str, List[Mapping[str, Any]]] = {}

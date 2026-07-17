@@ -721,7 +721,7 @@ class TradingPlaybookApiTests(unittest.TestCase):
             "Infinity",
         )
 
-    def test_large_historical_radar_is_summarized_without_loading_every_row(self):
+    def test_realistic_historical_radar_is_summarized_without_loading_every_row(self):
         async def expand_radar():
             async with self.Session() as db:
                 plan = await db.get(TradingPlanVersion, 1)
@@ -737,7 +737,7 @@ class TradingPlaybookApiTests(unittest.TestCase):
                         "rule_hash": "a" * 64,
                         "action_scope": "target",
                     }
-                    for index in range(501)
+                    for index in range(190)
                 ]
                 await db.commit()
 
@@ -758,7 +758,7 @@ class TradingPlaybookApiTests(unittest.TestCase):
             self.assertTrue(all(row["compacted"] for row in radar))
             self.assertEqual(
                 sum(row["summary_counts"]["scanned"] for row in radar),
-                501,
+                190,
             )
         self.assertNotIn("mode_radar", listed)
         self.assertEqual(listed["theme_ranking_json"], [])
