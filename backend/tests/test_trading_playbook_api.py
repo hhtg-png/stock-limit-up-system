@@ -742,13 +742,12 @@ class TradingPlaybookApiTests(unittest.TestCase):
                 await db.commit()
 
         asyncio.run(expand_radar())
-        responses = (
-            self.client.get(
-                "/trading-playbook/plans",
-                params={"trade_date": "2026-07-13"},
-            ).json()["items"][0],
-            self.client.get("/trading-playbook/plans/1").json(),
-        )
+        listed = self.client.get(
+            "/trading-playbook/plans",
+            params={"trade_date": "2026-07-13"},
+        ).json()["items"][0]
+        detail = self.client.get("/trading-playbook/plans/1").json()
+        responses = (listed, detail)
         for payload in responses:
             radar = payload["mode_radar_json"]
             self.assertEqual(len(radar), 2)
@@ -761,7 +760,14 @@ class TradingPlaybookApiTests(unittest.TestCase):
                 sum(row["summary_counts"]["scanned"] for row in radar),
                 501,
             )
-            self.assertEqual(payload["mode_radar"], radar)
+        self.assertNotIn("mode_radar", listed)
+        self.assertEqual(listed["theme_ranking_json"], [])
+        self.assertEqual(listed["rule_snapshot_json"], [])
+        self.assertLessEqual(
+            set(listed["market_state_json"]),
+            {"style", "window"},
+        )
+        self.assertEqual(detail["mode_radar"], detail["mode_radar_json"])
 
     def test_every_plan_endpoint_rejects_nonfinite_strong_history_with_fixed_503(self):
         async def add_bad_plan(index: int):

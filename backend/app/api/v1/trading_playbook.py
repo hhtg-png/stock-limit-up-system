@@ -602,7 +602,10 @@ async def list_plans(
         )
         return {
             "items": [
-                await _serialize_plan_response(db, plan) for plan in plans
+                _serialize_plan_list_item(
+                    await _serialize_plan_response(db, plan)
+                )
+                for plan in plans
             ]
         }
     except HTTPException:
@@ -962,6 +965,35 @@ async def get_personal_wechat_status(
         raise
     except Exception as exc:
         raise _service_unavailable() from exc
+
+
+def _serialize_plan_list_item(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Return only fields consumed by the timeline and selected-plan view."""
+    item = {
+        key: value
+        for key, value in payload.items()
+        if key
+        not in {
+            "market_state",
+            "theme_rankings",
+            "mode_radar",
+            "rule_snapshot",
+            "risk_settings",
+            "data_quality",
+        }
+    }
+    market_state = payload.get("market_state_json")
+    if isinstance(market_state, Mapping):
+        item["market_state_json"] = {
+            key: market_state[key]
+            for key in ("style", "window")
+            if key in market_state
+        }
+    else:
+        item["market_state_json"] = {}
+    item["theme_ranking_json"] = []
+    item["rule_snapshot_json"] = []
+    return item
 
 
 @router.put("/settings", summary="修改交易预案设置")
