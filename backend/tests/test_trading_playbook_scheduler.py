@@ -479,6 +479,40 @@ class TradingPlaybookSchedulerStageTests(unittest.IsolatedAsyncioTestCase):
             prepared_realtime_snapshot=prepared,
         )
 
+    async def test_preclose_freezes_realtime_before_fixing_build_time(self):
+        self.now = datetime(2026, 7, 13, 14, 40, tzinfo=CN_TZ)
+        prepared = object()
+
+        async def prepare(_trade_date):
+            self.now += timedelta(seconds=1)
+            return prepared
+
+        self.orchestrator.prepare_realtime_snapshot = AsyncMock(
+            side_effect=prepare
+        )
+
+        with patch(
+            "app.data_collectors.scheduler._get_cn_trading_dates",
+            return_value=[self.now.date(), self.now.date() + timedelta(days=1)],
+        ):
+            result = await self.scheduler._build_trading_playbook_plan(
+                "preclose",
+                send_notifications=False,
+            )
+
+        self.assertEqual(result, {"id": 9})
+        self.orchestrator.prepare_realtime_snapshot.assert_awaited_once_with(
+            self.now.date()
+        )
+        self.orchestrator.build_stage.assert_awaited_once_with(
+            self.db,
+            self.now.date(),
+            "preclose",
+            self.now,
+            degraded=False,
+            prepared_realtime_snapshot=prepared,
+        )
+
     async def test_unconfigured_future_services_are_controlled_noops(self):
         with patch(
             "app.data_collectors.scheduler._get_cn_trading_dates",
