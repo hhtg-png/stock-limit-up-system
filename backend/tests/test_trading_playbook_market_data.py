@@ -2166,6 +2166,40 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("broken_count", theme)
         self.assertEqual(theme["quality"], "degraded")
 
+    def test_complete_realtime_pool_certifies_absent_theme_counts_as_zero(self):
+        from app.services.trading_playbook.domain import CandidateSnapshot
+        from app.services.trading_playbook.market_data import (
+            TradingPlaybookMarketDataProvider,
+        )
+
+        candidate = CandidateSnapshot(
+            stock_code="000001",
+            stock_name="Historical candidate",
+            theme_name="Historical theme",
+            features={},
+        )
+
+        incomplete = TradingPlaybookMarketDataProvider._theme_rankings(
+            [candidate],
+            realtime_complete=False,
+        )[0]
+        complete = TradingPlaybookMarketDataProvider._theme_rankings(
+            [candidate],
+            realtime_complete=True,
+        )[0]
+
+        self.assertEqual(incomplete["quality"], "degraded")
+        self.assertEqual(complete["quality"], "ready")
+        for field in (
+            "limit_up_count",
+            "new_high_count",
+            "sealed_count",
+            "broken_count",
+            "middle_army_strength",
+        ):
+            self.assertEqual(complete[field], 0)
+            self.assertEqual(complete["field_quality"][field], "ready")
+
     async def test_bounded_union_quotes_full_market_and_loads_klines_only_for_candidates(
         self,
     ):

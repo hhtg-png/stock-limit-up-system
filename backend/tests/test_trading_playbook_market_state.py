@@ -1055,14 +1055,27 @@ class TestMarketStateAnalyzer:
             warning.startswith("market_state missing:")
             for warning in enriched.quality.warnings
         )
-        assert any(
-            warning.startswith("theme 机器人 missing:")
+        assert not any(
+            warning.startswith(("theme ", "recognition "))
             for warning in enriched.quality.warnings
         )
-        assert any(
-            warning.startswith("recognition 000001 missing:")
-            for warning in enriched.quality.warnings
+
+    def test_candidate_analysis_gaps_do_not_degrade_ready_market_snapshot(self):
+        snapshot = self._snapshot()
+        snapshot.theme_rankings[0].pop("middle_army_strength")
+        snapshot.candidates[0].features.pop("board_height")
+
+        enriched = market_state_module.MarketStateAnalyzer().enrich_snapshot(
+            snapshot
         )
+
+        assert enriched.quality.status == "ready"
+        assert enriched.quality.warnings == []
+        by_code = {
+            candidate.stock_code: candidate for candidate in enriched.candidates
+        }
+        assert by_code["000001"].features["theme_quality"] == "degraded"
+        assert by_code["000001"].features["recognition_quality"] == "degraded"
 
     def test_enrich_snapshot_preserves_missing_or_stale_quality_and_bounds_warnings(self):
         snapshot = self._snapshot()
@@ -1132,4 +1145,5 @@ class TestMarketStateAnalyzer:
                 "influence_rank",
             )
         )
-        assert enriched.quality.status == "degraded"
+        assert enriched.quality.status == "ready"
+        assert enriched.quality.warnings == []

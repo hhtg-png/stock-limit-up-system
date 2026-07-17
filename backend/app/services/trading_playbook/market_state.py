@@ -589,13 +589,6 @@ class MarketStateAnalyzer:
         theme_rankings = self.theme_ranker.rank(
             copy.deepcopy(snapshot.theme_rankings)
         )
-        for row in theme_rankings:
-            if row["quality"] != "ready":
-                analysis_degraded = True
-                analysis_warnings.append(
-                    f"theme {row['theme_name'] or '<missing>'} missing: "
-                    + ",".join(row["missing_fields"])
-                )
         theme_by_name = {
             row["theme_name"]: row
             for row in theme_rankings
@@ -603,13 +596,6 @@ class MarketStateAnalyzer:
         }
 
         recognition_rows = self._rank_recognition_by_theme(snapshot.candidates)
-        for row in recognition_rows:
-            if row["quality"] != "ready":
-                analysis_degraded = True
-                analysis_warnings.append(
-                    f"recognition {row['stock_code'] or '<missing>'} missing: "
-                    + ",".join(row["missing_fields"])
-                )
         recognition_by_code = {
             row["stock_code"]: row for row in recognition_rows
         }
@@ -632,11 +618,6 @@ class MarketStateAnalyzer:
 
             theme = theme_by_name.get(str(candidate.theme_name or "").strip())
             if theme is None:
-                analysis_degraded = True
-                analysis_warnings.append(
-                    f"candidate theme {candidate.stock_code or '<missing>'} "
-                    "missing: theme_ranking"
-                )
                 features.update(
                     {
                         "theme_rank": None,

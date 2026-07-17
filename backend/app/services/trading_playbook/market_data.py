@@ -1454,7 +1454,10 @@ class TradingPlaybookMarketDataProvider:
             as_of=as_of,
             market_features=market_features,
             candidates=candidates,
-            theme_rankings=self._theme_rankings(candidates),
+            theme_rankings=self._theme_rankings(
+                candidates,
+                realtime_complete=realtime_context_complete,
+            ),
             quality=DataQuality(
                 status="degraded" if overall_degraded else "ready",
                 as_of=as_of,
@@ -2429,6 +2432,8 @@ class TradingPlaybookMarketDataProvider:
     def _theme_rankings(
         cls,
         candidates: List[CandidateSnapshot],
+        *,
+        realtime_complete: bool = False,
     ) -> List[Dict[str, Any]]:
         grouped: Dict[str, List[CandidateSnapshot]] = {}
         for candidate in candidates:
@@ -2459,7 +2464,11 @@ class TradingPlaybookMarketDataProvider:
                 "candidate_count": len(members),
                 "stock_codes": sorted(member.stock_code for member in members),
             }
-            if realtime_members:
+            if not realtime_members and realtime_complete:
+                for field in field_quality:
+                    row[field] = 0
+                    field_quality[field] = "ready"
+            elif realtime_members:
                 row["limit_up_count"] = len(realtime_members)
                 field_quality["limit_up_count"] = "ready"
 
