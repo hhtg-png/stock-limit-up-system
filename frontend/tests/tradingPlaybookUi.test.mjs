@@ -92,7 +92,11 @@ test('page exposes loading, error, empty states, and personal WeChat status', ()
   assert.match(view, /v-loading=/, 'sections should expose loading state')
   assert.match(view, /el-alert[\s\S]*Error|plansError|reviewsError|alertsError|settingsError/, 'page should render request errors')
   assert.match(view, /<el-empty/, 'collections should render explicit empty states')
-  assert.match(view, /预案结论：观望\/空仓/, 'a ready plan with no candidate should render an explicit no-trade conclusion')
+  assert.match(view, /维持观望和空仓/, 'a ready plan with no candidate should render an explicit no-trade conclusion')
+  assert.match(view, /观望 \/ 空仓预案/, 'no-candidate plans should render a visible plan card')
+  assert.match(view, /目标日仓位 0%/, 'no-action plan should state the position explicitly')
+  assert.match(view, /禁止动作/, 'no-action plan should state prohibited actions')
+  assert.match(view, /重新评估/, 'no-action plan should state when the decision can change')
   assert.match(view, /个人微信提醒/, 'settings should expose the personal WeChat channel')
   assert.match(view, /getTradingPlaybookPersonalWechatStatus/, 'WeChat status should come from the backend')
   assert.match(view, /打开个人微信绑定二维码/, 'settings should expose the secure setup entry')
@@ -353,6 +357,38 @@ test('presentation helpers implement confirmation, canonical inbox, and section 
       '试错 10% · 确认上限 30% · 刚性止损 5% · 最多 3 只'
     )
     assert.equal(helpers.riskPermissionSummary({}), '-')
+  })
+})
+
+test('radar presentation translates internal codes and JSON summaries into readable Chinese', async () => {
+  await withFrontendModules(async server => {
+    const helpers = await server.ssrLoadModule('/src/views/trading-playbook/presentation.ts')
+    const row = {
+      mode_key: 'alive_theme_snake_arbitrage',
+      status: 'not_matched',
+      role: 'summary',
+      compacted: true,
+      summary_counts: {
+        scanned: 10,
+        matched: 0,
+        waiting: 0,
+        manual_review: 0,
+        not_matched: 10
+      }
+    }
+
+    assert.equal(helpers.tradingModeLabel(row), '板块未死的蛇形套利')
+    assert.equal(helpers.tradingModeLabel(row, { alive_theme_snake_arbitrage: '规则中文名' }), '规则中文名')
+    assert.equal(helpers.radarStatusLabel(row.status), '未命中')
+    assert.equal(helpers.radarStatusType(row.status), 'info')
+    assert.equal(helpers.radarCandidateLabel(row), '全市场汇总')
+    assert.equal(
+      helpers.radarEvidenceSummary(row),
+      '扫描 10 只 · 命中 0 · 等待确认 0 · 人工复核 0 · 未命中 10'
+    )
+    assert.equal(helpers.marketStateLabel('style', 'chaos_retreat'), '混沌退潮')
+    assert.equal(helpers.marketStateLabel('window', 'decline'), '退潮期')
+    assert.doesNotMatch(helpers.radarEvidenceSummary(row), /radar_summary|not_matched|[{}\[\]"]/)
   })
 })
 

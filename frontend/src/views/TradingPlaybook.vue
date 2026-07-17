@@ -67,10 +67,10 @@
         </div>
         <el-descriptions v-if="selectedPlan" :column="3" border>
           <el-descriptions-item label="风格">
-            {{ marketValue('style') }}
+            {{ marketValueLabel('style') }}
           </el-descriptions-item>
           <el-descriptions-item label="窗口">
-            {{ marketValue('window') }}
+            {{ marketValueLabel('window') }}
           </el-descriptions-item>
           <el-descriptions-item label="风险权限">
             {{ riskPermissionSummary(selectedPlan.risk_settings_json) }}
@@ -184,7 +184,34 @@
           </dl>
         </el-card>
       </div>
-      <el-empty v-else-if="!store.plansLoading" :description="candidateEmptyDescription" />
+      <div v-else-if="!store.plansLoading && selectedPlan" class="no-action-plan" role="status">
+        <div class="no-action-title">
+          <div>
+            <h5>{{ isDegraded ? '仅观察 / 空仓预案' : '观望 / 空仓预案' }}</h5>
+            <p>{{ selectedPlan.target_trade_date }} 目标日不新开仓，等待下一次系统确认。</p>
+          </div>
+          <el-tag type="warning" effect="dark">目标日仓位 0%</el-tag>
+        </div>
+        <dl class="no-action-details">
+          <div>
+            <dt>结论</dt>
+            <dd>当前没有满足完整触发条件的行动候选，维持观望和空仓。</dd>
+          </div>
+          <div>
+            <dt>原因</dt>
+            <dd>{{ noActionReason }}</dd>
+          </div>
+          <div>
+            <dt>禁止动作</dt>
+            <dd>不追涨，不临盘增加计划外交易，不把单股异动当成模式确认。</dd>
+          </div>
+          <div>
+            <dt>重新评估</dt>
+            <dd>{{ noActionReviewText }}</dd>
+          </div>
+        </dl>
+      </div>
+      <el-empty v-else-if="!store.plansLoading" description="该目标交易日暂无预案" />
     </section>
 
     <section class="panel" v-loading="store.plansLoading">
@@ -197,16 +224,20 @@
       </div>
       <el-table v-if="modeRadarRows.length" :data="modeRadarRows" stripe>
         <el-table-column prop="mode_name" label="模式" min-width="160">
-          <template #default="{ row }">{{ row.mode_name || row.mode_key || '-' }}</template>
+          <template #default="{ row }">{{ tradingModeLabel(row, ruleModeNames) }}</template>
         </el-table-column>
         <el-table-column prop="status" label="状态" width="110">
-          <template #default="{ row }"><el-tag effect="plain">{{ row.status || '-' }}</el-tag></template>
+          <template #default="{ row }">
+            <el-tag :type="radarStatusType(row.status)" effect="plain">
+              {{ radarStatusLabel(row.status) }}
+            </el-tag>
+          </template>
         </el-table-column>
         <el-table-column prop="stock_name" label="候选" min-width="130">
-          <template #default="{ row }">{{ row.stock_name || row.stock_code || '-' }}</template>
+          <template #default="{ row }">{{ radarCandidateLabel(row) }}</template>
         </el-table-column>
         <el-table-column label="证据/原因" min-width="280">
-          <template #default="{ row }">{{ readable(row.evidence || row.reasons || row) }}</template>
+          <template #default="{ row }">{{ radarEvidenceSummary(row) }}</template>
         </el-table-column>
       </el-table>
       <el-empty v-else-if="!store.plansLoading" description="当前版本暂无模式雷达数据" />
@@ -851,7 +882,13 @@ import {
   filterTradingAlerts,
   formatChinaDateTime,
   isObservationOnly,
+  marketStateLabel,
+  radarCandidateLabel,
+  radarEvidenceSummary,
+  radarStatusLabel,
+  radarStatusType,
   riskPermissionSummary,
+  tradingModeLabel,
   type ManualExecutionDraft,
   type TradingAlertFilter,
   type UnplannedExecutionDraft
@@ -939,11 +976,6 @@ const canConfirm = computed(() => canEnableActionAlerts(selectedPlan.value))
 const canCancel = computed(() => ['draft', 'active'].includes(selectedPlan.value?.status || ''))
 const isObservation = computed(() => isObservationOnly(selectedPlan.value))
 const isDegraded = computed(() => Boolean(selectedPlan.value) && isObservation.value)
-const candidateEmptyDescription = computed(() => (
-  isDegraded.value
-    ? '数据未通过完整性校验，暂不输出行动候选'
-    : '当前市场未命中可执行模式，预案结论：观望/空仓'
-))
 const qualityDescription = computed(() => {
   const quality = selectedPlan.value?.data_quality_json
   const warnings = quality?.warnings || []
@@ -959,6 +991,31 @@ const permissionTagType = computed(() => (
   isObservation.value ? 'warning' : selectedPlan.value?.status === 'active' ? 'success' : 'info'
 ))
 const modeRadarRows = computed(() => selectedPlan.value?.mode_radar_json || [])
+const ruleModeNames = computed(() => Object.fromEntries(
+  rules.value
+    .filter(rule => Boolean(rule.mode_key && rule.name))
+    .map(rule => [rule.mode_key, rule.name])
+))
+const matchedModeCount = computed(() => modeRadarRows.value.filter(row => row.status === 'matched').length)
+const waitingModeCount = computed(() => modeRadarRows.value.filter(row => (
+  row.status === 'waiting' || row.status === 'manual_review'
+)).length)
+const noActionReason = computed(() => {
+  if (isDegraded.value) return `数据完整性未通过：${qualityDescription.value}`
+  return [
+    `市场风格为${marketValueLabel('style')}，当前窗口为${marketValueLabel('window')}`,
+    `${modeRadarRows.value.length} 个模式中命中 ${matchedModeCount.value} 个，等待确认或人工复核 ${waitingModeCount.value} 个`
+  ].join('；')
+})
+const noActionReviewText = computed(() => {
+  if (selectedPlan.value?.stage === 'auction') {
+    return '09:26 竞价确认后仍无命中则继续空仓；只有新版本出现明确候选时才重新评估。'
+  }
+  if (selectedPlan.value?.stage === 'overnight') {
+    return '等待 09:26 竞价确认；只有数据完整且模式命中后才生成候选，否则继续空仓。'
+  }
+  return '08:50 刷新隔夜信息，09:26 再做竞价确认；只有数据完整且模式命中后才生成候选，否则继续空仓。'
+})
 const visibleAlerts = computed(() => filterTradingAlerts(store.alerts, alertFilter.value))
 const reviewRows = computed(() => store.reviews)
 const selectedReview = computed(() => (
@@ -1077,6 +1134,10 @@ function errorMessage(error: unknown) {
 function marketValue(key: string) {
   const value = selectedPlan.value?.market_state_json?.[key]
   return typeof value === 'string' || typeof value === 'number' ? String(value) : '-'
+}
+
+function marketValueLabel(key: 'style' | 'window') {
+  return marketStateLabel(key, marketValue(key))
 }
 
 function readable(value: unknown) {
@@ -1582,6 +1643,52 @@ h5 {
   border-color: #dbe4f0;
 }
 
+.no-action-plan {
+  padding: 18px;
+  border: 1px solid #f5c56b;
+  border-radius: 12px;
+  background: linear-gradient(135deg, #fffbeb 0%, #fff 100%);
+}
+
+.no-action-title {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+
+  p {
+    margin-top: 6px;
+    color: var(--muted);
+    font-size: 13px;
+  }
+}
+
+.no-action-details {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin: 16px 0 0;
+
+  div {
+    padding: 12px;
+    border-radius: 9px;
+    background: rgba(255, 255, 255, 0.82);
+  }
+
+  dt {
+    color: #92400e;
+    font-size: 13px;
+    font-weight: 700;
+  }
+
+  dd {
+    margin: 6px 0 0;
+    color: #334155;
+    font-size: 13px;
+    line-height: 1.6;
+  }
+}
+
 .candidate-title {
   align-items: flex-start;
 }
@@ -1900,8 +2007,13 @@ h5 {
 
   .execution-row,
   .unplanned-row,
-  .settings-form {
+  .settings-form,
+  .no-action-details {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .no-action-title {
+    flex-direction: column;
   }
 
   .inbox-panel,
