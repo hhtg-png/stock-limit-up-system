@@ -235,7 +235,6 @@ class TradingPlaybookMarketDataProvider:
         quotes: Dict[str, QuotePoint] = {}
         field_quality: QuoteFieldQuality = {}
         excluded_codes = set()
-        stale_codes = []
         future_quote_found = False
         invalid_price_found = False
         for code in requested_codes:
@@ -289,11 +288,6 @@ class TradingPlaybookMarketDataProvider:
                 quality["_baseline_freshness"] = (
                     "ready" if baseline_ready else "stale"
                 )
-                if not baseline_ready:
-                    stale_codes.append(code)
-                    warnings.append(
-                        f"stale quote for {code} at {captured_at.isoformat()}"
-                    )
 
             price = self._optional_float(
                 self._quote_source_value(
@@ -456,6 +450,24 @@ class TradingPlaybookMarketDataProvider:
                 )
 
         eligible_requested_count = len(requested_codes) - len(excluded_codes)
+        fresh_quote_count = sum(
+            1
+            for code, quality in field_quality.items()
+            if code in quotes
+            and quality.get("_baseline_freshness") == "ready"
+        )
+        fresh_coverage = (
+            fresh_quote_count / eligible_requested_count
+            if eligible_requested_count
+            else 1.0
+        )
+        globally_stale = fresh_coverage < 0.9
+        if globally_stale:
+            warnings.append(
+                "incomplete quote freshness coverage: "
+                f"{fresh_quote_count}/{eligible_requested_count} "
+                f"({fresh_coverage:.4f})"
+            )
         coverage = (
             len(quotes) / eligible_requested_count
             if eligible_requested_count
@@ -479,7 +491,7 @@ class TradingPlaybookMarketDataProvider:
                     status=status,
                     as_of=as_of,
                     source="tencent",
-                    stale=bool(stale_codes),
+                    stale=globally_stale,
                     warnings=warnings,
                 ),
             ),
@@ -1151,21 +1163,24 @@ class TradingPlaybookMarketDataProvider:
                         )
                     },
                 }
-                evidence.append(
-                    {
-                        "source": "tencent",
-                        "as_of": quote.captured_at,
-                        "evidence_trade_date": self._china_datetime(
-                            quote.captured_at
-                        ).date(),
-                        "quality": self._quote_evidence_quality(
-                            quote,
-                            as_of,
-                            quality,
-                        ),
-                        "field_quality": quote_evidence_field_quality,
-                    }
-                )
+                quote_evidence = {
+                    "source": "tencent",
+                    "as_of": quote.captured_at,
+                    "evidence_trade_date": self._china_datetime(
+                        quote.captured_at
+                    ).date(),
+                    "quality": self._quote_evidence_quality(
+                        quote,
+                        as_of,
+                        quality,
+                    ),
+                    "field_quality": quote_evidence_field_quality,
+                }
+                if quality.get("_baseline_freshness") == "stale":
+                    quote_evidence["warning"] = (
+                        f"stale quote for {code} at {quote.captured_at.isoformat()}"
+                    )
+                evidence.append(quote_evidence)
             else:
                 evidence.append(
                     {
@@ -1524,6 +1539,17 @@ class TradingPlaybookMarketDataProvider:
                     "board_height",
                 )
                 height = cls._optional_float(raw_height)
+                if height is None:
+                    board_label = str(row.get("board_label") or "").strip()
+                    if board_label == "首板" or (
+                        "天" in board_label and board_label.endswith("板")
+                    ):
+                        height = 1.0
+                    elif (
+                        board_label.endswith("板")
+                        and board_label[:-1].isdigit()
+                    ):
+                        height = float(board_label[:-1])
                 if (
                     height is not None
                     and height >= 0

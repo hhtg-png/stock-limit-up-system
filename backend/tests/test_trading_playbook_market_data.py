@@ -597,7 +597,45 @@ class TradingPlaybookQuoteSnapshotTests(unittest.IsolatedAsyncioTestCase):
                 for warning in snapshot.quality.warnings
             )
         )
-        self.assertTrue(any("stale quote" in warning for warning in snapshot.quality.warnings))
+        self.assertTrue(
+            any(
+                warning.startswith("incomplete quote freshness coverage")
+                for warning in snapshot.quality.warnings
+            )
+        )
+
+    async def test_small_stale_quote_minority_is_isolated_to_field_quality(self):
+        from app.services.trading_playbook.market_data import (
+            TradingPlaybookMarketDataProvider,
+        )
+
+        as_of = datetime(2026, 7, 13, 9, 30, 30)
+        codes = [f"{index:06d}" for index in range(10)]
+        payload = {
+            code: _quote_payload(code, 10, "20260713093030")
+            for code in codes
+        }
+        payload[codes[-1]] = _quote_payload(
+            codes[-1],
+            10,
+            "20260713093000",
+        )
+
+        snapshot, field_quality = await TradingPlaybookMarketDataProvider(
+            quote_api=_FakeQuoteAPI(payload)
+        )._quote_snapshot_with_quality(codes, as_of.date(), as_of)
+
+        self.assertFalse(snapshot.quality.stale)
+        self.assertEqual(
+            field_quality[codes[-1]]["_baseline_freshness"],
+            "stale",
+        )
+        self.assertFalse(
+            any(
+                warning.startswith("incomplete quote freshness coverage")
+                for warning in snapshot.quality.warnings
+            )
+        )
 
     async def test_naive_as_of_is_china_local_when_quote_timestamp_is_aware(self):
         from app.services.trading_playbook.market_data import (
@@ -1154,6 +1192,76 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             evidence[0]["field_quality"]["trend_new_high_count_prev"],
             "missing",
+        )
+
+    def test_realtime_board_labels_complete_missing_continuous_days(self):
+        from app.services.trading_playbook.context_service import (
+            FULL_MARKET_CONTEXT_FIELDS,
+        )
+        from app.services.trading_playbook.domain import DataQuality, QuoteSnapshot
+        from app.services.trading_playbook.market_data import (
+            TradingPlaybookMarketDataProvider,
+        )
+
+        trade_date = date(2026, 7, 13)
+        as_of = datetime(2026, 7, 13, 14, 40)
+        context = {
+            "limit_up_count": 3,
+            "limit_up_count_prev": 2,
+            "trend_new_high_count": 20,
+            "trend_new_high_count_prev": 18,
+            "limit_down_count": 0,
+            "seal_rate": 80,
+            "negative_feedback": False,
+            "divergence_days": 0,
+            "sell_pressure_falling": False,
+            "breadth_recovered": False,
+            "prior_window": "",
+            "sell_pressure_rising": False,
+        }
+
+        values, evidence, warning = (
+            TradingPlaybookMarketDataProvider._complete_market_context(
+                context,
+                [
+                    {
+                        "field_quality": {
+                            key: "ready" if key in context else "missing"
+                            for key in FULL_MARKET_CONTEXT_FIELDS
+                        }
+                    }
+                ],
+                source_trade_date=trade_date,
+                stage="preclose",
+                as_of=as_of,
+                universe_codes=[],
+                quote_snapshot=QuoteSnapshot(
+                    trade_date=trade_date,
+                    quotes={},
+                    quality=DataQuality("ready", as_of, "test"),
+                ),
+                quote_field_quality={},
+                realtime_rows=[
+                    {"continuous_limit_up_days": 3},
+                    {"continuous_limit_up_days": None, "board_label": "首板"},
+                    {
+                        "continuous_limit_up_days": None,
+                        "board_label": "3天2板",
+                    },
+                ],
+                realtime_complete=True,
+                realtime_evidence_date=trade_date,
+                kline_scope_codes=[],
+                kline_by_code={},
+                review_history_by_code={},
+            )
+        )
+
+        self.assertIsNone(warning)
+        self.assertEqual(values["max_board_height"], 3)
+        self.assertEqual(
+            evidence[0]["field_quality"]["max_board_height"],
+            "computed",
         )
 
     def test_invalid_bounded_trend_samples_still_block_market_context(self):
