@@ -1561,6 +1561,37 @@ class TradingPlaybookObsidianSnapshotBuilderTests(
         with self.assertRaisesRegex(ValueError, "triggered_at"):
             self.builder._alert_payload(corrupt_timestamp)
 
+    async def test_alerts_builder_ignores_other_channel_only_events(self):
+        async with self.session_factory() as session:
+            session.add(
+                TradingAlertEvent(
+                    id=619,
+                    plan_version_id=202,
+                    event_type="plan_ready",
+                    severity="info",
+                    dedup_key="plan:202:wxpusher:plan_ready",
+                    triggered_at=datetime(2026, 7, 16, 10, 19),
+                    market_snapshot_json={
+                        "source_trade_date": "2026-07-14",
+                        "target_trade_date": "2026-07-16",
+                        "stage": "after_close",
+                        "status": "draft",
+                    },
+                    message="WxPusher only",
+                    channel_status_json={
+                        "wxpusher": {"status": "delivered", "attempts": 1}
+                    },
+                )
+            )
+            await session.commit()
+
+        artifact = await self.builder.build_alerts_artifact(date(2026, 7, 16))
+
+        self.assertNotIn(
+            619,
+            [row["alert_id"] for row in artifact.payload_json()["timeline"]],
+        )
+
     async def test_confirmation_alert_terminal_failures_never_remain_pending(self):
         for index, channel_status in enumerate(
             ("failed", "uncertain", "skipped"),

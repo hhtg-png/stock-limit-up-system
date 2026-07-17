@@ -184,7 +184,7 @@
           </dl>
         </el-card>
       </div>
-      <el-empty v-else-if="!store.plansLoading" description="当前版本暂无正式行动候选" />
+      <el-empty v-else-if="!store.plansLoading" :description="candidateEmptyDescription" />
     </section>
 
     <section class="panel" v-loading="store.plansLoading">
@@ -824,6 +824,7 @@ import { ElMessage } from 'element-plus'
 import {
   cancelTradingPlan,
   confirmTradingPlan,
+  getLatestTradingPlanTargetDate,
   getTradingPlaybookPersonalWechatStatus,
   getTradingPlan,
   getTradingRules,
@@ -938,6 +939,11 @@ const canConfirm = computed(() => canEnableActionAlerts(selectedPlan.value))
 const canCancel = computed(() => ['draft', 'active'].includes(selectedPlan.value?.status || ''))
 const isObservation = computed(() => isObservationOnly(selectedPlan.value))
 const isDegraded = computed(() => Boolean(selectedPlan.value) && isObservation.value)
+const candidateEmptyDescription = computed(() => (
+  isDegraded.value
+    ? '数据未通过完整性校验，暂不输出行动候选'
+    : '当前市场未命中可执行模式，预案结论：观望/空仓'
+))
 const qualityDescription = computed(() => {
   const quality = selectedPlan.value?.data_quality_json
   const warnings = quality?.warnings || []
@@ -1408,12 +1414,22 @@ async function loadAll() {
   refreshing.value = false
 }
 
+async function selectLatestPlanTargetDate() {
+  try {
+    const latest = await getLatestTradingPlanTargetDate()
+    if (latest.target_trade_date) targetPlanDate.value = latest.target_trade_date
+  } catch {
+    // Keep Beijing today as a safe fallback when discovery is unavailable.
+  }
+}
+
 watch(selectedPlan, plan => {
   if (plan && selectedPlanId.value === null) selectedPlanId.value = plan.id
 })
 
-onMounted(() => {
-  void loadAll()
+onMounted(async () => {
+  await selectLatestPlanTargetDate()
+  await loadAll()
 })
 </script>
 

@@ -117,6 +117,11 @@ class MarketReviewPipelineService:
 
     async def _upsert_metric_row(self, db: AsyncSession, metric_row: Dict[str, Any]) -> None:
         values = self._filter_model_columns(MarketReviewDailyMetric, metric_row)
+        # SQLAlchemy's ``onupdate`` hook is not applied by SQLite's explicit
+        # ``ON CONFLICT DO UPDATE`` statement. Keep this capture time fresh so
+        # the after-close barrier can distinguish the 15:05 rebuild from the
+        # 14:50 intraday snapshot.
+        values["updated_at"] = datetime.now()
         stmt = sqlite_insert(MarketReviewDailyMetric).values(**values)
         update_values = {
             key: stmt.excluded[key]

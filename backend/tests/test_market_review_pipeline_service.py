@@ -268,6 +268,36 @@ class MarketReviewPipelineServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event_row.event_seq, 1)
         self.assertEqual(event_row.payload_json, {"note": "updated"})
 
+    async def test_metric_upsert_refreshes_capture_time_for_after_close_barrier(self):
+        service = MarketReviewPipelineService(session_factory=self.session_factory)
+        payload = await service.build_payload_for_date(
+            date(2026, 4, 28),
+            normalized=self._normalized_input(),
+        )
+        old_capture = datetime(2026, 4, 28, 14, 50)
+        payload["metric_row"]["updated_at"] = old_capture
+
+        async with self.session_factory() as session:
+            await service.persist_payload(session, payload)
+            await session.commit()
+
+        refreshed = await service.build_payload_for_date(
+            date(2026, 4, 28),
+            normalized=self._normalized_input(),
+        )
+        async with self.session_factory() as session:
+            await service.persist_payload(session, refreshed)
+            await session.commit()
+            metric = (
+                await session.execute(
+                    select(MarketReviewDailyMetric).where(
+                        MarketReviewDailyMetric.trade_date == date(2026, 4, 28)
+                    )
+                )
+            ).scalar_one()
+
+        self.assertGreater(metric.updated_at, old_capture)
+
     async def test_persist_payload_upserts_heterogeneous_rows_and_leaves_commit_to_caller(self):
         service = MarketReviewPipelineService(session_factory=self.session_factory)
         first_payload = await service.build_payload_for_date(

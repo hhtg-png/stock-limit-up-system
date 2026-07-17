@@ -615,6 +615,29 @@ async def list_plans(
         raise _service_unavailable() from exc
 
 
+@router.get("/plans/latest-target-date", summary="查询最新预案目标交易日")
+async def get_latest_plan_target_date(db: AsyncSession = Depends(get_db)):
+    try:
+        target_trade_date = await db.scalar(
+            select(TradingPlanVersion.target_trade_date)
+            .order_by(
+                TradingPlanVersion.target_trade_date.desc(),
+                TradingPlanVersion.generated_at.desc(),
+                TradingPlanVersion.id.desc(),
+            )
+            .limit(1)
+        )
+        return {
+            "target_trade_date": (
+                target_trade_date.isoformat()
+                if isinstance(target_trade_date, date)
+                else None
+            )
+        }
+    except Exception as exc:
+        raise _service_unavailable() from exc
+
+
 @router.get("/plans/{plan_id}", summary="查询预案详情")
 async def get_plan(plan_id: int, db: AsyncSession = Depends(get_db)):
     try:

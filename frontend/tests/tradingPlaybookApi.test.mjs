@@ -107,6 +107,7 @@ test('trading playbook API sends exact backend routes, params, and payloads', as
     const settings = { in_app_enabled: false, wechat_enabled: false }
 
     await client.getTradingRules()
+    await client.getLatestTradingPlanTargetDate()
     await client.getTradingPlans('2026-07-14')
     await client.getTradingPlan(7)
     await client.generateTradingPlan('2026-07-14', 'preclose')
@@ -126,6 +127,7 @@ test('trading playbook API sends exact backend routes, params, and payloads', as
     assert.equal(client.tradingPlaybookApi.defaults.baseURL, '/api/v1')
     assert.deepEqual(calls, [
       { method: 'get', url: '/trading-playbook/rules', params: undefined, data: undefined },
+      { method: 'get', url: '/trading-playbook/plans/latest-target-date', params: undefined, data: undefined },
       { method: 'get', url: '/trading-playbook/plans', params: { trade_date: '2026-07-14' }, data: undefined },
       { method: 'get', url: '/trading-playbook/plans/7', params: undefined, data: undefined },
       {

@@ -769,6 +769,17 @@ class TradingPlaybookApiTests(unittest.TestCase):
         )
         self.assertEqual(detail["mode_radar"], detail["mode_radar_json"])
 
+    def test_latest_target_date_discovers_next_session_plan(self):
+        response = self.client.get(
+            "/trading-playbook/plans/latest-target-date"
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            response.json(),
+            {"target_trade_date": "2026-07-13"},
+        )
+
     def test_every_plan_endpoint_rejects_nonfinite_strong_history_with_fixed_503(self):
         async def add_bad_plan(index: int):
             target = date(2026, 7, 20 + index)
@@ -2496,8 +2507,12 @@ class TradingPlaybookApiTests(unittest.TestCase):
             if route.path.startswith("/trading-playbook")
             for method in route.methods
         ]
-        self.assertEqual(len(operations), 16)
-        self.assertEqual(len(set(operations)), 16)
+        self.assertEqual(len(operations), 17)
+        self.assertEqual(len(set(operations)), 17)
+        self.assertIn(
+            ("/trading-playbook/plans/latest-target-date", "GET"),
+            operations,
+        )
         self.assertIn(
             (
                 "/trading-playbook/notifications/personal-wechat/status",

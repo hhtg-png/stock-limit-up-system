@@ -777,9 +777,11 @@ class DataScheduler:
                         "prepare_realtime_snapshot",
                         None,
                     )
-                    if stage in {"auction", "preclose"} and callable(
-                        prepare_realtime
-                    ):
+                    if stage in {
+                        "auction",
+                        "preclose",
+                        "after_close",
+                    } and callable(prepare_realtime):
                         prepared_realtime = await prepare_realtime(
                             source_trade_date
                         )

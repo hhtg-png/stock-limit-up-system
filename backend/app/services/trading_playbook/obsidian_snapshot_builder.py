@@ -508,6 +508,15 @@ class TradingPlaybookObsidianSnapshotBuilder:
                     )
                 ).all()
             )
+            # Channel services own separate durable events. The Obsidian alert
+            # timeline represents in-app delivery only; WxPusher-only events
+            # are unrelated records, not corrupt in-app state.
+            events = [
+                event
+                for event in events
+                if type(event.channel_status_json) is not dict
+                or "in_app" in event.channel_status_json
+            ]
             plan_ids = {
                 _positive_integer(event.plan_version_id, "alert plan_version_id")
                 for event in events

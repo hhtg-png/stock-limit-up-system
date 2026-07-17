@@ -32,6 +32,11 @@ export async function getTradingPlans(tradeDate: string) {
   return data as { items: TradingPlanVersion[] }
 }
 
+export async function getLatestTradingPlanTargetDate() {
+  const { data } = await tradingPlaybookApi.get('/trading-playbook/plans/latest-target-date')
+  return data as { target_trade_date: string | null }
+}
+
 export async function getTradingPlan(planId: number) {
   const { data } = await tradingPlaybookApi.get(`/trading-playbook/plans/${planId}`)
   return data as TradingPlanVersion
