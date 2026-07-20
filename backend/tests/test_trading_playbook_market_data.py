@@ -442,6 +442,80 @@ class TradingPlaybookQuoteSnapshotTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(math.isnan(stale_pair.quotes["000001"].speed_pct))
 
+    async def test_after_close_speed_is_not_applicable_not_missing(self):
+        from app.services.trading_playbook.market_data import (
+            TradingPlaybookMarketDataProvider,
+        )
+
+        trade_date = date(2026, 7, 13)
+        as_of = datetime(2026, 7, 13, 15, 30)
+        provider = TradingPlaybookMarketDataProvider(
+            quote_api=_FakeQuoteAPI(
+                {
+                    "000001": _quote_payload(
+                        "000001",
+                        10,
+                        "20260713150000",
+                    )
+                }
+            )
+        )
+
+        snapshot, field_quality = await provider._quote_snapshot_with_quality(
+            ["000001"],
+            trade_date,
+            as_of,
+            stage="after_close",
+        )
+
+        self.assertTrue(math.isnan(snapshot.quotes["000001"].speed_pct))
+        self.assertEqual(
+            field_quality["000001"]["speed_pct"],
+            "not_applicable",
+        )
+        self.assertEqual(snapshot.quality.status, "ready")
+        self.assertFalse(
+            any("speed_pct" in warning for warning in snapshot.quality.warnings)
+        )
+
+    async def test_overnight_speed_is_not_applicable_not_missing(self):
+        from app.services.trading_playbook.market_data import (
+            TradingPlaybookMarketDataProvider,
+        )
+
+        evidence_trade_date = date(2026, 7, 13)
+        trade_date = date(2026, 7, 14)
+        as_of = datetime(2026, 7, 14, 8, 50)
+        provider = TradingPlaybookMarketDataProvider(
+            quote_api=_FakeQuoteAPI(
+                {
+                    "000001": _quote_payload(
+                        "000001",
+                        10,
+                        "20260713150000",
+                    )
+                }
+            )
+        )
+
+        snapshot, field_quality = await provider._quote_snapshot_with_quality(
+            ["000001"],
+            trade_date,
+            as_of,
+            stage="overnight",
+            evidence_trade_date=evidence_trade_date,
+        )
+
+        self.assertTrue(math.isnan(snapshot.quotes["000001"].speed_pct))
+        self.assertEqual(
+            field_quality["000001"]["speed_pct"],
+            "not_applicable",
+        )
+        self.assertEqual(snapshot.quality.status, "ready")
+        self.assertFalse(
+            any("speed_pct" in warning for warning in snapshot.quality.warnings)
+        )
+
     async def test_cross_china_trading_date_quote_speed_is_missing(self):
         from app.services.trading_playbook.market_data import (
             TradingPlaybookMarketDataProvider,

@@ -67,6 +67,7 @@ class TradingPlaybookMarketDataProvider:
     MAX_CONCURRENCY = 16
     STALE_AFTER_SECONDS = 10
     SPEED_MAX_INTERVAL_SECONDS = 60
+    SPEED_NOT_APPLICABLE_STAGES = frozenset({"after_close", "overnight"})
 
     def __init__(
         self,
@@ -414,16 +415,27 @@ class TradingPlaybookMarketDataProvider:
                 change_pct = math.nan
                 quality["change_pct"] = "missing"
 
-            speed_timestamp_ready = (
-                quality["timestamp"] == "ready"
-                and self._speed_timestamp_ready(captured_at, as_of, trade_date)
-            )
-            speed_pct, quality["speed_pct"] = await self._speed_and_cache(
-                code,
-                price,
-                captured_at,
-                timestamp_ready=speed_timestamp_ready,
-            )
+            if stage in self.SPEED_NOT_APPLICABLE_STAGES:
+                # Closing and overnight plans use a settled close, not a live
+                # momentum interval. Preserve that distinction without
+                # degrading an otherwise complete quote snapshot.
+                speed_pct = math.nan
+                quality["speed_pct"] = "not_applicable"
+            else:
+                speed_timestamp_ready = (
+                    quality["timestamp"] == "ready"
+                    and self._speed_timestamp_ready(
+                        captured_at,
+                        as_of,
+                        trade_date,
+                    )
+                )
+                speed_pct, quality["speed_pct"] = await self._speed_and_cache(
+                    code,
+                    price,
+                    captured_at,
+                    timestamp_ready=speed_timestamp_ready,
+                )
             quotes[code] = QuotePoint(
                 stock_code=code,
                 stock_name=stock_name,
