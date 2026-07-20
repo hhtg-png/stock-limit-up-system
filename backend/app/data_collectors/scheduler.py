@@ -781,6 +781,7 @@ class DataScheduler:
                     )
                     if stage in {
                         "auction",
+                        "overnight",
                         "preclose",
                         "after_close",
                     } and callable(prepare_realtime):
