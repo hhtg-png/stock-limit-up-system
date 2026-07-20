@@ -48,6 +48,8 @@ _FULL_MARKET_PRIOR_WINDOWS = {
 class _QuoteCacheRecord:
     price: float
     captured_at: datetime
+    speed_pct: float = math.nan
+    speed_quality: str = "missing"
 
 
 @dataclass(frozen=True)
@@ -2909,6 +2911,21 @@ class TradingPlaybookMarketDataProvider:
                 speed_pct = 0.0
                 quality = "baseline"
             elif (
+                isinstance(previous, _QuoteCacheRecord)
+                and self._age_seconds(captured_at, previous.captured_at) == 0
+                and math.isclose(
+                    price,
+                    previous.price,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                )
+            ):
+                # Opening-auction quotes stop advancing after 09:25. Reusing
+                # the exact same observation must preserve the speed already
+                # computed for it instead of turning a valid snapshot missing.
+                speed_pct = previous.speed_pct
+                quality = previous.speed_quality
+            elif (
                 not isinstance(previous, _QuoteCacheRecord)
                 or not math.isfinite(previous.price)
                 or previous.price <= 0
@@ -2935,6 +2952,8 @@ class TradingPlaybookMarketDataProvider:
                 self._previous_prices[code] = _QuoteCacheRecord(
                     price=price,
                     captured_at=captured_at,
+                    speed_pct=speed_pct,
+                    speed_quality=quality,
                 )
             return speed_pct, quality
 

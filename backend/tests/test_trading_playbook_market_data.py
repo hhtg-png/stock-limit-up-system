@@ -378,6 +378,43 @@ class TradingPlaybookQuoteSnapshotTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(math.isnan(duplicate.quotes["000001"].speed_pct))
 
+    async def test_duplicate_unchanged_quote_reuses_computed_speed(self):
+        from app.services.trading_playbook.market_data import (
+            TradingPlaybookMarketDataProvider,
+        )
+
+        trade_date = date(2026, 7, 13)
+        api = _FakeQuoteAPI(
+            {"000001": _quote_payload("000001", 10, "20260713092400")}
+        )
+        provider = TradingPlaybookMarketDataProvider(quote_api=api)
+        await provider.quote_snapshot(
+            ["000001"],
+            trade_date,
+            datetime(2026, 7, 13, 9, 24),
+        )
+
+        api.payload["000001"] = _quote_payload(
+            "000001", 11, "20260713092500"
+        )
+        computed = await provider.quote_snapshot(
+            ["000001"],
+            trade_date,
+            datetime(2026, 7, 13, 9, 25),
+        )
+        repeated = await provider.quote_snapshot(
+            ["000001"],
+            trade_date,
+            datetime(2026, 7, 13, 9, 26),
+        )
+
+        self.assertEqual(computed.quotes["000001"].speed_pct, 10.0)
+        self.assertEqual(repeated.quotes["000001"].speed_pct, 10.0)
+        self.assertEqual(repeated.quality.status, "ready")
+        self.assertFalse(
+            any("speed_pct" in warning for warning in repeated.quality.warnings)
+        )
+
     async def test_quote_speed_over_sixty_seconds_is_missing(self):
         from app.services.trading_playbook.market_data import (
             TradingPlaybookMarketDataProvider,

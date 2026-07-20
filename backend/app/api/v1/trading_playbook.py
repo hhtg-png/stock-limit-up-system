@@ -526,11 +526,31 @@ async def generate_plan(
     if now.tzinfo is None or now.utcoffset() is None:
         raise _service_unavailable()
     try:
+        build_now = now.astimezone(CN_TZ)
+        build_kwargs = {}
+        prepare_realtime = getattr(
+            orchestrator,
+            "prepare_realtime_snapshot",
+            None,
+        )
+        if callable(prepare_realtime):
+            prepared_realtime = await prepare_realtime(
+                request.source_trade_date
+            )
+            build_now = get_trading_playbook_now()
+            if build_now.tzinfo is None or build_now.utcoffset() is None:
+                raise ValueError("trading playbook clock must be timezone-aware")
+            build_now = build_now.astimezone(CN_TZ)
+            if prepared_realtime is not None:
+                build_kwargs["prepared_realtime_snapshot"] = (
+                    prepared_realtime
+                )
         result = await orchestrator.build_stage(
             db,
             request.source_trade_date,
             request.stage,
-            now.astimezone(CN_TZ),
+            build_now,
+            **build_kwargs,
         )
         if isinstance(result, TradingPlanVersion):
             return await _serialize_plan_response(db, result)

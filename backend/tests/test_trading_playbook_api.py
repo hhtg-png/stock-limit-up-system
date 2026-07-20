@@ -677,6 +677,49 @@ class TradingPlaybookApiTests(unittest.TestCase):
         self.assertIsNotNone(as_of.utcoffset())
         self.assertEqual(as_of.utcoffset().total_seconds(), 8 * 3600)
 
+    def test_generate_prefetches_realtime_before_refixing_build_time(self):
+        prepared = object()
+        later = FIXED_NOW + timedelta(seconds=42)
+        original_build = self.orchestrator.build_stage
+        self.orchestrator.prepare_realtime_snapshot = AsyncMock(
+            return_value=prepared
+        )
+        captured_kwargs = {}
+
+        async def build_with_prepared(
+            db,
+            source_trade_date,
+            stage,
+            as_of,
+            **kwargs,
+        ):
+            captured_kwargs.update(kwargs)
+            return await original_build(db, source_trade_date, stage, as_of)
+
+        self.orchestrator.build_stage = build_with_prepared
+        with patch.object(
+            trading_playbook_api,
+            "get_trading_playbook_now",
+            return_value=later,
+        ):
+            response = self.client.post(
+                "/trading-playbook/plans/generate",
+                json={
+                    "source_trade_date": "2026-07-10",
+                    "stage": "auction",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.orchestrator.prepare_realtime_snapshot.assert_awaited_once_with(
+            date(2026, 7, 10)
+        )
+        self.assertEqual(self.orchestrator.calls[0][3], later)
+        self.assertIs(
+            captured_kwargs["prepared_realtime_snapshot"],
+            prepared,
+        )
+
     def test_generate_serializes_an_orm_result_without_leaking_it(self):
         async def return_plan(db, *_args, **_kwargs):
             return await db.get(TradingPlanVersion, 1)
