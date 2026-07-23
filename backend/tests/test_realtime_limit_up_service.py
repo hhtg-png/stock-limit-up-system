@@ -112,12 +112,20 @@ class RealtimeLimitUpServiceTests(unittest.IsolatedAsyncioTestCase):
             [collected_at, collected_at],
         )
         self.assertEqual(
+            [row["trade_date"] for row in refreshed],
+            [trade_date, trade_date],
+        )
+        self.assertEqual(
             [row["_collected_at"] for row in cached],
             [collected_at, collected_at],
         )
         self.assertEqual(
             [row["_collected_at"] for row in service._pool_cache[trade_date]],
             [collected_at, collected_at],
+        )
+        self.assertEqual(
+            [row["trade_date"] for row in service._pool_cache[trade_date]],
+            [trade_date, trade_date],
         )
 
     async def test_get_fast_limit_up_pool_can_wait_for_stale_refresh_before_returning(self):

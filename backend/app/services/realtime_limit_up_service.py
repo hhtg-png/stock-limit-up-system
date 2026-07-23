@@ -271,6 +271,10 @@ class RealtimeLimitUpService:
             merged = []
             for item in sealed_data + opened_data:
                 stamped = dict(item)
+                # The collection timestamp describes when the historical pool
+                # became available; the row date remains the market session
+                # explicitly requested from Eastmoney.
+                stamped["trade_date"] = trade_date
                 # Contract: this aware timestamp records the successful pool
                 # refresh and remains unchanged for the lifetime of the cache.
                 stamped["_collected_at"] = collected_at

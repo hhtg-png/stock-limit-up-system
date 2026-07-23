@@ -1605,7 +1605,14 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
             async def realtime_loader(trade_date):
                 requested_pool_dates.append(trade_date)
                 return RealtimeLimitUpSnapshot(
-                    items=[],
+                    items=[
+                        {
+                            "stock_code": "000001",
+                            "reason_category": "weekend evidence",
+                            "trade_date": trade_date,
+                            "_collected_at": as_of - timedelta(seconds=1),
+                        }
+                    ],
                     authoritative=True,
                     complete=True,
                     evidence_trade_date=trade_date,
