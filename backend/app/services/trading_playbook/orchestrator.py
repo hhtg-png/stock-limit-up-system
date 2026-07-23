@@ -51,12 +51,18 @@ class TradingPlaybookOrchestrator:
         if callable(close):
             await close()
 
-    async def prepare_realtime_snapshot(self, trade_date: date) -> Any:
+    async def prepare_realtime_snapshot(
+        self,
+        trade_date: date,
+        *,
+        stage: str,
+        as_of: datetime,
+    ) -> Any:
         """Collect live pool evidence before fixing the stage's as-of time."""
         prepare = getattr(self.market_data, "prepare_realtime_snapshot", None)
         if not callable(prepare):
             return None
-        return await prepare(trade_date)
+        return await prepare(trade_date, stage=stage, as_of=as_of)
 
     async def build_stage(
         self,

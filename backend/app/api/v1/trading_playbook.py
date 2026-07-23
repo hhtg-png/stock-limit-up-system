@@ -535,7 +535,9 @@ async def generate_plan(
         )
         if callable(prepare_realtime):
             prepared_realtime = await prepare_realtime(
-                request.source_trade_date
+                request.source_trade_date,
+                stage=request.stage,
+                as_of=build_now,
             )
             build_now = get_trading_playbook_now()
             if build_now.tzinfo is None or build_now.utcoffset() is None:

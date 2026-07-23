@@ -712,7 +712,9 @@ class TradingPlaybookApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200, response.text)
         self.orchestrator.prepare_realtime_snapshot.assert_awaited_once_with(
-            date(2026, 7, 10)
+            date(2026, 7, 10),
+            stage="auction",
+            as_of=FIXED_NOW,
         )
         self.assertEqual(self.orchestrator.calls[0][3], later)
         self.assertIs(

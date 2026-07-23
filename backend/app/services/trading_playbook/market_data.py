@@ -2037,9 +2037,29 @@ class TradingPlaybookMarketDataProvider:
     async def prepare_realtime_snapshot(
         self,
         trade_date: date,
-    ) -> RealtimeLimitUpSnapshot:
+        *,
+        stage: str,
+        as_of: datetime,
+    ) -> Optional[RealtimeLimitUpSnapshot]:
         """Freeze one pool snapshot before a live stage fixes its as-of time."""
-        return await self._load_realtime_limit_up(trade_date)
+        pool_trade_date = trade_date
+        if stage == "overnight":
+            _context, evidence, _warning = await self._load_full_market_context(
+                trade_date,
+                stage,
+                as_of,
+            )
+            evidence_trade_date = (
+                self._parse_date_value(evidence[0].get("evidence_trade_date"))
+                if evidence
+                else None
+            )
+            if evidence_trade_date is None:
+                # Let the normal build path resolve its own evidence date.
+                # Prefetching today's pool here would be provably mismatched.
+                return None
+            pool_trade_date = evidence_trade_date
+        return await self._load_realtime_limit_up(pool_trade_date)
 
     @classmethod
     def _normalize_realtime_row(

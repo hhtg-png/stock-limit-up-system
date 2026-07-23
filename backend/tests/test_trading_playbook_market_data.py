@@ -1611,7 +1611,7 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
                     evidence_trade_date=trade_date,
                 )
 
-            snapshot = await TradingPlaybookMarketDataProvider(
+            provider = TradingPlaybookMarketDataProvider(
                 quote_api=_FakeQuoteAPI(
                     {
                         "000001": _quote_payload(
@@ -1624,12 +1624,19 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
                 kline_loader=kline_loader,
                 realtime_limit_up_loader=realtime_loader,
                 full_market_context_loader=context_loader,
-            ).build_market_snapshot(
+            )
+            prepared_realtime = await provider.prepare_realtime_snapshot(
+                monday,
+                stage="overnight",
+                as_of=as_of,
+            )
+            snapshot = await provider.build_market_snapshot(
                 db=db,
                 source_trade_date=monday,
                 target_trade_date=monday,
                 stage="overnight",
                 as_of=as_of,
+                prepared_realtime_snapshot=prepared_realtime,
             )
 
         candidate = snapshot.candidates[0]
@@ -1640,6 +1647,10 @@ class TradingPlaybookMarketSnapshotTests(unittest.IsolatedAsyncioTestCase):
             item for item in candidate.evidence if item["source"] == "kline"
         )
         self.assertEqual(requested_pool_dates, [friday])
+        self.assertNotIn(
+            "mismatched realtime snapshot evidence date",
+            snapshot.quality.warnings,
+        )
         self.assertEqual(quote_evidence["evidence_trade_date"], friday)
         self.assertEqual(kline_evidence["evidence_trade_date"], friday)
         self.assertNotIn("speed_pct", candidate.features)

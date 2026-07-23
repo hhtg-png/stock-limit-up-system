@@ -786,7 +786,9 @@ class DataScheduler:
                         "after_close",
                     } and callable(prepare_realtime):
                         prepared_realtime = await prepare_realtime(
-                            source_trade_date
+                            source_trade_date,
+                            stage=stage,
+                            as_of=now,
                         )
                         build_now = self._playbook_now()
                         if prepared_realtime is not None:

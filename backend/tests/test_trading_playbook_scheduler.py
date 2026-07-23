@@ -449,7 +449,7 @@ class TradingPlaybookSchedulerStageTests(unittest.IsolatedAsyncioTestCase):
         self.now = datetime(2026, 7, 13, 9, 26, tzinfo=CN_TZ)
         prepared = object()
 
-        async def prepare(_trade_date):
+        async def prepare(_trade_date, **_kwargs):
             self.now += timedelta(seconds=1)
             return prepared
 
@@ -468,7 +468,9 @@ class TradingPlaybookSchedulerStageTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, {"id": 9})
         self.orchestrator.prepare_realtime_snapshot.assert_awaited_once_with(
-            self.now.date()
+            self.now.date(),
+            stage="auction",
+            as_of=self.now - timedelta(seconds=1),
         )
         self.orchestrator.build_stage.assert_awaited_once_with(
             self.db,
@@ -483,7 +485,7 @@ class TradingPlaybookSchedulerStageTests(unittest.IsolatedAsyncioTestCase):
         self.now = datetime(2026, 7, 13, 8, 50, tzinfo=CN_TZ)
         prepared = object()
 
-        async def prepare(_trade_date):
+        async def prepare(_trade_date, **_kwargs):
             self.now += timedelta(seconds=42)
             return prepared
 
@@ -502,7 +504,9 @@ class TradingPlaybookSchedulerStageTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, {"id": 9})
         self.orchestrator.prepare_realtime_snapshot.assert_awaited_once_with(
-            self.now.date()
+            self.now.date(),
+            stage="overnight",
+            as_of=self.now - timedelta(seconds=42),
         )
         self.orchestrator.build_stage.assert_awaited_once_with(
             self.db,
@@ -517,7 +521,7 @@ class TradingPlaybookSchedulerStageTests(unittest.IsolatedAsyncioTestCase):
         self.now = datetime(2026, 7, 13, 14, 40, tzinfo=CN_TZ)
         prepared = object()
 
-        async def prepare(_trade_date):
+        async def prepare(_trade_date, **_kwargs):
             self.now += timedelta(seconds=1)
             return prepared
 
@@ -536,7 +540,9 @@ class TradingPlaybookSchedulerStageTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, {"id": 9})
         self.orchestrator.prepare_realtime_snapshot.assert_awaited_once_with(
-            self.now.date()
+            self.now.date(),
+            stage="preclose",
+            as_of=self.now - timedelta(seconds=1),
         )
         self.orchestrator.build_stage.assert_awaited_once_with(
             self.db,
@@ -551,7 +557,7 @@ class TradingPlaybookSchedulerStageTests(unittest.IsolatedAsyncioTestCase):
         self.now = datetime(2026, 7, 13, 15, 30, tzinfo=CN_TZ)
         prepared = object()
 
-        async def prepare(_trade_date):
+        async def prepare(_trade_date, **_kwargs):
             self.now += timedelta(seconds=1)
             return prepared
 
@@ -570,7 +576,9 @@ class TradingPlaybookSchedulerStageTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, {"id": 9})
         self.orchestrator.prepare_realtime_snapshot.assert_awaited_once_with(
-            self.now.date()
+            self.now.date(),
+            stage="after_close",
+            as_of=self.now - timedelta(seconds=1),
         )
         self.orchestrator.build_stage.assert_awaited_once_with(
             self.db,
