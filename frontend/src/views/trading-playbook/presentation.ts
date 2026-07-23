@@ -89,8 +89,16 @@ export function tradingModeLabel(
   const key = displayText(row.mode_key)
   const explicit = displayText(row.mode_name)
   if (explicit && explicit !== key) return explicit
-  if (key && ruleNames[key]) return ruleNames[key]
-  return key ? FALLBACK_MODE_NAMES[key] || '未命名模式' : '未命名模式'
+  return modeKeyLabel(key, ruleNames)
+}
+
+export function modeKeyLabel(
+  value: unknown,
+  ruleNames: Record<string, string> = {}
+) {
+  const key = displayText(value)
+  if (!key) return '未标注模式'
+  return ruleNames[key] || FALLBACK_MODE_NAMES[key] || '未命名模式'
 }
 
 export function radarStatusLabel(status: unknown) {
@@ -234,6 +242,153 @@ export function riskPermissionSummary(settings: Record<string, unknown>) {
     typeof maximum !== 'number' || !Number.isInteger(maximum)
   ) return '-'
   return `试错 ${trial}% · 确认上限 ${confirmed}% · 刚性止损 ${hardStop}% · 最多 ${maximum} 只`
+}
+
+function recordValue(value: unknown) {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null
+}
+
+function finiteNumber(value: unknown) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
+function formatPrice(value: unknown) {
+  const number = finiteNumber(value)
+  return number === null ? null : `${number.toFixed(2)} 元`
+}
+
+function formatPercent(value: unknown) {
+  const number = finiteNumber(value)
+  return number === null ? null : `${number}%`
+}
+
+export function roleLabel(value: unknown) {
+  const role = displayText(value)
+  return ({
+    high_position: '高身位核心',
+    high_volatility: '高波动核心',
+    same_level_turnover: '同身位换手',
+    leader: '龙头',
+    core: '核心',
+    middle_army: '中军',
+    supplement: '补涨',
+    low_position: '低位'
+  } as Record<string, string>)[role || ''] || '待确认'
+}
+
+export function conditionSummary(value: unknown) {
+  const condition = recordValue(value)
+  if (!condition) return '暂无明确条件'
+
+  const parts: string[] = []
+  const label = displayText(condition.label)
+  if (label) parts.push(label)
+
+  const referencePrice = formatPrice(condition.reference_price)
+  if (referencePrice) parts.push(`参考价 ${referencePrice}`)
+
+  const priceUpper = formatPrice(condition.price_lte)
+  if (priceUpper) parts.push(`价格不高于 ${priceUpper}`)
+
+  const priceLower = formatPrice(condition.price_gte)
+  if (priceLower) parts.push(`价格不低于 ${priceLower}`)
+
+  const changeUpper = formatPercent(condition.change_pct_lte)
+  if (changeUpper) parts.push(`涨跌幅不高于 ${changeUpper}`)
+
+  const changeLower = formatPercent(condition.change_pct_gte)
+  if (changeLower) parts.push(`涨跌幅不低于 ${changeLower}`)
+
+  if (condition.sealed === true) parts.push('封板状态有效')
+  if (condition.sealed === false) parts.push('无需封板')
+
+  return parts.length ? parts.join('；') : '按系统条件观察'
+}
+
+export function candidateEvidenceSummary(value: unknown) {
+  if (!Array.isArray(value) || value.length === 0) return '暂无可用证据'
+
+  const sourceLabels: Record<string, string> = {
+    tencent: '实时报价',
+    full_market_quote_rank: '全市场排名',
+    kline: '日线走势',
+    realtime_limit_up_pool: '实时涨停池',
+    market_review_stock_daily: '市场复盘',
+    computed: '衍生指标'
+  }
+  const sources = new Set<string>()
+  let requirementTotal = 0
+  let requirementMatched = 0
+  let hardStopPrice: number | null = null
+
+  for (const raw of value) {
+    const item = recordValue(raw)
+    if (!item) continue
+    const source = displayText(item.source)
+    if (source && sourceLabels[source]) sources.add(sourceLabels[source])
+    if (source === 'mode_requirement') {
+      requirementTotal += 1
+      if (item.result === 'matched') requirementMatched += 1
+    }
+    if (source === 'mode_risk') {
+      hardStopPrice = finiteNumber(item.hard_stop_price)
+    }
+  }
+
+  const parts: string[] = []
+  if (sources.size) parts.push(`数据：${[...sources].join('、')}`)
+  if (requirementTotal) parts.push(`模式条件 ${requirementMatched}/${requirementTotal} 通过`)
+  if (hardStopPrice !== null) parts.push(`风控止损 ${hardStopPrice.toFixed(2)} 元`)
+  return parts.length ? parts.join('；') : `${value.length} 条系统证据已记录`
+}
+
+function changeMatches(value: unknown) {
+  return Array.isArray(value)
+    ? value.filter(item => recordValue(item))
+    : []
+}
+
+function uniqueStockCount(matches: unknown[]) {
+  const codes = new Set(
+    matches
+      .map(item => displayText(recordValue(item)?.stock_code))
+      .filter((code): code is string => Boolean(code))
+  )
+  return codes.size
+}
+
+export function planChangeSummary(
+  value: unknown,
+  ruleNames: Record<string, string> = {}
+) {
+  const change = recordValue(value)
+  if (!change) return '未记录版本变化'
+
+  const added = changeMatches(change.added_matches)
+  const removed = changeMatches(change.removed_matches)
+  const previousId = finiteNumber(change.previous_plan_version_id)
+  const parts: string[] = []
+
+  if (added.length) {
+    parts.push(`新增 ${added.length} 条命中（${uniqueStockCount(added)} 只股票）`)
+  }
+  if (removed.length) {
+    parts.push(`移除 ${removed.length} 条命中（${uniqueStockCount(removed)} 只股票）`)
+  }
+  if (!parts.length) parts.push(previousId === null ? '初始版本，无候选变化' : '与上一版本候选一致')
+
+  const modeKeys = [...new Set(
+    [...added, ...removed]
+      .map(item => displayText(recordValue(item)?.mode_key))
+      .filter((key): key is string => Boolean(key))
+  )]
+  if (modeKeys.length) {
+    const labels = modeKeys.slice(0, 2).map(key => modeKeyLabel(key, ruleNames))
+    parts.push(`涉及：${labels.join('、')}${modeKeys.length > 2 ? `等 ${modeKeys.length} 个模式` : ''}`)
+  }
+  return parts.join('；')
 }
 
 function positiveNumber(value: unknown) {

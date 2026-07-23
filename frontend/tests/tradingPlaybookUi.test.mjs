@@ -38,7 +38,6 @@ test('standalone playbook page exposes the complete working sections', () => {
     '版本时间轴',
     '正式行动计划',
     '全模式雷达',
-    '独立提醒',
     '执行复盘',
     '规则来源'
   ]) {
@@ -51,6 +50,7 @@ test('standalone playbook page exposes the complete working sections', () => {
   assert.match(view, /确认前修订/, 'draft plan should expose a revision editor')
   assert.match(view, /cancelTradingPlan/, 'page should allow cancelling eligible plans')
   assert.match(view, /\.slice\(0,\s*3\)/, 'action candidates should remain capped at three')
+  assert.doesNotMatch(view, /<h4>独立提醒(?:设置)?<\/h4>/, 'standalone reminder panels should be removed')
 })
 
 test('page binds every section to live store or API data and remains isolated', () => {
@@ -59,12 +59,8 @@ test('page binds every section to live store or API data and remains isolated', 
   for (const symbol of [
     'store.loadPlans',
     'store.loadReviews',
-    'store.loadAlerts',
-    'store.loadSettings',
     'getTradingRules',
-    'updateTradingExecutionReview',
-    'updateTradingPlaybookSettings',
-    'store.acknowledgeAlert'
+    'updateTradingExecutionReview'
   ]) {
     assert.match(view, new RegExp(symbol.replace('.', '\\.')), `page should use ${symbol}`)
   }
@@ -72,7 +68,6 @@ test('page binds every section to live store or API data and remains isolated', 
   assert.match(view, /getLatestTradingPlanTargetDate/, 'page should discover the latest generated target date')
   assert.match(view, /await selectLatestPlanTargetDate\(\)[\s\S]*await loadAll\(\)/, 'latest target date should be selected before initial loading')
   assert.match(view, /复盘交易日/, 'review date should be independently labelled')
-  assert.match(view, /acknowledged_at/, 'visible unread alerts must use persisted acknowledgement state')
   assert.match(view, /riskPermissionSummary\(selectedPlan\.risk_settings_json\)/, 'risk permission must use the persisted risk snapshot')
   assert.doesNotMatch(view, /marketValue\(['"]risk_permission['"]\)/, 'market state has no risk_permission field')
   assert.doesNotMatch(view, /alertsLoadedUnreadOnly/, 'view must not infer visibility from request metadata')
@@ -83,23 +78,44 @@ test('version timeline displays persisted version differences', () => {
   const view = read('src/views/TradingPlaybook.vue')
 
   assert.match(view, /change_summary_json/, 'timeline should expose the immutable version change summary')
-  assert.match(view, /版本变化/, 'timeline should label the persisted change summary')
+  assert.match(view, /planChangeSummary/, 'timeline should translate the persisted change summary')
+  assert.doesNotMatch(
+    view.slice(view.indexOf('<section class="panel timeline-panel"'), view.indexOf('<section class="panel action-panel"')),
+    /readable\(plan\.change_summary_json\)/,
+    'timeline must not print raw JSON'
+  )
 })
 
-test('page exposes loading, error, empty states, and personal WeChat status', () => {
+test('page exposes loading, error, empty states, and a readable no-action plan', () => {
   const view = read('src/views/TradingPlaybook.vue')
 
   assert.match(view, /v-loading=/, 'sections should expose loading state')
-  assert.match(view, /el-alert[\s\S]*Error|plansError|reviewsError|alertsError|settingsError/, 'page should render request errors')
+  assert.match(view, /el-alert[\s\S]*Error|plansError|reviewsError/, 'page should render request errors')
   assert.match(view, /<el-empty/, 'collections should render explicit empty states')
   assert.match(view, /维持观望和空仓/, 'a ready plan with no candidate should render an explicit no-trade conclusion')
   assert.match(view, /观望 \/ 空仓预案/, 'no-candidate plans should render a visible plan card')
   assert.match(view, /目标日仓位 0%/, 'no-action plan should state the position explicitly')
   assert.match(view, /禁止动作/, 'no-action plan should state prohibited actions')
   assert.match(view, /重新评估/, 'no-action plan should state when the decision can change')
-  assert.match(view, /个人微信提醒/, 'settings should expose the personal WeChat channel')
-  assert.match(view, /getTradingPlaybookPersonalWechatStatus/, 'WeChat status should come from the backend')
-  assert.match(view, /打开个人微信绑定二维码/, 'settings should expose the secure setup entry')
+  assert.doesNotMatch(view, /个人微信提醒|打开个人微信绑定二维码/, 'standalone reminder configuration should not occupy the playbook page')
+})
+
+test('formal action cards translate internal fields into concise Chinese summaries', () => {
+  const view = read('src/views/TradingPlaybook.vue')
+  const actionSection = view.slice(
+    view.indexOf('<section class="panel action-panel"'),
+    view.indexOf('<section class="panel" v-loading="store.plansLoading">')
+  )
+
+  for (const helper of [
+    'modeKeyLabel',
+    'roleLabel',
+    'conditionSummary',
+    'candidateEvidenceSummary'
+  ]) {
+    assert.match(actionSection, new RegExp(helper), `action plan should use ${helper}`)
+  }
+  assert.doesNotMatch(actionSection, /readable\(item\.(?:entry_trigger_json|invalidation_json|exit_trigger_json|evidence_json)\)/)
 })
 
 test('page exposes compact Obsidian sync controls without weakening manual boundaries', () => {
@@ -300,7 +316,7 @@ test('Obsidian export result helper reports every count and warns on partial res
 
 test('review and revision editors freeze every captured input while saving', () => {
   const view = read('src/views/TradingPlaybook.vue')
-  const reviewSection = view.slice(view.indexOf('<section class="panel review-panel"'), view.indexOf('<section class="panel settings-panel"'))
+  const reviewSection = view.slice(view.indexOf('<section class="panel review-panel"'), view.indexOf('<section class="panel obsidian-panel"'))
   const disabledReviewBindings = reviewSection.match(/:disabled="[^"]*reviewSaving[^"]*"/g) || []
 
   assert.match(view, /async function saveExecutionReview\(\)\s*{\s*if \(reviewSaving\.value \|\| !reviewEditorReady\.value\) return/)
@@ -389,6 +405,52 @@ test('radar presentation translates internal codes and JSON summaries into reada
     assert.equal(helpers.marketStateLabel('style', 'chaos_retreat'), '混沌退潮')
     assert.equal(helpers.marketStateLabel('window', 'decline'), '退潮期')
     assert.doesNotMatch(helpers.radarEvidenceSummary(row), /radar_summary|not_matched|[{}\[\]"]/)
+  })
+})
+
+test('timeline and action-plan helpers never expose raw backend JSON', async () => {
+  await withFrontendModules(async server => {
+    const helpers = await server.ssrLoadModule('/src/views/trading-playbook/presentation.ts')
+
+    const change = helpers.planChangeSummary({
+      previous_plan_version_id: 27,
+      added_matches: [
+        { stock_code: '000426', mode_key: 'new_theme_high_position' },
+        { stock_code: '000938', mode_key: 'new_theme_high_position' },
+        { stock_code: '000938', mode_key: 'new_theme_same_level_turnover' }
+      ],
+      removed_matches: [
+        { stock_code: '301234', mode_key: 'new_theme_high_volatility' }
+      ]
+    })
+    assert.match(change, /新增 3 条命中（2 只股票）/)
+    assert.match(change, /移除 1 条命中（1 只股票）/)
+    assert.match(change, /新题材高身位套利/)
+    assert.doesNotMatch(change, /previous_plan_version_id|stock_code|mode_key|[{}\[\]"]/)
+
+    assert.equal(helpers.modeKeyLabel('new_theme_high_position'), '新题材高身位套利')
+    assert.equal(helpers.roleLabel('high_position'), '高身位核心')
+    assert.equal(
+      helpers.conditionSummary({ label: '放量后不能承接', price_lte: 31.91 }),
+      '放量后不能承接；价格不高于 31.91 元'
+    )
+    assert.equal(
+      helpers.conditionSummary({ label: '新题材确认后的高身位套利', reference_price: 33.59, sealed: true }),
+      '新题材确认后的高身位套利；参考价 33.59 元；封板状态有效'
+    )
+
+    const evidence = helpers.candidateEvidenceSummary([
+      { source: 'tencent', quality: 'ready' },
+      { source: 'kline', quality: 'ready' },
+      { source: 'mode_requirement', result: 'matched' },
+      { source: 'mode_requirement', result: 'matched' },
+      { source: 'mode_risk', hard_stop_price: 31.91 }
+    ])
+    assert.equal(
+      evidence,
+      '数据：实时报价、日线走势；模式条件 2/2 通过；风控止损 31.91 元'
+    )
+    assert.doesNotMatch(evidence, /source|quality|mode_requirement|hard_stop_price|[{}\[\]"]/)
   })
 })
 

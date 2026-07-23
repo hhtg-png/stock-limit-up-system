@@ -56,8 +56,7 @@
       show-icon
     />
 
-    <div class="overview-grid">
-      <section class="panel market-panel" v-loading="store.plansLoading">
+    <section class="panel market-panel" v-loading="store.plansLoading">
         <div class="section-header">
           <div>
             <h4>市场状态</h4>
@@ -86,13 +85,13 @@
           </el-descriptions-item>
         </el-descriptions>
         <el-empty v-else-if="planState === 'empty'" description="该目标交易日暂无预案" />
-      </section>
+    </section>
 
-      <section class="panel timeline-panel" v-loading="store.plansLoading">
+    <section class="panel timeline-panel" v-loading="store.plansLoading">
         <div class="section-header">
           <div>
             <h4>版本时间轴</h4>
-            <span>14:40、15:30、08:50、09:26 版本均保留审计记录</span>
+            <span>按生成时间排列，点击版本可查看对应的市场判断和行动候选</span>
           </div>
           <el-tag effect="plain">{{ plans.length }} 个版本</el-tag>
         </div>
@@ -111,15 +110,24 @@
               :disabled="revisionSaving"
               @click="selectedPlanId = plan.id"
             >
-              <strong>{{ stageLabel(plan.stage) }} · v{{ plan.version_no }}</strong>
-              <span>{{ statusLabel(plan.status) }}</span>
-              <span class="timeline-change">版本变化：{{ readable(plan.change_summary_json) }}</span>
+              <span class="timeline-version-header">
+                <strong>{{ stageLabel(plan.stage) }}</strong>
+                <el-tag size="small" effect="plain">v{{ plan.version_no }}</el-tag>
+                <el-tag size="small" :type="statusTagType(plan.status)">
+                  {{ statusLabel(plan.status) }}
+                </el-tag>
+              </span>
+              <span class="timeline-version-meta">
+                {{ plan.candidates.length }} 只行动候选 · 目标日 {{ plan.target_trade_date }}
+              </span>
+              <span class="timeline-change">
+                {{ planChangeSummary(plan.change_summary_json, ruleModeNames) }}
+              </span>
             </button>
           </el-timeline-item>
         </el-timeline>
         <el-empty v-else-if="planState === 'empty'" description="暂无版本记录" />
-      </section>
-    </div>
+    </section>
 
     <section class="panel action-panel" v-loading="store.plansLoading">
       <div class="section-header action-header">
@@ -163,7 +171,7 @@
             <div class="candidate-title">
               <div>
                 <h5>{{ item.stock_name }}（{{ item.stock_code }}）</h5>
-                <span>{{ item.theme_name || '未标注方向' }} · {{ item.action_trade_date }}</span>
+                <span>第 {{ item.rank }} 顺位 · {{ item.theme_name || '未标注方向' }} · {{ item.action_trade_date }}</span>
               </div>
               <el-tag :type="candidatePermissionType(item.risk_level)">
                 {{ isObservation ? '仅供观察' : riskLabel(item.risk_level) }}
@@ -171,16 +179,27 @@
             </div>
           </template>
           <div class="candidate-meta">
-            <span>主模式：{{ item.primary_mode_key }}</span>
-            <span>角色：{{ item.role }}</span>
-            <span>排名：{{ item.rank }}</span>
+            <span class="primary-mode">模式：{{ modeKeyLabel(item.primary_mode_key, ruleModeNames) }}</span>
+            <span>定位：{{ roleLabel(item.role) }}</span>
             <span>参考仓位：{{ percent(item.position_reference) }}</span>
           </div>
           <dl class="condition-list">
-            <div><dt>触发</dt><dd>{{ readable(item.entry_trigger_json) }}</dd></div>
-            <div><dt>失效</dt><dd>{{ readable(item.invalidation_json) }}</dd></div>
-            <div><dt>退出</dt><dd>{{ readable(item.exit_trigger_json) }}</dd></div>
-            <div><dt>证据</dt><dd>{{ readable(item.evidence_json) }}</dd></div>
+            <div class="entry-condition">
+              <dt>触发条件</dt>
+              <dd>{{ conditionSummary(item.entry_trigger_json) }}</dd>
+            </div>
+            <div class="invalid-condition">
+              <dt>失效条件</dt>
+              <dd>{{ conditionSummary(item.invalidation_json) }}</dd>
+            </div>
+            <div class="exit-condition">
+              <dt>退出条件</dt>
+              <dd>{{ conditionSummary(item.exit_trigger_json) }}</dd>
+            </div>
+            <div class="evidence-summary">
+              <dt>判断依据</dt>
+              <dd>{{ candidateEvidenceSummary(item.evidence_json) }}</dd>
+            </div>
           </dl>
         </el-card>
       </div>
@@ -241,59 +260,6 @@
         </el-table-column>
       </el-table>
       <el-empty v-else-if="!store.plansLoading" description="当前版本暂无模式雷达数据" />
-    </section>
-
-    <section class="panel inbox-panel" v-loading="store.alertsLoading">
-      <div class="section-header">
-        <div>
-          <h4>独立提醒</h4>
-          <span>仅显示交易预案通道，未进入全局涨停播报、语音或桌面通知</span>
-        </div>
-        <div class="section-actions">
-          <el-radio-group v-model="alertFilter" size="small">
-            <el-radio-button value="unread">未读（{{ store.unreadCount }}）</el-radio-button>
-            <el-radio-button value="all">全部</el-radio-button>
-          </el-radio-group>
-          <el-button size="small" :loading="store.alertsLoading" @click="loadInbox">刷新</el-button>
-        </div>
-      </div>
-      <el-alert
-        v-if="store.alertsError"
-        type="error"
-        :title="`提醒加载失败：${store.alertsError}`"
-        :closable="false"
-        show-icon
-      />
-      <el-table v-if="visibleAlerts.length" :data="visibleAlerts" stripe>
-        <el-table-column label="状态" width="88">
-          <template #default="{ row }">
-            <el-tag :type="row.acknowledged_at ? 'info' : 'warning'">
-              {{ row.acknowledged_at ? '已读' : '未读' }}
-            </el-tag>
-          </template>
-        </el-table-column>
-        <el-table-column label="类型" width="130">
-          <template #default="{ row }">{{ alertTypeLabel(row.event_type) }}</template>
-        </el-table-column>
-        <el-table-column prop="message" label="提醒内容" min-width="280" show-overflow-tooltip />
-        <el-table-column label="触发时间" width="180">
-          <template #default="{ row }">{{ formatChinaDateTime(row.triggered_at) }}</template>
-        </el-table-column>
-        <el-table-column label="操作" width="90" fixed="right">
-          <template #default="{ row }">
-            <el-button
-              link
-              type="primary"
-              :disabled="Boolean(row.acknowledged_at) || acknowledgingAlertIds.has(row.id)"
-              :loading="acknowledgingAlertIds.has(row.id)"
-              @click="acknowledge(row.id)"
-            >
-              {{ row.acknowledged_at ? '已确认' : '确认已读' }}
-            </el-button>
-          </template>
-        </el-table-column>
-      </el-table>
-      <el-empty v-else-if="!store.alertsLoading" :description="alertFilter === 'unread' ? '暂无未读提醒' : '暂无提醒记录'" />
     </section>
 
     <section class="panel review-panel" v-loading="store.reviewsLoading || reviewPlanLoading">
@@ -421,79 +387,6 @@
           <el-button type="primary" :loading="reviewSaving" :disabled="reviewSaving" @click="saveExecutionReview">保存执行记录</el-button>
         </div>
       </div>
-    </section>
-
-    <section class="panel settings-panel" v-loading="store.settingsLoading">
-      <div class="section-header">
-        <div>
-          <h4>独立提醒设置</h4>
-          <span>只影响交易预案模块，不修改现有涨停播报设置</span>
-        </div>
-        <el-button type="primary" plain :loading="settingsSaving" :disabled="!store.settings" @click="saveSettings">
-          保存设置
-        </el-button>
-      </div>
-      <el-alert
-        v-if="store.settingsError || settingsActionError"
-        type="error"
-        :title="`设置加载或保存失败：${store.settingsError || settingsActionError}`"
-        :closable="false"
-        show-icon
-      />
-      <el-form v-if="store.settings" class="settings-form" label-position="top">
-        <el-form-item label="交易预案服务">
-          <el-switch v-model="settingsDraft.enabled" active-text="启用" inactive-text="停用" />
-        </el-form-item>
-        <el-form-item label="项目内提醒">
-          <el-switch v-model="settingsDraft.in_app_enabled" active-text="启用" inactive-text="停用" />
-        </el-form-item>
-        <el-form-item label="试错仓位参考（%）">
-          <el-input-number v-model="settingsDraft.trial_position_pct" :min="0" :max="100" :precision="1" />
-        </el-form-item>
-        <el-form-item label="确认仓位参考上限（%）">
-          <el-input-number v-model="settingsDraft.confirmed_position_pct" :min="0" :max="100" :precision="1" />
-        </el-form-item>
-        <el-form-item label="单票刚性止损（%）">
-          <el-input-number v-model="settingsDraft.hard_stop_pct" :min="0.1" :max="20" :precision="1" />
-        </el-form-item>
-        <el-form-item label="正式行动候选上限">
-          <el-input-number v-model="settingsDraft.max_action_candidates" :min="1" :max="3" :step="1" :precision="0" />
-        </el-form-item>
-        <el-form-item label="个人微信提醒">
-          <div class="wechat-setting">
-            <el-tag
-              :type="personalWechatStatus?.enabled ? 'success' : personalWechatStatus?.configured ? 'warning' : 'info'"
-            >
-              {{ personalWechatStatus?.enabled ? '已启用' : personalWechatStatus?.configured ? '待启用' : '未绑定' }}
-            </el-tag>
-            <span v-if="personalWechatStatus?.enabled">
-              WxPusher {{ personalWechatStatus.recipient_masked }}，将在 {{ personalWechatStatus.schedule.join('、') }} 推送。
-            </span>
-            <span v-else-if="personalWechatStatus?.configured">
-              个人微信凭证已安全配置，请启用服务器推送开关。
-            </span>
-            <span v-else>
-              使用个人微信扫描官方二维码获取 SPT，再由服务器安全配置；网页不会保存或显示完整凭证。
-            </span>
-            <el-link
-              v-if="personalWechatStatus?.setup_qr_url"
-              :href="personalWechatStatus.setup_qr_url"
-              target="_blank"
-              type="primary"
-            >
-              打开个人微信绑定二维码
-            </el-link>
-          </div>
-          <el-alert
-            v-if="personalWechatStatusError"
-            type="error"
-            :title="`个人微信状态加载失败：${personalWechatStatusError}`"
-            :closable="false"
-            show-icon
-          />
-        </el-form-item>
-      </el-form>
-      <el-empty v-else-if="!store.settingsLoading && !store.settingsError" description="暂无设置数据" />
     </section>
 
     <section class="panel obsidian-panel" v-loading="store.obsidianStatusLoading">
@@ -856,12 +749,10 @@ import {
   cancelTradingPlan,
   confirmTradingPlan,
   getLatestTradingPlanTargetDate,
-  getTradingPlaybookPersonalWechatStatus,
   getTradingPlan,
   getTradingRules,
   reviseTradingPlan,
-  updateTradingExecutionReview,
-  updateTradingPlaybookSettings
+  updateTradingExecutionReview
 } from '@/api/trading-playbook'
 import { useTradingPlaybookStore } from '@/stores/trading-playbook'
 import type {
@@ -870,38 +761,37 @@ import type {
   TradingModeRule,
   TradingPlanCandidate,
   TradingPlanStage,
-  TradingPlanVersion,
-  TradingPlaybookPersonalWechatStatus
+  TradingPlanVersion
 } from '@/types/trading-playbook'
 import {
   buildManualExecutionUpdate,
-  buildSettingsUpdate,
+  candidateEvidenceSummary,
   canEnableActionAlerts,
   chinaToday,
   collectionState,
-  filterTradingAlerts,
+  conditionSummary,
   formatChinaDateTime,
   isObservationOnly,
   marketStateLabel,
+  modeKeyLabel,
+  planChangeSummary,
   radarCandidateLabel,
   radarEvidenceSummary,
   radarStatusLabel,
   radarStatusType,
+  roleLabel,
   riskPermissionSummary,
   tradingModeLabel,
   type ManualExecutionDraft,
-  type TradingAlertFilter,
   type UnplannedExecutionDraft
 } from '@/views/trading-playbook/presentation'
 import {
   canEditReview,
   buildPlanRevision,
   createPlanRevisionController,
-  createConcurrentIdGuard,
   createPlanMutationController,
   createReviewSaveController,
   createReviewDomainController,
-  runAndClearErrorOnSuccess,
   type CandidateRevisionDraft
 } from '@/views/trading-playbook/interactions'
 
@@ -926,7 +816,6 @@ const targetPlanDate = ref(chinaToday())
 const reviewDate = ref(chinaToday())
 const selectedPlanId = ref<number | null>(null)
 const selectedReviewPlanId = ref<number | null>(null)
-const alertFilter = ref<TradingAlertFilter>('unread')
 const refreshing = ref(false)
 
 const rules = ref<TradingModeRule[]>([])
@@ -940,12 +829,7 @@ const reviewPlanError = ref<string | null>(null)
 
 const planActionLoading = ref<'confirm' | 'cancel' | null>(null)
 const planActionError = ref<string | null>(null)
-const acknowledgingAlertIds = ref<Set<number>>(new Set())
 const reviewSaving = ref(false)
-const settingsSaving = ref(false)
-const settingsActionError = ref<string | null>(null)
-const personalWechatStatus = ref<TradingPlaybookPersonalWechatStatus | null>(null)
-const personalWechatStatusError = ref<string | null>(null)
 const revisionDialogVisible = ref(false)
 const revisionSaving = ref(false)
 const revisionError = ref<string | null>(null)
@@ -956,16 +840,6 @@ const restrictReviewToPlan = ref(true)
 const plannedDrafts = ref<Record<string, ManualExecutionDraft>>({})
 const unplannedDrafts = ref<UnplannedExecutionRow[]>([])
 let unplannedKey = 0
-
-const settingsDraft = ref({
-  enabled: true,
-  in_app_enabled: true,
-  trial_position_pct: 10,
-  confirmed_position_pct: 30,
-  hard_stop_pct: 5,
-  max_action_candidates: 3,
-  wechat_enabled: false
-})
 
 const plans = computed(() => store.plans)
 const selectedPlan = computed(() => (
@@ -1016,7 +890,6 @@ const noActionReviewText = computed(() => {
   }
   return '08:50 刷新隔夜信息，09:26 再做竞价确认；只有数据完整且模式命中后才生成候选，否则继续空仓。'
 })
-const visibleAlerts = computed(() => filterTradingAlerts(store.alerts, alertFilter.value))
 const reviewRows = computed(() => store.reviews)
 const selectedReview = computed(() => (
   reviewRows.value.find(item => item.plan_version_id === selectedReviewPlanId.value) || null
@@ -1104,10 +977,6 @@ const planMutationController = createPlanMutationController({
   }
 })
 
-const acknowledgeGuard = createConcurrentIdGuard(activeIds => {
-  acknowledgingAlertIds.value = new Set(activeIds)
-})
-
 const planRevisionController = createPlanRevisionController({
   revise: reviseTradingPlan,
   reload: loadPlanDomain,
@@ -1176,6 +1045,16 @@ function statusLabel(status: TradingPlanVersion['status']) {
   } as Record<string, string>)[status] || status
 }
 
+function statusTagType(status: TradingPlanVersion['status']) {
+  return ({
+    draft: 'info',
+    confirmed: 'success',
+    active: 'success',
+    superseded: 'warning',
+    expired: 'danger'
+  } as Record<string, 'success' | 'warning' | 'info' | 'danger'>)[status] || 'info'
+}
+
 function riskLabel(risk: TradingPlanCandidate['risk_level']) {
   return ({ avoid: '回避', watch: '观察', trial: '试错', confirmed: '确认' } as Record<string, string>)[risk] || risk
 }
@@ -1185,20 +1064,6 @@ function candidatePermissionType(risk: TradingPlanCandidate['risk_level']) {
   if (risk === 'avoid') return 'danger'
   if (risk === 'confirmed') return 'success'
   return 'info'
-}
-
-function alertTypeLabel(type: string) {
-  return ({
-    plan_ready: '预案就绪',
-    confirmation_required: '待人工确认',
-    watch: '观察',
-    entry_triggered: '入场条件触发',
-    confirmation_triggered: '确认条件触发',
-    invalidated: '逻辑失效',
-    risk_warning: '风险警告',
-    exit_triggered: '退出条件触发',
-    review_ready: '复盘就绪'
-  } as Record<string, string>)[type] || type
 }
 
 function automationLabel(level: TradingModeRule['automation_level']) {
@@ -1214,14 +1079,6 @@ async function loadPlanDomain() {
     }
   } catch {
     // The store exposes the latest request error without allowing stale responses to win.
-  }
-}
-
-async function loadInbox() {
-  try {
-    await store.loadAlerts(false)
-  } catch {
-    // The canonical store retains WebSocket arrivals and exposes the request error.
   }
 }
 
@@ -1353,16 +1210,6 @@ async function submitRevision() {
   await planRevisionController.run(plan.id, revision)
 }
 
-async function acknowledge(alertId: number) {
-  await acknowledgeGuard.run(alertId, async () => {
-    try {
-      await store.acknowledgeAlert(alertId)
-    } catch (error) {
-      ElMessage.error(`提醒确认失败：${errorMessage(error)}`)
-    }
-  })
-}
-
 async function saveExecutionReview() {
   if (reviewSaving.value || !reviewEditorReady.value) return
   const review = selectedReview.value
@@ -1381,60 +1228,6 @@ async function saveExecutionReview() {
       )
     }
   })
-}
-
-function syncSettingsDraft() {
-  if (!store.settings) return
-  settingsDraft.value = {
-    enabled: store.settings.enabled,
-    in_app_enabled: store.settings.in_app_enabled,
-    trial_position_pct: store.settings.trial_position_pct,
-    confirmed_position_pct: store.settings.confirmed_position_pct,
-    hard_stop_pct: store.settings.hard_stop_pct,
-    max_action_candidates: store.settings.max_action_candidates,
-    wechat_enabled: false
-  }
-}
-
-async function loadSettings() {
-  try {
-    await runAndClearErrorOnSuccess(
-      () => store.loadSettings(),
-      () => { settingsActionError.value = null }
-    )
-    syncSettingsDraft()
-    return true
-  } catch {
-    // The store exposes the latest settings error.
-    return false
-  }
-}
-
-async function loadPersonalWechatStatus() {
-  personalWechatStatusError.value = null
-  try {
-    personalWechatStatus.value = await getTradingPlaybookPersonalWechatStatus()
-  } catch (error) {
-    personalWechatStatus.value = null
-    personalWechatStatusError.value = errorMessage(error)
-  }
-}
-
-async function saveSettings() {
-  settingsSaving.value = true
-  settingsActionError.value = null
-  try {
-    const patch = buildSettingsUpdate(settingsDraft.value)
-    await updateTradingPlaybookSettings(patch)
-    if (!await loadSettings()) {
-      throw new Error(store.settingsError || '设置重新加载失败')
-    }
-    ElMessage.success('独立提醒与风控设置已保存')
-  } catch (error) {
-    settingsActionError.value = errorMessage(error)
-  } finally {
-    settingsSaving.value = false
-  }
 }
 
 async function exportObsidian() {
@@ -1466,9 +1259,6 @@ async function loadAll() {
   await Promise.allSettled([
     loadPlanDomain(),
     loadReviewDomain(),
-    loadInbox(),
-    loadSettings(),
-    loadPersonalWechatStatus(),
     loadRules(),
     store.loadObsidianStatus()
   ])
@@ -1589,12 +1379,6 @@ h5 {
   border-radius: 10px;
 }
 
-.overview-grid {
-  display: grid;
-  grid-template-columns: minmax(0, 1.45fr) minmax(300px, 0.55fr);
-  gap: 16px;
-}
-
 .section-header {
   margin-bottom: 16px;
 }
@@ -1604,43 +1388,62 @@ h5 {
 }
 
 .plan-timeline {
-  max-height: 260px;
+  max-height: 420px;
   margin: 4px 0 0;
   overflow-y: auto;
 }
 
 .timeline-version {
   width: 100%;
-  padding: 8px 10px;
-  border: 1px solid transparent;
-  border-radius: 8px;
-  background: transparent;
+  padding: 12px 14px;
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  background: #f8fafc;
   color: inherit;
   text-align: left;
   cursor: pointer;
 
-  span {
-    display: block;
-    margin-top: 4px;
-    color: var(--muted);
-    font-size: 12px;
-  }
-
   &.selected {
-    border-color: #bfdbfe;
+    border-color: #60a5fa;
     background: #eff6ff;
+    box-shadow: 0 0 0 2px rgba(96, 165, 250, 0.12);
     color: #1d4ed8;
   }
 }
 
+.timeline-version-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.timeline-version-meta,
+.timeline-change {
+  display: block;
+  margin-top: 7px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.timeline-change {
+  color: #334155;
+  font-size: 13px;
+}
+
 .candidate-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
   gap: 14px;
 }
 
 .candidate-card {
   border-color: #dbe4f0;
+
+  :deep(.el-card__body) {
+    padding-top: 14px;
+  }
 }
 
 .no-action-plan {
@@ -1706,30 +1509,52 @@ h5 {
     color: #475569;
     font-size: 12px;
   }
+
+  .primary-mode {
+    background: #eff6ff;
+    color: #1d4ed8;
+    font-weight: 600;
+  }
 }
 
 .condition-list {
   display: grid;
-  gap: 9px;
+  gap: 10px;
   margin: 0;
 
   div {
-    display: grid;
-    grid-template-columns: 42px minmax(0, 1fr);
-    gap: 8px;
+    padding: 11px 12px;
+    border-left: 3px solid #94a3b8;
+    border-radius: 7px;
+    background: #f8fafc;
   }
 
   dt {
     color: #475569;
+    font-size: 12px;
     font-weight: 600;
   }
 
   dd {
-    margin: 0;
+    margin: 5px 0 0;
     color: #334155;
     font-size: 13px;
     line-height: 1.55;
     overflow-wrap: anywhere;
+  }
+
+  .entry-condition {
+    border-left-color: #22c55e;
+  }
+
+  .invalid-condition,
+  .exit-condition {
+    border-left-color: #f97316;
+  }
+
+  .evidence-summary {
+    border-left-color: #3b82f6;
+    background: #f0f7ff;
   }
 }
 
@@ -1776,12 +1601,6 @@ h5 {
 .editor-footer {
   justify-content: flex-end;
   margin-top: 16px;
-}
-
-.settings-form {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 0 22px;
 }
 
 .obsidian-alert {
@@ -1849,17 +1668,6 @@ h5 {
   color: #a16207;
   font-size: 12px;
   line-height: 1.5;
-}
-
-.wechat-setting {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-
-  span {
-    color: var(--muted);
-    font-size: 12px;
-  }
 }
 
 .source-refs {
@@ -1942,17 +1750,12 @@ h5 {
 }
 
 @media (max-width: 1180px) {
-  .overview-grid,
   .candidate-grid {
     grid-template-columns: 1fr;
   }
 
   .execution-row,
   .unplanned-row {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
-  .settings-form {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
@@ -1996,18 +1799,12 @@ h5 {
     flex: 1;
   }
 
-  .overview-grid {
-    grid-template-columns: minmax(0, 1fr);
-    gap: 10px;
-  }
-
   .market-panel :deep(.el-descriptions__body) {
     min-width: 620px;
   }
 
   .execution-row,
   .unplanned-row,
-  .settings-form,
   .no-action-details {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -2016,15 +1813,9 @@ h5 {
     flex-direction: column;
   }
 
-  .inbox-panel,
   .review-panel,
   .rules-panel {
     overflow-x: auto;
-  }
-
-  .wechat-setting {
-    align-items: flex-start;
-    flex-direction: column;
   }
 }
 </style>
