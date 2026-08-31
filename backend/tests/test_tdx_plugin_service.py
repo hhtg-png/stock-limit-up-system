@@ -583,16 +583,16 @@ class TdxPluginServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(history_loader.await_count, 1)
 
-    async def test_plate_strength_defaults_to_latest_available_trade_date(self):
+    async def test_plate_strength_defaults_to_today_instead_of_latest_db_date(self):
+        class FrozenDate(date):
+            @classmethod
+            def today(cls):
+                return cls(2026, 5, 29)
+
         service = TdxPluginService()
         db = object()
-        latest_trade_date = date(2026, 5, 28)
 
-        with patch.object(
-            service,
-            "_resolve_trade_date",
-            AsyncMock(return_value=latest_trade_date),
-        ) as resolver, patch.object(
+        with patch("app.services.tdx_plugin_service.date", FrozenDate), patch.object(
             service.realtime_limit_up_service,
             "get_fast_limit_up_pool",
             AsyncMock(return_value=[make_limit_up_item("001259", "利仁科技", "家电")]),
@@ -603,13 +603,12 @@ class TdxPluginServiceTests(unittest.IsolatedAsyncioTestCase):
         ):
             payload = await service.get_plate_strength(db=db, source="kpl", window_days=20)
 
-        resolver.assert_awaited_once_with(None, db)
         pool_loader.assert_awaited_once_with(
-            latest_trade_date,
+            date(2026, 5, 29),
             wait_for_refresh=False,
             max_cache_age=2,
         )
-        self.assertEqual(payload["history"][-1]["trade_date"], latest_trade_date.isoformat())
+        self.assertEqual(payload["history"][-1]["trade_date"], "2026-05-29")
 
     async def test_plate_constituents_sort_by_change_and_tag_intraday_dragons(self):
         topic_knowledge = SimpleNamespace(

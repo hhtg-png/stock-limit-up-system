@@ -38,7 +38,39 @@ REJECT_THEME_KEYWORDS = (
     "调整为",
     "风险博弈",
     "暂无异动",
+    "股权激励",
+    "定增",
+    "审核通过",
+    "递表",
+    "一季报",
+    "年报",
+    "半年报",
+    "业绩",
+    "分红",
+    "权益分派",
+    "风险提示",
+    "控股股东",
+    "总裁受让",
+    "市占率",
+    "龙头",
 )
+REJECT_THEME_NAMES = {
+    "其他",
+    "人工智能",
+    "半导体",
+    "新能源",
+    "通信",
+    "数字经济",
+    "重组",
+    "国资",
+    "央企",
+    "国企",
+    "中科院",
+    "重大订单",
+    "算力订单",
+    "新能源订单",
+    "资产处置",
+}
 MANUAL_TOPIC_SOURCES = {"local_codex", "manual", "local_manual"}
 
 
@@ -113,7 +145,7 @@ def is_valid_generated_theme(theme: str) -> bool:
         return False
     if any(keyword in text for keyword in REJECT_THEME_KEYWORDS):
         return False
-    return ThsLimitUpClassificationService._is_mineable_topic(text)
+    return text not in REJECT_THEME_NAMES
 
 
 def iter_jsonl_gz(path: Path) -> Iterator[Dict[str, Any]]:
