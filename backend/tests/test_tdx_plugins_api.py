@@ -55,6 +55,57 @@ class TdxPluginsApiTests(unittest.TestCase):
         self.assertEqual(response.json()["items"][0]["stock_code"], "605177")
         self.assertEqual(response.json()["source_status"]["public_attribution"], "skipped")
 
+    def test_plate_strength_endpoint_forwards_source_and_window(self):
+        payload = {
+            "items": [],
+            "history": [],
+            "source": "ths",
+            "window_days": 30,
+            "updated_at": datetime(2026, 5, 28, 10, 0, 0).isoformat(),
+            "source_status": {"plate_source": "ths"},
+            "is_cache": False,
+            "warnings": [],
+        }
+
+        with patch(
+            "app.api.v1.tdx_plugins.tdx_plugin_service.get_plate_strength",
+            AsyncMock(return_value=payload),
+        ) as get_plate_strength:
+            response = self.client.get(
+                "/tdx-plugins/plate-strength",
+                params={"trade_date": "2026-05-28", "source": "ths", "window_days": 30},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["source"], "ths")
+        self.assertEqual(get_plate_strength.await_args.kwargs["source"], "ths")
+        self.assertEqual(get_plate_strength.await_args.kwargs["window_days"], 30)
+
+    def test_plate_constituents_endpoint_forwards_plate_and_source(self):
+        payload = {
+            "plate_name": "房地产",
+            "source": "ths",
+            "items": [{"stock_code": "000001", "change_pct": 3.2, "dragon_tag": "龙1"}],
+            "updated_at": datetime(2026, 5, 28, 10, 0, 0).isoformat(),
+            "source_status": {"topic_knowledge": "ok", "tencent_quote": "ok"},
+            "is_cache": False,
+            "warnings": [],
+        }
+
+        with patch(
+            "app.api.v1.tdx_plugins.tdx_plugin_service.get_plate_constituents",
+            AsyncMock(return_value=payload),
+        ) as get_plate_constituents:
+            response = self.client.get(
+                "/tdx-plugins/plate-constituents",
+                params={"plate_name": "房地产", "source": "ths", "trade_date": "2026-05-28"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["items"][0]["dragon_tag"], "龙1")
+        self.assertEqual(get_plate_constituents.await_args.args[0], "房地产")
+        self.assertEqual(get_plate_constituents.await_args.kwargs["source"], "ths")
+
     def test_calibration_compare_endpoint_returns_diff_report(self):
         response = self.client.post(
             "/tdx-plugins/calibration/compare",

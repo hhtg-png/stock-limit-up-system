@@ -3,7 +3,8 @@ import type {
   TdxCalibrationDiff,
   TdxLimitUpEvent,
   TdxNewsItem,
-  TdxPlateStrength,
+  TdxPlateConstituentPayload,
+  TdxPlateStrengthPayload,
   TdxPluginPayload,
   TdxStockMove
 } from '@/types/tdx-plugins'
@@ -37,8 +38,19 @@ export async function getTdxStockMove(
 
 export async function getTdxPlateStrength(params?: {
   trade_date?: string
-}): Promise<TdxPluginPayload<TdxPlateStrength>> {
+  source?: 'kpl' | 'ths'
+  window_days?: number
+}): Promise<TdxPlateStrengthPayload> {
   const { data } = await api.get('/tdx-plugins/plate-strength', { params })
+  return data
+}
+
+export async function getTdxPlateConstituents(params: {
+  plate_name: string
+  source: 'kpl' | 'ths'
+  trade_date?: string
+}): Promise<TdxPlateConstituentPayload> {
+  const { data } = await api.get('/tdx-plugins/plate-constituents', { params })
   return data
 }
 

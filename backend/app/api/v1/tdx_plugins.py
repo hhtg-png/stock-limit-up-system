@@ -1,6 +1,6 @@
 """Tongdaxin embedded watch plugin API."""
 from datetime import date
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Body, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -38,9 +38,29 @@ async def get_stock_move(
 @router.get("/plate-strength", summary="通达信插件：实时板块强度")
 async def get_plate_strength(
     trade_date: Optional[date] = Query(None, description="交易日期，默认今天"),
+    source: Literal["kpl", "ths"] = Query("kpl", description="板块题材口径"),
+    window_days: int = Query(20, ge=5, le=120, description="历史趋势交易日窗口"),
     db: AsyncSession = Depends(get_db),
 ):
-    return await tdx_plugin_service.get_plate_strength(trade_date, db=db)
+    return await tdx_plugin_service.get_plate_strength(
+        trade_date,
+        db=db,
+        source=source,
+        window_days=window_days,
+    )
+
+
+@router.get("/plate-constituents", summary="通达信插件：板块成分股实时排行")
+async def get_plate_constituents(
+    plate_name: str = Query(..., min_length=1, max_length=40, description="板块或题材名称"),
+    trade_date: Optional[date] = Query(None, description="交易日期，默认今天"),
+    source: Literal["kpl", "ths"] = Query("kpl", description="板块题材口径"),
+):
+    return await tdx_plugin_service.get_plate_constituents(
+        plate_name,
+        trade_date,
+        source=source,
+    )
 
 
 @router.get("/news", summary="通达信插件：聚合快讯")

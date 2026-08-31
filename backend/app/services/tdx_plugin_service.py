@@ -4,17 +4,21 @@ from __future__ import annotations
 import copy
 import contextlib
 import asyncio
+import logging
+import math
 import time as time_module
 from collections import defaultdict
 from datetime import date, datetime, time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from sqlalchemy import func, select
+from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.limit_up import LimitUpRecord
 from app.models.stock import Stock
 from app.models.tdx_cache import TdxStockMoveCache
+from app.data_collectors.tencent_api import tencent_api
+from app.services.local_topic_knowledge_service import LocalTopicKnowledgeService
 from app.services.tdx_attribution_sources import (
     PublicStockAttribution,
     public_attribution_provider,
@@ -22,6 +26,10 @@ from app.services.tdx_attribution_sources import (
 from app.services.tdx_external_sources import ExternalStockMove, public_stock_move_provider
 from app.services.tdx_news_sources import public_market_news_provider
 from app.services.realtime_limit_up_service import realtime_limit_up_service
+from app.utils.market_data_sanitizer import normalize_change_pct
+
+
+logger = logging.getLogger(__name__)
 
 
 class TdxPluginService:
@@ -37,6 +45,13 @@ class TdxPluginService:
         stock_move_cache_ttl: int = 300,
         stock_move_cache_max: int = 500,
         stock_move_live_timeout: float = 0.9,
+        plate_strength_history_cache_ttl: float = 60.0,
+        topic_knowledge_service=None,
+        quote_fetcher=None,
+        plate_constituent_fetcher=None,
+        plate_constituent_cache_ttl: float = 3600.0,
+        plate_constituent_error_cache_ttl: float = 30.0,
+        plate_constituent_cache_max: int = 128,
     ):
         self.realtime_limit_up_service = realtime_limit_up_service
         self.external_move_provider = external_move_provider
@@ -46,7 +61,25 @@ class TdxPluginService:
         self.stock_move_cache_ttl = stock_move_cache_ttl
         self.stock_move_cache_max = stock_move_cache_max
         self.stock_move_live_timeout = stock_move_live_timeout
+        self.plate_strength_history_cache_ttl = plate_strength_history_cache_ttl
+        self.topic_knowledge_service = topic_knowledge_service or LocalTopicKnowledgeService()
+        self.quote_fetcher = quote_fetcher or tencent_api.get_quotes_batch
+        self.plate_constituent_fetcher = (
+            plate_constituent_fetcher or self._fetch_eastmoney_plate_constituents
+        )
+        self.plate_constituent_cache_ttl = max(0.0, float(plate_constituent_cache_ttl))
+        self.plate_constituent_error_cache_ttl = max(
+            0.0,
+            float(plate_constituent_error_cache_ttl),
+        )
+        self.plate_constituent_cache_max = max(1, int(plate_constituent_cache_max))
         self._stock_move_payload_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+        self._plate_strength_history_cache: Dict[
+            Tuple[str, str, int], Tuple[float, List[Dict[str, Any]]]
+        ] = {}
+        self._plate_constituent_fallback_cache: Dict[
+            str, Tuple[float, Dict[str, Any], Optional[str]]
+        ] = {}
 
     async def get_limit_up_live(self, trade_date: Optional[date] = None, db: Optional[AsyncSession] = None) -> Dict[str, Any]:
         target_date = trade_date or date.today()
@@ -258,27 +291,388 @@ class TdxPluginService:
         )
         return self._stock_move_payload_reason_title(persistent_payload)
 
-    async def get_plate_strength(self, trade_date: Optional[date] = None, db: Optional[AsyncSession] = None) -> Dict[str, Any]:
+    async def get_plate_strength(
+        self,
+        trade_date: Optional[date] = None,
+        db: Optional[AsyncSession] = None,
+        *,
+        source: str = "kpl",
+        window_days: int = 20,
+    ) -> Dict[str, Any]:
         target_date = trade_date or date.today()
+        source = "ths" if source == "ths" else "kpl"
+        window_days = max(5, min(120, int(window_days or 20)))
         warnings: List[str] = []
-        source_status = {"limit_up_pool": "ok", "plate_strength": "ok"}
+        source_status = {
+            "limit_up_pool": "ok",
+            "plate_strength": "ok",
+            "plate_history": "ok",
+        }
+        is_cache = False
 
         try:
-            raw_items = await self.realtime_limit_up_service.get_realtime_limit_up_list(target_date)
+            raw_items = await self.realtime_limit_up_service.get_fast_limit_up_pool(
+                target_date,
+                wait_for_refresh=False,
+                max_cache_age=2,
+            )
         except Exception as exc:
             raw_items = []
             source_status["limit_up_pool"] = "error"
+            logger.warning("Failed to load realtime plate-strength pool", exc_info=exc)
+            warnings.append("板块强度实时数据获取失败")
+
+        if source == "ths":
+            source_status["plate_source"] = "ths"
+            reason_map: Dict[str, str] = {}
+            try:
+                reason_map = await self.realtime_limit_up_service._fetch_ths_reason_map()
+            except Exception as exc:
+                source_status["ths_reason"] = "error"
+                logger.warning("Failed to load THS plate-strength reasons", exc_info=exc)
+                warnings.append("同花顺题材原因获取失败")
+            else:
+                source_status["ths_reason"] = "ok" if reason_map else "empty"
+            raw_items = [
+                {
+                    **item,
+                    "limit_up_reason": reason_map.get(item.get("stock_code", ""))
+                    or item.get("limit_up_reason")
+                    or item.get("reason_category")
+                    or "",
+                }
+                for item in raw_items
+            ]
+        else:
+            source_status["plate_source"] = "eastmoney_kpl_compatible"
+            warnings.append("开盘啦公开实时接口不可用，当前使用东方财富板块分类兼容口径")
+
+        if not raw_items:
+            if source_status["limit_up_pool"] == "ok":
+                source_status["limit_up_pool"] = "empty"
+            try:
+                raw_items = await self._load_limit_up_records_from_db(target_date, db)
+            except Exception as exc:
+                source_status["limit_up_db"] = "error"
+                logger.warning("Failed to load plate-strength DB fallback", exc_info=exc)
+                warnings.append("数据库板块强度兜底失败")
+            else:
+                if raw_items:
+                    is_cache = True
+                    source_status["limit_up_db"] = "ok"
+                    warnings.append("实时涨停池暂无数据，已使用数据库板块强度快照")
+                elif db is not None:
+                    source_status["limit_up_db"] = "empty"
+
+        items = self._build_plate_strength_items(raw_items, source)
+        if not items:
             source_status["plate_strength"] = "empty"
-            warnings.append(f"板块强度数据获取失败: {exc}")
+            if not any("暂无" in warning for warning in warnings):
+                warnings.append(f"{target_date.isoformat()} 暂无实时板块题材强度数据")
 
-        grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-        for item in raw_items:
-            plate = item.get("reason_category") or item.get("industry") or "其他"
-            grouped[plate].append(item)
+        try:
+            history = await self._get_cached_plate_strength_history(
+                target_date,
+                db,
+                source=source,
+                window_days=window_days,
+            )
+        except Exception as exc:
+            history = []
+            source_status["plate_history"] = "error"
+            logger.warning("Failed to load plate-strength history", exc_info=exc)
+            warnings.append("板块强度历史趋势获取失败")
 
-        items = [self._build_plate_strength_item(plate, members) for plate, members in grouped.items()]
-        items.sort(key=lambda item: item["strength_score"], reverse=True)
-        return self._plugin_payload(items, target_date, source_status, is_cache=False, warnings=warnings)
+        current_point = {
+            "trade_date": target_date.isoformat(),
+            "items": copy.deepcopy(items),
+        }
+        history = [point for point in history if point["trade_date"] != current_point["trade_date"]]
+        if items:
+            history.append(current_point)
+        history = history[-window_days:]
+        self._annotate_plate_strength_changes(history)
+        if items:
+            current_history = next(
+                (point for point in history if point["trade_date"] == current_point["trade_date"]),
+                None,
+            )
+            if current_history is not None:
+                items = copy.deepcopy(current_history["items"])
+
+        payload = self._plugin_payload(items, target_date, source_status, is_cache=is_cache, warnings=warnings)
+        payload.update({
+            "source": source,
+            "window_days": window_days,
+            "history": history,
+            "summary": {
+                "plate_count": len(items),
+                "limit_up_count": sum(item["limit_up_count"] for item in items),
+                "sealed_count": sum(item["sealed_count"] for item in items),
+                "total_seal_amount": round(sum(item["total_seal_amount"] for item in items), 2),
+            },
+        })
+        return payload
+
+    async def get_plate_constituents(
+        self,
+        plate_name: str,
+        trade_date: Optional[date] = None,
+        *,
+        source: str = "kpl",
+    ) -> Dict[str, Any]:
+        target_date = trade_date or date.today()
+        normalized_plate = str(plate_name or "").strip()[:40]
+        source = "ths" if source == "ths" else "kpl"
+        warnings: List[str] = []
+        source_status = {
+            "topic_knowledge": "ok",
+            "tencent_quote": "ok",
+            "limit_up_pool": "ok",
+        }
+        constituent_source = "local_topic_knowledge"
+        source_label = "同花顺" if source == "ths" else "开盘啦"
+        source_note = f"本地题材映射；{source_label}仅用于板块命名与强度口径"
+
+        try:
+            candidates = self.topic_knowledge_service.find_stocks_by_topic(normalized_plate)
+        except Exception as exc:
+            logger.warning("Failed to resolve plate constituents", exc_info=exc)
+            candidates = []
+            source_status["topic_knowledge"] = "error"
+            warnings.append("板块成分股匹配失败")
+        else:
+            if not candidates:
+                source_status["topic_knowledge"] = "empty"
+
+        if not candidates:
+            try:
+                fallback_payload = await self._get_cached_plate_constituent_fallback(normalized_plate)
+            except Exception as exc:
+                logger.warning("Failed to load Eastmoney plate constituents", exc_info=exc)
+                fallback_payload = {}
+                source_status["eastmoney_constituents"] = "error"
+                warnings.append("板块成分源不可用：本地题材映射未命中，东方财富板块兜底失败")
+            else:
+                candidates = list((fallback_payload or {}).get("items") or [])
+                source_status["eastmoney_constituents"] = "ok" if candidates else "empty"
+                if candidates:
+                    matched_plate = str(fallback_payload.get("matched_plate") or normalized_plate)
+                    constituent_source = "eastmoney_board"
+                    source_note = (
+                        f"东方财富“{matched_plate}”板块；"
+                        f"{source_label}仅用于板块命名与强度口径"
+                    )
+                else:
+                    warnings.append(f"暂未匹配到“{normalized_plate}”的板块成分股")
+
+        if not candidates:
+            constituent_source = "unavailable"
+            source_note = "本地题材映射与东方财富兼容板块均未匹配"
+
+        codes = list(dict.fromkeys(
+            code
+            for code in (self._normalize_code(item.get("stock_code", "")) for item in candidates)
+            if code
+        ))
+        try:
+            quotes = (await self.quote_fetcher(codes) if codes else {}) or {}
+        except Exception as exc:
+            logger.warning("Failed to load plate constituent quotes", exc_info=exc)
+            quotes = {}
+            source_status["tencent_quote"] = "error"
+            warnings.append("板块成分股实时行情获取失败")
+        else:
+            quoted_count = sum(1 for code in codes if quotes.get(code))
+            if not codes:
+                source_status["tencent_quote"] = "skipped"
+            elif quoted_count == 0:
+                source_status["tencent_quote"] = "error"
+                warnings.append(f"板块成分股实时行情未返回（0/{len(codes)}）")
+            elif quoted_count < len(codes):
+                source_status["tencent_quote"] = "partial"
+                warnings.append(f"板块成分股实时行情仅返回 {quoted_count}/{len(codes)} 只")
+
+        quoted_count = sum(1 for code in codes if quotes.get(code))
+
+        try:
+            limit_up_items = await self.realtime_limit_up_service.get_fast_limit_up_pool(
+                target_date,
+                wait_for_refresh=False,
+                max_cache_age=2,
+            )
+        except Exception as exc:
+            logger.warning("Failed to load intraday leader context", exc_info=exc)
+            limit_up_items = []
+            source_status["limit_up_pool"] = "error"
+            warnings.append("日内龙头封板信息获取失败，已按实时涨幅排序")
+
+        limit_up_by_code = {
+            self._normalize_code(item.get("stock_code", "")): item
+            for item in limit_up_items
+            if self._normalize_code(item.get("stock_code", ""))
+        }
+        items = [
+            self._build_plate_constituent_item(
+                candidate,
+                quotes.get(self._normalize_code(candidate.get("stock_code", "")), {}),
+                limit_up_by_code.get(self._normalize_code(candidate.get("stock_code", ""))),
+            )
+            for candidate in candidates
+        ]
+        self._annotate_intraday_tags(items)
+        items.sort(
+            key=lambda item: (
+                item["change_pct"] is None,
+                -(item["change_pct"] or 0.0),
+                -item["amount"],
+                item["stock_code"],
+            )
+        )
+
+        payload = self._plugin_payload(items, target_date, source_status, is_cache=False, warnings=warnings)
+        payload.update({
+            "plate_name": normalized_plate,
+            "source": source,
+            "constituent_source": constituent_source,
+            "source_note": source_note,
+            "summary": {
+                "stock_count": len(items),
+                "quoted_count": quoted_count,
+                "up_count": sum(1 for item in items if (item["change_pct"] or 0) > 0),
+                "down_count": sum(1 for item in items if (item["change_pct"] or 0) < 0),
+                "flat_count": sum(1 for item in items if item["change_pct"] == 0),
+                "limit_up_count": sum(1 for item in items if item["is_limit_up"]),
+            },
+        })
+        return payload
+
+    async def _get_cached_plate_constituent_fallback(self, plate_name: str) -> Dict[str, Any]:
+        cache_key = self._normalize_plate_lookup_name(plate_name)
+        now = time_module.monotonic()
+        cached = self._plate_constituent_fallback_cache.get(cache_key)
+        if cached:
+            cache_ttl = (
+                self.plate_constituent_error_cache_ttl
+                if cached[2]
+                else self.plate_constituent_cache_ttl
+            )
+            if cache_ttl > 0 and now - cached[0] <= cache_ttl:
+                if cached[2]:
+                    raise RuntimeError(cached[2])
+                return copy.deepcopy(cached[1])
+
+        try:
+            payload = await self.plate_constituent_fetcher(plate_name)
+        except Exception as exc:
+            error_message = str(exc).strip()[:200] or exc.__class__.__name__
+            self._plate_constituent_fallback_cache[cache_key] = (now, {}, error_message)
+            self._trim_plate_constituent_fallback_cache()
+            raise
+        normalized_payload = copy.deepcopy(payload or {})
+        self._plate_constituent_fallback_cache[cache_key] = (now, normalized_payload, None)
+        self._trim_plate_constituent_fallback_cache()
+        return copy.deepcopy(normalized_payload)
+
+    def _trim_plate_constituent_fallback_cache(self) -> None:
+        while len(self._plate_constituent_fallback_cache) > self.plate_constituent_cache_max:
+            oldest_key = next(iter(self._plate_constituent_fallback_cache))
+            self._plate_constituent_fallback_cache.pop(oldest_key, None)
+
+    async def _fetch_eastmoney_plate_constituents(self, plate_name: str) -> Dict[str, Any]:
+        """Resolve an Eastmoney industry/concept board without blocking the event loop."""
+        return await asyncio.wait_for(
+            asyncio.to_thread(self._fetch_eastmoney_plate_constituents_sync, plate_name),
+            timeout=10.0,
+        )
+
+    @classmethod
+    def _fetch_eastmoney_plate_constituents_sync(cls, plate_name: str) -> Dict[str, Any]:
+        import akshare as ak
+
+        normalized_query = cls._normalize_plate_lookup_name(plate_name)
+        if not normalized_query:
+            return {"items": [], "matched_plate": ""}
+
+        board_candidates: List[Tuple[int, int, int, str, str, str]] = []
+        board_sources = (
+            ("industry", ak.stock_board_industry_name_em, ak.stock_board_industry_cons_em),
+            ("concept", ak.stock_board_concept_name_em, ak.stock_board_concept_cons_em),
+        )
+        source_errors: List[Exception] = []
+        for source_priority, (board_type, name_fetcher, _constituent_fetcher) in enumerate(board_sources):
+            try:
+                name_frame = name_fetcher()
+            except Exception as exc:
+                source_errors.append(exc)
+                continue
+            if name_frame is None or name_frame.empty or "板块名称" not in name_frame.columns:
+                source_errors.append(RuntimeError(f"东方财富{board_type}板块列表为空或格式无效"))
+                continue
+            for _, row in name_frame.iterrows():
+                board_name = str(row.get("板块名称") or "").strip()
+                normalized_name = cls._normalize_plate_lookup_name(board_name)
+                match_priority = cls._plate_lookup_match_priority(normalized_query, normalized_name)
+                if match_priority is None:
+                    continue
+                board_candidates.append((
+                    match_priority,
+                    source_priority,
+                    abs(len(normalized_query) - len(normalized_name)),
+                    board_name,
+                    str(row.get("板块代码") or "").strip(),
+                    board_type,
+                ))
+
+        if not board_candidates:
+            if source_errors:
+                raise RuntimeError("东方财富行业/概念板块列表未完整返回") from source_errors[-1]
+            return {"items": [], "matched_plate": ""}
+
+        _, _, _, matched_plate, board_code, board_type = min(board_candidates)
+        constituent_fetcher = (
+            ak.stock_board_industry_cons_em
+            if board_type == "industry"
+            else ak.stock_board_concept_cons_em
+        )
+        frame = constituent_fetcher(board_code or matched_plate)
+        if frame is None or frame.empty:
+            return {"items": [], "matched_plate": matched_plate}
+
+        items: List[Dict[str, Any]] = []
+        for _, row in frame.iterrows():
+            stock_code = cls._normalize_code(row.get("代码"))
+            if len(stock_code) != 6 or not stock_code.isdigit():
+                continue
+            items.append({
+                "stock_code": stock_code,
+                "stock_name": str(row.get("名称") or stock_code).strip(),
+                "market": cls._market_from_stock_code(stock_code),
+                "match_reason": matched_plate,
+            })
+        return {"items": items, "matched_plate": matched_plate}
+
+    @staticmethod
+    def _normalize_plate_lookup_name(value: Any) -> str:
+        return str(value or "").strip().replace(" ", "")[:40]
+
+    @staticmethod
+    def _plate_lookup_match_priority(query: str, candidate: str) -> Optional[int]:
+        if not query or not candidate:
+            return None
+        if query == candidate:
+            return 0
+        if min(len(query), len(candidate)) >= 3 and (query in candidate or candidate in query):
+            return 1
+        return None
+
+    @staticmethod
+    def _market_from_stock_code(stock_code: str) -> str:
+        if stock_code.startswith(("4", "8")):
+            return "BJ"
+        if stock_code.startswith(("5", "6", "9")):
+            return "SH"
+        return "SZ"
 
     async def get_news(self, db: Optional[AsyncSession] = None, limit: int = 80) -> Dict[str, Any]:
         warnings: List[str] = []
@@ -670,16 +1064,77 @@ class TdxPluginService:
             "related_plates": [],
         }
 
+    def _build_plate_strength_items(
+        self,
+        raw_items: List[Dict[str, Any]],
+        source: str,
+    ) -> List[Dict[str, Any]]:
+        grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for item in raw_items:
+            grouped[self._plate_strength_name(item, source)].append(item)
+
+        items = [
+            self._build_plate_strength_item(plate, members)
+            for plate, members in grouped.items()
+        ]
+        items.sort(
+            key=lambda item: (
+                item["strength_score"],
+                item["limit_up_count"],
+                item["max_board"],
+                item["plate_name"],
+            ),
+            reverse=True,
+        )
+        for index, item in enumerate(items, start=1):
+            item["rank"] = index
+        return items
+
+    @staticmethod
+    def _plate_strength_name(item: Dict[str, Any], source: str) -> str:
+        if source == "ths":
+            from app.services.ths_limit_up_classification_service import ThsLimitUpClassificationService
+
+            reason = item.get("limit_up_reason") or item.get("reason_category") or item.get("industry") or ""
+            return ThsLimitUpClassificationService.classify_reason(str(reason)) or "其他"
+
+        category = item.get("reason_category")
+        if category and category != "其他":
+            return str(category)
+        industry = item.get("industry")
+        if industry:
+            return str(industry)
+        reason = item.get("limit_up_reason") or ""
+        concepts = TdxPluginService._split_concepts(str(reason))
+        return concepts[0] if concepts else "其他"
+
     def _build_plate_strength_item(self, plate: str, members: List[Dict[str, Any]]) -> Dict[str, Any]:
         sealed_members = [item for item in members if item.get("is_sealed", item.get("is_final_sealed", True))]
         limit_up_count = len(members)
         sealed_count = len(sealed_members)
+        opened_count = limit_up_count - sealed_count
         max_board = max([int(item.get("continuous_limit_up_days") or 1) for item in members], default=0)
         seal_rate = round(sealed_count / limit_up_count * 100, 1) if limit_up_count else 0
-        strength_score = round(limit_up_count * 20 + sealed_count * 10 + max_board * 5 + seal_rate * 0.3, 2)
+        total_seal_amount = round(sum(float(item.get("seal_amount") or 0) for item in members), 2)
+        total_amount = round(sum(float(item.get("amount") or 0) for item in members), 2)
+        total_open_count = sum(int(item.get("open_count") or 0) for item in members)
+        amount_score = min(25.0, math.log10(max(1.0, total_seal_amount) + 1.0) * 3.0)
+        strength_score = round(
+            limit_up_count * 20
+            + sealed_count * 10
+            + max_board * 5
+            + seal_rate * 0.3
+            + amount_score
+            - total_open_count * 1.5,
+            2,
+        )
         core_stocks = sorted(
             members,
-            key=lambda item: (int(item.get("continuous_limit_up_days") or 1), float(item.get("seal_amount") or 0)),
+            key=lambda item: (
+                int(item.get("continuous_limit_up_days") or 1),
+                bool(item.get("is_sealed", item.get("is_final_sealed", True))),
+                float(item.get("seal_amount") or 0),
+            ),
             reverse=True,
         )[:5]
 
@@ -688,18 +1143,346 @@ class TdxPluginService:
             "strength_score": strength_score,
             "limit_up_count": limit_up_count,
             "sealed_count": sealed_count,
+            "opened_count": opened_count,
             "seal_rate": seal_rate,
             "max_board": max_board,
+            "total_seal_amount": total_seal_amount,
+            "total_amount": total_amount,
+            "total_open_count": total_open_count,
             "core_stocks": [
                 {
                     "stock_code": item.get("stock_code", ""),
                     "stock_name": item.get("stock_name", ""),
                     "board": int(item.get("continuous_limit_up_days") or 1),
+                    "is_sealed": bool(item.get("is_sealed", item.get("is_final_sealed", True))),
+                    "seal_amount": float(item.get("seal_amount") or 0),
                 }
                 for item in core_stocks
             ],
-            "trend": "up" if sealed_count == limit_up_count else "mixed",
+            "rank": 0,
+            "rank_change": 0,
+            "score_change": 0.0,
+            "trend": "new",
         }
+
+    def _build_plate_constituent_item(
+        self,
+        candidate: Dict[str, Any],
+        quote: Dict[str, Any],
+        limit_up_item: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        stock_code = self._normalize_code(candidate.get("stock_code", ""))
+        price = float(quote.get("price") or 0)
+        amount = float(quote.get("amount") or 0)
+        change_pct = normalize_change_pct(
+            quote.get("change_pct"),
+            price=price,
+            amount=amount,
+        )
+        limit_up_price = float(quote.get("limit_up") or 0)
+        quote_has_limit_state = price > 0 and limit_up_price > 0
+        quote_is_limit_up = quote_has_limit_state and price >= limit_up_price - 0.001
+        board = int((limit_up_item or {}).get("continuous_limit_up_days") or 0)
+        pool_is_sealed = bool(limit_up_item) and bool(
+            (limit_up_item or {}).get("is_sealed", (limit_up_item or {}).get("is_final_sealed", False))
+        )
+        is_sealed = quote_is_limit_up if quote_has_limit_state else pool_is_sealed
+        is_limit_up = quote_is_limit_up if quote_has_limit_state else pool_is_sealed
+        return {
+            "stock_code": stock_code,
+            "stock_name": quote.get("name") or candidate.get("stock_name") or stock_code,
+            "market": candidate.get("market") or quote.get("market") or "",
+            "price": price or None,
+            "change_pct": change_pct,
+            "amount": amount,
+            "turnover_rate": float(quote.get("turnover_rate") or 0),
+            "is_limit_up": is_limit_up,
+            "is_sealed": is_sealed,
+            "board": board,
+            "first_limit_up_time": self._format_time((limit_up_item or {}).get("first_limit_up_time")),
+            "match_reason": candidate.get("match_reason") or "",
+            "dragon_tag": None,
+            "dragon_reason": "",
+            "tags": [],
+        }
+
+    def _annotate_intraday_tags(self, items: List[Dict[str, Any]]) -> None:
+        ranked = sorted(
+            [
+                item
+                for item in items
+                if int(item.get("board") or 0) > 0 or (item.get("change_pct") or 0) > 0
+            ],
+            key=lambda item: (
+                -int(item.get("board") or 0),
+                -int(bool(item.get("is_sealed"))),
+                self._intraday_time_rank(item.get("first_limit_up_time")),
+                -(item.get("change_pct") if item.get("change_pct") is not None else -999.0),
+                -float(item.get("amount") or 0),
+                item.get("stock_code") or "",
+            ),
+        )
+        dragon_items = ranked[:5]
+        for index, item in enumerate(dragon_items, start=1):
+            item["dragon_tag"] = f"龙{index}"
+            if item.get("board"):
+                status = "封板" if item.get("is_sealed") else "开板"
+                first_time = f"·{item['first_limit_up_time']}首封" if item.get("first_limit_up_time") else ""
+                item["dragon_reason"] = f"{item['board']}板·{status}{first_time}"
+            elif item.get("change_pct") is not None:
+                item["dragon_reason"] = f"日内涨幅{item['change_pct']:+.2f}%"
+            self._append_intraday_tag(
+                item,
+                label=item["dragon_tag"],
+                tag_type="dragon",
+                reason=item["dragon_reason"],
+            )
+
+        board_items = [item for item in ranked if int(item.get("board") or 0) > 0]
+        max_board = max((int(item.get("board") or 0) for item in board_items), default=0)
+        if max_board >= 2:
+            high_item = next(item for item in ranked if int(item.get("board") or 0) == max_board)
+            self._append_intraday_tag(
+                high_item,
+                label="高标",
+                tag_type="high",
+                reason=f"板块最高连板高度·{max_board}板",
+            )
+
+        timed_board_items = [
+            item
+            for item in board_items
+            if self._intraday_time_rank(item.get("first_limit_up_time")) < 999999
+        ]
+        if timed_board_items:
+            pioneer_item = min(
+                timed_board_items,
+                key=lambda item: (
+                    self._intraday_time_rank(item.get("first_limit_up_time")),
+                    item.get("stock_code") or "",
+                ),
+            )
+            self._append_intraday_tag(
+                pioneer_item,
+                label="先锋",
+                tag_type="pioneer",
+                reason=f"板块内最早触板·{pioneer_item['first_limit_up_time']}",
+            )
+
+        positive_amount_items = [
+            item
+            for item in items
+            if (item.get("change_pct") or 0) > 0 and float(item.get("amount") or 0) > 0
+        ]
+        if positive_amount_items:
+            core_item = max(
+                positive_amount_items,
+                key=lambda item: (
+                    float(item.get("amount") or 0),
+                    float(item.get("change_pct") or 0),
+                ),
+            )
+            self._append_intraday_tag(
+                core_item,
+                label="中军",
+                tag_type="core",
+                reason=f"板块内日内成交额最大·{float(core_item.get('amount') or 0):.0f}万",
+            )
+
+        catchup_items = [
+            item
+            for item in items
+            if not item.get("dragon_tag")
+            and int(item.get("board") or 0) <= 1
+            and float(item.get("change_pct") or 0) >= 5.0
+        ]
+        if catchup_items:
+            catchup_item = max(
+                catchup_items,
+                key=lambda item: (
+                    float(item.get("change_pct") or 0),
+                    float(item.get("amount") or 0),
+                ),
+            )
+            self._append_intraday_tag(
+                catchup_item,
+                label="补涨",
+                tag_type="catchup",
+                reason=f"非前五龙头中日内涨幅领先·{catchup_item['change_pct']:+.2f}%",
+            )
+
+        for opened_item in board_items:
+            if opened_item.get("is_sealed"):
+                continue
+            self._append_intraday_tag(
+                opened_item,
+                label="炸板",
+                tag_type="opened",
+                reason=f"日内曾触板后打开·{int(opened_item.get('board') or 0)}板",
+            )
+
+        tag_priority = {
+            "dragon": 0,
+            "opened": 1,
+            "high": 2,
+            "core": 3,
+            "pioneer": 4,
+            "catchup": 5,
+        }
+        for item in items:
+            item["tags"] = sorted(
+                item.get("tags") or [],
+                key=lambda tag: (tag_priority.get(tag.get("type"), 99), tag.get("label") or ""),
+            )[:3]
+
+    @staticmethod
+    def _append_intraday_tag(
+        item: Dict[str, Any],
+        *,
+        label: str,
+        tag_type: str,
+        reason: str,
+    ) -> None:
+        tags = item.setdefault("tags", [])
+        if any(tag.get("label") == label for tag in tags):
+            return
+        tags.append({"label": label, "type": tag_type, "reason": reason})
+
+    @staticmethod
+    def _intraday_time_rank(value: Any) -> int:
+        digits = "".join(character for character in str(value or "") if character.isdigit())
+        if len(digits) >= 6:
+            return int(digits[-6:])
+        return 999999
+
+    async def _get_cached_plate_strength_history(
+        self,
+        target_date: date,
+        db: Optional[AsyncSession],
+        *,
+        source: str,
+        window_days: int,
+    ) -> List[Dict[str, Any]]:
+        cache_key = (target_date.isoformat(), source, window_days)
+        now = time_module.monotonic()
+        cached = self._plate_strength_history_cache.get(cache_key)
+        if cached and now - cached[0] <= self.plate_strength_history_cache_ttl:
+            return copy.deepcopy(cached[1])
+
+        history = await self._load_plate_strength_history(
+            target_date,
+            db,
+            source=source,
+            window_days=window_days,
+        )
+        self._plate_strength_history_cache[cache_key] = (now, copy.deepcopy(history))
+        if len(self._plate_strength_history_cache) > 128:
+            oldest_key = min(
+                self._plate_strength_history_cache,
+                key=lambda key: self._plate_strength_history_cache[key][0],
+            )
+            self._plate_strength_history_cache.pop(oldest_key, None)
+        return history
+
+    async def _load_plate_strength_history(
+        self,
+        target_date: date,
+        db: Optional[AsyncSession],
+        *,
+        source: str,
+        window_days: int,
+    ) -> List[Dict[str, Any]]:
+        if db is None:
+            return []
+
+        date_result = await db.execute(
+            select(LimitUpRecord.trade_date)
+            .where(LimitUpRecord.trade_date <= target_date)
+            .distinct()
+            .order_by(desc(LimitUpRecord.trade_date))
+            .limit(window_days)
+        )
+        history_dates = [row[0] for row in date_result.all()]
+        if not history_dates:
+            return []
+
+        result = await db.execute(
+            select(
+                LimitUpRecord.trade_date,
+                Stock.stock_code,
+                Stock.stock_name,
+                Stock.industry,
+                LimitUpRecord.first_limit_up_time,
+                LimitUpRecord.limit_up_reason,
+                LimitUpRecord.reason_category,
+                LimitUpRecord.continuous_limit_up_days,
+                LimitUpRecord.open_count,
+                LimitUpRecord.is_final_sealed,
+                LimitUpRecord.current_status,
+                LimitUpRecord.final_seal_time,
+                LimitUpRecord.seal_amount,
+                LimitUpRecord.amount,
+                LimitUpRecord.turnover_rate,
+                LimitUpRecord.data_source,
+            )
+            .join(Stock, LimitUpRecord.stock_id == Stock.id)
+            .where(LimitUpRecord.trade_date.in_(history_dates))
+            .order_by(LimitUpRecord.trade_date, LimitUpRecord.first_limit_up_time, Stock.stock_code)
+        )
+
+        by_date: Dict[date, List[Dict[str, Any]]] = defaultdict(list)
+        for row in result.all():
+            stock_code = self._normalize_code(row[1])
+            is_final_sealed = bool(row[9]) if row[9] is not None else str(row[10] or "").lower() not in {"opened", "broken"}
+            by_date[row[0]].append({
+                "stock_code": stock_code,
+                "stock_name": row[2] or stock_code,
+                "industry": row[3],
+                "first_limit_up_time": row[4],
+                "limit_up_reason": row[5] or row[6] or "",
+                "reason_category": row[6] or row[3] or "其他",
+                "continuous_limit_up_days": int(row[7] or 1),
+                "open_count": int(row[8] or 0),
+                "is_final_sealed": is_final_sealed,
+                "is_sealed": is_final_sealed,
+                "current_status": row[10] or ("sealed" if is_final_sealed else "opened"),
+                "final_seal_time": row[11],
+                "seal_amount": float(row[12] or 0),
+                "amount": float(row[13] or 0),
+                "turnover_rate": float(row[14] or 0),
+                "data_source": row[15] or "DB",
+            })
+
+        return [
+            {
+                "trade_date": trade_day.isoformat(),
+                "items": self._build_plate_strength_items(by_date[trade_day], source),
+            }
+            for trade_day in sorted(by_date)
+        ]
+
+    @staticmethod
+    def _annotate_plate_strength_changes(history: List[Dict[str, Any]]) -> None:
+        previous_items: Dict[str, Dict[str, Any]] = {}
+        for point in history:
+            for item in point.get("items") or []:
+                previous = previous_items.get(item["plate_name"])
+                if previous is None:
+                    item["score_change"] = 0.0
+                    item["rank_change"] = 0
+                    item["trend"] = "new"
+                    continue
+
+                score_change = round(item["strength_score"] - previous["strength_score"], 2)
+                rank_change = int(previous.get("rank") or 0) - int(item.get("rank") or 0)
+                item["score_change"] = score_change
+                item["rank_change"] = rank_change
+                item["trend"] = "up" if score_change > 0 else "down" if score_change < 0 else "flat"
+
+            previous_items = {
+                item["plate_name"]: item
+                for item in point.get("items") or []
+            }
 
     def _build_news_item(self, document: Any) -> Dict[str, Any]:
         title = document.title or document.source_name or "市场快讯"

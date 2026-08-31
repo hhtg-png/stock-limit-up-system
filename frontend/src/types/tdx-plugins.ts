@@ -64,14 +64,77 @@ export interface TdxPlateStrength {
   strength_score: number
   limit_up_count: number
   sealed_count: number
+  opened_count: number
   seal_rate: number
   max_board: number
-  trend: string
+  total_seal_amount: number
+  total_amount: number
+  total_open_count: number
+  rank: number
+  rank_change: number
+  score_change: number
+  trend: 'new' | 'up' | 'down' | 'flat'
   core_stocks: Array<{
     stock_code: string
     stock_name: string
     board: number
+    is_sealed: boolean
+    seal_amount: number
   }>
+}
+
+export interface TdxPlateStrengthPayload extends TdxPluginPayload<TdxPlateStrength> {
+  source: 'kpl' | 'ths'
+  window_days: number
+  history: Array<{
+    trade_date: string
+    items: TdxPlateStrength[]
+  }>
+  summary: {
+    plate_count: number
+    limit_up_count: number
+    sealed_count: number
+    total_seal_amount: number
+  }
+}
+
+export interface TdxIntradayTag {
+  label: string
+  type: 'dragon' | 'high' | 'pioneer' | 'core' | 'catchup' | 'opened'
+  reason: string
+}
+
+export interface TdxPlateConstituent {
+  stock_code: string
+  stock_name: string
+  market: string
+  price: number | null
+  change_pct: number | null
+  amount: number
+  turnover_rate: number
+  is_limit_up: boolean
+  is_sealed: boolean
+  board: number
+  first_limit_up_time: string
+  match_reason: string
+  dragon_tag: '龙1' | '龙2' | '龙3' | '龙4' | '龙5' | null
+  dragon_reason: string
+  tags?: TdxIntradayTag[]
+}
+
+export interface TdxPlateConstituentPayload extends TdxPluginPayload<TdxPlateConstituent> {
+  plate_name: string
+  source: 'kpl' | 'ths'
+  constituent_source: 'local_topic_knowledge' | 'eastmoney_board' | 'unavailable'
+  source_note: string
+  summary: {
+    stock_count: number
+    quoted_count: number
+    up_count: number
+    down_count: number
+    flat_count: number
+    limit_up_count: number
+  }
 }
 
 export interface TdxNewsItem {

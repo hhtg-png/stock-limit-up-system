@@ -1,9 +1,11 @@
 import asyncio
 import unittest
+import sys
 from datetime import date, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import pandas as pd
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
@@ -11,6 +13,8 @@ from sqlalchemy.pool import StaticPool
 from app.database import Base
 from app.services.tdx_attribution_sources import PublicStockAttribution
 from app.services.tdx_external_sources import ExternalStockMove
+from app.models.limit_up import LimitUpRecord
+from app.models.stock import Stock
 from app.models.tdx_cache import TdxStockMoveCache
 from app.services.tdx_plugin_service import TdxPluginService
 
@@ -351,7 +355,7 @@ class TdxPluginServiceTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(
             service.realtime_limit_up_service,
-            "get_realtime_limit_up_list",
+            "get_fast_limit_up_pool",
             AsyncMock(
                 return_value=[
                     make_limit_up_item("001259", "利仁科技", "家电", board=7),
@@ -368,6 +372,573 @@ class TdxPluginServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["items"][0]["max_board"], 7)
         self.assertEqual(payload["items"][0]["core_stocks"][0]["stock_name"], "利仁科技")
         self.assertGreater(payload["items"][0]["strength_score"], payload["items"][1]["strength_score"])
+
+    async def test_plate_strength_uses_ths_fine_themes_and_exposes_realtime_metrics(self):
+        service = TdxPluginService()
+        trade_date = date(2026, 5, 28)
+
+        raw_items = [
+            make_limit_up_item("001259", "利仁科技", "家电", board=3),
+            make_limit_up_item("603311", "金海高科", "家电", board=1, sealed=False, open_count=2),
+        ]
+        raw_items[0]["limit_up_reason"] = "AI服务器电源+数据中心"
+        raw_items[1]["limit_up_reason"] = "AI算力电源+液冷服务器"
+
+        with patch.object(
+            service.realtime_limit_up_service,
+            "get_fast_limit_up_pool",
+            AsyncMock(return_value=raw_items),
+        ) as fast_pool, patch.object(
+            service.realtime_limit_up_service,
+            "_fetch_ths_reason_map",
+            AsyncMock(
+                return_value={
+                    "001259": "AI服务器电源+数据中心",
+                    "603311": "AI算力电源+液冷服务器",
+                }
+            ),
+        ):
+            payload = await service.get_plate_strength(
+                trade_date,
+                source="ths",
+                window_days=10,
+            )
+
+        fast_pool.assert_awaited_once_with(
+            trade_date,
+            wait_for_refresh=False,
+            max_cache_age=2,
+        )
+        self.assertEqual(payload["source"], "ths")
+        self.assertEqual(payload["window_days"], 10)
+        self.assertEqual(payload["source_status"]["plate_source"], "ths")
+        self.assertEqual(payload["items"][0]["plate_name"], "AI电源")
+        self.assertEqual(payload["items"][0]["limit_up_count"], 2)
+        self.assertEqual(payload["items"][0]["opened_count"], 1)
+        self.assertEqual(payload["items"][0]["total_seal_amount"], 100000000.0)
+        self.assertIn("score_change", payload["items"][0])
+        self.assertIn("rank_change", payload["items"][0])
+        self.assertEqual(payload["history"][-1]["trade_date"], "2026-05-28")
+
+    async def test_plate_strength_kpl_compatible_source_keeps_pool_category(self):
+        service = TdxPluginService()
+        trade_date = date(2026, 5, 28)
+        raw_item = make_limit_up_item("001259", "利仁科技", "新能源", board=2)
+        raw_item["limit_up_reason"] = "光伏设备"
+
+        with patch.object(
+            service.realtime_limit_up_service,
+            "get_fast_limit_up_pool",
+            AsyncMock(return_value=[raw_item]),
+        ), patch.object(
+            service.realtime_limit_up_service,
+            "_fetch_ths_reason_map",
+            AsyncMock(return_value={"001259": "AI服务器电源"}),
+        ) as ths_reason_map:
+            payload = await service.get_plate_strength(
+                trade_date,
+                source="kpl",
+                window_days=20,
+            )
+
+        ths_reason_map.assert_not_called()
+        self.assertEqual(payload["items"][0]["plate_name"], "新能源")
+        self.assertEqual(payload["source_status"]["plate_source"], "eastmoney_kpl_compatible")
+        self.assertTrue(any("开盘啦" in warning for warning in payload["warnings"]))
+
+    async def test_plate_strength_falls_back_to_db_and_builds_trading_day_history(self):
+        engine = create_async_engine(
+            "sqlite+aiosqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        Session = async_sessionmaker(engine, expire_on_commit=False)
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+        try:
+            async with Session() as db:
+                stock_a = Stock(stock_code="001259", stock_name="利仁科技", market="SZ", industry="家电")
+                stock_b = Stock(stock_code="603311", stock_name="金海高科", market="SH", industry="家电")
+                db.add_all([stock_a, stock_b])
+                await db.flush()
+                db.add_all([
+                    LimitUpRecord(
+                        stock_id=stock_a.id,
+                        trade_date=date(2026, 5, 27),
+                        limit_up_reason="家电",
+                        reason_category="家电",
+                        continuous_limit_up_days=2,
+                        is_final_sealed=True,
+                        seal_amount=3000,
+                    ),
+                    LimitUpRecord(
+                        stock_id=stock_a.id,
+                        trade_date=date(2026, 5, 28),
+                        limit_up_reason="家电",
+                        reason_category="家电",
+                        continuous_limit_up_days=3,
+                        is_final_sealed=True,
+                        seal_amount=5000,
+                    ),
+                    LimitUpRecord(
+                        stock_id=stock_b.id,
+                        trade_date=date(2026, 5, 28),
+                        limit_up_reason="家电",
+                        reason_category="家电",
+                        continuous_limit_up_days=1,
+                        is_final_sealed=False,
+                        seal_amount=0,
+                    ),
+                ])
+                await db.commit()
+
+                service = TdxPluginService()
+                with patch.object(
+                    service.realtime_limit_up_service,
+                    "get_fast_limit_up_pool",
+                    AsyncMock(return_value=[]),
+                ):
+                    payload = await service.get_plate_strength(
+                        date(2026, 5, 28),
+                        db=db,
+                        source="kpl",
+                        window_days=10,
+                    )
+
+            self.assertTrue(payload["is_cache"])
+            self.assertEqual(payload["source_status"]["limit_up_db"], "ok")
+            self.assertEqual(payload["items"][0]["limit_up_count"], 2)
+            self.assertEqual(
+                [point["trade_date"] for point in payload["history"]],
+                ["2026-05-27", "2026-05-28"],
+            )
+            self.assertGreater(payload["items"][0]["score_change"], 0)
+        finally:
+            await engine.dispose()
+
+    async def test_plate_strength_does_not_promote_previous_day_history_to_live_items(self):
+        engine = create_async_engine(
+            "sqlite+aiosqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        Session = async_sessionmaker(engine, expire_on_commit=False)
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+        try:
+            async with Session() as db:
+                stock = Stock(stock_code="001259", stock_name="利仁科技", market="SZ", industry="家电")
+                db.add(stock)
+                await db.flush()
+                db.add(
+                    LimitUpRecord(
+                        stock_id=stock.id,
+                        trade_date=date(2026, 5, 27),
+                        limit_up_reason="家电",
+                        reason_category="家电",
+                        continuous_limit_up_days=2,
+                        is_final_sealed=True,
+                        seal_amount=3000,
+                    )
+                )
+                await db.commit()
+
+                service = TdxPluginService()
+                with patch.object(
+                    service.realtime_limit_up_service,
+                    "get_fast_limit_up_pool",
+                    AsyncMock(return_value=[]),
+                ):
+                    payload = await service.get_plate_strength(
+                        date(2026, 5, 28),
+                        db=db,
+                        source="kpl",
+                        window_days=10,
+                    )
+
+            self.assertEqual(payload["items"], [])
+            self.assertEqual(payload["summary"]["plate_count"], 0)
+            self.assertEqual([point["trade_date"] for point in payload["history"]], ["2026-05-27"])
+            self.assertEqual(payload["source_status"]["plate_strength"], "empty")
+        finally:
+            await engine.dispose()
+
+    async def test_plate_strength_reuses_short_lived_history_cache(self):
+        service = TdxPluginService()
+        history = [{"trade_date": "2026-05-27", "items": []}]
+
+        with patch.object(
+            service.realtime_limit_up_service,
+            "get_fast_limit_up_pool",
+            AsyncMock(return_value=[]),
+        ), patch.object(
+            service,
+            "_load_plate_strength_history",
+            AsyncMock(return_value=history),
+        ) as history_loader:
+            await service.get_plate_strength(date(2026, 5, 28), source="kpl", window_days=20)
+            await service.get_plate_strength(date(2026, 5, 28), source="kpl", window_days=20)
+
+        self.assertEqual(history_loader.await_count, 1)
+
+    async def test_plate_strength_defaults_to_latest_available_trade_date(self):
+        service = TdxPluginService()
+        db = object()
+        latest_trade_date = date(2026, 5, 28)
+
+        with patch.object(
+            service,
+            "_resolve_trade_date",
+            AsyncMock(return_value=latest_trade_date),
+        ) as resolver, patch.object(
+            service.realtime_limit_up_service,
+            "get_fast_limit_up_pool",
+            AsyncMock(return_value=[make_limit_up_item("001259", "利仁科技", "家电")]),
+        ) as pool_loader, patch.object(
+            service,
+            "_load_plate_strength_history",
+            AsyncMock(return_value=[]),
+        ):
+            payload = await service.get_plate_strength(db=db, source="kpl", window_days=20)
+
+        resolver.assert_awaited_once_with(None, db)
+        pool_loader.assert_awaited_once_with(
+            latest_trade_date,
+            wait_for_refresh=False,
+            max_cache_age=2,
+        )
+        self.assertEqual(payload["history"][-1]["trade_date"], latest_trade_date.isoformat())
+
+    async def test_plate_constituents_sort_by_change_and_tag_intraday_dragons(self):
+        topic_knowledge = SimpleNamespace(
+            find_stocks_by_topic=lambda _plate: [
+                {"stock_code": "000001", "stock_name": "甲公司", "market": "SZ", "match_reason": "房地产"},
+                {"stock_code": "000002", "stock_name": "乙公司", "market": "SZ", "match_reason": "房地产开发"},
+                {"stock_code": "600001", "stock_name": "丙公司", "market": "SH", "match_reason": "房地产"},
+                {"stock_code": "600002", "stock_name": "丁公司", "market": "SH", "match_reason": "房地产"},
+            ]
+        )
+        quote_fetcher = AsyncMock(return_value={
+            "000001": {"name": "甲公司", "price": 10.0, "change_pct": 10.0, "amount": 8000, "turnover_rate": 6.0, "limit_up": 10.0},
+            "000002": {"name": "乙公司", "price": 9.5, "change_pct": 9.5, "amount": 9000, "turnover_rate": 7.0, "limit_up": 9.5},
+            "600001": {"name": "丙公司", "price": 11.0, "change_pct": 11.0, "amount": 10000, "turnover_rate": 8.0, "limit_up": 12.0},
+            "600002": {"name": "丁公司", "price": 8.0, "change_pct": -1.0, "amount": 1000, "turnover_rate": 2.0, "limit_up": 10.0},
+        })
+        service = TdxPluginService(
+            topic_knowledge_service=topic_knowledge,
+            quote_fetcher=quote_fetcher,
+        )
+        limit_up_items = [
+            make_limit_up_item("000001", "甲公司", "房地产", board=1, first_time=datetime(2026, 5, 28, 9, 31)),
+            make_limit_up_item("000002", "乙公司", "房地产", board=2, first_time=datetime(2026, 5, 28, 10, 0)),
+        ]
+
+        with patch.object(
+            service.realtime_limit_up_service,
+            "get_fast_limit_up_pool",
+            AsyncMock(return_value=limit_up_items),
+        ):
+            payload = await service.get_plate_constituents(
+                "房地产",
+                date(2026, 5, 28),
+                source="kpl",
+            )
+
+        self.assertEqual([item["stock_code"] for item in payload["items"]], ["600001", "000001", "000002", "600002"])
+        by_code = {item["stock_code"]: item for item in payload["items"]}
+        self.assertEqual(by_code["000002"]["dragon_tag"], "龙1")
+        self.assertEqual(by_code["000001"]["dragon_tag"], "龙2")
+        self.assertEqual(by_code["600001"]["dragon_tag"], "龙3")
+        self.assertIsNone(by_code["600002"]["dragon_tag"])
+        self.assertEqual(by_code["000002"]["board"], 2)
+        self.assertTrue(by_code["000001"]["is_sealed"])
+        self.assertEqual(payload["summary"]["stock_count"], 4)
+        self.assertEqual(payload["summary"]["up_count"], 3)
+        self.assertEqual(payload["summary"]["quoted_count"], 4)
+        self.assertEqual(payload["constituent_source"], "local_topic_knowledge")
+        self.assertIn("本地题材映射", payload["source_note"])
+        quote_fetcher.assert_awaited_once_with(["000001", "000002", "600001", "600002"])
+
+    async def test_plate_constituents_assign_top_five_and_intraday_role_tags(self):
+        candidates = [
+            {"stock_code": f"00000{index}", "stock_name": f"公司{index}", "market": "SZ"}
+            for index in range(1, 8)
+        ]
+        quotes = {
+            "000001": {"name": "公司1", "price": 10, "change_pct": 9.0, "amount": 5000, "limit_up": 10},
+            "000002": {"name": "公司2", "price": 10, "change_pct": 8.0, "amount": 4000, "limit_up": 10},
+            "000003": {"name": "公司3", "price": 10, "change_pct": 7.0, "amount": 20000, "limit_up": 10},
+            "000004": {"name": "公司4", "price": 10, "change_pct": 6.0, "amount": 3000, "limit_up": 11},
+            "000005": {"name": "公司5", "price": 10, "change_pct": 4.0, "amount": 2000, "limit_up": 10},
+            "000006": {"name": "公司6", "price": 10, "change_pct": 7.5, "amount": 1000, "limit_up": 11},
+            "000007": {"name": "公司7", "price": 10, "change_pct": 2.0, "amount": 10000, "limit_up": 11},
+        }
+        limit_up_items = [
+            make_limit_up_item("000001", "公司1", "测试", board=3, first_time=datetime(2026, 5, 28, 9, 40)),
+            make_limit_up_item("000002", "公司2", "测试", board=2, first_time=datetime(2026, 5, 28, 9, 25)),
+            make_limit_up_item("000003", "公司3", "测试", board=1, first_time=datetime(2026, 5, 28, 9, 30)),
+            make_limit_up_item(
+                "000004",
+                "公司4",
+                "测试",
+                board=1,
+                sealed=False,
+                first_time=datetime(2026, 5, 28, 9, 26),
+            ),
+            make_limit_up_item("000005", "公司5", "测试", board=1, first_time=datetime(2026, 5, 28, 9, 35)),
+        ]
+        service = TdxPluginService(
+            topic_knowledge_service=SimpleNamespace(find_stocks_by_topic=lambda _plate: candidates),
+            quote_fetcher=AsyncMock(return_value=quotes),
+        )
+
+        with patch.object(
+            service.realtime_limit_up_service,
+            "get_fast_limit_up_pool",
+            AsyncMock(return_value=limit_up_items),
+        ):
+            payload = await service.get_plate_constituents("测试题材", date(2026, 5, 28))
+
+        by_code = {item["stock_code"]: item for item in payload["items"]}
+        self.assertEqual(
+            {code: item["dragon_tag"] for code, item in by_code.items() if item["dragon_tag"]},
+            {
+                "000001": "龙1",
+                "000002": "龙2",
+                "000003": "龙3",
+                "000005": "龙4",
+                "000004": "龙5",
+            },
+        )
+        self.assertIn("高标", [tag["label"] for tag in by_code["000001"]["tags"]])
+        self.assertIn("先锋", [tag["label"] for tag in by_code["000002"]["tags"]])
+        self.assertIn("中军", [tag["label"] for tag in by_code["000003"]["tags"]])
+        self.assertIn("补涨", [tag["label"] for tag in by_code["000006"]["tags"]])
+        self.assertIn("炸板", [tag["label"] for tag in by_code["000004"]["tags"]])
+        self.assertTrue(all(len(item["tags"]) <= 3 for item in payload["items"]))
+        self.assertTrue(all(tag["reason"] for item in payload["items"] for tag in item["tags"]))
+
+    def test_plate_constituent_current_seal_state_prefers_complete_quote_over_pool(self):
+        service = TdxPluginService()
+        candidate = {"stock_code": "000001", "stock_name": "甲公司", "market": "SZ"}
+        sealed_pool_item = make_limit_up_item("000001", "甲公司", "测试", sealed=True, board=2)
+
+        opened_item = service._build_plate_constituent_item(
+            candidate,
+            {"name": "甲公司", "price": 9.8, "limit_up": 10.0, "change_pct": 7.0},
+            sealed_pool_item,
+        )
+        quote_only_sealed_item = service._build_plate_constituent_item(
+            candidate,
+            {"name": "甲公司", "price": 10.0, "limit_up": 10.0, "change_pct": 10.0},
+            None,
+        )
+
+        self.assertFalse(opened_item["is_sealed"])
+        self.assertFalse(opened_item["is_limit_up"])
+        self.assertTrue(quote_only_sealed_item["is_sealed"])
+        self.assertTrue(quote_only_sealed_item["is_limit_up"])
+
+    def test_intraday_tag_priority_keeps_opened_state_when_roles_collide(self):
+        service = TdxPluginService()
+        crowded_item = {
+            "stock_code": "000001",
+            "stock_name": "甲公司",
+            "board": 3,
+            "is_sealed": False,
+            "first_limit_up_time": "09:25:00",
+            "change_pct": 9.0,
+            "amount": 20000.0,
+            "dragon_tag": None,
+            "dragon_reason": "",
+            "tags": [],
+        }
+        follower_item = {
+            "stock_code": "000002",
+            "stock_name": "乙公司",
+            "board": 2,
+            "is_sealed": True,
+            "first_limit_up_time": "09:30:00",
+            "change_pct": 8.0,
+            "amount": 1000.0,
+            "dragon_tag": None,
+            "dragon_reason": "",
+            "tags": [],
+        }
+
+        service._annotate_intraday_tags([crowded_item, follower_item])
+
+        self.assertEqual(
+            [tag["label"] for tag in crowded_item["tags"]],
+            ["龙1", "炸板", "高标"],
+        )
+        self.assertEqual(len(crowded_item["tags"]), 3)
+
+    async def test_plate_constituents_fall_back_to_eastmoney_when_local_mapping_is_empty(self):
+        topic_knowledge = SimpleNamespace(find_stocks_by_topic=lambda _plate: [])
+        fallback_fetcher = AsyncMock(return_value={
+            "items": [
+                {
+                    "stock_code": "000001",
+                    "stock_name": "甲公司",
+                    "market": "SZ",
+                    "match_reason": "房地产开发",
+                }
+            ],
+            "matched_plate": "房地产开发",
+        })
+        service = TdxPluginService(
+            topic_knowledge_service=topic_knowledge,
+            plate_constituent_fetcher=fallback_fetcher,
+            quote_fetcher=AsyncMock(return_value={
+                "000001": {"name": "甲公司", "price": 10, "change_pct": 2.5, "amount": 1000},
+            }),
+        )
+
+        with patch.object(
+            service.realtime_limit_up_service,
+            "get_fast_limit_up_pool",
+            AsyncMock(return_value=[]),
+        ):
+            payload = await service.get_plate_constituents("房地产", date(2026, 5, 28), source="ths")
+            await service.get_plate_constituents("房地产", date(2026, 5, 28), source="ths")
+
+        fallback_fetcher.assert_awaited_once_with("房地产")
+        self.assertEqual(payload["constituent_source"], "eastmoney_board")
+        self.assertEqual(payload["source_status"]["eastmoney_constituents"], "ok")
+        self.assertEqual(payload["items"][0]["stock_code"], "000001")
+        self.assertIn("房地产开发", payload["source_note"])
+        self.assertFalse(any("暂未匹配" in warning for warning in payload["warnings"]))
+
+    async def test_plate_constituent_fallback_failure_uses_short_backoff_cache(self):
+        fallback_fetcher = AsyncMock(side_effect=RuntimeError("eastmoney unavailable"))
+        service = TdxPluginService(
+            topic_knowledge_service=SimpleNamespace(find_stocks_by_topic=lambda _plate: []),
+            plate_constituent_fetcher=fallback_fetcher,
+            quote_fetcher=AsyncMock(return_value={}),
+        )
+
+        with patch.object(
+            service.realtime_limit_up_service,
+            "get_fast_limit_up_pool",
+            AsyncMock(return_value=[]),
+        ):
+            first_payload = await service.get_plate_constituents("测试题材", date(2026, 5, 28))
+            second_payload = await service.get_plate_constituents("测试题材", date(2026, 5, 28))
+
+        fallback_fetcher.assert_awaited_once_with("测试题材")
+        self.assertEqual(first_payload["source_status"]["eastmoney_constituents"], "error")
+        self.assertEqual(second_payload["source_status"]["eastmoney_constituents"], "error")
+
+    def test_eastmoney_constituent_fallback_resolves_related_board_name(self):
+        industry_calls = []
+        fake_akshare = SimpleNamespace(
+            stock_board_industry_name_em=lambda: pd.DataFrame([
+                {"板块名称": "房地产开发", "板块代码": "BK0001"},
+                {"板块名称": "银行", "板块代码": "BK0002"},
+            ]),
+            stock_board_concept_name_em=lambda: pd.DataFrame([
+                {"板块名称": "房地产概念", "板块代码": "BK1001"},
+            ]),
+            stock_board_industry_cons_em=lambda symbol: industry_calls.append(symbol) or pd.DataFrame([
+                {"代码": "000001", "名称": "甲公司"},
+                {"代码": "600001", "名称": "乙公司"},
+            ]),
+            stock_board_concept_cons_em=lambda _symbol: self.fail("应优先使用行业板块"),
+        )
+
+        with patch.dict(sys.modules, {"akshare": fake_akshare}):
+            payload = TdxPluginService._fetch_eastmoney_plate_constituents_sync("房地产")
+
+        self.assertEqual(industry_calls, ["BK0001"])
+        self.assertEqual(payload["matched_plate"], "房地产开发")
+        self.assertEqual(
+            [(item["stock_code"], item["market"]) for item in payload["items"]],
+            [("000001", "SZ"), ("600001", "SH")],
+        )
+
+    def test_eastmoney_constituent_fallback_uses_concept_when_industry_list_fails(self):
+        def fail_industry_names():
+            raise RuntimeError("industry unavailable")
+
+        fake_akshare = SimpleNamespace(
+            stock_board_industry_name_em=fail_industry_names,
+            stock_board_concept_name_em=lambda: pd.DataFrame([
+                {"板块名称": "人工智能", "板块代码": "BK1001"},
+            ]),
+            stock_board_industry_cons_em=lambda _symbol: self.fail("行业源不可用"),
+            stock_board_concept_cons_em=lambda _symbol: pd.DataFrame([
+                {"代码": "300001", "名称": "甲公司"},
+            ]),
+        )
+
+        with patch.dict(sys.modules, {"akshare": fake_akshare}):
+            payload = TdxPluginService._fetch_eastmoney_plate_constituents_sync("人工智能")
+
+        self.assertEqual(payload["matched_plate"], "人工智能")
+        self.assertEqual(payload["items"][0]["stock_code"], "300001")
+
+    def test_eastmoney_constituent_fallback_treats_empty_board_lists_as_source_error(self):
+        fake_akshare = SimpleNamespace(
+            stock_board_industry_name_em=lambda: pd.DataFrame(),
+            stock_board_concept_name_em=lambda: pd.DataFrame(),
+            stock_board_industry_cons_em=lambda _symbol: self.fail("不应获取成分"),
+            stock_board_concept_cons_em=lambda _symbol: self.fail("不应获取成分"),
+        )
+
+        with patch.dict(sys.modules, {"akshare": fake_akshare}):
+            with self.assertRaisesRegex(RuntimeError, "板块列表"):
+                TdxPluginService._fetch_eastmoney_plate_constituents_sync("人工智能")
+
+    async def test_plate_constituents_report_partial_quote_coverage(self):
+        topic_knowledge = SimpleNamespace(
+            find_stocks_by_topic=lambda _plate: [
+                {"stock_code": "000001", "stock_name": "甲公司", "market": "SZ"},
+                {"stock_code": "000002", "stock_name": "乙公司", "market": "SZ"},
+            ]
+        )
+        service = TdxPluginService(
+            topic_knowledge_service=topic_knowledge,
+            quote_fetcher=AsyncMock(return_value={
+                "000001": {"name": "甲公司", "price": 10, "change_pct": 2.5, "amount": 1000},
+            }),
+        )
+
+        with patch.object(
+            service.realtime_limit_up_service,
+            "get_fast_limit_up_pool",
+            AsyncMock(return_value=[]),
+        ):
+            payload = await service.get_plate_constituents("测试题材", date(2026, 5, 28))
+
+        self.assertEqual(payload["source_status"]["tencent_quote"], "partial")
+        self.assertEqual(payload["summary"]["quoted_count"], 1)
+        self.assertTrue(any("1/2" in warning for warning in payload["warnings"]))
+        self.assertEqual([item["stock_code"] for item in payload["items"]], ["000001", "000002"])
+
+    async def test_plate_constituents_do_not_invent_dragons_without_intraday_data(self):
+        topic_knowledge = SimpleNamespace(
+            find_stocks_by_topic=lambda _plate: [
+                {"stock_code": "000001", "stock_name": "甲公司", "market": "SZ", "match_reason": "测试题材"},
+                {"stock_code": "000002", "stock_name": "乙公司", "market": "SZ", "match_reason": "测试题材"},
+            ]
+        )
+        service = TdxPluginService(
+            topic_knowledge_service=topic_knowledge,
+            quote_fetcher=AsyncMock(return_value={}),
+        )
+
+        with patch.object(
+            service.realtime_limit_up_service,
+            "get_fast_limit_up_pool",
+            AsyncMock(return_value=[]),
+        ):
+            payload = await service.get_plate_constituents("测试题材", date(2026, 5, 28))
+
+        self.assertEqual([item["dragon_tag"] for item in payload["items"]], [None, None])
+        self.assertEqual([item["tags"] for item in payload["items"]], [[], []])
 
     async def test_stock_move_combines_limit_up_reason_and_metadata(self):
         service = TdxPluginService()
