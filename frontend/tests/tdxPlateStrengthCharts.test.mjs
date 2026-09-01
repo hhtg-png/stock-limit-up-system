@@ -206,6 +206,22 @@ test('builds a plate constituent request and keeps only one expanded plate', asy
   assert.equal(helper.nextExpandedPlate('房地产', '半导体'), '半导体')
 })
 
+test('pages the constituent scroller without moving beyond either boundary', async () => {
+  const source = readFileSync(helperPath, 'utf8')
+  const transpiled = ts.transpileModule(source, {
+    compilerOptions: {
+      module: ts.ModuleKind.ESNext,
+      target: ts.ScriptTarget.ES2020
+    }
+  }).outputText
+  const helper = await import(`data:text/javascript;charset=utf-8,${encodeURIComponent(transpiled)}`)
+
+  assert.equal(helper.nextConstituentScrollTop(0, 200, 1000, 'down'), 170)
+  assert.equal(helper.nextConstituentScrollTop(170, 200, 1000, 'up'), 0)
+  assert.equal(helper.nextConstituentScrollTop(790, 200, 1000, 'down'), 800)
+  assert.equal(helper.nextConstituentScrollTop(0, 200, 150, 'down'), 0)
+})
+
 test('shows the actual constituent membership provenance in the expanded panel', () => {
   const source = readFileSync(viewPath, 'utf8')
 

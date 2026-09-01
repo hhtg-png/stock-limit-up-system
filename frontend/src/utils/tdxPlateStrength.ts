@@ -46,6 +46,7 @@ export interface IntradayTagStyleInput {
 }
 
 export type CompactChartMode = 'strength' | 'breadth' | 'rotation'
+export type ConstituentScrollDirection = 'up' | 'down'
 
 export function normalizeCompactChartMode(value: string, showTrend: boolean): CompactChartMode {
   if (value === 'breadth') return 'breadth'
@@ -110,6 +111,20 @@ export function buildPlateConstituentRequest(plateName: string, source: string):
 
 export function nextExpandedPlate(currentPlate: string | null, clickedPlate: string): string | null {
   return currentPlate === clickedPlate ? null : clickedPlate
+}
+
+export function nextConstituentScrollTop(
+  scrollTop: number,
+  clientHeight: number,
+  scrollHeight: number,
+  direction: ConstituentScrollDirection
+): number {
+  const maxScrollTop = Math.max(0, scrollHeight - clientHeight)
+  const pageDistance = Math.max(34, Math.floor(clientHeight * 0.85))
+  const nextScrollTop = direction === 'up'
+    ? scrollTop - pageDistance
+    : scrollTop + pageDistance
+  return Math.min(maxScrollTop, Math.max(0, nextScrollTop))
 }
 
 export class PlateStrengthRequestGate {

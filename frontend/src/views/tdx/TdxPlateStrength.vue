@@ -182,6 +182,10 @@
                       涨停{{ currentConstituentPayload.summary.limit_up_count }}
                     </span>
                     <span v-if="constituentLoading" class="loading-note">刷新中...</span>
+                    <span v-if="constituentItems.length" class="constituent-scroll-actions">
+                      <button type="button" @click.stop="scrollConstituents($event, 'up')">上翻</button>
+                      <button type="button" @click.stop="scrollConstituents($event, 'down')">下翻</button>
+                    </span>
                   </div>
                   <div v-if="currentConstituentPayload?.source_note" class="constituent-source-note">
                     成分口径：{{ currentConstituentPayload.source_note }}
@@ -193,7 +197,14 @@
                   <div v-else-if="!constituentItems.length" class="constituent-state">
                     {{ currentConstituentPayload?.warnings?.[0] || '暂无匹配的板块成分股' }}
                   </div>
-                  <div v-else class="constituent-scroll">
+                  <div
+                    v-else
+                    class="constituent-scroll"
+                    tabindex="0"
+                    aria-label="板块成分股滚动列表"
+                    @wheel.stop
+                    @touchmove.stop
+                  >
                     <table class="constituent-table">
                       <thead>
                         <tr>
@@ -267,12 +278,13 @@ import {
   hasRenderableChartSize,
   intradayTagClass,
   matchesPlateStrengthSelection,
+  nextConstituentScrollTop,
   nextExpandedPlate,
   normalizeCompactChartMode,
   normalizePlateStrengthWindow,
   PlateStrengthRequestGate
 } from '@/utils/tdxPlateStrength'
-import type { CompactChartMode } from '@/utils/tdxPlateStrength'
+import type { CompactChartMode, ConstituentScrollDirection } from '@/utils/tdxPlateStrength'
 import type {
   TdxIntradayTag,
   TdxPlateConstituent,
@@ -423,6 +435,21 @@ function closePlate() {
   constituentPayload.value = null
   constituentError.value = ''
   constituentLoading.value = false
+}
+
+function scrollConstituents(event: MouseEvent, direction: ConstituentScrollDirection) {
+  const trigger = event.currentTarget as HTMLElement | null
+  const scrollElement = trigger
+    ?.closest('.constituent-panel')
+    ?.querySelector<HTMLDivElement>('.constituent-scroll')
+  if (!scrollElement) return
+  scrollElement.scrollTop = nextConstituentScrollTop(
+    scrollElement.scrollTop,
+    scrollElement.clientHeight,
+    scrollElement.scrollHeight,
+    direction
+  )
+  scrollElement.focus()
 }
 
 async function loadConstituents(silent = false) {
@@ -951,6 +978,29 @@ onUnmounted(() => {
   color: #f0ad4e;
 }
 
+.constituent-scroll-actions {
+  display: inline-flex;
+  gap: 4px;
+  margin-left: auto;
+}
+
+.constituent-scroll-actions button {
+  height: 22px;
+  padding: 0 7px;
+  border: 1px solid #3a4354;
+  border-radius: 2px;
+  background: #1b2130;
+  color: #bcc6d8;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.constituent-scroll-actions button:hover,
+.constituent-scroll-actions button:focus-visible {
+  border-color: #70809a;
+  color: #fff;
+}
+
 .constituent-source-note {
   padding: 5px 9px;
   border-bottom: 1px solid #242a36;
@@ -958,8 +1008,33 @@ onUnmounted(() => {
 }
 
 .constituent-scroll {
-  max-height: 360px;
-  overflow: auto;
+  height: 360px;
+  min-height: 180px;
+  max-height: calc(100vh - 220px);
+  overflow-x: auto;
+  overflow-y: scroll;
+  overscroll-behavior: contain;
+  scrollbar-color: #4b5568 #11151e;
+  scrollbar-width: thin;
+}
+
+.constituent-scroll:focus {
+  outline: 1px solid #44516a;
+  outline-offset: -1px;
+}
+
+.constituent-scroll::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.constituent-scroll::-webkit-scrollbar-track {
+  background: #11151e;
+}
+
+.constituent-scroll::-webkit-scrollbar-thumb {
+  border-radius: 4px;
+  background: #4b5568;
 }
 
 .constituent-table {
@@ -1334,10 +1409,14 @@ onUnmounted(() => {
   }
 
   .constituent-summary strong {
-    width: 100%;
+    flex: 1 1 190px;
   }
 
   .loading-note {
+    margin-left: 0;
+  }
+
+  .constituent-scroll-actions {
     margin-left: 0;
   }
 
@@ -1347,9 +1426,12 @@ onUnmounted(() => {
   }
 
   .constituent-scroll {
-    max-height: 430px;
+    height: 320px;
+    min-height: 170px;
+    max-height: calc(100vh - 260px);
     overflow-x: hidden;
-    overflow-y: auto;
+    overflow-y: scroll;
+    -webkit-overflow-scrolling: touch;
   }
 
   .constituent-table,
