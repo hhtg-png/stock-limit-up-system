@@ -1,9 +1,10 @@
 <template>
-  <main class="target-strong">
+  <main class="target-strong" :class="{ 'drawer-open': isNarrowLayout && expandedPlate }">
     <header class="strong-top">
       <strong>板块轮动</strong>
       <div class="live-meta">
         <button
+          v-if="layout.showCharts"
           type="button"
           class="trend-toggle"
           role="switch"
@@ -39,7 +40,7 @@
       </button>
     </div>
 
-    <div v-show="showTrend" id="dates">
+    <div v-show="layout.showCharts && showTrend" id="dates">
       <div class="scroll-container">
         <div class="dates-container">
           <button
@@ -72,7 +73,7 @@
 
     <div v-if="errorText" class="state-line error-line">{{ errorText }}</div>
 
-    <nav class="compact-chart-tabs" aria-label="窄屏图表切换">
+    <nav v-if="layout.showCharts" class="compact-chart-tabs" aria-label="窄屏图表切换">
       <button
         type="button"
         :class="{ active: compactChartMode === 'strength' }"
@@ -94,7 +95,7 @@
       >题材轮动</button>
     </nav>
 
-    <section class="chart-shell" aria-label="板块强度图表">
+    <section v-if="layout.showCharts" class="chart-shell" aria-label="板块强度图表">
       <article class="chart-card strength-card" :class="{ 'compact-active': compactChartMode === 'strength' }">
         <h2>当前强度</h2>
         <div id="main2" ref="strengthChartEl" class="chart"></div>
@@ -135,7 +136,11 @@
         </thead>
         <tbody>
           <template v-for="item in items" :key="item.plate_name">
-            <tr :class="{ expanded: expandedPlate === item.plate_name }">
+            <tr
+              :class="{ expanded: expandedPlate === item.plate_name }"
+              @click="handlePlateRowClick(item.plate_name)"
+              @keydown.enter.prevent="handlePlateRowClick(item.plate_name)"
+            >
               <td>
                 {{ item.rank }}
                 <small v-if="item.rank_change" class="rank-change" :class="item.rank_change > 0 ? 'up' : 'down'">
@@ -143,7 +148,7 @@
                 </small>
               </td>
               <td class="plate-name">
-                <button type="button" class="plate-link" @click="togglePlate(item.plate_name)">
+                <button type="button" class="plate-link" @click.stop="togglePlate(item.plate_name)">
                   <span class="expand-arrow">{{ expandedPlate === item.plate_name ? '▾' : '▸' }}</span>
                   {{ item.plate_name }}
                 </button>
@@ -164,7 +169,7 @@
                   type="button"
                   :class="{ opened: !stock.is_sealed }"
                   :title="`${stock.stock_code} · ${stock.is_sealed ? '封板' : '已开板'}`"
-                  @click="openStock(stock.stock_code)"
+                  @click.stop="openStock(stock.stock_code)"
                 >
                   {{ stock.stock_name }}{{ stock.board }}
                 </button>
@@ -172,7 +177,7 @@
             </tr>
             <tr v-if="expandedPlate === item.plate_name" class="constituent-row">
               <td colspan="7" class="constituent-cell">
-                <div class="constituent-panel">
+                <div class="constituent-panel" @wheel.stop @touchmove.stop>
                   <div class="constituent-summary">
                     <strong>{{ item.plate_name }} · 成分股实时涨幅</strong>
                     <span v-if="currentConstituentPayload?.summary">
@@ -186,6 +191,12 @@
                       <button type="button" @click.stop="scrollConstituents($event, 'up')">上翻</button>
                       <button type="button" @click.stop="scrollConstituents($event, 'down')">下翻</button>
                     </span>
+                    <button
+                      type="button"
+                      class="mobile-drawer-close"
+                      aria-label="关闭成分股"
+                      @click.stop="closePlate"
+                    >×</button>
                   </div>
                   <div v-if="currentConstituentPayload?.source_note" class="constituent-source-note">
                     成分口径：{{ currentConstituentPayload.source_note }}
@@ -202,8 +213,6 @@
                     class="constituent-scroll"
                     tabindex="0"
                     aria-label="板块成分股滚动列表"
-                    @wheel.stop
-                    @touchmove.stop
                   >
                     <table class="constituent-table">
                       <thead>
@@ -282,7 +291,8 @@ import {
   nextExpandedPlate,
   normalizeCompactChartMode,
   normalizePlateStrengthWindow,
-  PlateStrengthRequestGate
+  PlateStrengthRequestGate,
+  resolvePlateStrengthLayout
 } from '@/utils/tdxPlateStrength'
 import type { CompactChartMode, ConstituentScrollDirection } from '@/utils/tdxPlateStrength'
 import type {
@@ -302,6 +312,7 @@ const customMode = ref(false)
 const customWindow = ref(20)
 const showTrend = ref(true)
 const compactChartMode = ref<CompactChartMode>('strength')
+const layout = ref(resolvePlateStrengthLayout(typeof window === 'undefined' ? 1024 : window.innerWidth))
 const expandedPlate = ref<string | null>(null)
 const constituentPayload = ref<TdxPlateConstituentPayload | null>(null)
 const constituentLoading = ref(false)
@@ -331,6 +342,7 @@ const currentConstituentPayload = computed(() => (
     : null
 ))
 const constituentItems = computed(() => currentConstituentPayload.value?.items || [])
+const isNarrowLayout = computed(() => layout.value.constituentPresentation === 'bottom-drawer')
 const updatedAt = computed(() => (currentPayload.value?.updated_at || '').replace('T', ' ').slice(5, 19))
 const emptyText = computed(() => currentPayload.value?.warnings?.[0] || '暂无板块题材强度数据')
 const sourceLabel = computed(() => (
@@ -428,6 +440,11 @@ function togglePlate(plateName: string) {
   constituentPayload.value = null
   constituentError.value = ''
   void loadConstituents(false)
+}
+
+function handlePlateRowClick(plateName: string) {
+  if (!isNarrowLayout.value) return
+  togglePlate(plateName)
 }
 
 function closePlate() {
@@ -605,6 +622,37 @@ function clearCharts() {
   rotationChart?.clear()
 }
 
+function disposeCharts() {
+  strengthChart?.dispose()
+  breadthChart?.dispose()
+  rotationChart?.dispose()
+  strengthChart = null
+  breadthChart = null
+  rotationChart = null
+}
+
+function syncResponsiveLayout() {
+  const nextLayout = resolvePlateStrengthLayout(window.innerWidth)
+  if (
+    nextLayout.showCharts === layout.value.showCharts &&
+    nextLayout.constituentPresentation === layout.value.constituentPresentation
+  ) return
+
+  if (layout.value.showCharts && !nextLayout.showCharts) disposeCharts()
+  layout.value = nextLayout
+  if (nextLayout.showCharts) {
+    void nextTick().then(() => {
+      renderCharts()
+      resizeCharts()
+    })
+  }
+}
+
+function handleViewportResize() {
+  syncResponsiveLayout()
+  resizeCharts()
+}
+
 function resizeCharts() {
   const hasNewlyVisibleChart = (
     (!strengthChart && strengthChartEl.value && hasRenderableChartSize(strengthChartEl.value.clientWidth, strengthChartEl.value.clientHeight)) ||
@@ -625,27 +673,28 @@ function resizeCharts() {
 }
 
 onMounted(() => {
+  syncResponsiveLayout()
   void loadData()
   refreshTimer = window.setInterval(() => {
     void loadData(true)
     if (expandedPlate.value) void loadConstituents(true)
   }, 5000)
-  window.addEventListener('resize', resizeCharts)
+  window.addEventListener('resize', handleViewportResize)
 })
 
 onUnmounted(() => {
   window.clearInterval(refreshTimer)
-  window.removeEventListener('resize', resizeCharts)
-  strengthChart?.dispose()
-  breadthChart?.dispose()
-  rotationChart?.dispose()
+  window.removeEventListener('resize', handleViewportResize)
+  disposeCharts()
 })
 </script>
 
 <style scoped>
 .target-strong {
-  min-height: 100vh;
+  height: 100vh;
+  min-height: 0;
   overflow: auto;
+  -webkit-overflow-scrolling: touch;
   background: #111219;
   color: #e2e8f0;
   font-size: 12px;
@@ -973,6 +1022,10 @@ onUnmounted(() => {
   font-size: 12px;
 }
 
+.mobile-drawer-close {
+  display: none;
+}
+
 .loading-note {
   margin-left: auto;
   color: #f0ad4e;
@@ -1188,6 +1241,11 @@ onUnmounted(() => {
   color: #c5ae7d;
 }
 
+@keyframes constituent-drawer-rise {
+  from { transform: translateY(100%); }
+  to { transform: translateY(0); }
+}
+
 @media (max-width: 760px) {
   .strong-top,
   .rank-summary {
@@ -1201,8 +1259,12 @@ onUnmounted(() => {
 
 @media (max-width: 520px) {
   .target-strong {
-    min-height: 100dvh;
-    overflow-x: hidden;
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    height: 100dvh;
+    min-height: 0;
+    overflow: hidden;
   }
 
   .strong-top {
@@ -1228,9 +1290,7 @@ onUnmounted(() => {
   }
 
   .compact-chart-tabs {
-    display: flex;
-    gap: 3px;
-    padding: 4px 4px 0;
+    display: none;
   }
 
   .compact-chart-tabs button {
@@ -1253,7 +1313,7 @@ onUnmounted(() => {
   }
 
   .chart-shell {
-    display: block;
+    display: none;
     min-width: 0;
     padding: 4px;
   }
@@ -1273,8 +1333,21 @@ onUnmounted(() => {
   }
 
   .rank-panel {
+    box-sizing: border-box;
+    flex: 1 1 0;
     min-width: 0;
+    min-height: 0;
     padding: 0 4px 4px;
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    scrollbar-color: #4b5568 #11151e;
+    scrollbar-width: thin;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .drawer-open .rank-panel {
+    padding-bottom: calc(min(58dvh, 480px) + 8px);
   }
 
   .rank-summary {
@@ -1306,6 +1379,7 @@ onUnmounted(() => {
     border: 1px solid #292d38;
     border-top: 0;
     background: #111219;
+    cursor: pointer;
   }
 
   .strong-table > tbody > tr:not(.constituent-row):hover,
@@ -1401,6 +1475,31 @@ onUnmounted(() => {
     width: 100%;
   }
 
+  .constituent-row {
+    position: fixed;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    z-index: 20;
+    height: min(58dvh, 480px);
+    border-top: 1px solid #59657a;
+    background: #0d1017;
+    box-shadow: 0 -8px 24px rgb(0 0 0 / 55%);
+    animation: constituent-drawer-rise 160ms ease-out;
+  }
+
+  .strong-table td.constituent-cell {
+    height: 100%;
+  }
+
+  .constituent-panel {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    min-height: 0;
+    overflow: hidden;
+  }
+
   .constituent-summary {
     flex-wrap: wrap;
     gap: 2px 8px;
@@ -1412,12 +1511,30 @@ onUnmounted(() => {
     flex: 1 1 190px;
   }
 
+  .mobile-drawer-close {
+    display: inline-flex;
+    flex: 0 0 24px;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    margin-left: auto;
+    padding: 0;
+    border: 1px solid #4b5568;
+    border-radius: 3px;
+    background: #191c25;
+    color: #d8dee9;
+    font-size: 18px;
+    line-height: 1;
+    cursor: pointer;
+  }
+
   .loading-note {
     margin-left: 0;
   }
 
   .constituent-scroll-actions {
-    margin-left: 0;
+    display: none;
   }
 
   .constituent-source-note {
@@ -1426,11 +1543,13 @@ onUnmounted(() => {
   }
 
   .constituent-scroll {
-    height: 320px;
-    min-height: 170px;
-    max-height: calc(100vh - 260px);
+    flex: 1 1 auto;
+    height: 0;
+    min-height: 0;
+    max-height: none;
     overflow-x: hidden;
-    overflow-y: scroll;
+    overflow-y: auto;
+    overscroll-behavior: contain;
     -webkit-overflow-scrolling: touch;
   }
 

@@ -123,6 +123,30 @@ test('does not initialize a chart while its responsive container is hidden', asy
   assert.equal(helper.hasRenderableChartSize(390, 0), false)
 })
 
+test('uses a chart-free bottom drawer layout only on narrow plugin widths', async () => {
+  const source = readFileSync(helperPath, 'utf8')
+  const transpiled = ts.transpileModule(source, {
+    compilerOptions: {
+      module: ts.ModuleKind.ESNext,
+      target: ts.ScriptTarget.ES2020
+    }
+  }).outputText
+  const helper = await import(`data:text/javascript;charset=utf-8,${encodeURIComponent(transpiled)}`)
+
+  assert.deepEqual(helper.resolvePlateStrengthLayout(390), {
+    showCharts: false,
+    constituentPresentation: 'bottom-drawer'
+  })
+  assert.deepEqual(helper.resolvePlateStrengthLayout(520), {
+    showCharts: false,
+    constituentPresentation: 'bottom-drawer'
+  })
+  assert.deepEqual(helper.resolvePlateStrengthLayout(521), {
+    showCharts: true,
+    constituentPresentation: 'inline'
+  })
+})
+
 test('builds API parameters for each supported plate source', async () => {
   assert.ok(existsSync(helperPath), 'plate-strength chart model helper should exist')
 

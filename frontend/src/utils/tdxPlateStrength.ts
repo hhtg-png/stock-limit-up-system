@@ -47,6 +47,20 @@ export interface IntradayTagStyleInput {
 
 export type CompactChartMode = 'strength' | 'breadth' | 'rotation'
 export type ConstituentScrollDirection = 'up' | 'down'
+export type PlateStrengthConstituentPresentation = 'inline' | 'bottom-drawer'
+
+export interface PlateStrengthLayout {
+  showCharts: boolean
+  constituentPresentation: PlateStrengthConstituentPresentation
+}
+
+export function resolvePlateStrengthLayout(width: number): PlateStrengthLayout {
+  const isNarrow = width <= 520
+  return {
+    showCharts: !isNarrow,
+    constituentPresentation: isNarrow ? 'bottom-drawer' : 'inline'
+  }
+}
 
 export function normalizeCompactChartMode(value: string, showTrend: boolean): CompactChartMode {
   if (value === 'breadth') return 'breadth'
