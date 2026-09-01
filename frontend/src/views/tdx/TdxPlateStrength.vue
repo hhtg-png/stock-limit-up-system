@@ -72,16 +72,42 @@
 
     <div v-if="errorText" class="state-line error-line">{{ errorText }}</div>
 
+    <nav class="compact-chart-tabs" aria-label="窄屏图表切换">
+      <button
+        type="button"
+        :class="{ active: compactChartMode === 'strength' }"
+        :aria-pressed="compactChartMode === 'strength'"
+        @click="selectCompactChart('strength')"
+      >当前强度</button>
+      <button
+        type="button"
+        :class="{ active: compactChartMode === 'breadth' }"
+        :aria-pressed="compactChartMode === 'breadth'"
+        @click="selectCompactChart('breadth')"
+      >涨停广度</button>
+      <button
+        v-if="showTrend"
+        type="button"
+        :class="{ active: compactChartMode === 'rotation' }"
+        :aria-pressed="compactChartMode === 'rotation'"
+        @click="selectCompactChart('rotation')"
+      >题材轮动</button>
+    </nav>
+
     <section class="chart-shell" aria-label="板块强度图表">
-      <article class="chart-card strength-card">
+      <article class="chart-card strength-card" :class="{ 'compact-active': compactChartMode === 'strength' }">
         <h2>当前强度</h2>
         <div id="main2" ref="strengthChartEl" class="chart"></div>
       </article>
-      <article class="chart-card breadth-card">
+      <article class="chart-card breadth-card" :class="{ 'compact-active': compactChartMode === 'breadth' }">
         <h2>涨停广度</h2>
         <div id="main3" ref="breadthChartEl" class="chart"></div>
       </article>
-      <article v-show="showTrend" class="chart-card rotation-card">
+      <article
+        v-show="showTrend"
+        class="chart-card rotation-card"
+        :class="{ 'compact-active': compactChartMode === 'rotation' }"
+      >
         <h2>题材轮动 · 近{{ selectedWindow }}个交易日</h2>
         <div id="main1" ref="rotationChartEl" class="chart"></div>
       </article>
@@ -197,11 +223,11 @@
                               :title="tag.reason"
                             >{{ tag.label }}</span>
                           </td>
-                          <td>{{ formatPrice(stock.price) }}</td>
-                          <td :class="changeClass(stock.change_pct)">{{ formatPct(stock.change_pct) }}</td>
-                          <td>{{ formatAmount(stock.amount) }}</td>
-                          <td>{{ stock.turnover_rate ? `${stock.turnover_rate.toFixed(2)}%` : '--' }}</td>
-                          <td>
+                          <td data-label="现价">{{ formatPrice(stock.price) }}</td>
+                          <td data-label="涨幅" :class="changeClass(stock.change_pct)">{{ formatPct(stock.change_pct) }}</td>
+                          <td data-label="成交">{{ formatAmount(stock.amount) }}</td>
+                          <td data-label="换手">{{ stock.turnover_rate ? `${stock.turnover_rate.toFixed(2)}%` : '--' }}</td>
+                          <td data-label="状态">
                             <span v-if="stock.board" :class="stock.is_sealed ? 'limit-state' : 'opened-state'">
                               {{ stock.is_sealed ? `${stock.board}板封板` : `${stock.board}板开板` }}
                             </span>
@@ -238,12 +264,15 @@ import {
   buildPlateStrengthChartData,
   buildPlateConstituentRequest,
   buildPlateStrengthRequest,
+  hasRenderableChartSize,
   intradayTagClass,
   matchesPlateStrengthSelection,
   nextExpandedPlate,
+  normalizeCompactChartMode,
   normalizePlateStrengthWindow,
   PlateStrengthRequestGate
 } from '@/utils/tdxPlateStrength'
+import type { CompactChartMode } from '@/utils/tdxPlateStrength'
 import type {
   TdxIntradayTag,
   TdxPlateConstituent,
@@ -260,6 +289,7 @@ const selectedWindow = ref(20)
 const customMode = ref(false)
 const customWindow = ref(20)
 const showTrend = ref(true)
+const compactChartMode = ref<CompactChartMode>('strength')
 const expandedPlate = ref<string | null>(null)
 const constituentPayload = ref<TdxPlateConstituentPayload | null>(null)
 const constituentLoading = ref(false)
@@ -363,10 +393,16 @@ function applyCustomWindow() {
 
 async function toggleTrend() {
   showTrend.value = !showTrend.value
-  if (showTrend.value) {
-    await nextTick()
-    renderCharts()
-  }
+  compactChartMode.value = normalizeCompactChartMode(compactChartMode.value, showTrend.value)
+  await nextTick()
+  renderCharts()
+  resizeCharts()
+}
+
+async function selectCompactChart(mode: CompactChartMode) {
+  compactChartMode.value = normalizeCompactChartMode(mode, showTrend.value)
+  await nextTick()
+  renderCharts()
   resizeCharts()
 }
 
@@ -448,86 +484,92 @@ function renderCharts() {
   if (!currentPayload.value || !strengthChartEl.value || !breadthChartEl.value || !rotationChartEl.value) return
   const chartData = buildPlateStrengthChartData(currentPayload.value)
 
-  strengthChart ||= echarts.init(strengthChartEl.value, undefined, { renderer: 'canvas' })
-  strengthChart.setOption({
-    animationDuration: 300,
-    grid: { top: 6, right: 38, bottom: 22, left: 86 },
-    tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
-    xAxis: {
-      type: 'value',
-      splitLine: { lineStyle: { color: '#252936' } },
-      axisLabel: { color: '#8f98aa' }
-    },
-    yAxis: {
-      type: 'category',
-      data: chartData.strength.names,
-      axisLabel: { color: '#d8dee9', width: 78, overflow: 'truncate' },
-      axisLine: { lineStyle: { color: '#343a48' } }
-    },
-    series: [{
-      name: '强度',
-      type: 'bar',
-      data: chartData.strength.scores,
-      barMaxWidth: 16,
-      label: { show: true, position: 'right', color: '#ff7b72' },
-      itemStyle: { color: '#b23b37', borderRadius: [0, 3, 3, 0] }
-    }]
-  }, true)
+  if (hasRenderableChartSize(strengthChartEl.value.clientWidth, strengthChartEl.value.clientHeight)) {
+    strengthChart ||= echarts.init(strengthChartEl.value, undefined, { renderer: 'canvas' })
+    strengthChart.setOption({
+      animationDuration: 300,
+      grid: { top: 6, right: 38, bottom: 22, left: 86 },
+      tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
+      xAxis: {
+        type: 'value',
+        splitLine: { lineStyle: { color: '#252936' } },
+        axisLabel: { color: '#8f98aa' }
+      },
+      yAxis: {
+        type: 'category',
+        data: chartData.strength.names,
+        axisLabel: { color: '#d8dee9', width: 78, overflow: 'truncate' },
+        axisLine: { lineStyle: { color: '#343a48' } }
+      },
+      series: [{
+        name: '强度',
+        type: 'bar',
+        data: chartData.strength.scores,
+        barMaxWidth: 16,
+        label: { show: true, position: 'right', color: '#ff7b72' },
+        itemStyle: { color: '#b23b37', borderRadius: [0, 3, 3, 0] }
+      }]
+    }, true)
+  }
 
-  breadthChart ||= echarts.init(breadthChartEl.value, undefined, { renderer: 'canvas' })
-  breadthChart.setOption({
-    animationDuration: 300,
-    color: ['#d84a4a', '#687080'],
-    grid: { top: 20, right: 12, bottom: 56, left: 38 },
-    legend: { top: 0, right: 8, textStyle: { color: '#aab2c0' }, data: ['封板', '开板'] },
-    tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
-    xAxis: {
-      type: 'category',
-      data: chartData.breadth.names,
-      axisLabel: { color: '#9aa4b2', rotate: 35, interval: 0 },
-      axisLine: { lineStyle: { color: '#343a48' } }
-    },
-    yAxis: {
-      type: 'value',
-      minInterval: 1,
-      axisLabel: { color: '#8f98aa' },
-      splitLine: { lineStyle: { color: '#252936' } }
-    },
-    series: [
-      { name: '封板', type: 'bar', stack: 'total', data: chartData.breadth.sealed, barMaxWidth: 22 },
-      { name: '开板', type: 'bar', stack: 'total', data: chartData.breadth.opened, barMaxWidth: 22 }
-    ]
-  }, true)
+  if (hasRenderableChartSize(breadthChartEl.value.clientWidth, breadthChartEl.value.clientHeight)) {
+    breadthChart ||= echarts.init(breadthChartEl.value, undefined, { renderer: 'canvas' })
+    breadthChart.setOption({
+      animationDuration: 300,
+      color: ['#d84a4a', '#687080'],
+      grid: { top: 20, right: 12, bottom: 56, left: 38 },
+      legend: { top: 0, right: 8, textStyle: { color: '#aab2c0' }, data: ['封板', '开板'] },
+      tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
+      xAxis: {
+        type: 'category',
+        data: chartData.breadth.names,
+        axisLabel: { color: '#9aa4b2', rotate: 35, interval: 0 },
+        axisLine: { lineStyle: { color: '#343a48' } }
+      },
+      yAxis: {
+        type: 'value',
+        minInterval: 1,
+        axisLabel: { color: '#8f98aa' },
+        splitLine: { lineStyle: { color: '#252936' } }
+      },
+      series: [
+        { name: '封板', type: 'bar', stack: 'total', data: chartData.breadth.sealed, barMaxWidth: 22 },
+        { name: '开板', type: 'bar', stack: 'total', data: chartData.breadth.opened, barMaxWidth: 22 }
+      ]
+    }, true)
+  }
 
-  rotationChart ||= echarts.init(rotationChartEl.value, undefined, { renderer: 'canvas' })
-  rotationChart.setOption({
-    animationDuration: 300,
-    color: ['#f0be83', '#ff6b6b', '#9d7cff', '#4ecdc4', '#6ea8fe', '#c0ca55'],
-    grid: { top: 34, right: 20, bottom: 28, left: 44 },
-    legend: { top: 0, textStyle: { color: '#aab2c0' } },
-    tooltip: { trigger: 'axis' },
-    xAxis: {
-      type: 'category',
-      boundaryGap: false,
-      data: chartData.rotation.dates,
-      axisLabel: { color: '#8f98aa' },
-      axisLine: { lineStyle: { color: '#343a48' } }
-    },
-    yAxis: {
-      type: 'value',
-      axisLabel: { color: '#8f98aa' },
-      splitLine: { lineStyle: { color: '#252936' } }
-    },
-    series: chartData.rotation.series.map(series => ({
-      name: series.name,
-      type: 'line',
-      connectNulls: false,
-      showSymbol: chartData.rotation.dates.length <= 20,
-      symbolSize: 5,
-      data: series.values,
-      lineStyle: { width: 2 }
-    }))
-  }, true)
+  if (hasRenderableChartSize(rotationChartEl.value.clientWidth, rotationChartEl.value.clientHeight)) {
+    rotationChart ||= echarts.init(rotationChartEl.value, undefined, { renderer: 'canvas' })
+    rotationChart.setOption({
+      animationDuration: 300,
+      color: ['#f0be83', '#ff6b6b', '#9d7cff', '#4ecdc4', '#6ea8fe', '#c0ca55'],
+      grid: { top: 34, right: 20, bottom: 28, left: 44 },
+      legend: { top: 0, textStyle: { color: '#aab2c0' } },
+      tooltip: { trigger: 'axis' },
+      xAxis: {
+        type: 'category',
+        boundaryGap: false,
+        data: chartData.rotation.dates,
+        axisLabel: { color: '#8f98aa' },
+        axisLine: { lineStyle: { color: '#343a48' } }
+      },
+      yAxis: {
+        type: 'value',
+        axisLabel: { color: '#8f98aa' },
+        splitLine: { lineStyle: { color: '#252936' } }
+      },
+      series: chartData.rotation.series.map(series => ({
+        name: series.name,
+        type: 'line',
+        connectNulls: false,
+        showSymbol: chartData.rotation.dates.length <= 20,
+        symbolSize: 5,
+        data: series.values,
+        lineStyle: { width: 2 }
+      }))
+    }, true)
+  }
 }
 
 function clearCharts() {
@@ -537,9 +579,22 @@ function clearCharts() {
 }
 
 function resizeCharts() {
-  strengthChart?.resize()
-  breadthChart?.resize()
-  rotationChart?.resize()
+  const hasNewlyVisibleChart = (
+    (!strengthChart && strengthChartEl.value && hasRenderableChartSize(strengthChartEl.value.clientWidth, strengthChartEl.value.clientHeight)) ||
+    (!breadthChart && breadthChartEl.value && hasRenderableChartSize(breadthChartEl.value.clientWidth, breadthChartEl.value.clientHeight)) ||
+    (!rotationChart && rotationChartEl.value && hasRenderableChartSize(rotationChartEl.value.clientWidth, rotationChartEl.value.clientHeight))
+  )
+  if (hasNewlyVisibleChart) renderCharts()
+
+  if (strengthChartEl.value && hasRenderableChartSize(strengthChartEl.value.clientWidth, strengthChartEl.value.clientHeight)) {
+    strengthChart?.resize()
+  }
+  if (breadthChartEl.value && hasRenderableChartSize(breadthChartEl.value.clientWidth, breadthChartEl.value.clientHeight)) {
+    breadthChart?.resize()
+  }
+  if (rotationChartEl.value && hasRenderableChartSize(rotationChartEl.value.clientWidth, rotationChartEl.value.clientHeight)) {
+    rotationChart?.resize()
+  }
 }
 
 onMounted(() => {
@@ -720,6 +775,10 @@ onUnmounted(() => {
   background: #0f1118;
   color: #f0be83;
   text-align: center;
+}
+
+.compact-chart-tabs {
+  display: none;
 }
 
 .chart-shell {
@@ -1062,6 +1121,335 @@ onUnmounted(() => {
     gap: 2px;
     padding-top: 4px;
     padding-bottom: 4px;
+  }
+}
+
+@media (max-width: 520px) {
+  .target-strong {
+    min-height: 100dvh;
+    overflow-x: hidden;
+  }
+
+  .strong-top {
+    align-items: center;
+    flex-direction: row;
+    flex-wrap: wrap;
+    gap: 3px 8px;
+    padding: 4px 6px;
+  }
+
+  .live-meta {
+    gap: 6px;
+    margin-left: auto;
+    font-size: 11px;
+  }
+
+  .trend-toggle {
+    gap: 3px;
+  }
+
+  .dates-container {
+    padding: 4px;
+  }
+
+  .compact-chart-tabs {
+    display: flex;
+    gap: 3px;
+    padding: 4px 4px 0;
+  }
+
+  .compact-chart-tabs button {
+    flex: 1;
+    min-width: 0;
+    height: 25px;
+    padding: 0 4px;
+    border: 1px solid #343a48;
+    border-radius: 3px;
+    background: #191c25;
+    color: #8f98aa;
+    font-size: 11px;
+    cursor: pointer;
+  }
+
+  .compact-chart-tabs button.active {
+    border-color: #b23b37;
+    background: #2a1b20;
+    color: #ff8f8f;
+  }
+
+  .chart-shell {
+    display: block;
+    min-width: 0;
+    padding: 4px;
+  }
+
+  .chart-card:not(.compact-active) {
+    display: none;
+  }
+
+  .chart-card h2 {
+    height: 23px;
+    padding: 5px 7px 0;
+  }
+
+  .chart,
+  .rotation-card .chart {
+    height: 168px;
+  }
+
+  .rank-panel {
+    min-width: 0;
+    padding: 0 4px 4px;
+  }
+
+  .rank-summary {
+    min-height: 0;
+    gap: 2px;
+    padding: 5px 7px;
+    line-height: 16px;
+  }
+
+  .strong-table,
+  .strong-table > tbody {
+    display: block;
+    width: 100%;
+  }
+
+  .strong-table > thead {
+    display: none;
+  }
+
+  .strong-table > tbody > tr:not(.constituent-row) {
+    display: grid;
+    grid-template-areas:
+      'rank plate score limit'
+      'seal seal height height'
+      'core core core core';
+    grid-template-columns: 32px minmax(0, 1fr) 78px 44px;
+    align-items: center;
+    padding: 6px 7px;
+    border: 1px solid #292d38;
+    border-top: 0;
+    background: #111219;
+  }
+
+  .strong-table > tbody > tr:not(.constituent-row):hover,
+  .strong-table > tbody > tr.expanded {
+    background: #1b2130;
+  }
+
+  .strong-table > tbody > tr:not(.constituent-row) > td {
+    padding: 2px 3px;
+    border: 0;
+    overflow: visible;
+    background: transparent !important;
+    text-overflow: clip;
+    white-space: normal;
+  }
+
+  .strong-table > tbody > tr:not(.constituent-row) > td:nth-child(1) {
+    grid-area: rank;
+    padding-left: 0;
+    color: #8f98aa;
+  }
+
+  .strong-table > tbody > tr:not(.constituent-row) > td:nth-child(2) {
+    grid-area: plate;
+    min-width: 0;
+    text-align: left;
+  }
+
+  .strong-table > tbody > tr:not(.constituent-row) > td:nth-child(3) {
+    grid-area: score;
+    text-align: right;
+  }
+
+  .strong-table > tbody > tr:not(.constituent-row) > td:nth-child(4) {
+    grid-area: limit;
+    text-align: right;
+  }
+
+  .strong-table > tbody > tr:not(.constituent-row) > td:nth-child(4)::before {
+    color: #697386;
+    content: '板 ';
+  }
+
+  .strong-table > tbody > tr:not(.constituent-row) > td:nth-child(5) {
+    grid-area: seal;
+    color: #aab2c0;
+    text-align: left;
+  }
+
+  .strong-table > tbody > tr:not(.constituent-row) > td:nth-child(5)::before {
+    color: #697386;
+    content: '封板率 ';
+  }
+
+  .strong-table > tbody > tr:not(.constituent-row) > td:nth-child(6) {
+    grid-area: height;
+    color: #aab2c0;
+    text-align: right;
+  }
+
+  .strong-table > tbody > tr:not(.constituent-row) > td:nth-child(6)::before {
+    color: #697386;
+    content: '高度 ';
+  }
+
+  .strong-table > tbody > tr:not(.constituent-row) > td:nth-child(7) {
+    grid-area: core;
+    padding-top: 4px;
+    text-align: left;
+  }
+
+  .strong-table > tbody > tr:not(.constituent-row) > td:nth-child(7)::before {
+    margin-right: 5px;
+    color: #697386;
+    content: '核心';
+  }
+
+  .plate-link {
+    width: 100%;
+    font-size: 13px;
+    font-weight: 600;
+  }
+
+  .core-stocks button {
+    margin: 1px 6px 1px 0;
+    padding: 1px 0;
+    font-size: 11px;
+  }
+
+  .constituent-row,
+  .strong-table td.constituent-cell {
+    display: block;
+    width: 100%;
+  }
+
+  .constituent-summary {
+    flex-wrap: wrap;
+    gap: 2px 8px;
+    padding: 6px 8px;
+    line-height: 16px;
+  }
+
+  .constituent-summary strong {
+    width: 100%;
+  }
+
+  .loading-note {
+    margin-left: 0;
+  }
+
+  .constituent-source-note {
+    padding: 5px 8px;
+    line-height: 16px;
+  }
+
+  .constituent-scroll {
+    max-height: 430px;
+    overflow-x: hidden;
+    overflow-y: auto;
+  }
+
+  .constituent-table,
+  .constituent-table > tbody {
+    display: block;
+    width: 100%;
+    min-width: 0;
+  }
+
+  .constituent-table > thead {
+    display: none;
+  }
+
+  .constituent-table > tbody > tr {
+    display: grid;
+    grid-template-areas: 'index name tags change state';
+    grid-template-columns: 22px minmax(90px, 1fr) minmax(0, auto) 64px 58px;
+    align-items: center;
+    gap: 0 4px;
+    min-height: 34px;
+    padding: 3px 6px;
+    border-bottom: 1px solid #242a36;
+  }
+
+  .strong-table .constituent-table td {
+    padding: 1px 0;
+    border: 0;
+    overflow: visible;
+    text-overflow: clip;
+    white-space: normal;
+  }
+
+  .constituent-table td:nth-child(1) {
+    grid-area: index;
+    color: #697386;
+  }
+
+  .constituent-table td:nth-child(2) {
+    grid-area: name;
+    min-width: 0;
+  }
+
+  .constituent-table td:nth-child(3) {
+    grid-area: tags;
+    min-width: 0;
+    overflow: hidden;
+    padding: 0;
+    white-space: nowrap !important;
+  }
+
+  .constituent-table td:nth-child(4) {
+    display: none;
+  }
+
+  .constituent-table td:nth-child(5) {
+    grid-area: change;
+    font-size: 13px;
+    font-weight: 700;
+    text-align: right;
+  }
+
+  .constituent-table td:nth-child(6) {
+    display: none;
+  }
+
+  .constituent-table td:nth-child(7) {
+    display: none;
+  }
+
+  .constituent-table td:nth-child(8) {
+    grid-area: state;
+    overflow: hidden;
+    font-size: 11px;
+    text-align: right;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .constituent-name button {
+    color: #f0be83;
+    font-size: 12px;
+    font-weight: 600;
+  }
+
+  .constituent-name small {
+    margin-left: 3px;
+    font-size: 10px;
+  }
+
+  .intraday-tag {
+    min-width: 24px;
+    margin: 0 1px;
+    padding: 0 3px;
+    border-radius: 2px;
+    font-size: 10px;
+    line-height: 17px;
+  }
+
+  .intraday-tags-cell .intraday-tag:first-child {
+    margin-left: 0;
   }
 }
 </style>

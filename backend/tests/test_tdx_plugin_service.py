@@ -660,6 +660,87 @@ class TdxPluginServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("本地题材映射", payload["source_note"])
         quote_fetcher.assert_awaited_once_with(["000001", "000002", "600001", "600002"])
 
+    async def test_plate_constituents_adds_missing_intraday_leader_before_tagging(self):
+        topic_knowledge = SimpleNamespace(
+            find_stocks_by_topic=lambda _plate: [
+                {
+                    "stock_code": "000011",
+                    "stock_name": "深物业A",
+                    "market": "SZ",
+                    "match_reason": "房地产开发",
+                }
+            ]
+        )
+        quote_rows = {
+            "000011": {
+                "name": "深物业A",
+                "price": 10.07,
+                "change_pct": 10.05,
+                "amount": 20000,
+                "limit_up": 10.07,
+            },
+            "000560": {
+                "name": "我爱我家",
+                "price": 2.90,
+                "change_pct": 9.85,
+                "amount": 30000,
+                "limit_up": 2.90,
+            },
+        }
+
+        async def fetch_quotes(codes):
+            return {code: quote_rows[code] for code in codes if code in quote_rows}
+
+        service = TdxPluginService(
+            topic_knowledge_service=topic_knowledge,
+            quote_fetcher=fetch_quotes,
+        )
+        limit_up_items = [
+            make_limit_up_item(
+                "000011",
+                "深物业A",
+                "房地产",
+                board=2,
+                first_time=datetime(2026, 8, 31, 9, 25),
+            ),
+            make_limit_up_item(
+                "000560",
+                "我爱我家",
+                "房地产",
+                board=3,
+                first_time=datetime(2026, 8, 31, 9, 25),
+            ),
+            make_limit_up_item(
+                "600001",
+                "无关公司",
+                "电子",
+                board=4,
+                first_time=datetime(2026, 8, 31, 9, 25),
+            ),
+        ]
+
+        with patch.object(
+            service.realtime_limit_up_service,
+            "get_fast_limit_up_pool",
+            AsyncMock(return_value=limit_up_items),
+        ):
+            payload = await service.get_plate_constituents(
+                "房地产",
+                date(2026, 8, 31),
+                source="kpl",
+            )
+
+        self.assertEqual(
+            [item["stock_code"] for item in payload["items"]],
+            ["000011", "000560"],
+        )
+        by_code = {item["stock_code"]: item for item in payload["items"]}
+        self.assertEqual(by_code["000560"]["stock_name"], "我爱我家")
+        self.assertEqual(by_code["000560"]["dragon_tag"], "龙1")
+        self.assertEqual(by_code["000011"]["dragon_tag"], "龙2")
+        self.assertIn("日内涨停池补齐", payload["source_note"])
+        self.assertEqual(payload["summary"]["stock_count"], 2)
+
     async def test_plate_constituents_assign_top_five_and_intraday_role_tags(self):
         candidates = [
             {"stock_code": f"00000{index}", "stock_name": f"公司{index}", "market": "SZ"}

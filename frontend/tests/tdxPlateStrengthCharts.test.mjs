@@ -92,6 +92,37 @@ test('normalizes custom history windows to the supported range', async () => {
   assert.equal(helper.normalizePlateStrengthWindow(Number.NaN), 20)
 })
 
+test('keeps the compact chart selection valid when trend visibility changes', async () => {
+  const source = readFileSync(helperPath, 'utf8')
+  const transpiled = ts.transpileModule(source, {
+    compilerOptions: {
+      module: ts.ModuleKind.ESNext,
+      target: ts.ScriptTarget.ES2020
+    }
+  }).outputText
+  const helper = await import(`data:text/javascript;charset=utf-8,${encodeURIComponent(transpiled)}`)
+
+  assert.equal(helper.normalizeCompactChartMode('rotation', true), 'rotation')
+  assert.equal(helper.normalizeCompactChartMode('rotation', false), 'strength')
+  assert.equal(helper.normalizeCompactChartMode('breadth', false), 'breadth')
+  assert.equal(helper.normalizeCompactChartMode('unknown', true), 'strength')
+})
+
+test('does not initialize a chart while its responsive container is hidden', async () => {
+  const source = readFileSync(helperPath, 'utf8')
+  const transpiled = ts.transpileModule(source, {
+    compilerOptions: {
+      module: ts.ModuleKind.ESNext,
+      target: ts.ScriptTarget.ES2020
+    }
+  }).outputText
+  const helper = await import(`data:text/javascript;charset=utf-8,${encodeURIComponent(transpiled)}`)
+
+  assert.equal(helper.hasRenderableChartSize(390, 168), true)
+  assert.equal(helper.hasRenderableChartSize(0, 168), false)
+  assert.equal(helper.hasRenderableChartSize(390, 0), false)
+})
+
 test('builds API parameters for each supported plate source', async () => {
   assert.ok(existsSync(helperPath), 'plate-strength chart model helper should exist')
 

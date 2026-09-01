@@ -45,6 +45,18 @@ export interface IntradayTagStyleInput {
   type: string
 }
 
+export type CompactChartMode = 'strength' | 'breadth' | 'rotation'
+
+export function normalizeCompactChartMode(value: string, showTrend: boolean): CompactChartMode {
+  if (value === 'breadth') return 'breadth'
+  if (value === 'rotation' && showTrend) return 'rotation'
+  return 'strength'
+}
+
+export function hasRenderableChartSize(width: number, height: number): boolean {
+  return width > 0 && height > 0
+}
+
 export function intradayTagClass(tag: IntradayTagStyleInput): string {
   if (tag.type === 'dragon') {
     if (tag.label === '龙1') return 'dragon-one'

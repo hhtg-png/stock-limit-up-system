@@ -470,6 +470,51 @@ class TdxPluginService:
             constituent_source = "unavailable"
             source_note = "本地题材映射与东方财富兼容板块均未匹配"
 
+        try:
+            limit_up_items = await self.realtime_limit_up_service.get_fast_limit_up_pool(
+                target_date,
+                wait_for_refresh=False,
+                max_cache_age=2,
+            )
+        except Exception as exc:
+            logger.warning("Failed to load intraday leader context", exc_info=exc)
+            limit_up_items = []
+            source_status["limit_up_pool"] = "error"
+            warnings.append("日内龙头封板信息获取失败，已按实时涨幅排序")
+
+        existing_codes = {
+            self._normalize_code(item.get("stock_code", ""))
+            for item in candidates
+            if self._normalize_code(item.get("stock_code", ""))
+        }
+        supplemented_count = 0
+        for limit_up_item in limit_up_items:
+            stock_code = self._normalize_code(limit_up_item.get("stock_code", ""))
+            if (
+                not stock_code
+                or stock_code in existing_codes
+                or self._plate_strength_name(limit_up_item, source) != normalized_plate
+            ):
+                continue
+            candidates.append({
+                "stock_code": stock_code,
+                "stock_name": limit_up_item.get("stock_name") or stock_code,
+                "market": limit_up_item.get("market") or "",
+                "match_reason": f"{source_label}日内涨停池补齐",
+            })
+            existing_codes.add(stock_code)
+            supplemented_count += 1
+
+        if supplemented_count:
+            source_status["intraday_constituents"] = "supplemented"
+            if constituent_source == "unavailable":
+                constituent_source = "intraday_limit_up_pool"
+                source_note = f"{source_label}日内涨停池匹配；仅包含当日涨停或炸板股票"
+            else:
+                source_note = f"{source_note}；日内涨停池补齐 {supplemented_count} 只"
+        else:
+            source_status["intraday_constituents"] = "unchanged"
+
         codes = list(dict.fromkeys(
             code
             for code in (self._normalize_code(item.get("stock_code", "")) for item in candidates)
@@ -494,19 +539,6 @@ class TdxPluginService:
                 warnings.append(f"板块成分股实时行情仅返回 {quoted_count}/{len(codes)} 只")
 
         quoted_count = sum(1 for code in codes if quotes.get(code))
-
-        try:
-            limit_up_items = await self.realtime_limit_up_service.get_fast_limit_up_pool(
-                target_date,
-                wait_for_refresh=False,
-                max_cache_age=2,
-            )
-        except Exception as exc:
-            logger.warning("Failed to load intraday leader context", exc_info=exc)
-            limit_up_items = []
-            source_status["limit_up_pool"] = "error"
-            warnings.append("日内龙头封板信息获取失败，已按实时涨幅排序")
-
         limit_up_by_code = {
             self._normalize_code(item.get("stock_code", "")): item
             for item in limit_up_items
