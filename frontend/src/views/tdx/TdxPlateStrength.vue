@@ -1,5 +1,9 @@
 <template>
-  <main class="target-strong" :class="{ 'drawer-open': isNarrowLayout && expandedPlate }">
+  <main
+    class="target-strong"
+    :class="{ 'drawer-open': isNarrowLayout && expandedPlate }"
+    :style="{ '--constituent-drawer-height': `${layout.constituentDrawerHeight}px` }"
+  >
     <header class="strong-top">
       <strong>板块轮动</strong>
       <div class="live-meta">
@@ -312,7 +316,10 @@ const customMode = ref(false)
 const customWindow = ref(20)
 const showTrend = ref(true)
 const compactChartMode = ref<CompactChartMode>('strength')
-const layout = ref(resolvePlateStrengthLayout(typeof window === 'undefined' ? 1024 : window.innerWidth))
+const layout = ref(resolvePlateStrengthLayout(
+  typeof window === 'undefined' ? 1024 : window.innerWidth,
+  typeof window === 'undefined' ? 720 : window.innerHeight
+))
 const expandedPlate = ref<string | null>(null)
 const constituentPayload = ref<TdxPlateConstituentPayload | null>(null)
 const constituentLoading = ref(false)
@@ -632,10 +639,11 @@ function disposeCharts() {
 }
 
 function syncResponsiveLayout() {
-  const nextLayout = resolvePlateStrengthLayout(window.innerWidth)
+  const nextLayout = resolvePlateStrengthLayout(window.innerWidth, window.innerHeight)
   if (
     nextLayout.showCharts === layout.value.showCharts &&
-    nextLayout.constituentPresentation === layout.value.constituentPresentation
+    nextLayout.constituentPresentation === layout.value.constituentPresentation &&
+    nextLayout.constituentDrawerHeight === layout.value.constituentDrawerHeight
   ) return
 
   if (layout.value.showCharts && !nextLayout.showCharts) disposeCharts()
@@ -1347,7 +1355,7 @@ onUnmounted(() => {
   }
 
   .drawer-open .rank-panel {
-    padding-bottom: calc(min(58dvh, 480px) + 8px);
+    padding-bottom: calc(var(--constituent-drawer-height, 58vh) + 8px);
   }
 
   .rank-summary {
@@ -1481,7 +1489,8 @@ onUnmounted(() => {
     bottom: 0;
     left: 0;
     z-index: 20;
-    height: min(58dvh, 480px);
+    height: var(--constituent-drawer-height, 58vh);
+    max-height: calc(100vh - 40px);
     border-top: 1px solid #59657a;
     background: #0d1017;
     box-shadow: 0 -8px 24px rgb(0 0 0 / 55%);
@@ -1543,12 +1552,12 @@ onUnmounted(() => {
   }
 
   .constituent-scroll {
-    flex: 1 1 auto;
-    height: 0;
+    flex: 1 1 0;
+    height: auto;
     min-height: 0;
     max-height: none;
     overflow-x: hidden;
-    overflow-y: auto;
+    overflow-y: scroll;
     overscroll-behavior: contain;
     -webkit-overflow-scrolling: touch;
   }

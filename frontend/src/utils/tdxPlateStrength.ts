@@ -52,13 +52,18 @@ export type PlateStrengthConstituentPresentation = 'inline' | 'bottom-drawer'
 export interface PlateStrengthLayout {
   showCharts: boolean
   constituentPresentation: PlateStrengthConstituentPresentation
+  constituentDrawerHeight: number
 }
 
-export function resolvePlateStrengthLayout(width: number): PlateStrengthLayout {
+export function resolvePlateStrengthLayout(width: number, height = 720): PlateStrengthLayout {
   const isNarrow = width <= 520
+  const viewportHeight = Number.isFinite(height) && height > 0 ? Math.floor(height) : 720
+  const preferredDrawerHeight = Math.max(300, Math.floor(viewportHeight * 0.68))
+  const availableDrawerHeight = Math.max(160, viewportHeight - 40)
   return {
     showCharts: !isNarrow,
-    constituentPresentation: isNarrow ? 'bottom-drawer' : 'inline'
+    constituentPresentation: isNarrow ? 'bottom-drawer' : 'inline',
+    constituentDrawerHeight: Math.min(560, preferredDrawerHeight, availableDrawerHeight)
   }
 }
 

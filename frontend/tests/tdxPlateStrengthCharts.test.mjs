@@ -133,18 +133,36 @@ test('uses a chart-free bottom drawer layout only on narrow plugin widths', asyn
   }).outputText
   const helper = await import(`data:text/javascript;charset=utf-8,${encodeURIComponent(transpiled)}`)
 
-  assert.deepEqual(helper.resolvePlateStrengthLayout(390), {
+  assert.deepEqual(helper.resolvePlateStrengthLayout(390, 770), {
     showCharts: false,
-    constituentPresentation: 'bottom-drawer'
+    constituentPresentation: 'bottom-drawer',
+    constituentDrawerHeight: 523
   })
-  assert.deepEqual(helper.resolvePlateStrengthLayout(520), {
+  assert.deepEqual(helper.resolvePlateStrengthLayout(520, 770), {
     showCharts: false,
-    constituentPresentation: 'bottom-drawer'
+    constituentPresentation: 'bottom-drawer',
+    constituentDrawerHeight: 523
   })
-  assert.deepEqual(helper.resolvePlateStrengthLayout(521), {
+  assert.deepEqual(helper.resolvePlateStrengthLayout(521, 770), {
     showCharts: true,
-    constituentPresentation: 'inline'
+    constituentPresentation: 'inline',
+    constituentDrawerHeight: 523
   })
+})
+
+test('gives the narrow constituent drawer enough height without covering the whole viewport', async () => {
+  const source = readFileSync(helperPath, 'utf8')
+  const transpiled = ts.transpileModule(source, {
+    compilerOptions: {
+      module: ts.ModuleKind.ESNext,
+      target: ts.ScriptTarget.ES2020
+    }
+  }).outputText
+  const helper = await import(`data:text/javascript;charset=utf-8,${encodeURIComponent(transpiled)}`)
+
+  assert.equal(helper.resolvePlateStrengthLayout(390, 770).constituentDrawerHeight, 523)
+  assert.equal(helper.resolvePlateStrengthLayout(390, 1000).constituentDrawerHeight, 560)
+  assert.equal(helper.resolvePlateStrengthLayout(390, 240).constituentDrawerHeight, 200)
 })
 
 test('builds API parameters for each supported plate source', async () => {
