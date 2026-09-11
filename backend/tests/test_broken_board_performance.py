@@ -100,3 +100,26 @@ class BrokenBoardPerformanceTests(unittest.IsolatedAsyncioTestCase):
             restarted = BrokenBoardPerformanceService(cache_dir=directory)
             with patch.object(restarted, "_fetch_eastmoney_history", side_effect=AssertionError("must use disk cache")):
                 self.assertEqual((await restarted._fetch_fallback_history("600001", self.today))[self.today], 3.5)
+
+    def test_sina_adjustment_removes_split_and_invalid_rows_break_chain(self):
+        factors = [{"d": "1900-01-01", "f": "2"}, {"d": "2026-09-10", "f": "1"}]
+        rows = [{"day": "2026-09-09", "close": "20"}, {"day": "2026-09-10", "close": "10"},
+                {"day": "2026-09-11", "close": "11"}]
+        parsed = self.service.parse_sina_adjusted_history(rows, factors, self.today)
+        self.assertEqual(parsed[self.previous], 0)
+        self.assertEqual(parsed[self.today], 10)
+        rows[1]["close"] = "invalid"
+        self.assertNotIn(self.today, self.service.parse_sina_adjusted_history(rows, factors, self.today))
+        self.assertEqual(self.service.parse_sina_adjusted_history(rows, [], self.today), {})
+
+    async def test_old_cache_survives_next_day_source_outage(self):
+        import tempfile
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            service = BrokenBoardPerformanceService(cache_dir=directory)
+            service._save_disk_cache("fallback", "600001", self.previous, {self.previous: 3.5})
+            with patch.object(service, "_fetch_eastmoney_history", side_effect=RuntimeError("down")), patch.object(
+                service, "_fetch_sina_history", side_effect=RuntimeError("down")):
+                result = await service._fetch_fallback_history("600001", self.today)
+            self.assertEqual(result, {self.previous: 3.5})
+            self.assertEqual(service._disk_ends[("fallback", "600001")], self.previous)

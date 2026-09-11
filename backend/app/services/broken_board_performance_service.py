@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+from bisect import bisect_right
 import json
 import os
 import time
@@ -46,6 +47,7 @@ class BrokenBoardPerformanceService:
         self._history_limit = asyncio.Semaphore(8)
         self.cache_dir = Path(cache_dir)
         self._primary_retry_at = 0.0
+        self._disk_ends = {}
 
     @staticmethod
     def _number(value):
@@ -77,9 +79,8 @@ class BrokenBoardPerformanceService:
         if len(code) != 6 or not code.isdigit():
             return {}
         try:
-            payload = json.loads((self.cache_dir / f"{source}-{code}.json").read_text(encoding="utf-8"))
-            if date.fromisoformat(payload["end_date"]) < end_date:
-                return {}
+            payload = json.loads((self.cache_dir / f"v2-{source}-{code}.json").read_text(encoding="utf-8"))
+            self._disk_ends[(source, code)] = date.fromisoformat(payload["end_date"])
             return {date.fromisoformat(day): value for day, value in payload["values"].items()
                     if self._number(value) is not None}
         except (OSError, ValueError, KeyError, TypeError, AttributeError):
@@ -91,7 +92,7 @@ class BrokenBoardPerformanceService:
         temporary = None
         try:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
-            target = self.cache_dir / f"{source}-{code}.json"
+            target = self.cache_dir / f"v2-{source}-{code}.json"
             temporary = self.cache_dir / f".{source}-{code}-{uuid.uuid4().hex}.tmp"
             temporary.write_text(json.dumps({"end_date": end_date.isoformat(),
                 "values": {day.isoformat(): value for day, value in values.items()}}), encoding="utf-8")
@@ -110,25 +111,28 @@ class BrokenBoardPerformanceService:
         if key in self._history_cache:
             return self._history_cache[key]
         disk = self._read_disk_cache("primary", code, end_date)
-        if disk:
+        if disk and self._disk_ends.get(("primary", code), date.min) >= end_date:
             self._history_cache[key] = disk
             return disk
         async with self._history_limit:
             if key in self._history_cache:
                 return self._history_cache[key]
             if time.monotonic() < self._primary_retry_at:
-                return {}
+                return disk
             symbol = ("sh" if code.startswith("6") else "bj" if code.startswith(("4", "8", "92")) else "sz") + code
-            async with httpx.AsyncClient(timeout=12) as client:
-                response = await client.get("https://web.ifzq.gtimg.cn/appstock/app/fqkline/get", params={
-                    "param": f"{symbol},day,,{end_date.isoformat()},640,qfq"
-                })
-                if response.status_code >= 500 or response.status_code == 429:
-                    self._primary_retry_at = time.monotonic() + 300
-                    logger.warning("Broken-board primary history returned {}; backing off for 5 minutes", response.status_code)
-                response.raise_for_status()
-                data = (response.json().get("data") or {}).get(symbol) or {}
-            history = self.parse_history(data.get("qfqday") or data.get("day") or [])
+            try:
+                async with httpx.AsyncClient(timeout=12) as client:
+                    response = await client.get("https://web.ifzq.gtimg.cn/appstock/app/fqkline/get", params={
+                        "param": f"{symbol},day,,{end_date.isoformat()},640,qfq"
+                    })
+                    if response.status_code >= 500 or response.status_code == 429:
+                        self._primary_retry_at = time.monotonic() + 300
+                        logger.warning("Broken-board primary history returned {}; backing off for 5 minutes", response.status_code)
+                    response.raise_for_status()
+                    data = (response.json().get("data") or {}).get(symbol) or {}
+                history = {**disk, **self.parse_history(data.get("qfqday") or data.get("day") or [])}
+            except Exception:
+                return disk
             if history:
                 self._history_cache[key] = history
                 self._save_disk_cache("primary", code, end_date, history)
@@ -139,7 +143,7 @@ class BrokenBoardPerformanceService:
         if key in self._history_cache:
             return self._history_cache[key]
         disk = self._read_disk_cache("fallback", code, end_date)
-        if disk:
+        if disk and self._disk_ends.get(("fallback", code), date.min) >= end_date:
             self._history_cache[key] = disk
             return disk
         async with self._history_limit:
@@ -150,18 +154,53 @@ class BrokenBoardPerformanceService:
             except Exception:
                 result = {}
             if not result:
-                result = await self._fetch_sina_history(code, end_date)
+                try:
+                    result = await self._fetch_sina_history(code, end_date)
+                except Exception:
+                    return disk
+            if not result:
+                return disk
+            result = {**disk, **result}
             if result:
                 self._history_cache[key] = result
                 self._save_disk_cache("fallback", code, end_date, result)
             return result
 
+    @classmethod
+    def parse_sina_adjusted_history(cls, rows, factors, end_date):
+        # Sina raw closes must be divided by the factor effective on that day.
+        parsed_factors = sorted((date.fromisoformat(item["d"]), float(item["f"])) for item in factors)
+        if not parsed_factors or any(not math.isfinite(f) or f <= 0 for _, f in parsed_factors):
+            return {}
+        factor_dates = [day for day, _ in parsed_factors]
+        adjusted = []
+        for row in rows:
+            try:
+                day = date.fromisoformat(row["day"])
+                if day > end_date:
+                    continue
+                index = bisect_right(factor_dates, day) - 1
+                close = float(row["close"]) / parsed_factors[index][1] if index >= 0 else None
+            except (ValueError, TypeError, KeyError):
+                close = None
+            adjusted.append([row.get("day", ""), None, close])
+        return cls.parse_history(adjusted)
+
     async def _fetch_sina_history(self, code, end_date):
-        from app.api.v1.market import _fetch_kline_from_sina
-        market = "SH" if code.startswith("6") else "BJ" if code.startswith(("4", "8", "92")) else "SZ"
-        rows = await _fetch_kline_from_sina(code, market, "day", 640)
-        return {row["date"]: row["change_pct"] for row in rows
-                if row["date"] <= end_date and self._number(row.get("change_pct")) is not None}
+        from app.api.v1.market import SINA_KLINE_URL, _parse_sina_kline_payload
+        symbol = ("sh" if code.startswith("6") else "bj" if code.startswith(("4", "8", "92")) else "sz") + code
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+            prices, factors = await asyncio.gather(
+                client.get(SINA_KLINE_URL, headers={"User-Agent": "Mozilla/5.0"}, params={
+                    "symbol": symbol, "scale": "240", "ma": "no", "datalen": "640"}),
+                client.get(f"https://finance.sina.com.cn/realstock/company/{symbol}/qfq.js"),
+            )
+            prices.raise_for_status()
+            factors.raise_for_status()
+            # Parse only the JSON value; never execute the provider's JavaScript.
+            factor_payload, _ = json.JSONDecoder().raw_decode(factors.text.split("=", 1)[1].lstrip())
+            return self.parse_sina_adjusted_history(_parse_sina_kline_payload(prices.text),
+                                                    factor_payload["data"], end_date)
 
     async def _fetch_eastmoney_history(self, code, end_date):
         async with httpx.AsyncClient(timeout=10) as client:
