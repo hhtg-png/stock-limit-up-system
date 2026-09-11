@@ -30,7 +30,7 @@ class BrokenBoardPerformanceTests(unittest.IsolatedAsyncioTestCase):
         })
         self.history = AsyncMock(return_value={self.today: 2.0})
         self.service = BrokenBoardPerformanceService(session_factory=self.sessions,
-            quote_fetcher=self.quotes, history_fetcher=self.history, fallback_fetcher=AsyncMock(return_value={}),
+            suspension_fetcher=AsyncMock(return_value=set()), quote_fetcher=self.quotes, history_fetcher=self.history, fallback_fetcher=AsyncMock(return_value={}),
             calendar_loader=lambda: [self.previous, self.today], today_provider=lambda: self.today)
 
     async def asyncTearDown(self):
@@ -123,3 +123,27 @@ class BrokenBoardPerformanceTests(unittest.IsolatedAsyncioTestCase):
                 result = await service._fetch_fallback_history("600001", self.today)
             self.assertEqual(result, {self.previous: 3.5})
             self.assertEqual(service._disk_ends[("fallback", "600001")], self.previous)
+
+    async def test_confirmed_suspension_excluded_from_average_but_retained_in_details(self):
+        self.service.suspension_fetcher = AsyncMock(return_value={"600002"})
+        point = (await self.service.get_performance(1, self.today))["points"][0]
+        self.assertEqual(point["average_change"], 5)
+        self.assertEqual(point["data_status"], "ready")
+        self.assertEqual(point["suspended_count"], 1)
+        self.assertEqual(point["priced_count"], 1)
+        self.assertEqual(point["stocks"][1]["quote_status"], "suspended")
+        self.assertIsNone(point["stocks"][1]["change_pct"])
+
+    async def test_unknown_missing_quote_remains_unavailable_when_suspension_lookup_fails(self):
+        self.quotes.return_value.pop("600002")
+        self.service.suspension_fetcher = AsyncMock(side_effect=RuntimeError("down"))
+        point = (await self.service.get_performance(1, self.today))["points"][0]
+        self.assertIsNone(point["average_change"])
+        self.assertEqual(point["stocks"][1]["quote_status"], "unavailable")
+
+    async def test_all_suspended_is_not_zero_percent(self):
+        self.service.suspension_fetcher = AsyncMock(return_value={"600001", "600002"})
+        point = (await self.service.get_performance(1, self.today))["points"][0]
+        self.assertIsNone(point["average_change"])
+        self.assertEqual(point["suspended_count"], 2)
+        self.assertEqual(point["data_status"], "ready")

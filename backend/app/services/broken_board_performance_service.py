@@ -16,6 +16,7 @@ from loguru import logger
 from sqlalchemy import select, func
 
 from app.database import async_session_maker
+from app.services.stock_suspension_service import stock_suspension_service
 from app.data_collectors.tencent_api import tencent_api
 from app.models.market_review import MarketReviewDailyMetric, MarketReviewStockDaily
 
@@ -34,7 +35,8 @@ class BrokenBoardPerformanceService:
     """Prior session's failed multi-board cohort, valued on each chart date."""
 
     def __init__(self, session_factory=async_session_maker, quote_fetcher=None,
-                 history_fetcher=None, calendar_loader=None, today_provider=_today, fallback_fetcher=None, cache_dir="data/broken-board-history"):
+                 history_fetcher=None, calendar_loader=None, today_provider=_today, fallback_fetcher=None, cache_dir="data/broken-board-history", suspension_fetcher=None):
+        self.suspension_fetcher = suspension_fetcher or stock_suspension_service.get_codes
         self.session_factory = session_factory
         self.quote_fetcher = quote_fetcher or tencent_api.get_quotes_batch
         self.history_fetcher = history_fetcher or self._fetch_history
@@ -268,6 +270,10 @@ class BrokenBoardPerformanceService:
         for code, extra in zip(missing_codes, fallback_results):
             if isinstance(extra, dict):
                 history[code] = {**extra, **history.get(code, {})}
+        check_days = sorted(day for day, cohort in cohorts.items() if cohort and (
+            day == today or any(day not in history.get(row.stock_code, {}) for row in cohort)))
+        suspension_results = await asyncio.gather(*(self.suspension_fetcher(day) for day in check_days), return_exceptions=True)
+        suspensions = {day: result if isinstance(result, set) else set() for day, result in zip(check_days, suspension_results)}
         points = []
         for day in selected:
             stocks = []
@@ -277,12 +283,16 @@ class BrokenBoardPerformanceService:
                     value = quote.get("change_pct") if str(quote.get("datetime", ""))[:8] == day.strftime("%Y%m%d") else None
                 else:
                     value = history.get(row.stock_code, {}).get(day)
-                stocks.append({"stock_code": row.stock_code, "stock_name": row.stock_name,
+                suspended = row.stock_code in suspensions.get(day, set())
+                value = None if suspended else self._number(value)
+                stocks.append({"quote_status": "suspended" if suspended else "ready" if value is not None else "unavailable",
+                               "stock_code": row.stock_code, "stock_name": row.stock_name,
                                "previous_board": row.yesterday_continuous_days, "change_pct": self._number(value)})
             changes = [stock["change_pct"] for stock in stocks if stock["change_pct"] is not None]
-            complete = day in cohorts and len(changes) == len(stocks)
+            suspended_count = sum(stock["quote_status"] == "suspended" for stock in stocks)
+            complete = day in cohorts and len(changes) + suspended_count == len(stocks)
             points.append({"trade_date": day.isoformat(), "average_change": round(sum(changes) / len(changes), 2) if complete and changes else None,
-                           "sample_count": len(stocks), "priced_count": len(changes), "stocks": stocks,
+                           "sample_count": len(stocks), "suspended_count": suspended_count, "priced_count": len(changes), "stocks": stocks,
                            "data_status": "ready" if complete else "unavailable"})
         return {"points": points}
 

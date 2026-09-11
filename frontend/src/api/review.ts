@@ -46,8 +46,9 @@ export interface BrokenBoardPoint {
   average_change: number | null
   sample_count: number
   priced_count: number
+  suspended_count: number
   data_status: string
-  stocks: { stock_code: string; stock_name: string; previous_board: number; change_pct: number | null }[]
+  stocks: { stock_code: string; stock_name: string; previous_board: number; change_pct: number | null; quote_status: 'ready' | 'suspended' | 'unavailable' }[]
 }
 
 export async function getBrokenBoardPerformance(params: { days: number; end_date: string }): Promise<{ points: BrokenBoardPoint[] }> {

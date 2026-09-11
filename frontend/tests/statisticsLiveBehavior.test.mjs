@@ -67,6 +67,13 @@ test('broken-board tooltip lists each stock and escapes names', () => {
   assert.match(html, /2.00%/)
   assert.match(html, /暂无数据/)
   assert.doesNotMatch(html, /<b>X/)
+  c.brokenBoardPoints.value[0].suspended_count = 1
+  c.brokenBoardPoints.value[0].stocks[1].quote_status = 'suspended'
+  const suspendedHtml = c.formatBrokenBoardTooltip([{ dataIndex: 0 }])
+  assert.match(suspendedHtml, /有效行情 1\/1/)
+  assert.match(suspendedHtml, /停牌 1 只/)
+  assert.match(suspendedHtml, /停牌（不计入均值）/)
+  assert.doesNotMatch(suspendedHtml, /暂无数据/)
 })
 
 test('slow cohort history survives minute refresh without duplicate requests', async () => {

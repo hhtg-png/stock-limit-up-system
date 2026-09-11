@@ -714,9 +714,9 @@ function formatBrokenBoardTooltip(params: any) {
   const pct = (value: number | null) => value == null ? '暂无数据' : `${value > 0 ? '+' : ''}${value.toFixed(2)}%`
   return [
     `<b>${escapeTooltipHtml(row.trade_date)}</b>`,
-    `平均涨幅：${pct(row.average_change)} · 行情 ${row.priced_count}/${row.sample_count} 只`,
+    `平均涨幅：${pct(row.average_change)} · 有效行情 ${row.priced_count}/${row.sample_count - (row.suspended_count || 0)} 只 · 停牌 ${row.suspended_count || 0} 只（不计入均值）`,
     '<span style="color:#64748b">前日连板 → 昨日断板 → 当日表现</span>',
-    ...row.stocks.map(stock => `${escapeTooltipHtml(stock.stock_name)} (${escapeTooltipHtml(stock.stock_code)}) · 前日${stock.previous_board}板：${pct(stock.change_pct)}`)
+    ...row.stocks.map(stock => `${escapeTooltipHtml(stock.stock_name)} (${escapeTooltipHtml(stock.stock_code)}) · 前日${stock.previous_board}板：${stock.quote_status === 'suspended' ? '停牌（不计入均值）' : pct(stock.change_pct)}`)
   ].join('<br/>')
 }
 
