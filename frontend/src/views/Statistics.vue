@@ -26,13 +26,23 @@
         <el-tag v-if="isLiveIntraday" type="success" size="small">
           盘中实时
         </el-tag>
-        <el-tag v-else type="info" size="small">
+        <el-tag v-else-if="!currentDataUnavailable" type="info" size="small">
           收盘复盘
         </el-tag>
-        <el-tag v-if="hasFallback" type="warning" size="small">
-          已回退到最近可用数据
+        <el-tag v-if="currentDataUnavailable" type="warning" size="small">
+          当日数据暂不可用，等待更新
         </el-tag>
       </div>
+    </div>
+
+    <el-alert v-if="currentDataUnavailable" title="当日数据暂不可用；曲线仅保留历史对照，明细不会回退到上一交易日。" type="warning" :closable="false" show-icon />
+
+    <div class="card chart-card broken-board-card">
+      <div class="card-header">
+        <h3>昨日连板断板股今日平均涨幅</h3>
+        <span class="cohort-description">前日 ≥ 2 连板 · 昨日未封涨停 · 悬停查看个股</span>
+      </div>
+      <div ref="brokenBoardChartRef" class="chart-container"></div>
     </div>
 
     <el-row :gutter="16">
@@ -228,11 +238,11 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
 import * as echarts from 'echarts'
 import dayjs from 'dayjs'
-import { getMarketReviewDaily, getMarketReviewDetail, getMarketReviewIntraday, getMarketReviewLadder } from '@/api'
+import { getMarketReviewDaily, getMarketReviewIntraday } from '@/api'
 import { getChinaDateString } from '@/utils/chinaDate'
+import { getBrokenBoardPerformance, type BrokenBoardPoint } from '@/api/review'
 import { buildReviewRange } from '@/utils/reviewRange'
 import type {
   MarketReviewDailyRow,
@@ -256,6 +266,10 @@ const dailyHasFallback = ref(false)
 const detailResponse = ref<MarketReviewDetailResponse | null>(null)
 const ladderResponse = ref<MarketReviewLadderResponse | null>(null)
 const isLiveIntraday = ref(false)
+const currentDataUnavailable = ref(false)
+const brokenBoardPoints = ref<BrokenBoardPoint[]>([])
+const brokenBoardChartRef = ref<HTMLElement>()
+let brokenBoardChart: echarts.ECharts | null = null
 const intradaySnapshotTime = ref<string | null>(null)
 
 const boardHeightChartRef = ref<HTMLElement>()
@@ -273,14 +287,14 @@ let breadthChart: echarts.ECharts | null = null
 let amountChart: echarts.ECharts | null = null
 let fetchSequence = 0
 let reviewRefreshTimer: number | null = null
+let brokenBoardRequestKey = ''
+let brokenBoardRequestPending = false
+let brokenBoardRequestSequence = 0
 
 const detailStocks = computed(() => detailResponse.value?.stocks ?? [])
 const ladderLevels = computed(() => ladderResponse.value?.ladders ?? [])
 const resolvedTradeDate = computed(
   () => detailResponse.value?.trade_date || ladderResponse.value?.trade_date || activeEndDate.value
-)
-const hasFallback = computed(
-  () => Boolean(dailyHasFallback.value || detailResponse.value?.is_fallback || ladderResponse.value?.is_fallback)
 )
 const sealedCloseCount = computed(
   () => detailStocks.value.filter(stock => stock.today_sealed_close).length
@@ -693,7 +707,37 @@ function formatBoardHeightTooltip(params: unknown) {
   ].join('<br/>')
 }
 
+function formatBrokenBoardTooltip(params: any) {
+  const point = Array.isArray(params) ? params[0] : params
+  const row = brokenBoardPoints.value[point?.dataIndex]
+  if (!row) return ''
+  const pct = (value: number | null) => value == null ? '暂无数据' : `${value > 0 ? '+' : ''}${value.toFixed(2)}%`
+  return [
+    `<b>${escapeTooltipHtml(row.trade_date)}</b>`,
+    `平均涨幅：${pct(row.average_change)} · 行情 ${row.priced_count}/${row.sample_count} 只`,
+    '<span style="color:#64748b">前日连板 → 昨日断板 → 当日表现</span>',
+    ...row.stocks.map(stock => `${escapeTooltipHtml(stock.stock_name)} (${escapeTooltipHtml(stock.stock_code)}) · 前日${stock.previous_board}板：${pct(stock.change_pct)}`)
+  ].join('<br/>')
+}
+
+function updateBrokenBoardChart() {
+  brokenBoardChart?.setOption({
+    ...getBaseGridOption(),
+    tooltip: { trigger: 'axis', confine: true, enterable: true,
+      extraCssText: 'max-height:360px;overflow-y:auto;', formatter: formatBrokenBoardTooltip },
+    xAxis: { type: 'category', data: brokenBoardPoints.value.map(row => row.trade_date), axisLabel: { formatter: formatDateLabel } },
+    yAxis: { type: 'value', axisLabel: { formatter: formatPercentAxisLabel } },
+    series: [{ name: '昨日连板断板股今日平均涨幅', type: 'line', smooth: false, connectNulls: false,
+      symbol: 'circle', symbolSize: 7, itemStyle: { color: '#8b5cf6' },
+      data: brokenBoardPoints.value.map(row => row.average_change),
+      label: getPercentPointLabelOption('top', true),
+      markLine: { symbol: 'none', silent: true, data: [{ yAxis: 0 }], lineStyle: { type: 'dashed', color: '#8c8c8c' } }
+    }]
+  }, true)
+}
+
 function updateCharts() {
+  updateBrokenBoardChart()
   const charts = [
     boardHeightChart,
     promotionRateChart,
@@ -1004,6 +1048,7 @@ function initCharts() {
   if (promotionRateChartRef.value) {
     promotionRateChart = echarts.init(promotionRateChartRef.value)
   }
+  if (brokenBoardChartRef.value) brokenBoardChart = echarts.init(brokenBoardChartRef.value)
   if (yesterdayChangeChartRef.value) {
     yesterdayChangeChart = echarts.init(yesterdayChangeChartRef.value)
   }
@@ -1021,6 +1066,7 @@ function initCharts() {
 function resizeCharts() {
   boardHeightChart?.resize()
   promotionRateChart?.resize()
+  brokenBoardChart?.resize()
   yesterdayChangeChart?.resize()
   limitTrendChart?.resize()
   breadthChart?.resize()
@@ -1030,6 +1076,8 @@ function resizeCharts() {
 function disposeCharts() {
   boardHeightChart?.dispose()
   promotionRateChart?.dispose()
+  brokenBoardChart?.dispose()
+  brokenBoardChart = null
   yesterdayChangeChart?.dispose()
   limitTrendChart?.dispose()
   breadthChart?.dispose()
@@ -1047,121 +1095,75 @@ type FetchDataOptions = {
   silent?: boolean
 }
 
+async function fetchBrokenBoardData(query: { days: number; end_date: string }) {
+  const key = JSON.stringify(query)
+  if (brokenBoardRequestPending && brokenBoardRequestKey === key) return
+  brokenBoardRequestKey = key
+  brokenBoardRequestPending = true
+  const request = ++brokenBoardRequestSequence
+  try {
+    const result = await getBrokenBoardPerformance(query)
+    if (request !== brokenBoardRequestSequence) return
+    brokenBoardPoints.value = result.points
+  } catch {
+    if (request !== brokenBoardRequestSequence) return
+    brokenBoardPoints.value = []
+  } finally {
+    if (request === brokenBoardRequestSequence) {
+      brokenBoardRequestPending = false
+      updateBrokenBoardChart()
+    }
+  }
+}
+
 async function fetchData(options: FetchDataOptions = {}) {
   const currentSequence = ++fetchSequence
   const shouldShowLoading = !options.silent
-
   if (shouldShowLoading) {
     loading.value = true
   }
-
   const today = getChinaDateString()
   const { startDate, endDate, query } = getDateRange()
+  void fetchBrokenBoardData(query)
+  const [history, snapshot] = await Promise.allSettled([
+    getMarketReviewDaily(query), getMarketReviewIntraday(today)
+  ])
+  if (currentSequence !== fetchSequence) return
 
-  if (shouldShowLoading) {
-    isLiveIntraday.value = false
-    intradaySnapshotTime.value = null
-  }
-
-  let detailDate = endDate
-  let hasError = false
-  let hasLiveIntradayDetail = false
-
-  try {
-    const dailyResult = await getMarketReviewDaily(query)
-
-    if (currentSequence !== fetchSequence) {
-      return
-    }
-
-    dailySeries.value = dailyResult.data.series
-    dailyRows.value = dailyResult.data.rows
-    dailyHasFallback.value = Boolean(dailyResult.is_fallback)
-    const lastSeriesDate = dailyResult.data.series[dailyResult.data.series.length - 1]
-    activeStartDate.value = dailyResult.start_date || startDate
-    activeEndDate.value = dailyResult.end_date || lastSeriesDate || endDate
-    detailDate = activeEndDate.value
-  } catch (e) {
-    console.error('Fetch market review daily error:', e)
-    if (options.silent) {
-      return
-    }
+  if (history.status === 'fulfilled') {
+    dailySeries.value = history.value.data.series
+    dailyRows.value = history.value.data.rows
+    activeStartDate.value = history.value.start_date || dailySeries.value[0] || startDate
+  } else {
     dailySeries.value = []
     dailyRows.value = []
-    dailyHasFallback.value = false
     activeStartDate.value = startDate
-    activeEndDate.value = endDate
-    hasError = true
   }
-
-  try {
-    const intradayResult = await getMarketReviewIntraday(today)
-
-    if (currentSequence !== fetchSequence) {
-      return
-    }
-
-    if (intradayResult.is_live && intradayResult.data.rows.length) {
-      const intradayRow = intradayResult.data.rows[0]
+  dailyHasFallback.value = false
+  activeEndDate.value = endDate
+  detailResponse.value = null
+  ladderResponse.value = null
+  intradaySnapshotTime.value = null
+  isLiveIntraday.value = snapshot.status === 'fulfilled' && snapshot.value.is_live
+  currentDataUnavailable.value = true
+  // History remains a comparison only. Never keep a stale current-day point.
+  dailyRows.value = dailyRows.value.filter(row => row.trade_date !== today)
+  dailySeries.value = dailyRows.value.map(row => row.trade_date)
+  if (snapshot.status === 'fulfilled') {
+    const intradayResult = snapshot.value
+    const intradayRow = intradayResult.data.rows[0]
+    if (intradayResult.data_status !== 'unavailable' && !intradayResult.is_fallback && intradayRow?.trade_date === today) {
       const mergedDaily = mergeIntradayDailyRows(dailySeries.value, dailyRows.value, intradayRow)
       dailySeries.value = mergedDaily.series
       dailyRows.value = mergedDaily.rows
-      dailyHasFallback.value = Boolean(dailyHasFallback.value || intradayResult.is_fallback)
-      activeEndDate.value = intradayRow.trade_date
-      detailDate = intradayRow.trade_date
-      isLiveIntraday.value = true
-      intradaySnapshotTime.value = intradayResult.snapshot_time
       detailResponse.value = intradayResult.detail
       ladderResponse.value = intradayResult.ladder
-      hasLiveIntradayDetail = true
-    } else {
-      isLiveIntraday.value = false
-      intradaySnapshotTime.value = null
-    }
-  } catch (e) {
-    console.warn('Fetch market review intraday status error:', e)
-  }
-
-  if (!hasLiveIntradayDetail) {
-    const [detailResult, ladderResult] = await Promise.allSettled([
-      getMarketReviewDetail(detailDate),
-      getMarketReviewLadder(detailDate)
-    ])
-
-    if (currentSequence !== fetchSequence) {
-      return
-    }
-
-    if (detailResult.status === 'fulfilled') {
-      detailResponse.value = detailResult.value
-    } else {
-      console.error('Fetch market review detail error:', detailResult.reason)
-      if (!options.silent) {
-        detailResponse.value = null
-        hasError = true
-      }
-    }
-
-    if (ladderResult.status === 'fulfilled') {
-      ladderResponse.value = ladderResult.value
-    } else {
-      console.error('Fetch market review ladder error:', ladderResult.reason)
-      if (!options.silent) {
-        ladderResponse.value = null
-        hasError = true
-      }
+      intradaySnapshotTime.value = intradayResult.snapshot_time
+      currentDataUnavailable.value = false
     }
   }
-
   updateCharts()
-
-  if (hasError && shouldShowLoading) {
-    ElMessage.error('获取市场复盘数据失败')
-  }
-
-  if (shouldShowLoading && currentSequence === fetchSequence) {
-    loading.value = false
-  }
+  if (shouldShowLoading) loading.value = false
 }
 
 function goToDetail(stockCode: string) {
@@ -1523,4 +1525,9 @@ onUnmounted(() => {
     grid-template-columns: 1fr;
   }
 }
+</style>
+
+<style scoped>
+.broken-board-card { margin-bottom: 16px; }
+.cohort-description { color: #64748b; font-size: 12px; }
 </style>

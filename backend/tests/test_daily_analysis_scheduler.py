@@ -160,7 +160,8 @@ class DailyAnalysisSchedulerTests(unittest.TestCase):
         ):
             asyncio.run(scheduler._calculate_daily_analysis())
 
-    def test_calculate_intraday_daily_analysis_refreshes_market_review_first(self):
+    @patch("app.data_collectors.scheduler._should_run_after_close_catchup", return_value=False)
+    def test_calculate_intraday_daily_analysis_refreshes_market_review_first(self, _after_close):
         scheduler = DataScheduler()
         trade_date = date(2026, 5, 19)
 
@@ -180,6 +181,14 @@ class DailyAnalysisSchedulerTests(unittest.TestCase):
         build_daily_analysis.assert_awaited_once()
         self.assertEqual(build_daily_analysis.await_args.args[1], trade_date)
         self.assertEqual(build_daily_analysis.await_args.kwargs["session"], "intraday")
+
+    def test_late_intraday_job_cannot_overwrite_final_review(self):
+        scheduler = DataScheduler()
+        with patch("app.data_collectors.scheduler._resolve_cn_trade_date_for_market_review", return_value=date(2026, 9, 11)), patch(
+            "app.data_collectors.scheduler._should_run_after_close_catchup", return_value=True
+        ), patch("app.data_collectors.scheduler.market_review_pipeline_service.run_for_date", new_callable=AsyncMock) as run:
+            asyncio.run(scheduler._calculate_intraday_daily_analysis())
+        run.assert_not_awaited()
 
     def test_archive_limit_up_classification_skips_non_trading_day(self):
         scheduler = DataScheduler()

@@ -236,6 +236,7 @@ export interface MarketReviewLadderResponse {
 }
 
 export interface MarketReviewIntradayResponse extends MarketReviewDailyResponse {
+  data_status: 'ready' | 'unavailable'
   is_intraday: true
   is_live: boolean
   snapshot_time: string

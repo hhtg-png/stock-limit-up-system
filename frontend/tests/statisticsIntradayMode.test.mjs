@@ -26,8 +26,8 @@ test('statistics view automatically merges live intraday data into the selected 
   assert.match(statisticsSource, /getMarketReviewIntraday\(today\)/, 'today intraday snapshot should be checked automatically')
   assert.match(
     statisticsSource,
-    /if \(intradayResult\.is_live && intradayResult\.data\.rows\.length\)/,
-    'live intraday data should only be merged during live market time'
+    /intradayRow\?\.trade_date === today/,
+    'only an exact current-day snapshot may supply current data'
   )
   assert.match(statisticsSource, /mergeIntradayDailyRows/, 'today intraday row should be merged into historical rows')
   assert.match(statisticsSource, /detailResponse\.value = intradayResult\.detail/)

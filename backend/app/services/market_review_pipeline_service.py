@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime, time
 from typing import Any, Dict, Iterable, Optional
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, func
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -36,6 +36,19 @@ class MarketReviewPipelineService:
         self.metrics_service = metrics_service or market_review_metrics_service
         self.source_service = source_service or market_review_source_service
         self.session_factory = session_factory
+
+    async def has_after_close_data(self, trade_date: date) -> bool:
+        async with self.session_factory() as session:
+            metric = (await session.execute(select(MarketReviewDailyMetric).where(
+                MarketReviewDailyMetric.trade_date == trade_date
+            ))).scalar_one_or_none()
+            if metric is None or metric.calc_version < 1 or metric.source_status not in {"primary", "partial"}:
+                return False
+            touched = await session.scalar(select(func.count()).select_from(MarketReviewStockDaily).where(
+                MarketReviewStockDaily.trade_date == trade_date,
+                MarketReviewStockDaily.today_touched_limit_up.is_(True),
+            ))
+            return touched == metric.limit_up_count
 
     async def build_payload_for_date(
         self,

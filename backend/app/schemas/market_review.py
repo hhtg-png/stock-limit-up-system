@@ -100,6 +100,7 @@ class MarketReviewLadderResponse(BaseModel):
 class MarketReviewIntradayResponse(MarketReviewDailyResponse):
     """市场复盘盘中快照响应"""
 
+    data_status: str = Field("ready", description="ready 或 unavailable")
     is_intraday: bool = Field(True, description="是否为盘中实时快照")
     is_live: bool = Field(False, description="是否为交易时段实时采集")
     snapshot_time: datetime

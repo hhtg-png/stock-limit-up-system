@@ -5,6 +5,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Iterable
 
 from fastapi import APIRouter, Depends, Query
+from loguru import logger
 from sqlalchemy import desc, distinct, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -367,6 +368,8 @@ def _should_collect_live_intraday(trade_date: date) -> bool:
 
 async def _build_intraday_snapshot(trade_date: date, is_live: bool = True) -> MarketReviewIntradayResponse:
     normalized_data = await _collect_intraday_source(trade_date)
+    if normalized_data.get("is_authoritative") is not True:
+        raise ValueError("Current market review source unavailable")
     stock_rows = normalized_data.get("stock_rows") or []
     metric = market_review_metrics_service.aggregate_daily_metrics(
         trade_date,
@@ -459,7 +462,7 @@ async def _build_stored_intraday_snapshot(
     requested_date: date,
 ) -> MarketReviewIntradayResponse | None:
     resolved_date = await _resolve_latest_metric_trade_date(db, requested_date)
-    if resolved_date is None:
+    if resolved_date != requested_date:
         return None
 
     result = await db.execute(
@@ -548,20 +551,26 @@ async def get_market_review_intraday(
     """获取盘中实时复盘快照。"""
     target_date = trade_date or datetime.now(CN_TZ).date()
 
-    if _should_collect_live_intraday(target_date):
+    is_live = _should_collect_live_intraday(target_date)
+    if is_live:
         try:
             return await _build_intraday_snapshot(target_date, is_live=True)
         except Exception:
-            stored_snapshot = await _build_stored_intraday_snapshot(db, target_date)
-            if stored_snapshot is not None:
-                return stored_snapshot
-            raise
+            logger.exception("Live market review unavailable for {}", target_date)
+    else:
+        stored_snapshot = await _build_stored_intraday_snapshot(db, target_date)
+        if stored_snapshot is not None:
+            return stored_snapshot
 
-    stored_snapshot = await _build_stored_intraday_snapshot(db, target_date)
-    if stored_snapshot is not None:
-        return stored_snapshot
-
-    return await _build_intraday_snapshot(target_date, is_live=False)
+    return MarketReviewIntradayResponse(
+        data=MarketReviewDailyData(series=[], rows=[]),
+        requested_start_date=target_date, requested_end_date=target_date,
+        start_date=target_date, end_date=target_date, latest_trade_date=None,
+        is_fallback=False, is_live=is_live, data_status="unavailable",
+        snapshot_time=datetime.now(CN_TZ),
+        detail=MarketReviewDetailResponse(trade_date=target_date, stocks=[]),
+        ladder=MarketReviewLadderResponse(trade_date=target_date, ladders=[]),
+    )
 
 
 @router.get("/daily", response_model=MarketReviewDailyResponse, summary="获取复盘日级指标")
@@ -641,3 +650,12 @@ async def get_market_review_ladder(
     """获取指定交易日的市场复盘连板梯队。"""
     resolved_date, is_fallback = await _resolve_review_trade_date(db, trade_date)
     return await _build_ladder_response_from_db(db, resolved_date, is_fallback)
+
+
+@router.get("/broken-board-performance", summary="昨日连板断板股今日表现")
+async def get_broken_board_performance(
+    days: int = Query(30, ge=1, le=250),
+    end_date: date | None = Query(None),
+):
+    from app.services.broken_board_performance_service import broken_board_performance_service
+    return await broken_board_performance_service.get_performance(days, end_date or datetime.now(CN_TZ).date())

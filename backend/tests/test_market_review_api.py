@@ -561,10 +561,11 @@ class MarketReviewApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()
-        self.assertEqual(payload["data"]["series"], ["2026-04-28"])
-        self.assertEqual(payload["end_date"], "2026-04-28")
-        self.assertEqual(payload["detail"]["trade_date"], "2026-04-28")
-        self.assertTrue(payload["is_fallback"])
+        self.assertEqual(payload["data"]["series"], [])
+        self.assertEqual(payload["end_date"], "2026-04-29")
+        self.assertEqual(payload["detail"]["trade_date"], "2026-04-29")
+        self.assertFalse(payload["is_fallback"])
+        self.assertEqual(payload["data_status"], "unavailable")
         self.review_module._collect_intraday_source.assert_not_awaited()
 
     def test_live_intraday_detection_uses_trading_calendar_and_closes_at_market_end(self):
@@ -596,9 +597,32 @@ class MarketReviewApiTests(unittest.TestCase):
             self.review_module.datetime = original_datetime
             self.review_module._TRADING_DAY_CACHE.clear()
 
+    def test_live_failure_never_returns_stored_or_previous_day_snapshot(self):
+        self.review_module._should_collect_live_intraday = Mock(return_value=True)
+        self.review_module._collect_intraday_source = AsyncMock(side_effect=RuntimeError("source down"))
+        for target in ("2026-04-28", "2026-04-30"):
+            response = self.client.get("/api/v1/statistics/review/intraday", params={"trade_date": target})
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+            self.assertEqual(payload["data_status"], "unavailable")
+            self.assertEqual(payload["data"]["rows"], [])
+            self.assertEqual(payload["detail"]["trade_date"], target)
+            self.assertEqual(payload["detail"]["stocks"], [])
+            self.assertEqual(payload["ladder"]["ladders"], [])
+            self.assertFalse(payload["is_fallback"])
+            self.assertTrue(payload["is_live"])
+
+    def test_live_non_authoritative_source_is_unavailable(self):
+        self.review_module._should_collect_live_intraday = Mock(return_value=True)
+        self.review_module._collect_intraday_source = AsyncMock(return_value={"is_authoritative": False, "stock_rows": []})
+        response = self.client.get("/api/v1/statistics/review/intraday", params={"trade_date": "2026-04-30"})
+        self.assertEqual(response.json()["data_status"], "unavailable")
+        self.assertEqual(response.json()["data"]["rows"], [])
+
     def test_intraday_endpoint_returns_live_metric_detail_and_ladder_snapshot(self):
         collect_mock = AsyncMock(
             return_value={
+                "is_authoritative": True,
                 "stock_rows": [
                     {
                         "stock_code": "600010",

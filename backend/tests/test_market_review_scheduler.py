@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from datetime import date, timedelta, tzinfo
 import sys
@@ -180,6 +181,68 @@ class MarketReviewSchedulerTests(unittest.IsolatedAsyncioTestCase):
             60,
         )
         self.assertTrue(jobs_by_id["after_close_catchup"]["coalesce"])
+
+    def test_closing_jobs_tolerate_delays_and_register_reconciliation(self):
+        scheduler = self._create_scheduler()
+        with patch("app.data_collectors.scheduler.settings.MARKET_REVIEW_ENABLED", True), patch(
+            "app.data_collectors.scheduler.settings.MARKET_REVIEW_REPAIR_ENABLED", True
+        ):
+            scheduler.start()
+        jobs = {job["id"]: job for job in scheduler.scheduler.jobs}
+        for name in ("daily_stats", "daily_analysis", "limit_up_classification_archive",
+                     "market_review_build", "market_review_repair", "market_review_reconcile"):
+            self.assertEqual(jobs[name]["misfire_grace_time"], 900)
+            self.assertTrue(jobs[name]["coalesce"])
+            self.assertEqual(jobs[name]["max_instances"], 1)
+        trigger = jobs["market_review_reconcile"]["trigger"]
+        seconds = trigger.kwargs["seconds"] if hasattr(trigger, "kwargs") else trigger.interval.total_seconds()
+        self.assertEqual(seconds, 300)
+
+    async def test_reconcile_retries_failures_and_skips_complete_review(self):
+        scheduler = self._create_scheduler()
+        target = date(2026, 9, 11)
+        with patch("app.data_collectors.scheduler._should_run_after_close_catchup", return_value=True), patch(
+            "app.data_collectors.scheduler._resolve_latest_cn_trade_date_for_market_review", return_value=target
+        ), patch("app.data_collectors.scheduler.market_review_pipeline_service.has_after_close_data",
+                 new_callable=AsyncMock) as complete, patch(
+            "app.data_collectors.scheduler.market_review_pipeline_service.run_for_date", new_callable=AsyncMock
+        ) as run:
+            complete.side_effect = [False, False, True]
+            run.side_effect = [RuntimeError("source temporarily unavailable"), {}]
+            await scheduler._reconcile_market_review()
+            await scheduler._reconcile_market_review()
+            await scheduler._reconcile_market_review()
+        self.assertEqual(run.await_count, 2)
+        run.assert_awaited_with(target, calc_version=1)
+
+    async def test_reconcile_does_not_run_before_close(self):
+        scheduler = self._create_scheduler()
+        with patch("app.data_collectors.scheduler._should_run_after_close_catchup", return_value=False), patch(
+            "app.data_collectors.scheduler._resolve_latest_cn_trade_date_for_market_review"
+        ) as calendar:
+            await scheduler._reconcile_market_review()
+        calendar.assert_not_called()
+
+    async def test_reconcile_serializes_with_scheduled_build(self):
+        scheduler = self._create_scheduler()
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def build(*args, **kwargs):
+            entered.set()
+            await release.wait()
+        with patch("app.data_collectors.scheduler._should_run_after_close_catchup", return_value=True), patch(
+            "app.data_collectors.scheduler._resolve_latest_cn_trade_date_for_market_review", return_value=date(2026, 9, 11)
+        ), patch("app.data_collectors.scheduler.market_review_pipeline_service.has_after_close_data",
+                 new_callable=AsyncMock, return_value=True) as complete, patch(
+            "app.data_collectors.scheduler.market_review_pipeline_service.run_for_date", side_effect=build
+        ) as run:
+            task = asyncio.create_task(scheduler._build_market_review(date(2026, 9, 11)))
+            await entered.wait()
+            recovery = asyncio.create_task(scheduler._reconcile_market_review())
+            await asyncio.sleep(0.01)
+            complete.assert_not_awaited()
+            release.set()
+            await asyncio.gather(task, recovery)
+            run.assert_awaited_once()
 
     def test_start_registers_l2_collect_when_enabled(self):
         scheduler = self._create_scheduler()

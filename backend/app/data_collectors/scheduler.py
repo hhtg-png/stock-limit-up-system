@@ -147,6 +147,7 @@ class DataScheduler:
             ),
         )
         self._playbook_upgrade_lock = asyncio.Lock()
+        self._market_review_build_lock = asyncio.Lock()
         self._playbook_job_claims = (
             job_claim_service
             or TradingPlaybookJobClaimService(
@@ -208,9 +209,12 @@ class DataScheduler:
         # 盘后统计（每天15:30）
         self.scheduler.add_job(
             self._calculate_daily_stats,
-            CronTrigger(hour=15, minute=30),
+            CronTrigger(hour=15, minute=30, timezone=CN_TZ),
             id="daily_stats",
-            name="每日统计计算"
+            misfire_grace_time=900,
+            coalesce=True,
+            name="每日统计计算",
+            max_instances=1
         )
 
         # 每个交易日9:00主动刷新通达信涨停播报实时池，避免早盘继续沿用昨日兜底数据。
@@ -232,6 +236,8 @@ class DataScheduler:
                 timezone=CN_TZ,
             ),
             id="daily_analysis",
+            misfire_grace_time=900,
+            coalesce=True,
             name="每日分析月表生成",
             max_instances=1
         )
@@ -244,6 +250,8 @@ class DataScheduler:
                 timezone=CN_TZ,
             ),
             id="limit_up_classification_archive",
+            misfire_grace_time=900,
+            coalesce=True,
             name="涨停分类日终归档",
             max_instances=1,
         )
@@ -278,6 +286,8 @@ class DataScheduler:
                     timezone=CN_TZ,
                 ),
                 id="market_review_build",
+                misfire_grace_time=900,
+                coalesce=True,
                 name="市场复盘构建",
                 max_instances=1,
             )
@@ -291,9 +301,22 @@ class DataScheduler:
                         timezone=CN_TZ,
                     ),
                     id="market_review_repair",
+                    misfire_grace_time=900,
+                    coalesce=True,
                     name="市场复盘修复",
                     max_instances=1,
                 )
+
+        if settings.MARKET_REVIEW_ENABLED:
+            self.scheduler.add_job(
+                self._reconcile_market_review,
+                IntervalTrigger(seconds=300, timezone=CN_TZ),
+                id="market_review_reconcile",
+                name="收盘复盘缺失检查",
+                max_instances=1,
+                misfire_grace_time=900,
+                coalesce=True,
+            )
 
         if settings.INTELLIGENCE_ENABLED:
             self.scheduler.add_job(
@@ -2201,8 +2224,12 @@ class DataScheduler:
                 logger.info("Skipping intraday daily analysis build because current China date is not a trading day")
                 return
 
-            if settings.MARKET_REVIEW_ENABLED:
-                await market_review_pipeline_service.run_for_date(resolved_trade_date, calc_version=0)
+            async with self._market_review_build_lock:
+                if _should_run_after_close_catchup():
+                    logger.info("Skipping delayed intraday review after final build time")
+                    return
+                if settings.MARKET_REVIEW_ENABLED:
+                    await market_review_pipeline_service.run_for_date(resolved_trade_date, calc_version=0)
 
             async with async_session_maker() as db:
                 await daily_analysis_service.build_for_date(db, resolved_trade_date, session="intraday")
@@ -2242,6 +2269,25 @@ class DataScheduler:
                 logger.debug(f"Knowledge intelligence probe unchanged: {result}")
         except Exception as e:
             logger.error(f"Knowledge intelligence probe error: {e}")
+
+    async def _reconcile_market_review(self):
+        """Recover missed/failed final reviews without rebuilding complete sessions."""
+        if not _should_run_after_close_catchup():
+            return
+        try:
+            trade_date = await asyncio.to_thread(
+                _resolve_latest_cn_trade_date_for_market_review, today_cn()
+            )
+            if trade_date is None:
+                return
+            async with self._market_review_build_lock:
+                if await market_review_pipeline_service.has_after_close_data(trade_date):
+                    return
+                logger.warning("Recovering missing after-close market review for {}", trade_date)
+                await market_review_pipeline_service.run_for_date(trade_date, calc_version=1)
+                logger.info("Recovered after-close market review for {}", trade_date)
+        except Exception:
+            logger.exception("Market review recovery failed; will retry on next reconciliation")
 
     async def _run_after_close_catchup(self):
         """补跑服务启动时错过的收盘后任务。"""
@@ -2302,7 +2348,8 @@ class DataScheduler:
             if resolved_trade_date is None:
                 logger.info("Skipping market review build because current China date is not a trading day")
                 return
-            await market_review_pipeline_service.run_for_date(resolved_trade_date, calc_version=1)
+            async with self._market_review_build_lock:
+                await market_review_pipeline_service.run_for_date(resolved_trade_date, calc_version=1)
             logger.info("Market review build completed")
         except Exception as e:
             logger.error(f"Market review build error: {e}")
@@ -2315,7 +2362,8 @@ class DataScheduler:
             if trade_date is None:
                 logger.info("Skipping market review repair because current China date is not a trading day")
                 return
-            await market_review_pipeline_service.run_for_date(trade_date, calc_version=2)
+            async with self._market_review_build_lock:
+                await market_review_pipeline_service.run_for_date(trade_date, calc_version=2)
             logger.info("Market review repair completed")
         except Exception as e:
             logger.error(f"Market review repair error: {e}")

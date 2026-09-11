@@ -75,6 +75,20 @@ class MarketReviewPipelineServiceTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         await self.engine.dispose()
 
+    async def test_after_close_completeness_requires_final_metric_and_matching_details(self):
+        service = MarketReviewPipelineService(session_factory=self.session_factory)
+        target = date(2026, 9, 11)
+        self.assertFalse(await service.has_after_close_data(target))
+        await service.run_for_date(target, calc_version=0, normalized={**self._normalized_input(), "source_status": "primary"})
+        self.assertFalse(await service.has_after_close_data(target))
+        await service.run_for_date(target, calc_version=1, normalized={**self._normalized_input(), "source_status": "primary"})
+        self.assertTrue(await service.has_after_close_data(target))
+        from sqlalchemy import delete
+        async with self.session_factory() as session:
+            await session.execute(delete(MarketReviewStockDaily).where(MarketReviewStockDaily.trade_date == target))
+            await session.commit()
+        self.assertFalse(await service.has_after_close_data(target))
+
     def _normalized_input(self):
         return {
             "is_authoritative": True,

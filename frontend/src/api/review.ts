@@ -40,3 +40,17 @@ export async function getMarketReviewIntraday(tradeDate?: string): Promise<Marke
   })
   return data
 }
+
+export interface BrokenBoardPoint {
+  trade_date: string
+  average_change: number | null
+  sample_count: number
+  priced_count: number
+  data_status: string
+  stocks: { stock_code: string; stock_name: string; previous_board: number; change_pct: number | null }[]
+}
+
+export async function getBrokenBoardPerformance(params: { days: number; end_date: string }): Promise<{ points: BrokenBoardPoint[] }> {
+  const { data } = await api.get('/statistics/review/broken-board-performance', { params, timeout: 120000 })
+  return data
+}
