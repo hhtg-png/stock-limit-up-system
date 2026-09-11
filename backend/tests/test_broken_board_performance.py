@@ -85,3 +85,18 @@ class BrokenBoardPerformanceTests(unittest.IsolatedAsyncioTestCase):
         point = (await self.service.get_performance(1, self.today))["points"][0]
         self.assertEqual(point["average_change"], -1.5)
         self.assertEqual(point["priced_count"], 2)
+
+    async def test_fallback_uses_sina_and_persists_history_across_instances(self):
+        import tempfile
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            service = BrokenBoardPerformanceService(cache_dir=directory)
+            with patch.object(service, "_fetch_eastmoney_history", side_effect=RuntimeError("source down")), patch.object(
+                service, "_fetch_sina_history", new_callable=AsyncMock, return_value={self.today: 3.5}
+            ) as sina:
+                result = await service._fetch_fallback_history("600001", self.today)
+                self.assertEqual(result[self.today], 3.5)
+                sina.assert_awaited_once()
+            restarted = BrokenBoardPerformanceService(cache_dir=directory)
+            with patch.object(restarted, "_fetch_eastmoney_history", side_effect=AssertionError("must use disk cache")):
+                self.assertEqual((await restarted._fetch_fallback_history("600001", self.today))[self.today], 3.5)

@@ -2,6 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import math
+import json
+import os
+import time
+import uuid
+from pathlib import Path
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
@@ -28,7 +33,7 @@ class BrokenBoardPerformanceService:
     """Prior session's failed multi-board cohort, valued on each chart date."""
 
     def __init__(self, session_factory=async_session_maker, quote_fetcher=None,
-                 history_fetcher=None, calendar_loader=None, today_provider=_today, fallback_fetcher=None):
+                 history_fetcher=None, calendar_loader=None, today_provider=_today, fallback_fetcher=None, cache_dir="data/broken-board-history"):
         self.session_factory = session_factory
         self.quote_fetcher = quote_fetcher or tencent_api.get_quotes_batch
         self.history_fetcher = history_fetcher or self._fetch_history
@@ -39,6 +44,8 @@ class BrokenBoardPerformanceService:
         self._history_cache = {}
         self._cache_day = None
         self._history_limit = asyncio.Semaphore(8)
+        self.cache_dir = Path(cache_dir)
+        self._primary_retry_at = 0.0
 
     @staticmethod
     def _number(value):
@@ -66,49 +73,114 @@ class BrokenBoardPerformanceService:
             previous = close
         return result
 
+    def _read_disk_cache(self, source, code, end_date):
+        if len(code) != 6 or not code.isdigit():
+            return {}
+        try:
+            payload = json.loads((self.cache_dir / f"{source}-{code}.json").read_text(encoding="utf-8"))
+            if date.fromisoformat(payload["end_date"]) < end_date:
+                return {}
+            return {date.fromisoformat(day): value for day, value in payload["values"].items()
+                    if self._number(value) is not None}
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            return {}
+
+    def _save_disk_cache(self, source, code, end_date, values):
+        if not values or len(code) != 6 or not code.isdigit():
+            return
+        temporary = None
+        try:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            target = self.cache_dir / f"{source}-{code}.json"
+            temporary = self.cache_dir / f".{source}-{code}-{uuid.uuid4().hex}.tmp"
+            temporary.write_text(json.dumps({"end_date": end_date.isoformat(),
+                "values": {day.isoformat(): value for day, value in values.items()}}), encoding="utf-8")
+            os.replace(temporary, target)
+        except OSError as exc:
+            logger.warning("Unable to cache broken-board history for {}: {}", code, exc)
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
     async def _fetch_history(self, code, end_date):
         key = (code, end_date)
         if key in self._history_cache:
             return self._history_cache[key]
+        disk = self._read_disk_cache("primary", code, end_date)
+        if disk:
+            self._history_cache[key] = disk
+            return disk
         async with self._history_limit:
             if key in self._history_cache:
                 return self._history_cache[key]
+            if time.monotonic() < self._primary_retry_at:
+                return {}
             symbol = ("sh" if code.startswith("6") else "bj" if code.startswith(("4", "8", "92")) else "sz") + code
             async with httpx.AsyncClient(timeout=12) as client:
                 response = await client.get("https://web.ifzq.gtimg.cn/appstock/app/fqkline/get", params={
                     "param": f"{symbol},day,,{end_date.isoformat()},640,qfq"
                 })
+                if response.status_code >= 500 or response.status_code == 429:
+                    self._primary_retry_at = time.monotonic() + 300
+                    logger.warning("Broken-board primary history returned {}; backing off for 5 minutes", response.status_code)
                 response.raise_for_status()
                 data = (response.json().get("data") or {}).get(symbol) or {}
             history = self.parse_history(data.get("qfqday") or data.get("day") or [])
             if history:
                 self._history_cache[key] = history
+                self._save_disk_cache("primary", code, end_date, history)
             return history
 
     async def _fetch_fallback_history(self, code, end_date):
         key = ("fallback", code, end_date)
         if key in self._history_cache:
             return self._history_cache[key]
+        disk = self._read_disk_cache("fallback", code, end_date)
+        if disk:
+            self._history_cache[key] = disk
+            return disk
         async with self._history_limit:
-            async with httpx.AsyncClient(timeout=10) as client:
-                response = await client.get("https://push2his.eastmoney.com/api/qt/stock/kline/get", params={
-                    "secid": f"{1 if code.startswith('6') else 0}.{code}",
-                    "fields1": "f1,f2,f3", "fields2": "f51,f59", "klt": "101", "fqt": "1",
-                    "end": end_date.strftime("%Y%m%d"), "lmt": "640",
-                })
-                response.raise_for_status()
+            if key in self._history_cache:
+                return self._history_cache[key]
+            try:
+                result = await self._fetch_eastmoney_history(code, end_date)
+            except Exception:
                 result = {}
-                for row in (response.json().get("data") or {}).get("klines") or []:
-                    parts = row.split(",")
-                    try:
-                        value = self._number(parts[1])
-                        if value is not None:
-                            result[date.fromisoformat(parts[0])] = value
-                    except (ValueError, IndexError):
-                        continue
+            if not result:
+                result = await self._fetch_sina_history(code, end_date)
             if result:
                 self._history_cache[key] = result
+                self._save_disk_cache("fallback", code, end_date, result)
             return result
+
+    async def _fetch_sina_history(self, code, end_date):
+        from app.api.v1.market import _fetch_kline_from_sina
+        market = "SH" if code.startswith("6") else "BJ" if code.startswith(("4", "8", "92")) else "SZ"
+        rows = await _fetch_kline_from_sina(code, market, "day", 640)
+        return {row["date"]: row["change_pct"] for row in rows
+                if row["date"] <= end_date and self._number(row.get("change_pct")) is not None}
+
+    async def _fetch_eastmoney_history(self, code, end_date):
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.get("https://push2his.eastmoney.com/api/qt/stock/kline/get", params={
+                "secid": f"{1 if code.startswith('6') else 0}.{code}",
+                "fields1": "f1,f2,f3", "fields2": "f51,f59", "klt": "101", "fqt": "1",
+                "end": end_date.strftime("%Y%m%d"), "lmt": "640",
+            })
+            response.raise_for_status()
+            result = {}
+            for row in (response.json().get("data") or {}).get("klines") or []:
+                parts = row.split(",")
+                try:
+                    value = self._number(parts[1])
+                    if value is not None:
+                        result[date.fromisoformat(parts[0])] = value
+                except (ValueError, IndexError):
+                    continue
+        return result
 
     async def get_performance(self, days: int, end_date: date):
         today = self.today_provider()
