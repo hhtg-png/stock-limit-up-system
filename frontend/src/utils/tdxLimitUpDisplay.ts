@@ -3,6 +3,14 @@ function toFiniteNumber(value: unknown): number | null {
   return Number.isFinite(numberValue) ? numberValue : null
 }
 
+export function resolveTdxBoardLabel(isSealed: boolean, board: unknown, label?: string): string {
+  if (!isSealed) return '炸板'
+  if (label) return label
+  const count = Number(board)
+  if (!Number.isFinite(count) || count <= 0) return '涨停'
+  return count > 1 ? `${count}板` : '首板'
+}
+
 export function pickDisplayChangePct(previous: unknown, next: unknown): number {
   const nextValue = toFiniteNumber(next)
   if (nextValue !== null && nextValue !== 0) return nextValue

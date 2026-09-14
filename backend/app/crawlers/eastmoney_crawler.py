@@ -293,7 +293,11 @@ class EastMoneyCrawler(BaseCrawler):
 
                 if source_lbc is not None:
                     continuous_days = source_lbc
-                elif zttj_count is not None and zttj_days == zttj_count:
+                elif not is_sealed and zttj.get("days") == 0 and zttj.get("ct") == 0:
+                    # The broken pool excludes today's touch: an explicitly
+                    # empty completed-board history confirms a first touch.
+                    continuous_days = 1
+                elif is_sealed and zttj_count is not None and zttj_days == zttj_count:
                     continuous_days = zttj_count
                 else:
                     continuous_days = None

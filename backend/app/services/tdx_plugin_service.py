@@ -989,7 +989,7 @@ class TdxPluginService:
             "event_time": event_time,
             "stock_code": item.get("stock_code", ""),
             "stock_name": item.get("stock_name", ""),
-            "board": int(item.get("continuous_limit_up_days") or 1),
+            "board": int(item.get("continuous_limit_up_days") or 0),
             "reason": reason,
             "reason_category": item.get("reason_category") or "其他",
             "change_pct": float(item.get("change_pct") or 0),
@@ -999,9 +999,11 @@ class TdxPluginService:
             "is_sealed": is_sealed,
             "open_count": open_count,
             "sources": sources,
-            "target_status_label": status_label or self._target_status_label(
-                is_sealed,
-                int(item.get("continuous_limit_up_days") or 1),
+            "target_status_label": (
+                "炸板" if not is_sealed else
+                item.get("board_label") or status_label or self._target_status_label(
+                    True, int(item.get("continuous_limit_up_days") or 0)
+                )
             ),
             "target_plate": target_plate,
             "target_reason_summary": self._target_reason_summary_from_attribution(public_attribution, reason) or self._target_reason_summary(reason),
@@ -1732,6 +1734,7 @@ class TdxPluginService:
                 .join(Stock, LimitUpRecord.stock_id == Stock.id)
                 .where(Stock.stock_code.in_(codes))
                 .where(LimitUpRecord.trade_date <= target_date)
+                .where(LimitUpRecord.is_final_sealed.is_(True))
                 .order_by(Stock.stock_code, LimitUpRecord.trade_date)
             )
             date_result = await db.execute(
@@ -1764,7 +1767,7 @@ class TdxPluginService:
                 target_date,
                 by_code.get(code, []),
                 market_dates,
-                int(item.get("continuous_limit_up_days") or 1),
+                int(item.get("continuous_limit_up_days") or 0),
             )
             if label:
                 labels[code] = label
@@ -1958,6 +1961,8 @@ class TdxPluginService:
     def _target_status_label(is_sealed: bool, board: int) -> str:
         if not is_sealed:
             return "炸板"
+        if board <= 0:
+            return "涨停"
         if board <= 1:
             return "首板"
         return f"{board}天{board}板"

@@ -194,7 +194,7 @@ class LimitUpDetailApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record.final_seal_time, final_time)
         self.assertEqual(db.commit_count, 1)
 
-    async def test_get_realtime_limit_up_defaults_unknown_continuous_days_to_first_board(self):
+    async def test_get_realtime_limit_up_keeps_unknown_continuous_days_unconfirmed(self):
         trade_date = date(2026, 6, 16)
 
         with patch("app.api.v1.limit_up.today_cn", return_value=trade_date), patch.object(
@@ -226,7 +226,7 @@ class LimitUpDetailApiTests(unittest.IsolatedAsyncioTestCase):
                 db=None,
             )
 
-        self.assertEqual(response.data[0].continuous_limit_up_days, 1)
+        self.assertEqual(response.data[0].continuous_limit_up_days, 0)
 
     async def test_get_realtime_limit_up_reads_historical_date_from_database_first(self):
         today = date(2026, 6, 18)

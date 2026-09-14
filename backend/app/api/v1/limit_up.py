@@ -391,7 +391,7 @@ async def get_realtime_limit_up(
     # 处理实时数据
     limit_up_list = []
     for item in raw_data:
-        continuous_limit_up_days = _positive_int_or_default(item.get("continuous_limit_up_days"))
+        continuous_limit_up_days = _positive_int_or_default(item.get("continuous_limit_up_days"), default=0)
         
         is_sealed = item.get("is_sealed", item.get("is_final_sealed", True))
         current_status = item.get("current_status", "sealed" if is_sealed else "opened")
@@ -415,6 +415,7 @@ async def get_realtime_limit_up(
             limit_up_reason=item.get("limit_up_reason", ""),
             reason_category=item.get("reason_category", "其他"),
             continuous_limit_up_days=continuous_limit_up_days,
+            board_label=item.get("board_label") or "",
             open_count=open_count,
             is_sealed=is_sealed,
             is_one_word=_is_one_word_limit_up(first_time_str, open_count, is_sealed),

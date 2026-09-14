@@ -392,7 +392,7 @@ class TongHuaShunCrawler(BaseCrawler):
                 reason_category = self._classify_reason(reason)
                 
                 # 解析连板标签 - high_days 可能是 "首板"、"2连板"、"3天2板"
-                continuous_days = 1
+                continuous_days = None
                 high_days = item.get("high_days", "")
                 board_label = "首板"
                 if high_days:
@@ -405,7 +405,9 @@ class TongHuaShunCrawler(BaseCrawler):
                         window_match = re.search(r"(\d+)天(\d+)板", high_days_text)
                         board_match = re.search(r"(\d+)板", high_days_text)
                         if window_match:
-                            continuous_days = int(window_match.group(2))
+                            window_days = int(window_match.group(1))
+                            count = int(window_match.group(2))
+                            continuous_days = count if window_days == count else None
                             board_label = f"{window_match.group(1)}天{window_match.group(2)}板"
                         elif board_match:
                             continuous_days = int(board_match.group(1))

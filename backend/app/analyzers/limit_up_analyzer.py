@@ -206,7 +206,7 @@ class LimitUpAnalyzer:
             result = await db.execute(query)
             record = result.scalar_one_or_none()
             
-            if record:
+            if record and record.is_final_sealed:
                 continuous_days += 1
                 check_date -= timedelta(days=1)
             else:
@@ -250,7 +250,9 @@ class LimitUpAnalyzer:
             return existing
         
         # 计算连板天数
-        continuous_days = await self.calculate_continuous_days(stock.id, trade_date, db)
+        continuous_days = data.get("continuous_limit_up_days")
+        if continuous_days is None:
+            continuous_days = await self.calculate_continuous_days(stock.id, trade_date, db)
         
         # 创建新记录
         record = LimitUpRecord(

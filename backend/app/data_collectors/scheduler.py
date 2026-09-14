@@ -2075,6 +2075,8 @@ class DataScheduler:
             
             if not data_list:
                 return
+            from app.services.realtime_limit_up_service import realtime_limit_up_service
+            await realtime_limit_up_service._enrich_board_metadata(data_list, date.today())
             
             async with async_session_maker() as db:
                 for data in data_list:

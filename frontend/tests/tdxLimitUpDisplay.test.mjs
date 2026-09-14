@@ -13,6 +13,11 @@ const transpiled = ts.transpileModule(helperSource, {
 }).outputText
 const helper = await import(`data:text/javascript;charset=utf-8,${encodeURIComponent(transpiled)}`)
 
+assert.equal(helper.resolveTdxBoardLabel(true, 3, '6天4板'), '6天4板')
+assert.equal(helper.resolveTdxBoardLabel(true, 2, ''), '2板')
+assert.equal(helper.resolveTdxBoardLabel(true, null, ''), '涨停')
+assert.equal(helper.resolveTdxBoardLabel(false, 2, '2板'), '炸板')
+
 assert.equal(helper.pickDisplayChangePct(9.99, 0), 9.99, 'status refresh zero should not hide a real snapshot change pct')
 assert.equal(helper.pickDisplayChangePct(20.21, null), 20.21, 'empty status change pct should preserve snapshot value')
 assert.equal(helper.pickDisplayChangePct(0, 10), 10, 'a valid next change pct should be used')

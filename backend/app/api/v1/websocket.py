@@ -392,8 +392,8 @@ async def broadcast_tdx_limit_up_event(alert: dict, trade_date: Optional[date] =
     fallback_reason = alert.get("reason")
     event_trade_date = coerce_tdx_alert_trade_date(trade_date or alert.get("trade_date"))
     reason = await resolve_tdx_limit_up_speech_reason(stock_code, fallback_reason, event_trade_date)
-    continuous_days = alert.get("continuous_days", 1)
-    status_label = tdx_limit_up_status_label(continuous_days)
+    continuous_days = alert.get("continuous_days")
+    status_label = alert.get("board_label") or tdx_limit_up_status_label(continuous_days)
     event_id = f"tdx-limit-up-touch-{stock_code}-{event_time}"
     await manager.broadcast_tdx_plugin_event(
         "tdx_limit_up_event",
@@ -485,9 +485,11 @@ def short_tdx_limit_up_reason(reason: object) -> str:
 
 def tdx_limit_up_status_label(continuous_days: object) -> str:
     try:
-        board = int(continuous_days or 1)
+        board = int(continuous_days or 0)
     except (TypeError, ValueError):
-        board = 1
+        board = 0
+    if board <= 0:
+        return "涨停"
     return f"{board}板" if board > 1 else "首板"
 
 

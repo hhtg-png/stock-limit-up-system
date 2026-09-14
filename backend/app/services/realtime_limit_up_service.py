@@ -13,7 +13,7 @@ import asyncio
 import copy
 import time
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
 
@@ -47,6 +47,9 @@ class RealtimeLimitUpService:
         self._pool_cache_time: Dict[date, float] = {}
         self._pool_refresh_tasks: Dict[date, asyncio.Task] = {}
         self._pool_refresh_errors: Dict[date, str] = {}
+        self._previous_board_counts: Dict[date, Dict[str, int]] = {}
+        self._previous_board_retry_at: Dict[date, float] = {}
+        self._previous_board_lock = asyncio.Lock()
 
         self._ths_reason_cache: Dict[str, str] = {}
         self._ths_reason_cache_time: float = 0.0
@@ -267,6 +270,7 @@ class RealtimeLimitUpService:
 
             sealed_data = em_crawler.parse(sealed_resp.json(), is_sealed=True)
             opened_data = em_crawler.parse(opened_resp.json(), is_sealed=False)
+            await self._enrich_board_metadata(sealed_data + opened_data, trade_date)
             collected_at = datetime.now(ZoneInfo("Asia/Shanghai"))
             merged = []
             for item in sealed_data + opened_data:
@@ -294,6 +298,81 @@ class RealtimeLimitUpService:
             self._pool_refresh_errors[trade_date] = str(exc)
             logger.warning(f"快速涨停池刷新失败，trade_date={trade_date}: {exc}")
             return self._pool_cache.get(trade_date, [])
+
+    async def _load_previous_board_counts(self, trade_date: date) -> Optional[Dict[str, int]]:
+        """Use a finalized, complete previous-session review, never a guessed date."""
+        async with self._previous_board_lock:
+            if trade_date in self._previous_board_counts:
+                return self._previous_board_counts[trade_date]
+            if time.time() < self._previous_board_retry_at.get(trade_date, 0):
+                return None
+            self._previous_board_retry_at[trade_date] = time.time() + 30
+            try:
+                from app.data_collectors.scheduler import _get_cn_trading_dates
+
+                dates = await asyncio.wait_for(asyncio.to_thread(
+                    _get_cn_trading_dates, trade_date - timedelta(days=30), trade_date
+                ), timeout=5)
+                if trade_date not in dates:
+                    return None
+                previous = max(day for day in dates if day < trade_date)
+                from app.database import async_session_maker
+                from app.models.market_review import MarketReviewDailyMetric, MarketReviewStockDaily
+
+                async with async_session_maker() as db:
+                    metric = (await db.execute(select(MarketReviewDailyMetric).where(
+                        MarketReviewDailyMetric.trade_date == previous
+                    ))).scalar_one_or_none()
+                    if (metric is None or metric.source_status != "primary"
+                            or metric.updated_at is None
+                            or metric.updated_at < datetime.combine(previous, datetime.min.time()).replace(hour=15)):
+                        raise ValueError("Previous review is not finalized and authoritative")
+                    records = (await db.execute(select(MarketReviewStockDaily).where(
+                        MarketReviewStockDaily.trade_date == previous,
+                    ))).scalars().all()
+                    if sum(row.today_touched_limit_up for row in records) != metric.limit_up_count:
+                        raise ValueError("Previous review touched rows do not match its complete metric")
+                    counts = {row.stock_code: (em_crawler._to_positive_int(row.today_continuous_days)
+                                              if row.today_sealed_close else 0)
+                              for row in records if row.data_quality_flag == "ok"}
+                    if len(counts) != len(records) or any(value is None for value in counts.values()):
+                        raise ValueError("Previous review has missing or invalid streak counts")
+                self._previous_board_counts = {trade_date: counts}
+                self._previous_board_retry_at = {}
+                return counts
+            except Exception as exc:
+                logger.warning("Previous-session board metadata unavailable: {}", exc)
+                return None
+
+    async def _enrich_board_metadata(self, rows: List[Dict], trade_date: date) -> None:
+        previous_items = {row.get("stock_code"): row for row in self._pool_cache.get(trade_date, [])}
+        unresolved = []
+        for row in rows:
+            if em_crawler._to_positive_int(row.get("continuous_limit_up_days")):
+                continue
+            cached = previous_items.get(row.get("stock_code"), {})
+            known = em_crawler._to_positive_int(cached.get("continuous_limit_up_days"))
+            # The broken pool's zttj excludes today's unsealed touch. Its label
+            # must never overwrite metadata already confirmed while sealed.
+            if known:
+                row["continuous_limit_up_days"] = known
+                row["board_label"] = cached.get("board_label") or (f"{known}板" if known > 1 else "首板")
+            else:
+                unresolved.append(row)
+        if not unresolved:
+            return
+        counts = await self._load_previous_board_counts(trade_date)
+        for row in unresolved:
+            if counts is None or row.get("stock_code") not in counts:
+                row["continuous_limit_up_days"] = None
+                row["board_label"] = ""
+                continue
+            board = counts[row["stock_code"]] + 1
+            row["continuous_limit_up_days"] = board
+            # Preserve a same-day THS interval label; broken-pool labels are
+            # not today's completed-board statistics.
+            if row.get("data_source") != "THS" or not row.get("board_label"):
+                row["board_label"] = f"{board}板" if board > 1 else "首板"
 
     async def _fetch_ths_reason_map(self) -> Dict[str, str]:
         """获取同花顺涨停原因，使用 stale-while-revalidate 缓存"""

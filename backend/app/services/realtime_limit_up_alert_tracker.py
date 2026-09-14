@@ -55,7 +55,8 @@ class RealtimeLimitUpAlertTracker:
                     if hasattr(first_limit_up_time, "strftime")
                     else (first_limit_up_time or ""),
                     "reason": record.get("limit_up_reason"),
-                    "continuous_days": record.get("continuous_limit_up_days", 1),
+                    "continuous_days": record.get("continuous_limit_up_days"),
+                    "board_label": record.get("board_label") or "",
                 }
             )
 

@@ -94,7 +94,7 @@ import { useSpeech } from '@/composables/useSpeech'
 import { useTdxStockLink } from '@/composables/useTdxStockLink'
 import { clearTdxPluginRealtime, useTdxPluginRealtime } from '@/composables/useWebSocket'
 import { useLimitUpStore } from '@/stores/limit-up'
-import { formatTdxSealAmount, pickDisplayChangePct, resolveTdxMergedDisplayState } from '@/utils/tdxLimitUpDisplay'
+import { formatTdxSealAmount, resolveTdxBoardLabel, pickDisplayChangePct, resolveTdxMergedDisplayState } from '@/utils/tdxLimitUpDisplay'
 import type { LimitUpRealtime } from '@/types/limit-up'
 import type { TdxLimitUpEvent, TdxPluginPayload } from '@/types/tdx-plugins'
 
@@ -368,7 +368,7 @@ function normalizeTdxEvent(item: TdxLimitUpEvent): TdxLimitUpEvent {
     event_time: item.event_time || '',
     stock_code: item.stock_code,
     stock_name: item.stock_name || item.stock_code,
-    board: Number(item.board || 1),
+    board: Number(item.board || 0),
     reason: item.reason || '',
     reason_category: item.reason_category || '其他',
     change_pct: Number(item.change_pct || 0),
@@ -409,7 +409,7 @@ function realtimeToTdxEvent(item: LimitUpRealtime): TdxLimitUpEvent {
     event_time: eventTime,
     stock_code: item.stock_code,
     stock_name: item.stock_name,
-    board: Number(item.continuous_limit_up_days || 1),
+    board: Number(item.continuous_limit_up_days || 0),
     reason: item.limit_up_reason || item.reason_category || '',
     reason_category: item.reason_category || '其他',
     change_pct: Number((item as LimitUpRealtime & { change_pct?: number }).change_pct || 0),
@@ -419,7 +419,7 @@ function realtimeToTdxEvent(item: LimitUpRealtime): TdxLimitUpEvent {
     is_sealed: isSealed,
     open_count: openCount,
     sources: ['实时涨停池'],
-    target_status_label: targetStatusLabel(isSealed, Number(item.continuous_limit_up_days || 1)),
+    target_status_label: resolveTdxBoardLabel(isSealed, item.continuous_limit_up_days, item.board_label),
     target_plate: item.reason_category || item.industry || '',
     target_reason_summary: item.limit_up_reason || item.reason_category || '',
     target_seal_amount: formatTdxSealAmount(sealAmount)
@@ -443,8 +443,7 @@ function buildPlateFilters(items: TdxLimitUpEvent[]) {
 }
 
 function targetStatusLabel(isSealed: boolean, board: number) {
-  if (!isSealed) return '炸板'
-  return board > 1 ? `${board}板` : '首板'
+  return resolveTdxBoardLabel(isSealed, board)
 }
 
 function limitUpStatusSpeechLabel(item: TdxLimitUpEvent) {
@@ -452,13 +451,13 @@ function limitUpStatusSpeechLabel(item: TdxLimitUpEvent) {
   const rawLabel = item.target_status_label || item.event_label || ''
   if (rawLabel && !rawLabel.includes('封死涨停')) return rawLabel
   if (item.event_type === 'limit_up_resealed') return '回封'
-  return targetStatusLabel(true, Number(item.board || 1))
+  return targetStatusLabel(true, Number(item.board || 0))
 }
 
 function limitUpTouchSpeechLabel(item: TdxLimitUpEvent) {
   const rawLabel = item.target_status_label || ''
   if (rawLabel && !/炸板|涨停打开|回封/.test(rawLabel)) return rawLabel
-  return targetStatusLabel(true, Number(item.board || 1))
+  return targetStatusLabel(true, Number(item.board || 0))
 }
 
 function isPlainSealedStatusEvent(item: TdxLimitUpEvent) {
@@ -548,7 +547,7 @@ function formatAmount(value: number) {
 
 function resolvedTargetStatusLabel(item: TdxLimitUpEvent) {
   if (item.event_type === 'limit_up_opened' || !item.is_sealed) return '炸板'
-  return item.target_status_label || item.event_label || targetStatusLabel(true, Number(item.board || 1))
+  return item.target_status_label || item.event_label || targetStatusLabel(true, Number(item.board || 0))
 }
 
 function displayStatus(item: TdxLimitUpEvent) {

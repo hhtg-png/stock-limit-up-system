@@ -37,6 +37,7 @@ class LimitUpRecord(LimitUpBase):
 
 class LimitUpRealtime(LimitUpBase):
     """实时涨停信息"""
+    board_label: str = Field("", description="涨停标签，与连续板数分别传递")
     first_limit_up_time: Optional[str] = Field(None, description="首次涨停时间(HH:MM:SS)")
     final_seal_time: Optional[str] = Field(None, description="最终封板时间(HH:MM:SS)")
     limit_up_reason: Optional[str] = Field(None, description="涨停原因")
