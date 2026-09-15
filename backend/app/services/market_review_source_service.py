@@ -193,6 +193,11 @@ class MarketReviewSourceService:
             return self._merge_market_stats(historical_stats, stored_stats)
 
         try:
+            return await self._fetch_tencent_market_stats(trade_date)
+        except Exception as exc:
+            logger.warning(f'Tencent full-market snapshot failed for {trade_date}: {exc}')
+
+        try:
             live_stats = await asyncio.to_thread(self._fetch_live_market_stats_sync)
         except Exception as exc:
             logger.warning(f"Live market snapshot fetch failed for {trade_date}: {exc}")
@@ -202,6 +207,11 @@ class MarketReviewSourceService:
             return stored_stats
 
         return self._merge_market_stats(live_stats, stored_stats)
+
+    async def _fetch_tencent_market_stats(self, trade_date: date) -> Dict[str, Any]:
+        from app.services.live_market_stats_service import live_market_stats_service
+
+        return await asyncio.wait_for(live_market_stats_service.get_stats(trade_date), timeout=18.0)
 
     async def _load_daily_statistics(self, trade_date: date) -> Dict[str, Any]:
         async with self.session_factory() as session:
