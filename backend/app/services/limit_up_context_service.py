@@ -19,6 +19,7 @@ from app.database import async_session_maker
 from app.models.limit_up import LimitUpRecord
 from app.models.market_review import MarketReviewStockDaily
 from app.models.stock import Stock
+from app.services.opening_auction_archive_service import opening_auction_archive_service
 from app.utils.time_utils import now_cn, today_cn
 
 
@@ -50,6 +51,7 @@ class LimitUpContextService:
         *,
         calendar_loader=None,
         session_factory=async_session_maker,
+        archive_service=opening_auction_archive_service,
         history_fetcher=None,
         pool_fetcher=None,
         http_client=None,
@@ -62,6 +64,7 @@ class LimitUpContextService:
     ):
         self.calendar_loader = calendar_loader or _calendar
         self.session_factory = session_factory
+        self.archive_service = archive_service
         self.history_fetcher = history_fetcher or self._fetch_history
         self.pool_fetcher = pool_fetcher or _pool
         self.today_provider = today_provider
@@ -164,9 +167,17 @@ class LimitUpContextService:
         async def populate():
             nonlocal previous
             previous = await self._previous_session(trade_date)
+            await asyncio.gather(*(
+                self._load_archived_openings(day, codes)
+                for day in (previous, trade_date) if day is not None
+            ))
+            # Fresh current quotes take precedence over imported snapshots.
+            for code, value in live.items():
+                self._put(self._daily_cache, (trade_date, code), value)
             await asyncio.gather(
                 self._load_daily(trade_date, previous, codes),
                 self._load_seals(previous, codes) if previous else asyncio.sleep(0),
+                self._record_current_openings(trade_date, {code: quotes[code] for code in live}),
             )
 
         try:
@@ -186,6 +197,31 @@ class LimitUpContextService:
                 if seal:
                     row["yesterday_first_limit_up_time"], row["yesterday_final_seal_time"] = seal
         return result
+
+    async def _load_archived_openings(self, day, codes):
+        if self.archive_service is None or not self._opening_finished(day):
+            return
+        try:
+            # Read every call so an imported file can replace a recent missing
+            # provider result without waiting for the negative cache to expire.
+            values = await self.archive_service.get_percentages(day)
+            for code in codes:
+                percentage = self._number(values.get(code))
+                if percentage is not None:
+                    self._put(self._daily_cache, (day, code), percentage)
+        except Exception as exc:
+            logger.debug("Archived opening context unavailable for {}: {}", day, exc)
+
+    async def _record_current_openings(self, day, quotes):
+        if self.archive_service is None or day != self.today_provider() or not self._opening_finished(day):
+            return
+        try:
+            # This schedules the all-market job; the list never awaits it.
+            self.archive_service.request_full_capture(day)
+            if quotes:
+                await self.archive_service.record_quotes(day, quotes)
+        except Exception as exc:
+            logger.debug("Opening snapshot capture unavailable for {}: {}", day, exc)
 
     async def _previous_session(self, day):
         async with self._calendar_lock:
@@ -226,6 +262,10 @@ class LimitUpContextService:
                     logger.debug("Opening history unavailable for {}: {}", code, exc)
                     history = {}
                 for value in missing:
+                    # Another request may have loaded a new archive or quote
+                    # while this provider request was in flight.
+                    if self._get(self._daily_cache, (value, code))[1] is not None:
+                        continue
                     prices = (history or {}).get(value) or {}
                     percentage = self._opening_pct(prices.get("open"), prices.get("pre_close"))
                     self._put(self._daily_cache, (value, code), percentage, missing=percentage is None)

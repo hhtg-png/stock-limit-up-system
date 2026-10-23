@@ -46,6 +46,12 @@ Files: frontend/src/views/LimitUpList.vue; frontend/src/components/stock/MobileL
 - [x] Independent review of spec compliance and code quality; fix important issues and rerun relevant tests.
 - [x] Commit reviewed changes; deliver verified feature, reporting deployment state explicitly.
 
+### Production follow-up: durable opening facts
+Files: backend/app/services/opening_auction_archive_service.py; backend/tests/test_opening_auction_archive_service.py; context service and tests.
+- [x] Verify RED→GREEN for atomic merged day files, quote timestamp validation, real zero, independent-day reload and nonblocking bounded-batch capture.
+- [x] Load archives before historical requests, overriding recent negative cache entries; retain live quote precedence and enrichment deadline.
+- [x] Import verified October 21–23 opening facts, verify API current/historical rows after deployment, and confirm all-market background capture persists current session for future yesterday lookups.
+
 ## Verification record
 
 - Backend full suite: 1118 tests, 2 skipped, no failures; final context/integration regression: 22 passed.
@@ -54,3 +60,6 @@ Files: frontend/src/views/LimitUpList.vue; frontend/src/components/stock/MobileL
 - Production read-only probe: 94/94 current openings, 87/94 historical openings available; unavailable adjusted history is left null rather than mixing price bases.
 
 - Post-deployment source verification: Tencent web history returned 501 from production; switched the history provider to its public proxy.finance.qq.com API. Endpoint/header regression and all 22 context/integration tests passed.
+
+- Durable-archive final validation: full backend 1132 tests passed (2 skipped); 34 final context/integration/archive regressions passed; frontend 132 tests and build passed. Worker cancellation/partial quote coverage fixes approved by independent review.
+- Production all-market current-session opening archive captured 5572 codes successfully; historical day files imported for October 21–23.

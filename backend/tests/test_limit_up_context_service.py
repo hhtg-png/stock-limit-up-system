@@ -5,6 +5,8 @@ import threading
 import time
 import unittest
 from datetime import date, datetime, time as wall_time
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -44,6 +46,7 @@ class LimitUpContextTests(unittest.IsolatedAsyncioTestCase):
         defaults = dict(
             calendar_loader=lambda start, end: [PREVIOUS, DAY],
             session_factory=None,
+            archive_service=None,
             history_fetcher=empty_history,
             pool_fetcher=empty_pool,
             today_provider=lambda: DAY,
@@ -189,6 +192,93 @@ class LimitUpContextTests(unittest.IsolatedAsyncioTestCase):
         result = await service.enrich(next_day, rows)
         self.assertAlmostEqual(result[0]["yesterday_open_change_pct"], 10)
         self.assertAlmostEqual(result[0]["today_open_change_pct"], -10)
+
+    async def test_persisted_openings_supply_historical_dates_without_network_history(self):
+        archived = {PREVIOUS: {"000001": 0.0}, DAY: {"000001": -2.5}}
+        archive = SimpleNamespace(get_percentages=AsyncMock(side_effect=lambda day: archived.get(day, {})),
+                                  record_quotes=AsyncMock(), request_full_capture=Mock())
+        history = AsyncMock(side_effect=AssertionError("persisted prices must avoid provider requests"))
+        service = self.service(archive_service=archive, history_fetcher=history, today_provider=lambda: date(2026, 10, 23))
+        result = await service.enrich(DAY, [{"stock_code": "000001"}])
+        self.assertEqual(result[0]["yesterday_open_change_pct"], 0)
+        self.assertEqual(result[0]["today_open_change_pct"], -2.5)
+        history.assert_not_awaited()
+        archive.record_quotes.assert_not_awaited()
+        archive.request_full_capture.assert_not_called()
+
+    async def test_fresh_archive_import_replaces_missing_cache_and_valid_live_quote_wins(self):
+        archived = {}
+        archive = SimpleNamespace(get_percentages=AsyncMock(side_effect=lambda day: archived.get(day, {})),
+                                  record_quotes=AsyncMock(), request_full_capture=Mock())
+        service = self.service(archive_service=archive)
+        rows = [{"stock_code": "000001"}]
+        self.assertIsNone((await service.enrich(DAY, rows))[0]["today_open_change_pct"])
+        archived.update({PREVIOUS: {"000001": 0.0}, DAY: {"000001": 3.5}})
+        result = await service.enrich(DAY, rows)
+        self.assertEqual(result[0]["yesterday_open_change_pct"], 0)
+        self.assertEqual(result[0]["today_open_change_pct"], 3.5)
+        valid_quote = {"datetime": "20261012100000", "open": 11, "pre_close": 10}
+        result = await service.enrich(DAY, rows, {
+            "000001": valid_quote,
+            "000002": {"datetime": "20261009150000", "open": 11, "pre_close": 10},
+        })
+        self.assertEqual(result[0]["today_open_change_pct"], 10)
+        archive.record_quotes.assert_awaited_once_with(DAY, {"000001": valid_quote})
+        self.assertTrue(all(call.args == (DAY,) for call in archive.request_full_capture.call_args_list))
+        self.assertTrue(archive.request_full_capture.called)
+
+    async def test_archive_rejects_nonfinite_values_and_does_not_capture_indicative_open(self):
+        archive = SimpleNamespace(get_percentages=AsyncMock(return_value={"000001": float("nan")}),
+                                  record_quotes=AsyncMock(), request_full_capture=Mock())
+        result = await self.service(archive_service=archive, now_provider=lambda: datetime(2026, 10, 12, 9, 24)).enrich(
+            DAY, [{"stock_code": "000001"}], {"000001": {"datetime": "20261012092400", "open": 11, "pre_close": 10}}
+        )
+        self.assertIsNone(result[0]["today_open_change_pct"])
+        self.assertIsNone(result[0]["yesterday_open_change_pct"])
+        archive.record_quotes.assert_not_awaited()
+        archive.request_full_capture.assert_not_called()
+
+    async def test_archive_io_is_inside_total_budget_and_does_not_lose_live_quote(self):
+        entered = asyncio.Event()
+
+        async def slow_archive(day):
+            entered.set()
+            await asyncio.sleep(1)
+            return {}
+
+        archive = SimpleNamespace(get_percentages=AsyncMock(side_effect=slow_archive),
+                                  record_quotes=AsyncMock(), request_full_capture=Mock())
+        started = time.monotonic()
+        result = await self.service(archive_service=archive, budget_seconds=0.04).enrich(
+            DAY, [{"stock_code": "000001"}], {"000001": {"datetime": "20261012100000", "open": 10, "pre_close": 10}}
+        )
+        self.assertLess(time.monotonic() - started, 0.2)
+        self.assertEqual(result[0]["today_open_change_pct"], 0)
+        self.assertTrue(entered.is_set())
+
+    async def test_inflight_history_failure_cannot_replace_newly_imported_openings(self):
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        archived = {}
+
+        async def history(*args):
+            entered.set()
+            await release.wait()
+            return {}
+
+        archive = SimpleNamespace(get_percentages=AsyncMock(side_effect=lambda day: archived.get(day, {})),
+                                  record_quotes=AsyncMock(), request_full_capture=Mock())
+        service = self.service(archive_service=archive, history_fetcher=history)
+        rows = [{"stock_code": "000001"}]
+        first = asyncio.create_task(service.enrich(DAY, rows))
+        await asyncio.wait_for(entered.wait(), 0.2)
+        archived.update({PREVIOUS: {"000001": 1.25}, DAY: {"000001": 0.0}})
+        newer = await service.enrich(DAY, rows)
+        self.assertEqual(newer[0]["today_open_change_pct"], 0)
+        release.set()
+        original = await first
+        self.assertEqual(original[0]["today_open_change_pct"], 0)
+        self.assertEqual(original[0]["yesterday_open_change_pct"], 1.25)
 
     async def test_overall_budget_returns_partial_data_and_limits_concurrency(self):
         running = 0
