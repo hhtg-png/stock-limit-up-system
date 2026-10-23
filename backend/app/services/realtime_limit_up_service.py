@@ -124,6 +124,7 @@ class RealtimeLimitUpService:
         trade_date: Optional[date] = None,
         wait_for_pool_refresh: bool = False,
         pool_max_cache_age: Optional[float] = None,
+        include_monitor_context: bool = False,
     ) -> List[Dict]:
         """获取高实时涨停列表（EM 元数据 + THS 原因 + 腾讯行情）"""
         if trade_date is None:
@@ -158,7 +159,7 @@ class RealtimeLimitUpService:
                 except Exception as quote_exc:
                     logger.warning(f"腾讯行情获取失败，回退到东方财富基础数据: {quote_exc}")
 
-        return [
+        merged_rows = [
             self._merge_quote(
                 item,
                 quotes.get(item.get("stock_code", "")),
@@ -166,6 +167,17 @@ class RealtimeLimitUpService:
             )
             for item in raw_data
         ]
+
+        if not include_monitor_context:
+            return merged_rows
+
+        from app.services.limit_up_context_service import limit_up_context_service
+
+        try:
+            return await limit_up_context_service.enrich(trade_date, merged_rows, quotes=quotes)
+        except Exception as exc:
+            logger.warning("Limit-up context enrichment failed for {}: {}", trade_date, exc)
+            return merged_rows
 
     async def get_realtime_limit_up_item(self, stock_code: str, trade_date: Optional[date] = None) -> Optional[Dict]:
         """获取单只股票的实时涨停详情基础数据"""

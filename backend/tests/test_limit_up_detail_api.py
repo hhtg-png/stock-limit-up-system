@@ -122,6 +122,15 @@ def make_record(
 
 
 class LimitUpDetailApiTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        # Historical provider I/O is covered by the context service/integration tests.
+        async def keep_rows(trade_date, rows, quotes=None):
+            return rows
+        context_patch = patch('app.services.limit_up_context_service.limit_up_context_service.enrich',
+                              AsyncMock(side_effect=keep_rows))
+        context_patch.start()
+        self.addCleanup(context_patch.stop)
+
     def test_data_init_existing_record_update_persists_seal_fields(self):
         service = DataInitService()
         record = make_record(

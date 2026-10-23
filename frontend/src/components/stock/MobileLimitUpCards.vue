@@ -42,6 +42,26 @@
           <span>换手</span>
           <strong>{{ formatPercent(item.turnover_rate) }}</strong>
         </div>
+        <div>
+          <span>昨日首封</span>
+          <strong>{{ formatLimitUpContextTime(item.yesterday_first_limit_up_time) }}</strong>
+        </div>
+        <div>
+          <span>昨日终封</span>
+          <strong>{{ formatLimitUpContextTime(item.yesterday_final_seal_time) }}</strong>
+        </div>
+        <div>
+          <span>昨日竞价</span>
+          <strong :class="{ up: (item.yesterday_open_change_pct ?? 0) > 0, down: (item.yesterday_open_change_pct ?? 0) < 0 }">
+            {{ formatOpeningChangePct(item.yesterday_open_change_pct) }}
+          </strong>
+        </div>
+        <div>
+          <span>今日竞价</span>
+          <strong :class="{ up: (item.today_open_change_pct ?? 0) > 0, down: (item.today_open_change_pct ?? 0) < 0 }">
+            {{ formatOpeningChangePct(item.today_open_change_pct) }}
+          </strong>
+        </div>
       </div>
 
       <div class="mobile-stock-reason">
@@ -56,6 +76,7 @@
 
 <script setup lang="ts">
 import type { LimitUpRealtime } from '@/types/limit-up'
+import { formatLimitUpContextTime, formatOpeningChangePct } from '@/utils/limitUpContext'
 
 defineProps<{
   items: LimitUpRealtime[]
@@ -156,6 +177,14 @@ function formatPercent(value: number | undefined | null): string {
       font-size: 12px;
       line-height: 1.1;
       white-space: nowrap;
+
+      &.up {
+        color: #ef232a;
+      }
+
+      &.down {
+        color: #14a058;
+      }
     }
   }
 

@@ -6,6 +6,10 @@ export interface LimitUpRecord {
   trade_date: string
   first_limit_up_time?: string
   final_seal_time?: string
+  yesterday_first_limit_up_time?: string | null
+  yesterday_final_seal_time?: string | null
+  yesterday_open_change_pct?: number | null
+  today_open_change_pct?: number | null
   limit_up_reason?: string
   reason_category?: string
   continuous_limit_up_days: number

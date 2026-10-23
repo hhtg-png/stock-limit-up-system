@@ -203,7 +203,9 @@ async def send_realtime_limit_up_snapshot(client_id: str):
             return
 
     if snapshot is None:
-        realtime_data = await realtime_limit_up_service.get_realtime_limit_up_list(trade_date)
+        realtime_data = await realtime_limit_up_service.get_realtime_limit_up_list(
+            trade_date, include_monitor_context=True
+        )
         snapshot = realtime_stream_tracker.sync(realtime_data, trade_date)
         if snapshot is None:
             snapshot = realtime_stream_tracker.get_cached_snapshot(trade_date)
@@ -282,6 +284,7 @@ async def process_realtime_rich_limit_up_sync(trade_date: date):
         trade_date,
         wait_for_pool_refresh=False,
         pool_max_cache_age=REALTIME_RICH_POOL_MAX_CACHE_AGE,
+        include_monitor_context=True,
     )
     sync_message = realtime_stream_tracker.sync(realtime_data, trade_date)
     if sync_message:

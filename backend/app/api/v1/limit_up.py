@@ -318,6 +318,17 @@ async def _get_database_limit_up_response(
         for record, stock in rows
     ]
 
+    if limit_up_list:
+        from app.services.limit_up_context_service import limit_up_context_service
+
+        try:
+            enriched = await limit_up_context_service.enrich(
+                actual_date, [item.model_dump() for item in limit_up_list]
+            )
+            limit_up_list = [LimitUpRealtime.model_validate(item) for item in enriched]
+        except Exception as exc:
+            logger.warning("Historical limit-up context failed for {}: {}", actual_date, exc)
+
     return LimitUpRealtimeResponse(
         trade_date=actual_date,
         is_fallback=is_fallback,
@@ -372,7 +383,9 @@ async def get_realtime_limit_up(
             max_price=max_price,
         )
 
-    raw_data = await realtime_limit_up_service.get_realtime_limit_up_list(trade_date)
+    raw_data = await realtime_limit_up_service.get_realtime_limit_up_list(
+        trade_date, include_monitor_context=True
+    )
     
     if not raw_data:
         return await _get_database_limit_up_response(
@@ -412,6 +425,10 @@ async def get_realtime_limit_up(
             trade_date=trade_date,
             first_limit_up_time=first_time_str,
             final_seal_time=final_time_str,
+            yesterday_first_limit_up_time=item.get("yesterday_first_limit_up_time"),
+            yesterday_final_seal_time=item.get("yesterday_final_seal_time"),
+            yesterday_open_change_pct=item.get("yesterday_open_change_pct"),
+            today_open_change_pct=item.get("today_open_change_pct"),
             limit_up_reason=item.get("limit_up_reason", ""),
             reason_category=item.get("reason_category", "其他"),
             continuous_limit_up_days=continuous_limit_up_days,
