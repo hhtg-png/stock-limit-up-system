@@ -48,7 +48,9 @@ Files: frontend/src/views/LimitUpList.vue; frontend/src/components/stock/MobileL
 
 ## Verification record
 
-- Backend full suite: 1118 tests, 2 skipped, no failures; final context/integration regression: 21 passed.
+- Backend full suite: 1118 tests, 2 skipped, no failures; final context/integration regression: 22 passed.
 - Frontend: 132 tests passed; production build passed.
 - Independent spec and quality review approved after partial-seal fallback repair.
 - Production read-only probe: 94/94 current openings, 87/94 historical openings available; unavailable adjusted history is left null rather than mixing price bases.
+
+- Post-deployment source verification: Tencent web history returned 501 from production; switched the history provider to its public proxy.finance.qq.com API. Endpoint/header regression and all 22 context/integration tests passed.

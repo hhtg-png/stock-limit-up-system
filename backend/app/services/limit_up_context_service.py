@@ -343,8 +343,9 @@ class LimitUpContextService:
         try:
             symbol = ("sh" if code.startswith("6") else "bj" if code.startswith(("4", "8", "92")) else "sz") + code
             response = await asyncio.wait_for(client.get(
-                "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
+                "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/fqkline/get",
                 params={"param": f"{symbol},day,{(start - timedelta(days=45)).isoformat()},{end.isoformat()},160,qfq"},
+                headers={"Referer": "https://gu.qq.com/"},
             ), timeout=self.request_timeout)
             response.raise_for_status()
             data = (response.json().get("data") or {}).get(symbol) or {}

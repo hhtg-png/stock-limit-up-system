@@ -261,6 +261,26 @@ class LimitUpContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(result[0]["yesterday_open_change_pct"], 0)
         self.assertAlmostEqual(result[0]["today_open_change_pct"], 5)
 
+    async def test_tencent_public_api_supplies_history_when_web_frontend_is_unavailable(self):
+        async def respond(request):
+            if "eastmoney" in request.url.host:
+                raise httpx.ConnectError("primary unavailable", request=request)
+            if request.url.host != "proxy.finance.qq.com":
+                return httpx.Response(501, text="Web frontend unavailable")
+            self.assertEqual(request.url.path, "/ifzqgtimg/appstock/app/fqkline/get")
+            self.assertEqual(request.headers["Referer"], "https://gu.qq.com/")
+            return httpx.Response(200, json={"data": {"sz000001": {"qfqday": [
+                ["2026-10-08", "10", "10", "10", "10", "100"],
+                ["2026-10-09", "10", "10", "10", "10", "100"],
+                ["2026-10-12", "10.5", "11", "11", "10.5", "100"],
+            ]}}})
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(respond), headers={"Referer": "https://quote.eastmoney.com/"})
+        self.addAsyncCleanup(client.aclose)
+        result = await self.service(history_fetcher=None, http_client=client).enrich(DAY, [{"stock_code": "000001"}])
+        self.assertEqual(result[0]["yesterday_open_change_pct"], 0)
+        self.assertEqual(result[0]["today_open_change_pct"], 5)
+
     async def test_tencent_raw_candles_are_not_mixed_across_ex_right_days(self):
         async def respond(request):
             if "eastmoney" in request.url.host:
