@@ -24,7 +24,8 @@ export async function getRealtimeLimitUp(params?: {
   sort_by?: string
   sort_order?: string
 }): Promise<LimitUpRealtimeResponse> {
-  const { data } = await api.get('/limit-up/realtime', { params })
+  // Rich snapshots can include a cold historical lookup before cache warm-up.
+  const { data } = await api.get('/limit-up/realtime', { params, timeout: 60000 })
   return data
 }
 
