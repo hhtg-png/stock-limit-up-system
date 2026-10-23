@@ -54,6 +54,9 @@ class RealtimeLimitUpService:
         self._ths_reason_cache: Dict[str, str] = {}
         self._ths_reason_cache_time: float = 0.0
         self._ths_reason_refresh_task: Optional[asyncio.Task] = None
+        self._monitor_float_share_date: Optional[date] = None
+        self._monitor_float_share_map: Dict[str, float] = {}
+        self._monitor_float_share_task: Optional[asyncio.Task] = None
 
         self._POOL_CACHE_TTL = 3
         self._POOL_STALE_TTL = 15
@@ -130,16 +133,23 @@ class RealtimeLimitUpService:
         if trade_date is None:
             trade_date = date.today()
 
-        raw_data, reason_map = await asyncio.gather(
-            self.get_fast_limit_up_pool(
-                trade_date,
-                wait_for_refresh=wait_for_pool_refresh,
-                max_cache_age=pool_max_cache_age,
-            ),
-            self._fetch_ths_reason_map(),
+        pool = self.get_fast_limit_up_pool(
+            trade_date,
+            wait_for_refresh=wait_for_pool_refresh,
+            max_cache_age=pool_max_cache_age,
         )
+        if include_monitor_context:
+            raw_data = await pool
+            reason_age = time.time() - self._ths_reason_cache_time
+            reason_map = dict(self._ths_reason_cache) if reason_age < self._THS_STALE_TTL else {}
+            if reason_age >= self._THS_CACHE_TTL:
+                self._ensure_reason_refresh()
+        else:
+            raw_data, reason_map = await asyncio.gather(pool, self._fetch_ths_reason_map())
 
         if not raw_data:
+            if include_monitor_context:
+                self._get_monitor_float_share_map(trade_date, [])
             return []
 
         self._enrich_reasons(raw_data, reason_map)
@@ -149,9 +159,13 @@ class RealtimeLimitUpService:
         float_share_map: Dict[str, float] = {}
         if codes:
             quote_task = tencent_api.get_quotes_batch(codes)
-            float_share_task = tradable_market_value_service.get_float_share_map(trade_date, codes)
             try:
-                quotes, float_share_map = await asyncio.gather(quote_task, float_share_task)
+                if include_monitor_context:
+                    float_share_map = self._get_monitor_float_share_map(trade_date, codes)
+                    quotes = await quote_task
+                else:
+                    float_share_task = tradable_market_value_service.get_float_share_map(trade_date, codes)
+                    quotes, float_share_map = await asyncio.gather(quote_task, float_share_task)
             except Exception as exc:
                 logger.warning(f"实时行情或流通股本获取失败，回退到基础数据: {exc}")
                 try:
@@ -178,6 +192,32 @@ class RealtimeLimitUpService:
         except Exception as exc:
             logger.warning("Limit-up context enrichment failed for {}: {}", trade_date, exc)
             return merged_rows
+
+    def _get_monitor_float_share_map(self, trade_date: date, codes: List[str]) -> Dict[str, float]:
+        if self._monitor_float_share_date != trade_date:
+            if self._monitor_float_share_task and not self._monitor_float_share_task.done():
+                self._monitor_float_share_task.cancel()
+            self._monitor_float_share_date = trade_date
+            self._monitor_float_share_map = {}
+            self._monitor_float_share_task = None
+        missing = list(dict.fromkeys(code for code in codes if code not in self._monitor_float_share_map))
+        task = self._monitor_float_share_task
+        if missing and (task is None or task.done()):
+            fetcher = tradable_market_value_service.get_float_share_map
+
+            async def refresh():
+                try:
+                    values = await fetcher(trade_date, missing)
+                    if self._monitor_float_share_date == trade_date:
+                        self._monitor_float_share_map.update(values)
+                except Exception as exc:
+                    logger.warning("Monitor float shares unavailable for {}: {}", trade_date, exc)
+                finally:
+                    if self._monitor_float_share_task is asyncio.current_task():
+                        self._monitor_float_share_task = None
+
+            self._monitor_float_share_task = asyncio.create_task(refresh())
+        return dict(self._monitor_float_share_map)
 
     async def get_realtime_limit_up_item(self, stock_code: str, trade_date: Optional[date] = None) -> Optional[Dict]:
         """获取单只股票的实时涨停详情基础数据"""

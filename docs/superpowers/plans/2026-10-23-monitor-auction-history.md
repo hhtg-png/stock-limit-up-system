@@ -63,3 +63,4 @@ Files: backend/app/services/opening_auction_archive_service.py; backend/tests/te
 
 - Durable-archive final validation: full backend 1132 tests passed (2 skipped); 34 final context/integration/archive regressions passed; frontend 132 tests and build passed. Worker cancellation/partial quote coverage fixes approved by independent review.
 - Production all-market current-session opening archive captured 5572 codes successfully; historical day files imported for October 21–23.
+- Monitor metadata latency follow-up: THS reasons and float shares now refresh in the background for monitor snapshots; current quotes remain awaited. Seven new latency/isolation tests, seven existing realtime-service tests and four integration tests passed; independent review approved.

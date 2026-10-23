@@ -37,6 +37,7 @@ class MonitorContextIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         service = RealtimeLimitUpService()
         with patch.object(service, 'get_fast_limit_up_pool', AsyncMock(return_value=[row])), \
+             patch.object(service, '_ensure_reason_refresh'), \
              patch.object(service, '_fetch_ths_reason_map', AsyncMock(return_value={})), \
              patch.object(realtime_module.tencent_api, 'get_quotes_batch', AsyncMock(return_value=quotes)), \
              patch.object(realtime_module.tradable_market_value_service, 'get_float_share_map', AsyncMock(return_value={})), \
