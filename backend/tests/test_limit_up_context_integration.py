@@ -12,6 +12,12 @@ CONTEXT = dict(yesterday_first_limit_up_time='09:31:02',
 
 
 class MonitorContextIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        # Calendar routing has dedicated session-date tests; keep these on the live branch.
+        calendar_patch = patch.object(limit_up, 'is_a_share_trading_day', AsyncMock(return_value=True))
+        calendar_patch.start()
+        self.addCleanup(calendar_patch.stop)
+
     async def test_live_api_preserves_all_context_fields_in_response(self):
         day = date(2026, 10, 23)
         raw = dict(stock_code='600001', stock_name='Alpha', limit_up_price=11,

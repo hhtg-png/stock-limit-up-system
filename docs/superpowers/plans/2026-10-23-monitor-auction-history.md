@@ -64,3 +64,10 @@ Files: backend/app/services/opening_auction_archive_service.py; backend/tests/te
 - Durable-archive final validation: full backend 1132 tests passed (2 skipped); 34 final context/integration/archive regressions passed; frontend 132 tests and build passed. Worker cancellation/partial quote coverage fixes approved by independent review.
 - Production all-market current-session opening archive captured 5572 codes successfully; historical day files imported for October 21–23.
 - Monitor metadata latency follow-up: THS reasons and float shares now refresh in the background for monitor snapshots; current quotes remain awaited. Seven new latency/isolation tests, seven existing realtime-service tests and four integration tests passed; independent review approved.
+
+### 2026-10-25: monitor visibility and non-trading sessions
+
+- Reproduced both omissions on production: the navigation's Dashboard desktop table/export lacked the four fields; Sunday requests labelled Friday pool rows as Sunday and returned four null fields, while explicit Friday queries returned valid context.
+- Added Dashboard columns and shared CSV presentation; both page exports use the effective data date and have download behavior coverage.
+- Current HTTP queries now confirm an exchange session before using a live pool. Closed/unverified dates follow the existing database fallback and its actual session. Weekend, initial WebSocket, rich sync and watcher guards prevent wrongly dated updates from replacing historical context; weekday verification shares the existing cached, off-loop authoritative calendar class.
+- Verification: full backend 1155 tests, 2 skipped, no failures; frontend 135 tests and production build passed. Independent review approved; new date and WebSocket regressions were observed failing before the fix.

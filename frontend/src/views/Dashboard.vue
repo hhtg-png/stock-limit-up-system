@@ -139,6 +139,30 @@
             <span v-else>-</span>
           </template>
         </el-table-column>
+        <el-table-column prop="yesterday_first_limit_up_time" label="昨日首封" width="95" align="center">
+          <template #default="{ row }">
+            {{ formatLimitUpContextTime(row.yesterday_first_limit_up_time) }}
+          </template>
+        </el-table-column>
+        <el-table-column prop="yesterday_final_seal_time" label="昨日终封" width="95" align="center">
+          <template #default="{ row }">
+            {{ formatLimitUpContextTime(row.yesterday_final_seal_time) }}
+          </template>
+        </el-table-column>
+        <el-table-column prop="yesterday_open_change_pct" label="昨日竞价" width="95" align="right">
+          <template #default="{ row }">
+            <span class="auction-change" :class="{ up: row.yesterday_open_change_pct > 0, down: row.yesterday_open_change_pct < 0 }">
+              {{ formatOpeningChangePct(row.yesterday_open_change_pct) }}
+            </span>
+          </template>
+        </el-table-column>
+        <el-table-column prop="today_open_change_pct" label="今日竞价" width="95" align="right">
+          <template #default="{ row }">
+            <span class="auction-change" :class="{ up: row.today_open_change_pct > 0, down: row.today_open_change_pct < 0 }">
+              {{ formatOpeningChangePct(row.today_open_change_pct) }}
+            </span>
+          </template>
+        </el-table-column>
         <el-table-column prop="limit_up_price" label="涨停价" width="85" align="right">
           <template #default="{ row }">
             {{ row.limit_up_price?.toFixed(2) }}
@@ -186,6 +210,7 @@ import { getRealtimeLimitUp } from '@/api/limit-up'
 import { useLimitUpStore } from '@/stores/limit-up'
 import type { LimitUpRealtime } from '@/types/limit-up'
 import MobileLimitUpCards from '@/components/stock/MobileLimitUpCards.vue'
+import { buildLimitUpCsv, formatLimitUpContextTime, formatOpeningChangePct } from '@/utils/limitUpContext'
 
 const router = useRouter()
 const limitUpStore = useLimitUpStore()
@@ -433,25 +458,12 @@ function formatTradableMarketValue(value: number | undefined | null): string {
 }
 
 function exportData() {
-  const headers = ['代码', '名称', '连板', '首封时间', '状态', '封单(万)', '成交额(亿)', '实际流通值(亿)', '涨停原因']
-  const rows = tableData.value.map(item => [
-    item.stock_code,
-    item.stock_name,
-    item.continuous_limit_up_days,
-    item.first_limit_up_time || '',
-    item.is_sealed ? '封板' : '开板',
-    item.seal_amount?.toFixed(0) || '',
-    formatAmountInYi(item.amount),
-    formatTradableMarketValue(item.tradable_market_value),
-    item.limit_up_reason || ''
-  ])
-
-  const csv = [headers, ...rows].map(row => row.join(',')).join('\n')
+  const csv = buildLimitUpCsv(tableData.value)
   const blob = new Blob(['\ufeff' + csv], { type: 'text/csv;charset=utf-8' })
   const url = URL.createObjectURL(blob)
   const a = document.createElement('a')
   a.href = url
-  a.download = `涨停列表_${new Date().toLocaleDateString()}.csv`
+  a.download = `涨停列表_${displayTradeDate.value || selectedDate.value}.csv`
   a.click()
   URL.revokeObjectURL(url)
 }
@@ -581,6 +593,14 @@ onUnmounted(() => {
   }
 
   .data-table {
+    .auction-change.up {
+      color: #ef232a;
+    }
+
+    .auction-change.down {
+      color: #14a058;
+    }
+
     :deep(.el-table) {
       cursor: pointer;
       

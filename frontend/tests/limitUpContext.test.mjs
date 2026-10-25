@@ -77,8 +77,8 @@ test('CSV exports the same context values including zero and missing data', () =
   ].join('\n'))
 })
 
-test('desktop, mobile and CSV are wired to the shared context presentation', () => {
-  const desktop = readFileSync(resolve(root, 'src/views/LimitUpList.vue'), 'utf8')
+for (const view of ['Dashboard', 'LimitUpList']) test(`${view} desktop, mobile and CSV use shared context presentation`, () => {
+  const desktop = readFileSync(resolve(root, `src/views/${view}.vue`), 'utf8')
   const mobile = readFileSync(resolve(root, 'src/components/stock/MobileLimitUpCards.vue'), 'utf8')
   const fields = [
     ['yesterday_first_limit_up_time', '昨日首封', 'formatLimitUpContextTime'],
@@ -92,6 +92,42 @@ test('desktop, mobile and CSV are wired to the shared context presentation', () 
     assert.match(mobile, new RegExp(`<span>${label}</span>[\\s\\S]*?${formatter}\\(item\\.${field}\\)`), `mobile should format ${label}`)
   }
   assert.match(desktop, /const csv = buildLimitUpCsv\(tableData\.value\)/, 'download should use the tested CSV builder')
+})
+
+for (const view of ['Dashboard', 'LimitUpList']) test(`${view} downloads context CSV named for its effective data date`, async () => {
+  const source = readFileSync(resolve(root, `src/views/${view}.vue`), 'utf8')
+  const script = source.match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1]
+  const ast = ts.createSourceFile(`${view}.ts`, script, ts.ScriptTarget.ES2022, true, ts.ScriptKind.TS)
+  const functions = ast.statements
+    .filter(node => ts.isFunctionDeclaration(node) && ['exportData', 'formatAmountInYi', 'formatTradableMarketValue'].includes(node.name?.text))
+    .map(node => node.getText(ast)).join('\n')
+  const executable = ts.transpileModule(functions, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText
+  const row = {
+    stock_code: '000001', stock_name: '示例股份', continuous_limit_up_days: 1,
+    first_limit_up_time: '09:32:00', is_sealed: true,
+    yesterday_first_limit_up_time: '09:30:01', yesterday_final_seal_time: '14:56:00',
+    yesterday_open_change_pct: 0, today_open_change_pct: 3.25
+  }
+  for (const [effectiveDate, expectedDate] of [['2026-10-23', '2026-10-23'], ['', '2026-10-25']]) {
+    let downloadBlob, clicked = false
+    const revoked = []
+    const anchor = { href: '', download: '', click() { clicked = true } }
+    const scope = {
+      tableData: { value: [row] }, displayTradeDate: { value: effectiveDate }, selectedDate: { value: '2026-10-25' },
+      buildLimitUpCsv: helper.buildLimitUpCsv, Blob,
+      URL: { createObjectURL(blob) { downloadBlob = blob; return 'blob:context-csv' }, revokeObjectURL(url) { revoked.push(url) } },
+      document: { createElement(tag) { assert.equal(tag, 'a'); return anchor } }
+    }
+    const exportData = new Function(...Object.keys(scope), `${executable}\nreturn exportData`)(...Object.values(scope))
+    exportData()
+    assert.equal(clicked, true)
+    assert.equal(anchor.download, `涨停列表_${expectedDate}.csv`)
+    assert.equal(await downloadBlob.text(), [
+      '代码,名称,连板,首封时间,昨日首封,昨日终封,昨日竞价,今日竞价,状态,封单(万),成交额(亿),实际流通值(亿),涨停原因',
+      '000001,示例股份,1,09:32:00,09:30:01,14:56:00,0.00%,+3.25%,封板,,-,-,'
+    ].join('\n'))
+    assert.deepEqual(revoked, ['blob:context-csv'])
+  }
 })
 
 const { useLimitUpStore } = await loadTypeScript(resolve(root, 'src/stores/limit-up.ts'), true)

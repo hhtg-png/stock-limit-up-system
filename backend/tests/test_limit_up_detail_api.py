@@ -123,6 +123,9 @@ def make_record(
 
 class LimitUpDetailApiTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        calendar_patch = patch('app.api.v1.limit_up.is_a_share_trading_day', AsyncMock(return_value=True))
+        calendar_patch.start()
+        self.addCleanup(calendar_patch.stop)
         # Historical provider I/O is covered by the context service/integration tests.
         async def keep_rows(trade_date, rows, quotes=None):
             return rows

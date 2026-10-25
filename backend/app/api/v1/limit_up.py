@@ -21,7 +21,7 @@ from app.schemas.limit_up import (
 from app.services.realtime_limit_up_service import realtime_limit_up_service
 from app.services.ths_limit_up_classification_service import ths_limit_up_classification_service
 from app.utils.time_utils import today_cn
-from app.utils.trade_date import get_trade_date_with_fallback
+from app.utils.trade_date import get_trade_date_with_fallback, is_a_share_trading_day
 
 router = APIRouter()
 
@@ -369,7 +369,7 @@ async def get_realtime_limit_up(
     if trade_date is None:
         trade_date = current_date
 
-    if trade_date != current_date:
+    if trade_date != current_date or not await is_a_share_trading_day(trade_date):
         return await _get_database_limit_up_response(
             db,
             trade_date,

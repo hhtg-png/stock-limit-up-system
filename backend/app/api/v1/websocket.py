@@ -19,6 +19,8 @@ from app.services.realtime_limit_up_stream_tracker import RealtimeLimitUpStreamT
 from app.services.tdx_news_realtime_tracker import TdxNewsRealtimeTracker
 from app.services.tdx_news_sources import public_market_news_provider
 from app.services.tdx_plugin_service import tdx_plugin_service
+from app.utils.time_utils import now_cn, today_cn
+from app.utils.trade_date import is_a_share_trading_day
 from loguru import logger
 
 router = APIRouter()
@@ -196,7 +198,9 @@ async def stop_tdx_news_sync_watcher_if_idle():
 
 async def send_realtime_limit_up_snapshot(client_id: str):
     """向新连接客户端发送当前实时涨停列表快照"""
-    trade_date = date.today()
+    trade_date = today_cn()
+    if not await is_a_share_trading_day(trade_date):
+        return
     snapshot = realtime_stream_tracker.get_cached_snapshot(trade_date)
     if not is_trading_time():
         if not snapshot or not snapshot.get("data", {}).get("items"):
@@ -280,6 +284,8 @@ async def refresh_tdx_stock_move_cache(stock_code: str, trade_date: date) -> Non
 
 async def process_realtime_rich_limit_up_sync(trade_date: date):
     """Slow path: refresh complete list data for table fields and deltas."""
+    if not await is_a_share_trading_day(trade_date):
+        return
     realtime_data = await realtime_limit_up_service.get_realtime_limit_up_list(
         trade_date,
         wait_for_pool_refresh=False,
@@ -315,7 +321,10 @@ async def realtime_sync_loop():
                 await asyncio.sleep(REALTIME_SYNC_IDLE_INTERVAL)
                 continue
 
-            trade_date = date.today()
+            trade_date = today_cn()
+            if not await is_a_share_trading_day(trade_date):
+                await asyncio.sleep(REALTIME_SYNC_IDLE_INTERVAL)
+                continue
             await process_realtime_hot_limit_up_tick(trade_date)
 
             now = asyncio.get_running_loop().time()
@@ -530,7 +539,9 @@ async def broadcast_tdx_news_event(item: dict):
 
 def is_trading_time() -> bool:
     """判断是否在交易时间"""
-    now = datetime.now()
+    now = now_cn()
+    if now.weekday() >= 5:
+        return False
     current_time = now.time()
     
     morning_start = time_type(9, 30)

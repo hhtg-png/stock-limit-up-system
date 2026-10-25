@@ -2,10 +2,34 @@
 交易日期工具函数
 """
 from datetime import date
+from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 
 from app.models.limit_up import LimitUpRecord
+from app.services.trading_playbook.calendar_service import TradingCalendarService
+
+
+def _load_a_share_calendar(start: date, end: date):
+    # TradingCalendarService runs this lazy import and provider off-loop.
+    from app.data_collectors.scheduler import _get_cn_trading_dates
+
+    return _get_cn_trading_dates(start, end)
+
+
+_a_share_calendar = TradingCalendarService(loader=_load_a_share_calendar)
+
+
+async def is_a_share_trading_day(day: date) -> bool:
+    """Confirm an exchange session before using a provider's current pool."""
+    if day.weekday() >= 5:
+        return False
+    try:
+        await _a_share_calendar.ensure_date(day)
+        return _a_share_calendar.is_trading_day(day)
+    except Exception as exc:
+        logger.warning("Unable to verify A-share session for {}; using database history: {}", day, exc)
+        return False
 
 
 async def get_latest_trade_date(db: AsyncSession, target_date: date = None) -> date:
