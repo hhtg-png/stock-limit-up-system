@@ -23,7 +23,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.crawlers.eastmoney_crawler import em_crawler
+from app.crawlers.eastmoney_crawler import EastMoneyPoolDateError, em_crawler
 from app.crawlers.tonghuashun_crawler import ths_crawler
 from app.data_collectors.tencent_api import tencent_api
 from app.services.tradable_market_value_service import tradable_market_value_service
@@ -320,8 +320,11 @@ class RealtimeLimitUpService:
             sealed_resp.raise_for_status()
             opened_resp.raise_for_status()
 
-            sealed_data = em_crawler.parse(sealed_resp.json(), is_sealed=True)
-            opened_data = em_crawler.parse(opened_resp.json(), is_sealed=False)
+            sealed_payload, opened_payload = sealed_resp.json(), opened_resp.json()
+            em_crawler.validate_pool_date(sealed_payload, trade_date)
+            em_crawler.validate_pool_date(opened_payload, trade_date)
+            sealed_data = em_crawler.parse(sealed_payload, is_sealed=True)
+            opened_data = em_crawler.parse(opened_payload, is_sealed=False)
             await self._enrich_board_metadata(sealed_data + opened_data, trade_date)
             collected_at = datetime.now(ZoneInfo("Asia/Shanghai"))
             merged = []
@@ -346,6 +349,12 @@ class RealtimeLimitUpService:
                 f"(封板 {len(sealed_data)} / 炸板 {len(opened_data)})"
             )
             return merged
+        except EastMoneyPoolDateError as exc:
+            self._pool_cache.pop(trade_date, None)
+            self._pool_cache_time.pop(trade_date, None)
+            self._pool_refresh_errors[trade_date] = str(exc)
+            logger.warning("Limit-up pool date unavailable for {}: {}", trade_date, exc)
+            return []
         except Exception as exc:
             self._pool_refresh_errors[trade_date] = str(exc)
             logger.warning(f"快速涨停池刷新失败，trade_date={trade_date}: {exc}")

@@ -71,3 +71,10 @@ Files: backend/app/services/opening_auction_archive_service.py; backend/tests/te
 - Added Dashboard columns and shared CSV presentation; both page exports use the effective data date and have download behavior coverage.
 - Current HTTP queries now confirm an exchange session before using a live pool. Closed/unverified dates follow the existing database fallback and its actual session. Weekend, initial WebSocket, rich sync and watcher guards prevent wrongly dated updates from replacing historical context; weekday verification shares the existing cached, off-loop authoritative calendar class.
 - Verification: full backend 1155 tests, 2 skipped, no failures; frontend 135 tests and production build passed. Independent review approved; new date and WebSocket regressions were observed failing before the fix.
+
+### 2026-10-26: pre-open provider coverage
+
+- Reproduced Monday 08:12 production requests returning Friday's 82 sealed and 12 broken rows with qdate=20261023, then stamping them as Monday. The Monday context correctly selected Friday, causing the displayed current and yesterday seal times to duplicate.
+- Treat qdate as the provider's latest available date, not an exact historical-row date. Both raw crawling and realtime aggregation reject requests later than qdate before enrichment; invalid-date refreshes clear the affected cache and use the existing database fallback. Earlier historical queries and ordinary network failure caching remain compatible.
+- Added six provider/cache regressions and an end-to-end API regression: a Monday request with Friday coverage falls back to Friday, with current final seal 09:25:00 and Thursday final seal 10:52:37. The new behavior was observed failing before implementation.
+- Verification: full backend 1162 tests, 2 skipped, no failures; fresh frontend build passed with unchanged source. Independent review approved.

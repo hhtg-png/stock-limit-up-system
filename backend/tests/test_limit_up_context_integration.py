@@ -18,6 +18,57 @@ class MonitorContextIntegrationTests(unittest.IsolatedAsyncioTestCase):
         calendar_patch.start()
         self.addCleanup(calendar_patch.stop)
 
+    async def test_preopen_stale_pool_falls_back_before_computing_yesterday(self):
+        import httpx
+        import app.services.realtime_limit_up_service as realtime_module
+        from app.services.limit_up_context_service import limit_up_context_service
+        from test_limit_up_detail_api import (
+            make_stock, make_record, SequencedSession, FakeAllResult, FakeScalarResult,
+        )
+        from datetime import datetime
+
+        monday, friday = date(2026, 10, 26), date(2026, 10, 23)
+        stock = make_stock(stock_code='600838', stock_name='Shanghai Nine Hundred')
+        record = make_record(friday, first_limit_up_time=datetime(2026, 10, 23, 9, 25),
+                             final_seal_time=datetime(2026, 10, 23, 9, 25))
+        db = SequencedSession([FakeScalarResult(0), FakeScalarResult(friday),
+                               FakeAllResult([(record, stock)]), FakeAllResult([(stock.id, True, 2)])])
+
+        def source(request):
+            pool = [] if 'getTopicZBPool' in request.url.path else [{
+                'c': '600838', 'n': 'Shanghai Nine Hundred', 'p': 11000,
+                'fbt': 92500, 'lbt': 92500, 'lbc': 3, 'zttj': {'days': 3, 'ct': 3},
+            }]
+            return httpx.Response(200, json={'rc': 0, 'data': {'qdate': 20261023, 'pool': pool}})
+
+        real_client = httpx.AsyncClient
+        service = RealtimeLimitUpService()
+
+        async def context(day, rows, quotes=None):
+            self.assertEqual(day, friday)
+            return [{**row, 'yesterday_first_limit_up_time': '10:52:37',
+                     'yesterday_final_seal_time': '10:52:37',
+                     'yesterday_open_change_pct': 0.55, 'today_open_change_pct': 10} for row in rows]
+
+        with patch.object(limit_up, 'today_cn', return_value=monday), \
+             patch.object(limit_up, 'realtime_limit_up_service', service), \
+             patch.object(service, '_ensure_reason_refresh'), \
+             patch.object(service, '_enrich_board_metadata', AsyncMock()), \
+             patch.object(realtime_module.httpx, 'AsyncClient', side_effect=lambda **kwargs: real_client(transport=httpx.MockTransport(source))), \
+             patch.object(realtime_module.tencent_api, 'get_quotes_batch', AsyncMock(return_value={})), \
+             patch.object(realtime_module.tradable_market_value_service, 'get_float_share_map', AsyncMock(return_value={})), \
+             patch.object(limit_up_context_service, 'enrich', AsyncMock(side_effect=context)) as enrich:
+            result = await limit_up.get_realtime_limit_up(
+                monday, continuous_days=None, reason_category=None, sort_by='time', db=db)
+
+        self.assertEqual(result.trade_date, friday)
+        self.assertTrue(result.is_fallback)
+        self.assertEqual(result.data[0].final_seal_time, '09:25:00')
+        self.assertEqual(result.data[0].yesterday_final_seal_time, '10:52:37')
+        self.assertNotEqual(result.data[0].final_seal_time, result.data[0].yesterday_final_seal_time)
+        enrich.assert_awaited_once()
+        self.assertEqual(enrich.await_args.args[0], friday)
+
     async def test_live_api_preserves_all_context_fields_in_response(self):
         day = date(2026, 10, 23)
         raw = dict(stock_code='600001', stock_name='Alpha', limit_up_price=11,

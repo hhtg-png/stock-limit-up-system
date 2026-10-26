@@ -9,6 +9,10 @@ from loguru import logger
 from app.crawlers.base_crawler import BaseCrawler
 
 
+class EastMoneyPoolDateError(ValueError):
+    """The pool source cannot establish coverage of the requested date."""
+
+
 class EastMoneyCrawler(BaseCrawler):
     """东方财富涨停数据爬虫"""
     
@@ -34,6 +38,28 @@ class EastMoneyCrawler(BaseCrawler):
             "Host": "push2ex.eastmoney.com",
         })
         return headers
+
+    @staticmethod
+    def validate_pool_date(content: Any, trade_date: date) -> None:
+        """qdate is latest availability, so earlier historical requests remain valid.
+
+        Missing metadata retains the legacy payload contract; explicitly invalid
+        metadata is rejected instead of asserting a session the source cannot prove.
+        """
+        data = content.get("data") if isinstance(content, dict) else None
+        if not isinstance(data, dict) or data.get("qdate") is None:
+            return
+        raw_date = str(data["qdate"]).strip()
+        try:
+            if len(raw_date) != 8 or not raw_date.isdigit():
+                raise ValueError("expected YYYYMMDD")
+            available_through = datetime.strptime(raw_date, "%Y%m%d").date()
+        except ValueError as exc:
+            raise EastMoneyPoolDateError(f"Invalid Eastmoney pool qdate: {raw_date!r}") from exc
+        if trade_date > available_through:
+            raise EastMoneyPoolDateError(
+                f"Eastmoney pool available through {available_through}, requested {trade_date}"
+            )
     
     async def crawl(self, trade_date: date = None) -> List[Dict]:
         """爬取涨停数据（包含封板和炸板），使用自由流通市值计算真实换手率"""
@@ -60,6 +86,7 @@ class EastMoneyCrawler(BaseCrawler):
             json_data = await self.fetch_json(self.LIMIT_UP_API, params=params)
             sealed_data = []
             if json_data:
+                self.validate_pool_date(json_data, trade_date)
                 sealed_data = self.parse(json_data, is_sealed=True)
                 logger.info(f"[{self.name}] 封板池获取 {len(sealed_data)} 条")
             else:
@@ -70,6 +97,7 @@ class EastMoneyCrawler(BaseCrawler):
             broken_data = await self.fetch_json(self.BROKEN_API, params=params)
             opened_data = []
             if broken_data:
+                self.validate_pool_date(broken_data, trade_date)
                 logger.info(f"[{self.name}] 炸板池API返回: rc={broken_data.get('rc')}, tc={broken_data.get('data', {}).get('tc', 0)}")
                 opened_data = self.parse(broken_data, is_sealed=False)
                 logger.info(f"[{self.name}] 炸板池解析 {len(opened_data)} 条")
@@ -88,6 +116,9 @@ class EastMoneyCrawler(BaseCrawler):
             logger.warning(f"[{self.name}] No data returned for {date_str}")
             return []
             
+        except EastMoneyPoolDateError as exc:
+            logger.warning("[{}] Pool date unavailable: {}", self.name, exc)
+            return []
         except Exception as e:
             logger.error(f"[{self.name}] Crawl error: {e}")
             import traceback
