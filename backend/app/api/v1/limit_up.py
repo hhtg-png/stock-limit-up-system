@@ -78,6 +78,18 @@ def _sort_desc(sort_by: str, sort_order: Optional[str]) -> bool:
     return sort_by in {"seal_amount", "continuous_days"}
 
 
+def _yesterday_final_seal_sort_key(item: LimitUpRealtime, reverse: bool):
+    raw = (item.yesterday_final_seal_time or "").strip()
+    try:
+        if len(raw) != 8:
+            raise ValueError("expected HH:MM:SS")
+        stamp = datetime.strptime(raw, "%H:%M:%S")
+        seconds = stamp.hour * 3600 + stamp.minute * 60 + stamp.second
+    except ValueError:
+        return (True, 0, item.stock_code)
+    return (False, -seconds if reverse else seconds, item.stock_code)
+
+
 def _filter_and_sort_limit_up_list(
     limit_up_list: List[LimitUpRealtime],
     continuous_days: Optional[int],
@@ -129,6 +141,8 @@ def _filter_and_sort_limit_up_list(
     reverse = _sort_desc(sort_by, sort_order)
     if sort_by == "time":
         limit_up_list.sort(key=lambda x: x.first_limit_up_time or "99:99:99", reverse=reverse)
+    elif sort_by == "yesterday_final_seal_time":
+        limit_up_list.sort(key=lambda item: _yesterday_final_seal_sort_key(item, reverse))
     elif sort_by == "seal_amount":
         limit_up_list.sort(key=lambda x: (x.seal_amount or 0, bool(x.is_one_word)), reverse=reverse)
     elif sort_by == "continuous_days":
@@ -323,7 +337,7 @@ async def _get_database_limit_up_response(
 
         try:
             enriched = await limit_up_context_service.enrich(
-                actual_date, [item.model_dump() for item in limit_up_list]
+                trade_date, [item.model_dump() for item in limit_up_list]
             )
             limit_up_list = [LimitUpRealtime.model_validate(item) for item in enriched]
         except Exception as exc:
@@ -355,7 +369,7 @@ async def get_realtime_limit_up(
     status: Optional[str] = Query(None, description="状态筛选(sealed/opened)"),
     min_price: Optional[float] = Query(None, description="最低涨停价筛选"),
     max_price: Optional[float] = Query(None, description="最高涨停价筛选"),
-    sort_by: str = Query("time", description="排序字段(time/seal_amount/continuous_days)"),
+    sort_by: str = Query("time", description="排序字段(time/yesterday_final_seal_time/seal_amount/continuous_days)"),
     sort_order: Optional[str] = Query(None, description="排序方向(asc/desc)"),
     db: AsyncSession = Depends(get_db)
 ):
@@ -423,6 +437,8 @@ async def get_realtime_limit_up(
             stock_code=code,
             stock_name=item.get("stock_name", ""),
             trade_date=trade_date,
+            context_date=item.get("context_date"),
+            previous_trade_date=item.get("previous_trade_date"),
             first_limit_up_time=first_time_str,
             final_seal_time=final_time_str,
             yesterday_first_limit_up_time=item.get("yesterday_first_limit_up_time"),

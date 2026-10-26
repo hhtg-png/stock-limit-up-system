@@ -75,6 +75,7 @@
           <el-button-group size="small">
             <el-button :type="sortBy === 'time' ? 'primary' : 'default'" @click="setSortBy('time')">首封</el-button>
             <el-button :type="sortBy === 'reseal_time' ? 'primary' : 'default'" @click="setSortBy('reseal_time')">回封</el-button>
+            <el-button :type="sortBy === 'yesterday_final_seal_time' ? 'primary' : 'default'" @click="setSortBy('yesterday_final_seal_time')">昨日终封</el-button>
             <el-button :type="sortBy === 'seal_amount' ? 'primary' : 'default'" @click="setSortBy('seal_amount')">封单</el-button>
             <el-button :type="sortBy === 'continuous_days' ? 'primary' : 'default'" @click="setSortBy('continuous_days')">连板</el-button>
           </el-button-group>
@@ -83,6 +84,9 @@
           <el-tag :type="isFallbackDate ? 'warning' : 'info'" size="small">
             数据日期 {{ displayTradeDate }}
           </el-tag>
+        </el-form-item>
+        <el-form-item v-if="previousTradeDate" class="filter-date-tag">
+          <el-tag type="info" size="small">昨日日期 {{ previousTradeDate }}</el-tag>
         </el-form-item>
         <el-form-item class="filter-actions">
           <el-button type="primary" @click="applyFilters">查询</el-button>
@@ -210,7 +214,7 @@ import { getRealtimeLimitUp } from '@/api/limit-up'
 import { useLimitUpStore } from '@/stores/limit-up'
 import type { LimitUpRealtime } from '@/types/limit-up'
 import MobileLimitUpCards from '@/components/stock/MobileLimitUpCards.vue'
-import { buildLimitUpCsv, formatLimitUpContextTime, formatOpeningChangePct } from '@/utils/limitUpContext'
+import { buildLimitUpCsv, formatLimitUpContextTime, formatOpeningChangePct, sortByYesterdayFinalSealTime } from '@/utils/limitUpContext'
 
 const router = useRouter()
 const limitUpStore = useLimitUpStore()
@@ -220,7 +224,7 @@ const refreshing = ref(false)
 const isFetching = ref(false)
 const tableRef = ref<any>()
 const selectedDate = ref(dayjs().format('YYYY-MM-DD'))
-const sortBy = ref<'time' | 'reseal_time' | 'seal_amount' | 'continuous_days'>('time')
+const sortBy = ref<'time' | 'reseal_time' | 'yesterday_final_seal_time' | 'seal_amount' | 'continuous_days'>('time')
 const RESYNC_INTERVAL = 90000
 let refreshTimer: number | null = null
 
@@ -254,6 +258,7 @@ interface FetchOptions {
 }
 
 const displayTradeDate = computed(() => limitUpStore.tradeDate)
+const previousTradeDate = computed(() => limitUpStore.realtimeList.find(item => item.previous_trade_date)?.previous_trade_date || '')
 const isSelectedToday = computed(() => selectedDate.value === dayjs().format('YYYY-MM-DD'))
 const isFallbackDate = computed(
   () => Boolean(displayTradeDate.value && displayTradeDate.value !== selectedDate.value)
@@ -272,6 +277,8 @@ const reasonCategories = computed(() => {
 const tableData = computed(() => {
   const list = [...limitUpStore.realtimeList]
   switch (sortBy.value) {
+    case 'yesterday_final_seal_time':
+      return sortByYesterdayFinalSealTime(list)
     case 'reseal_time':
       list.sort((a, b) => {
         const aTime = a.final_seal_time || ''
@@ -312,6 +319,9 @@ const hasInvalidPriceRange = computed(() => {
 })
 
 const apiSort = computed(() => {
+  if (sortBy.value === 'yesterday_final_seal_time') {
+    return { sortBy: 'yesterday_final_seal_time', sortOrder: 'asc' }
+  }
   if (sortBy.value === 'seal_amount') {
     return { sortBy: 'seal_amount', sortOrder: 'desc' }
   }
@@ -401,7 +411,7 @@ function handleDateChange() {
   fetchData({ showLoading: true })
 }
 
-function setSortBy(type: 'time' | 'reseal_time' | 'seal_amount' | 'continuous_days') {
+function setSortBy(type: 'time' | 'reseal_time' | 'yesterday_final_seal_time' | 'seal_amount' | 'continuous_days') {
   sortBy.value = type
   resetTableScroll()
   fetchData({ showLoading: true })
@@ -650,7 +660,7 @@ onUnmounted(() => {
 
       :deep(.el-button-group) {
         display: grid;
-        grid-template-columns: repeat(4, minmax(0, 1fr));
+        grid-template-columns: repeat(5, minmax(0, 1fr));
       }
 
       :deep(.el-button) {
@@ -678,6 +688,10 @@ onUnmounted(() => {
       }
 
       .filter-sort {
+        :deep(.el-button) {
+          padding: 8px 4px;
+        }
+
         :deep(.el-form-item__content) {
           display: block;
           width: 100%;

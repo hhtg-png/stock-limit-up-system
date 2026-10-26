@@ -45,10 +45,12 @@ class MonitorContextIntegrationTests(unittest.IsolatedAsyncioTestCase):
         service = RealtimeLimitUpService()
 
         async def context(day, rows, quotes=None):
-            self.assertEqual(day, friday)
-            return [{**row, 'yesterday_first_limit_up_time': '10:52:37',
-                     'yesterday_final_seal_time': '10:52:37',
-                     'yesterday_open_change_pct': 0.55, 'today_open_change_pct': 10} for row in rows]
+            self.assertEqual(day, monday)
+            self.assertEqual(rows[0]['trade_date'], friday)
+            return [{**row, 'context_date': monday, 'previous_trade_date': friday,
+                     'yesterday_first_limit_up_time': '09:25:00',
+                     'yesterday_final_seal_time': '09:25:00',
+                     'yesterday_open_change_pct': 10, 'today_open_change_pct': None} for row in rows]
 
         with patch.object(limit_up, 'today_cn', return_value=monday), \
              patch.object(limit_up, 'realtime_limit_up_service', service), \
@@ -64,15 +66,18 @@ class MonitorContextIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.trade_date, friday)
         self.assertTrue(result.is_fallback)
         self.assertEqual(result.data[0].final_seal_time, '09:25:00')
-        self.assertEqual(result.data[0].yesterday_final_seal_time, '10:52:37')
-        self.assertNotEqual(result.data[0].final_seal_time, result.data[0].yesterday_final_seal_time)
+        self.assertEqual(result.data[0].yesterday_final_seal_time, '09:25:00')
+        self.assertEqual(result.data[0].context_date, monday)
+        self.assertEqual(result.data[0].previous_trade_date, friday)
+        self.assertIsNone(result.data[0].today_open_change_pct)
         enrich.assert_awaited_once()
-        self.assertEqual(enrich.await_args.args[0], friday)
+        self.assertEqual(enrich.await_args.args[0], monday)
 
     async def test_live_api_preserves_all_context_fields_in_response(self):
         day = date(2026, 10, 23)
         raw = dict(stock_code='600001', stock_name='Alpha', limit_up_price=11,
-                   current_price=11, continuous_limit_up_days=2, **CONTEXT)
+                   current_price=11, continuous_limit_up_days=2,
+                   context_date=day, previous_trade_date=date(2026, 10, 22), **CONTEXT)
         with patch.object(limit_up, 'today_cn', return_value=day), patch.object(
             limit_up.realtime_limit_up_service, 'get_realtime_limit_up_list', AsyncMock(return_value=[raw])
         ):
@@ -80,6 +85,8 @@ class MonitorContextIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 day, continuous_days=None, reason_category=None, sort_by='time', db=None)
         payload = result.model_dump()['data'][0]
         self.assertEqual({key: payload.get(key) for key in CONTEXT}, CONTEXT)
+        self.assertEqual(payload.get('context_date'), day)
+        self.assertEqual(payload.get('previous_trade_date'), date(2026, 10, 22))
 
     async def test_rich_realtime_enrichment_receives_existing_quotes_and_stream_keeps_fields(self):
         from app.services.limit_up_context_service import limit_up_context_service
@@ -120,7 +127,7 @@ class MonitorContextIntegrationTests(unittest.IsolatedAsyncioTestCase):
         enrich.assert_not_awaited()
         self.assertEqual(result[0]['stock_code'], '600001')
 
-    async def test_database_fallback_enriches_actual_date_not_requested_date(self):
+    async def test_database_fallback_preserves_actual_rows_with_requested_context_date(self):
         from app.services.limit_up_context_service import limit_up_context_service
         from test_limit_up_detail_api import make_stock, make_record, SequencedSession, FakeAllResult
         actual = date(2026, 10, 9)
@@ -130,9 +137,9 @@ class MonitorContextIntegrationTests(unittest.IsolatedAsyncioTestCase):
         db = SequencedSession([FakeAllResult([(record, stock)]), FakeAllResult([(stock.id, True, 2)])])
 
         async def enriched(trade_date, rows, quotes=None):
-            self.assertEqual(trade_date, actual)
+            self.assertEqual(trade_date, requested)
             self.assertEqual(rows[0]['trade_date'], actual)
-            return [{**item, **CONTEXT} for item in rows]
+            return [{**item, **CONTEXT, 'context_date': requested, 'previous_trade_date': actual} for item in rows]
 
         with patch.object(limit_up, 'get_trade_date_with_fallback', AsyncMock(return_value=(actual, True))), \
              patch.object(limit_up_context_service, 'enrich', AsyncMock(side_effect=enriched)) as enrich:
@@ -143,3 +150,5 @@ class MonitorContextIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.is_fallback)
         payload = result.model_dump()['data'][0]
         self.assertEqual({key: payload.get(key) for key in CONTEXT}, CONTEXT)
+        self.assertEqual(payload.get('context_date'), requested)
+        self.assertEqual(payload.get('previous_trade_date'), actual)

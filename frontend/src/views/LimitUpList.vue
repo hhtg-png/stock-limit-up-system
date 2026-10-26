@@ -76,6 +76,9 @@
             数据日期 {{ displayTradeDate }}
           </el-tag>
         </el-form-item>
+        <el-form-item v-if="previousTradeDate" class="filter-date-tag">
+          <el-tag type="info" size="small">昨日日期 {{ previousTradeDate }}</el-tag>
+        </el-form-item>
         <el-form-item class="filter-actions">
           <el-button type="primary" @click="applyFilters">查询</el-button>
           <el-button @click="resetFilters">重置</el-button>
@@ -137,7 +140,7 @@
             {{ formatLimitUpContextTime(row.yesterday_first_limit_up_time) }}
           </template>
         </el-table-column>
-        <el-table-column prop="yesterday_final_seal_time" label="昨日终封" width="95" align="center">
+        <el-table-column prop="yesterday_final_seal_time" label="昨日终封" width="95" align="center" sortable="custom">
           <template #default="{ row }">
             {{ formatLimitUpContextTime(row.yesterday_final_seal_time) }}
           </template>
@@ -203,7 +206,7 @@ import { getRealtimeLimitUp } from '@/api/limit-up'
 import { useLimitUpStore } from '@/stores/limit-up'
 import type { LimitUpRealtime } from '@/types/limit-up'
 import MobileLimitUpCards from '@/components/stock/MobileLimitUpCards.vue'
-import { buildLimitUpCsv, formatLimitUpContextTime, formatOpeningChangePct } from '@/utils/limitUpContext'
+import { buildLimitUpCsv, formatLimitUpContextTime, formatOpeningChangePct, sortByYesterdayFinalSealTime } from '@/utils/limitUpContext'
 
 const router = useRouter()
 const limitUpStore = useLimitUpStore()
@@ -250,6 +253,7 @@ interface FetchOptions {
 }
 
 const displayTradeDate = computed(() => limitUpStore.tradeDate)
+const previousTradeDate = computed(() => limitUpStore.realtimeList.find(item => item.previous_trade_date)?.previous_trade_date || '')
 const isSelectedToday = computed(() => selectedDate.value === dayjs().format('YYYY-MM-DD'))
 const isFallbackDate = computed(
   () => Boolean(displayTradeDate.value && displayTradeDate.value !== selectedDate.value)
@@ -265,7 +269,12 @@ const reasonCategories = computed(() => {
   return [...cats].sort()
 })
 
-const tableData = computed(() => limitUpStore.realtimeList)
+const tableData = computed(() => {
+  if (tableSort.value.prop === 'yesterday_final_seal_time' && tableSort.value.order) {
+    return sortByYesterdayFinalSealTime(limitUpStore.realtimeList, tableSort.value.order === 'ascending' ? 'asc' : 'desc')
+  }
+  return limitUpStore.realtimeList
+})
 
 const boardFilter = computed(() => {
   const scope = filters.boardScope || ''
@@ -293,6 +302,9 @@ const hasInvalidPriceRange = computed(() => {
 })
 
 const apiSort = computed(() => {
+  if (tableSort.value.prop === 'yesterday_final_seal_time' && tableSort.value.order) {
+    return { sortBy: 'yesterday_final_seal_time', sortOrder: tableSort.value.order === 'ascending' ? 'asc' : 'desc' }
+  }
   if (tableSort.value.prop === 'seal_amount') {
     return { sortBy: 'seal_amount', sortOrder: tableSort.value.order === 'ascending' ? 'asc' : 'desc' }
   }

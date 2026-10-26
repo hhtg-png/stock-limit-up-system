@@ -147,8 +147,9 @@ class LimitUpContextService:
         return self._opening_pct(quote.get("open"), quote.get("pre_close"))
 
     async def enrich(self, trade_date: date, rows: list[dict], quotes: dict | None = None) -> list[dict]:
-        """Return copies with four nullable fields, retaining available results on timeout."""
-        result = [dict(row, yesterday_first_limit_up_time=None, yesterday_final_seal_time=None,
+        """Anchor comparisons to the requested date while preserving each row's data date."""
+        result = [dict(row, context_date=trade_date, previous_trade_date=None,
+                       yesterday_first_limit_up_time=None, yesterday_final_seal_time=None,
                        yesterday_open_change_pct=None, today_open_change_pct=None) for row in rows]
         codes = list(dict.fromkeys(str(row.get("stock_code") or "") for row in rows))
         codes = [code for code in codes if len(code) == 6 and code.isdigit()]
@@ -189,6 +190,7 @@ class LimitUpContextService:
 
         for row in result:
             code = str(row.get("stock_code") or "")
+            row["previous_trade_date"] = previous
             if self._opening_finished(trade_date):
                 row["today_open_change_pct"] = live.get(code, self._get(self._daily_cache, (trade_date, code))[1])
             if previous:
@@ -233,8 +235,9 @@ class LimitUpContextService:
                     asyncio.to_thread(self.calendar_loader, day - timedelta(days=60), day),
                     timeout=self.request_timeout,
                 )
-                # A selected non-session must never be assigned a guessed prior day.
-                previous = max(value for value in dates if value < day) if day in dates else None
+                # A weekend/holiday query still compares with its last known
+                # exchange session; never subtract a guessed calendar day.
+                previous = max((value for value in dates if value < day), default=None)
             except Exception as exc:
                 logger.debug("Opening context calendar unavailable for {}: {}", day, exc)
                 previous = None

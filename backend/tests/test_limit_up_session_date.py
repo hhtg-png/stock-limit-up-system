@@ -74,7 +74,7 @@ class LimitUpSessionDateTests(unittest.IsolatedAsyncioTestCase):
         raw = dict(stock_code=stock.stock_code, stock_name=stock.stock_name, limit_up_price=42.5)
 
         async def enriched(day, rows, quotes=None):
-            self.assertEqual(day, actual)
+            self.assertEqual(day, requested)
             self.assertEqual(rows[0]["trade_date"], actual)
             return [{**row, **CONTEXT} for row in rows]
 
@@ -92,7 +92,7 @@ class LimitUpSessionDateTests(unittest.IsolatedAsyncioTestCase):
         live.assert_not_awaited()
         enrich.assert_awaited_once()
 
-    async def test_sunday_uses_friday_rows_and_friday_opening_context(self):
+    async def test_sunday_uses_friday_rows_with_sunday_comparison_anchor(self):
         await self.database_fallback(SUNDAY, FRIDAY)
 
     async def test_weekday_holiday_uses_last_database_session_without_live_pool(self):

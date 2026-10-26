@@ -4,6 +4,8 @@ export interface LimitUpRecord {
   stock_code: string
   stock_name: string
   trade_date: string
+  context_date?: string | null
+  previous_trade_date?: string | null
   first_limit_up_time?: string
   final_seal_time?: string
   yesterday_first_limit_up_time?: string | null
