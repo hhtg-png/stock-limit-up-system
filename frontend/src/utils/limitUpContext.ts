@@ -14,13 +14,14 @@ export function formatOpeningChangePct(value: number | undefined | null): string
   return `${rounded > 0 ? '+' : ''}${rounded.toFixed(2)}%`
 }
 
+function sortTime(value: string | undefined | null): string {
+  const raw = value?.trim() || ''
+  return /^(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d$/.test(raw) ? raw : ''
+}
+
 export function sortByYesterdayFinalSealTime<T extends Pick<LimitUpRealtime, 'stock_code' | 'yesterday_final_seal_time'>>(
   items: readonly T[], order: 'asc' | 'desc' = 'asc'
 ): T[] {
-  const sortTime = (value: string | undefined | null): string => {
-    const raw = value?.trim() || ''
-    return /^(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d$/.test(raw) ? raw : ''
-  }
   return [...items].sort((a, b) => {
     const aTime = sortTime(a.yesterday_final_seal_time)
     const bTime = sortTime(b.yesterday_final_seal_time)
@@ -32,15 +33,24 @@ export function sortByYesterdayFinalSealTime<T extends Pick<LimitUpRealtime, 'st
 
 type OpeningChangeField = 'yesterday_open_change_pct' | 'today_open_change_pct'
 
-export function sortByLimitUpField<T extends Pick<LimitUpRealtime, 'first_limit_up_time' | 'seal_amount' | 'is_one_word' | 'continuous_limit_up_days'>>(
-  items: readonly T[], field: 'time' | 'seal_amount' | 'continuous_days'
+export function sortByLimitUpField<T extends Pick<LimitUpRealtime, 'first_limit_up_time' | 'final_seal_time' | 'seal_amount' | 'is_one_word' | 'continuous_limit_up_days'>>(
+  items: readonly T[], field: 'time' | 'reseal_time' | 'seal_amount' | 'continuous_days',
+  order: 'asc' | 'desc' = field === 'time' || field === 'reseal_time' ? 'asc' : 'desc'
 ): T[] {
   return [...items].sort((a, b) => {
-    if (field === 'time') return (a.first_limit_up_time || '99:99:99').localeCompare(b.first_limit_up_time || '99:99:99')
-    if (field === 'seal_amount') {
-      return ((b.seal_amount || 0) - (a.seal_amount || 0)) || Number(Boolean(b.is_one_word)) - Number(Boolean(a.is_one_word))
+    if (field === 'time' || field === 'reseal_time') {
+      const key = field === 'time' ? 'first_limit_up_time' : 'final_seal_time'
+      const aTime = sortTime(a[key]), bTime = sortTime(b[key])
+      if (Boolean(aTime) !== Boolean(bTime)) return aTime ? -1 : 1
+      return aTime.localeCompare(bTime) * (order === 'asc' ? 1 : -1)
     }
-    return (b.continuous_limit_up_days || 0) - (a.continuous_limit_up_days || 0)
+    const key = field === 'seal_amount' ? 'seal_amount' : 'continuous_limit_up_days'
+    const aValue = a[key], bValue = b[key]
+    const aValid = typeof aValue === 'number' && Number.isFinite(aValue)
+    const bValid = typeof bValue === 'number' && Number.isFinite(bValue)
+    if (!aValid || !bValid) return aValid ? -1 : bValid ? 1 : 0
+    const difference = (aValue - bValue) * (order === 'asc' ? 1 : -1)
+    return difference || (field === 'seal_amount' ? Number(Boolean(b.is_one_word)) - Number(Boolean(a.is_one_word)) : 0)
   })
 }
 

@@ -100,6 +100,33 @@ def _opening_change_sort_key(item: LimitUpRealtime, field: str, reverse: bool):
     return (False, -value if reverse else value, item.stock_code)
 
 
+def _first_limit_up_sort_key(item: LimitUpRealtime, reverse: bool):
+    raw = item.first_limit_up_time
+    try:
+        if not isinstance(raw, str) or len(raw.strip()) != 8:
+            raise ValueError("expected HH:MM:SS")
+        stamp = datetime.strptime(raw.strip(), "%H:%M:%S")
+        seconds = stamp.hour * 3600 + stamp.minute * 60 + stamp.second
+    except ValueError:
+        return (True, 0)
+    return (False, -seconds if reverse else seconds)
+
+
+def _finite_number_sort_key(raw, reverse: bool):
+    try:
+        value = float(raw)
+        if not math.isfinite(value):
+            raise ValueError("expected finite number")
+    except (TypeError, ValueError, OverflowError):
+        return (True, 0)
+    return (False, -value if reverse else value)
+
+
+def _seal_amount_sort_key(item: LimitUpRealtime, reverse: bool):
+    missing, value = _finite_number_sort_key(item.seal_amount, reverse)
+    return (missing, value, not bool(item.is_one_word) if not missing else False)
+
+
 def _filter_and_sort_limit_up_list(
     limit_up_list: List[LimitUpRealtime],
     continuous_days: Optional[int],
@@ -150,15 +177,15 @@ def _filter_and_sort_limit_up_list(
 
     reverse = _sort_desc(sort_by, sort_order)
     if sort_by == "time":
-        limit_up_list.sort(key=lambda x: x.first_limit_up_time or "99:99:99", reverse=reverse)
+        limit_up_list.sort(key=lambda item: _first_limit_up_sort_key(item, reverse))
     elif sort_by == "yesterday_final_seal_time":
         limit_up_list.sort(key=lambda item: _yesterday_final_seal_sort_key(item, reverse))
     elif sort_by in {"yesterday_open_change_pct", "today_open_change_pct"}:
         limit_up_list.sort(key=lambda item: _opening_change_sort_key(item, sort_by, reverse))
     elif sort_by == "seal_amount":
-        limit_up_list.sort(key=lambda x: (x.seal_amount or 0, bool(x.is_one_word)), reverse=reverse)
+        limit_up_list.sort(key=lambda item: _seal_amount_sort_key(item, reverse))
     elif sort_by == "continuous_days":
-        limit_up_list.sort(key=lambda x: x.continuous_limit_up_days or 0, reverse=reverse)
+        limit_up_list.sort(key=lambda item: _finite_number_sort_key(item.continuous_limit_up_days, reverse))
 
     return limit_up_list
 

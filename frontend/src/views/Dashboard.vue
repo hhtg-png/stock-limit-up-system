@@ -82,6 +82,12 @@
             <el-button :type="sortBy === 'continuous_days' ? 'primary' : 'default'" @click="setSortBy('continuous_days')">连板</el-button>
           </el-button-group>
         </el-form-item>
+        <el-form-item label="方向" class="filter-sort filter-sort-direction">
+          <el-button-group size="small">
+            <el-button :type="effectiveOrder === 'asc' ? 'primary' : 'default'" @click="setSortOrder('asc')">顺序</el-button>
+            <el-button :type="effectiveOrder === 'desc' ? 'primary' : 'default'" @click="setSortOrder('desc')">倒序</el-button>
+          </el-button-group>
+        </el-form-item>
         <el-form-item v-if="displayTradeDate" class="filter-date-tag">
           <el-tag :type="isFallbackDate ? 'warning' : 'info'" size="small">
             数据日期 {{ displayTradeDate }}
@@ -225,6 +231,7 @@ const refreshing = ref(false)
 const tableRef = ref<any>()
 const selectedDate = ref(dayjs().format('YYYY-MM-DD'))
 const sortBy = ref<MonitorSort>('time')
+const sortDirection = ref<'asc' | 'desc' | null>(null)
 const RESYNC_INTERVAL = 90000
 let refreshTimer: number | null = null
 let priceQueryTimer: number | null = null
@@ -280,30 +287,24 @@ const reasonCategories = computed(() => {
   return [...cats].sort()
 })
 
+const effectiveOrder = computed(() => sortDirection.value || (
+  ['yesterday_open_change_pct', 'today_open_change_pct', 'seal_amount', 'continuous_days'].includes(sortBy.value) ? 'desc' : 'asc'
+))
+
 const tableData = computed(() => {
-  const list = [...limitUpStore.realtimeList]
+  const list = limitUpStore.realtimeList
   switch (sortBy.value) {
     case 'time':
+    case 'reseal_time':
     case 'seal_amount':
     case 'continuous_days':
-      return sortByLimitUpField(list, sortBy.value)
+      return sortByLimitUpField(list, sortBy.value, effectiveOrder.value)
     case 'yesterday_final_seal_time':
-      return sortByYesterdayFinalSealTime(list)
+      return sortByYesterdayFinalSealTime(list, effectiveOrder.value)
     case 'yesterday_open_change_pct':
     case 'today_open_change_pct':
-      return sortByOpeningChangePct(list, sortBy.value)
-    case 'reseal_time':
-      list.sort((a, b) => {
-        const aTime = a.final_seal_time || ''
-        const bTime = b.final_seal_time || ''
-        if (!aTime && !bTime) return 0
-        if (!aTime) return 1
-        if (!bTime) return -1
-        return aTime.localeCompare(bTime)
-      })
-      break
+      return sortByOpeningChangePct(list, sortBy.value, effectiveOrder.value)
   }
-  return list
 })
 
 const boardFilter = computed(() => {
@@ -331,17 +332,10 @@ const hasInvalidPriceRange = computed(() => {
   return min !== undefined && max !== undefined && min > max
 })
 
-const apiSort = computed(() => {
-  if (sortBy.value === 'yesterday_final_seal_time') {
-    return { sortBy: 'yesterday_final_seal_time', sortOrder: 'asc' }
-  }
-  if (sortBy.value === 'yesterday_open_change_pct' || sortBy.value === 'today_open_change_pct') {
-    return { sortBy: sortBy.value, sortOrder: 'desc' }
-  }
-  if (sortBy.value === 'seal_amount') return { sortBy: 'seal_amount', sortOrder: 'desc' }
-  if (sortBy.value === 'continuous_days') return { sortBy: 'continuous_days', sortOrder: 'desc' }
-  return { sortBy: 'time', sortOrder: 'asc' }
-})
+const apiSort = computed(() => ({
+  sortBy: sortBy.value === 'reseal_time' ? 'time' : sortBy.value,
+  sortOrder: effectiveOrder.value
+}))
 
 function parsePriceInput(value: string): number | undefined {
   const text = String(value ?? '').trim()
@@ -449,6 +443,13 @@ function setSortBy(type: MonitorSort) {
   if (sortBy.value === type) return
   sortBy.value = type
   return applyFilters()
+}
+
+function setSortOrder(order: 'asc' | 'desc') {
+  if (sortDirection.value === order) return
+  const changed = effectiveOrder.value !== order
+  sortDirection.value = order
+  if (changed) return applyFilters()
 }
 
 function resetFilters() {
@@ -718,6 +719,10 @@ onUnmounted(() => {
         display: grid;
         grid-template-columns: repeat(2, minmax(0, 1fr));
         gap: 6px;
+      }
+
+      .filter-sort-direction :deep(.el-button-group) {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
       }
 
       .filter-sort {

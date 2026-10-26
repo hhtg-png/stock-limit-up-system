@@ -22,13 +22,14 @@ function loadView(view, autoResolve = true) {
   const ast = ts.createSourceFile(`${view}.ts`, script, ts.ScriptTarget.ES2022, true, ts.ScriptKind.TS)
   const code = transpile(ast.statements.filter(node => !ts.isImportDeclaration(node)).map(node => node.getText(ast)).join('\n'))
   const mounted = [], unmounted = [], requests = [], messages = [], timers = new Map()
-  let now = 0, nextTimer = 0
+  let now = 0, nextTimer = 0, exportedBlob
   const scope = {
     ...vue, ...context,
     onMounted(callback) { mounted.push(callback) }, onUnmounted(callback) { unmounted.push(callback) },
     useLimitUpStore: () => store, useRouter: () => ({ push() {} }), dayjs: () => ({ format: () => '2026-10-26' }),
     ElMessage: Object.fromEntries(['warning', 'error', 'success'].map(type => [type, value => messages.push([type, value])])),
-    console: { error() {} }, document: { visibilityState: 'visible' },
+    console: { error() {} }, document: { visibilityState: 'visible', createElement: () => ({ click() {} }) },
+    Blob, URL: { createObjectURL(blob) { exportedBlob = blob; return 'blob:csv' }, revokeObjectURL() {} },
     window: {
       setTimeout(callback, delay) { const id = ++nextTimer; timers.set(id, { callback, due: now + delay }); return id },
       clearTimeout(id) { timers.delete(id) }, setInterval() { return ++nextTimer }, clearInterval() {}
@@ -46,10 +47,14 @@ function loadView(view, autoResolve = true) {
   const state = effects.run(() => new Function(...Object.keys(scope), `${code}\nreturn {
     filters, selectedDate, loading, refreshing, tableData, apiSort, applyFilters, applyPriceRange,
     handleCustomPriceChange, handleDateChange, resetFilters, refreshData,
-    setSortBy: typeof setSortBy === 'undefined' ? undefined : setSortBy
+    setSortBy: typeof setSortBy === 'undefined' ? undefined : setSortBy,
+    setSortOrder: typeof setSortOrder === 'undefined' ? undefined : setSortOrder,
+    effectiveOrder: typeof effectiveOrder === 'undefined' ? undefined : effectiveOrder,
+    exportData
   }`)(...Object.values(scope)))
   return {
     ...state, source, requests, messages, store,
+    async exportedCodes() { state.exportData(); return (await exportedBlob.text()).split('\n').slice(1).map(line => line.split(',')[0]) },
     async mount() { mounted.forEach(callback => callback()); await flush() },
     async advance(ms) {
       now += ms
@@ -226,6 +231,106 @@ for (const view of ['Dashboard', 'LimitUpList']) {
         state.store.applyRealtimeDelta([{ stock_code: '000004', first_limit_up_time: '08:59:00', seal_amount: 200, continuous_limit_up_days: 4 }], [], '2026-10-26')
         assert.deepEqual(state.tableData.value.map(row => row.stock_code), after, `${sort} should sort changed websocket values`)
       }
+    } finally { state.dispose() }
+  })
+
+  test(`${view} keeps defaults until an explicit direction is chosen, then carries it across fields and resets`, async () => {
+    const state = loadView(view)
+    try {
+      await state.mount()
+      for (const [sort, direction] of [['time', 'asc'], ['reseal_time', 'asc'], ['yesterday_final_seal_time', 'asc'], ['yesterday_open_change_pct', 'desc'], ['today_open_change_pct', 'desc'], ['seal_amount', 'desc'], ['continuous_days', 'desc']]) {
+        await state.setSortBy(sort)
+        assert.equal(state.apiSort.value.sortOrder, direction)
+      }
+      assert.equal(typeof state.setSortOrder, 'function', 'direction controls must update query state')
+      const before = state.requests.length
+      await state.setSortOrder('asc')
+      assert.equal(state.requests.length, before + 1, 'direction changes should query automatically')
+      for (const sort of ['today_open_change_pct', 'seal_amount', 'time']) {
+        await state.setSortBy(sort)
+        assert.equal(state.apiSort.value.sortOrder, 'asc')
+      }
+      await state.setSortOrder('desc')
+      state.filters.status = 'opened'
+      await state.resetFilters()
+      assert.equal(state.apiSort.value.sortBy, 'time')
+      assert.equal(state.apiSort.value.sortOrder, 'desc', 'reset should retain field and direction')
+    } finally { state.dispose() }
+  })
+
+  test(`${view} sorts all seven fields in both directions after websocket updates and exports the same order`, async () => {
+    const state = loadView(view)
+    try {
+      await state.mount()
+      assert.equal(typeof state.setSortOrder, 'function')
+      const rows = [
+        { stock_code: '000003', first_limit_up_time: '11:00:00', final_seal_time: '11:00:00', yesterday_final_seal_time: '11:00:00', seal_amount: 100, is_one_word: false, continuous_limit_up_days: 1, yesterday_open_change_pct: -1, today_open_change_pct: -1 },
+        { stock_code: '000002', first_limit_up_time: null, final_seal_time: null, yesterday_final_seal_time: null, seal_amount: null, continuous_limit_up_days: null, yesterday_open_change_pct: null, today_open_change_pct: null },
+        { stock_code: '000001', first_limit_up_time: '09:25:00', final_seal_time: '09:25:00', yesterday_final_seal_time: '09:25:00', seal_amount: 100, is_one_word: true, continuous_limit_up_days: 2, yesterday_open_change_pct: 0, today_open_change_pct: 0 },
+        { stock_code: '000004', first_limit_up_time: '09:25:00', final_seal_time: '09:25:00', yesterday_final_seal_time: '09:25:00', seal_amount: 0, continuous_limit_up_days: 0, yesterday_open_change_pct: 0, today_open_change_pct: 0 },
+        { stock_code: '000005', first_limit_up_time: '9:25:00', final_seal_time: '9:25:00', yesterday_final_seal_time: '9:25:00', seal_amount: Infinity, continuous_limit_up_days: Infinity, yesterday_open_change_pct: Infinity, today_open_change_pct: Infinity }
+      ].map(row => ({ ...row, stock_name: row.stock_code, trade_date: '2026-10-26' }))
+      const cases = [
+        ['time', ['000001', '000004', '000003', '000002', '000005'], ['000003', '000001', '000004', '000002', '000005'], ['000002', '000001', '000004', '000003', '000005'], ['000003', '000001', '000004', '000002', '000005']],
+        ['reseal_time', ['000001', '000004', '000003', '000002', '000005'], ['000003', '000001', '000004', '000002', '000005'], ['000002', '000001', '000004', '000003', '000005'], ['000003', '000001', '000004', '000002', '000005']],
+        ['yesterday_final_seal_time', ['000001', '000004', '000003', '000002', '000005'], ['000003', '000001', '000004', '000002', '000005'], ['000002', '000001', '000004', '000003', '000005'], ['000003', '000001', '000004', '000002', '000005']],
+        ['yesterday_open_change_pct', ['000003', '000001', '000004', '000002', '000005'], ['000001', '000004', '000003', '000002', '000005'], ['000002', '000003', '000001', '000004', '000005'], ['000001', '000004', '000003', '000002', '000005']],
+        ['today_open_change_pct', ['000003', '000001', '000004', '000002', '000005'], ['000001', '000004', '000003', '000002', '000005'], ['000002', '000003', '000001', '000004', '000005'], ['000001', '000004', '000003', '000002', '000005']],
+        ['seal_amount', ['000004', '000001', '000003', '000002', '000005'], ['000001', '000003', '000004', '000002', '000005'], ['000002', '000004', '000001', '000003', '000005'], ['000001', '000003', '000004', '000002', '000005']],
+        ['continuous_days', ['000004', '000003', '000001', '000002', '000005'], ['000001', '000003', '000004', '000002', '000005'], ['000002', '000004', '000003', '000001', '000005'], ['000001', '000003', '000004', '000002', '000005']]
+      ]
+      for (const [sort, asc, desc, changedAsc, changedDesc] of cases) {
+        await state.setSortBy(sort)
+        for (const [direction, expected, updated] of [['asc', asc, changedAsc], ['desc', desc, changedDesc]]) {
+          await state.setSortOrder(direction)
+          const requestCount = state.requests.length
+          state.store.setRealtimeSnapshot('2026-10-26', rows)
+          assert.deepEqual(state.tableData.value.map(row => row.stock_code), expected, `${sort} ${direction} snapshot`)
+          assert.equal(state.apiSort.value.sortOrder, direction)
+          state.store.applyRealtimeDelta([{ stock_code: '000002', first_limit_up_time: '00:00:00', final_seal_time: '00:00:00', yesterday_final_seal_time: '00:00:00', seal_amount: -5, continuous_limit_up_days: -1, yesterday_open_change_pct: -2, today_open_change_pct: -2 }], [], '2026-10-26')
+          assert.deepEqual(state.tableData.value.map(row => row.stock_code), updated, `${sort} ${direction} delta`)
+          assert.deepEqual(await state.exportedCodes(), updated, `${sort} ${direction} CSV`)
+          assert.equal(state.requests.length, requestCount, 'websocket updates must not create HTTP queries')
+        }
+      }
+    } finally { state.dispose() }
+  })
+
+  test(`${view} direction A-B-A changes never reuse or apply an obsolete request`, async () => {
+    const state = loadView(view, false)
+    try {
+      await state.mount()
+      assert.equal(typeof state.setSortOrder, 'function')
+      state.setSortOrder('desc')
+      await flush()
+      state.setSortOrder('asc')
+      await flush()
+      assert.equal(state.requests.length, 3)
+      assert.deepEqual(state.requests.map(request => request.params.sort_order), ['asc', 'desc', 'asc'])
+      state.requests[2].resolve({ trade_date: '2026-10-26', data: [{ stock_code: 'new' }] })
+      await flush()
+      state.requests[0].resolve({ trade_date: '2026-10-23', data: [{ stock_code: 'old' }] })
+      state.requests[1].reject(new Error('obsolete direction'))
+      await flush()
+      assert.equal(state.store.realtimeList[0].stock_code, 'new')
+      assert.equal(state.messages.some(([type]) => type === 'error'), false)
+    } finally { state.dispose() }
+  })
+
+  test(`${view} pins an explicitly clicked default direction without issuing a duplicate query`, async () => {
+    const state = loadView(view)
+    try {
+      await state.mount()
+      assert.match(state.source, /label="方向"[\s\S]*?@click="setSortOrder\('asc'\)"[^>]*>顺序<\/el-button>[\s\S]*?@click="setSortOrder\('desc'\)"[^>]*>倒序<\/el-button>/)
+      assert.equal(state.apiSort.value.sortOrder, 'asc')
+      const before = state.requests.length
+      await state.setSortOrder('asc')
+      assert.equal(state.requests.length, before, 'pinning the current direction does not change query parameters')
+      await state.setSortBy('today_open_change_pct')
+      assert.equal(state.apiSort.value.sortOrder, 'asc', 'the explicit default click must survive a field with another natural default')
+      await state.setSortOrder('desc')
+      await state.setSortBy('time')
+      assert.equal(state.apiSort.value.sortOrder, 'desc')
     } finally { state.dispose() }
   })
 }

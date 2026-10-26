@@ -88,3 +88,10 @@ Files: backend/app/services/opening_auction_archive_service.py; backend/tests/te
 - [x] Remove query buttons; automatically query all filter changes, debounce price input by 300ms, preserve reset/refresh/export, and prevent outdated responses/errors overwriting newer filter results. A→B→A and price-input reversions have behavior coverage.
 - [x] Run full backend suite (1169 tests, 2 skipped, no failures) and frontend tests/build (152 tests, production build passed); independent review approved after repairing the three existing sorts' realtime ordering.
 - Delivery verification: deploy origin/main and verify both pages, matching frontend assets, service supervision and public API sorting/date results; record the deployed commit and results in the task response.
+
+### 2026-10-26: explicit sort direction
+
+- Add independent 顺序 / 倒序 buttons beside the seven sort fields on both pages. Keep each field's existing default until a direction is chosen explicitly, then retain that direction across field/filter changes.
+- Pass the selected direction through HTTP and all local realtime comparators. Both directions keep missing/invalid values last, preserve real zero, stable old-field ties and the one-word seal-amount tie rule. Historical date definitions and automatic querying remain intact.
+- Verify ascending/descending behavior across all seven fields, API/local agreement, realtime delta changes, direction-triggered queries and request race handling; run the full required deployment checks before publishing origin/main.
+- Verification complete: full backend 1175 tests (2 skipped, no failures), frontend 160 tests and production build passed. Independent review approved both backend keys and frontend controls/comparators; direction pinning and A→B→A request cases execute actual SFC logic.
