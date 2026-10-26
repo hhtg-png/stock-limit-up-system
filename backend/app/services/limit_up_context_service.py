@@ -147,7 +147,11 @@ class LimitUpContextService:
         return self._opening_pct(quote.get("open"), quote.get("pre_close"))
 
     async def enrich(self, trade_date: date, rows: list[dict], quotes: dict | None = None) -> list[dict]:
-        """Anchor comparisons to the requested date while preserving each row's data date."""
+        """Enrich an actual market session with its opening and previous-session facts.
+
+        Database fallbacks pass their actual row date as the comparison basis.
+        Existing row fields are preserved.
+        """
         result = [dict(row, context_date=trade_date, previous_trade_date=None,
                        yesterday_first_limit_up_time=None, yesterday_final_seal_time=None,
                        yesterday_open_change_pct=None, today_open_change_pct=None) for row in rows]
@@ -235,8 +239,8 @@ class LimitUpContextService:
                     asyncio.to_thread(self.calendar_loader, day - timedelta(days=60), day),
                     timeout=self.request_timeout,
                 )
-                # A weekend/holiday query still compares with its last known
-                # exchange session; never subtract a guessed calendar day.
+                # Always use the authoritative preceding exchange session;
+                # never subtract a guessed calendar day.
                 previous = max((value for value in dates if value < day), default=None)
             except Exception as exc:
                 logger.debug("Opening context calendar unavailable for {}: {}", day, exc)

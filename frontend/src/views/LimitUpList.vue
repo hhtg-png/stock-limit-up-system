@@ -15,7 +15,7 @@
           />
         </el-form-item>
         <el-form-item label="连板天数">
-          <el-select v-model="filters.boardScope" placeholder="全部" clearable style="width: 120px">
+          <el-select v-model="filters.boardScope" placeholder="全部" clearable style="width: 120px" @change="applyFilters">
             <el-option label="首板" value="first" />
             <el-option label="2板以上" value="min-2" />
             <el-option label="3板以上" value="min-3" />
@@ -24,12 +24,12 @@
           </el-select>
         </el-form-item>
         <el-form-item label="涨停原因">
-          <el-select v-model="filters.reasonCategory" placeholder="全部" clearable style="width: 140px">
+          <el-select v-model="filters.reasonCategory" placeholder="全部" clearable style="width: 140px" @change="applyFilters">
             <el-option v-for="r in reasonCategories" :key="r" :label="r" :value="r" />
           </el-select>
         </el-form-item>
         <el-form-item label="状态">
-          <el-select v-model="filters.status" placeholder="全部" clearable style="width: 100px">
+          <el-select v-model="filters.status" placeholder="全部" clearable style="width: 100px" @change="applyFilters">
             <el-option label="封板" value="sealed" />
             <el-option label="开板" value="opened" />
           </el-select>
@@ -71,6 +71,17 @@
           </div>
         </el-form-item>
         <span class="filter-break" aria-hidden="true"></span>
+        <el-form-item label="排序" class="filter-sort">
+          <el-button-group size="small">
+            <el-button :type="sortBy === 'time' ? 'primary' : 'default'" @click="setSortBy('time')">首封</el-button>
+            <el-button :type="sortBy === 'reseal_time' ? 'primary' : 'default'" @click="setSortBy('reseal_time')">回封</el-button>
+            <el-button :type="sortBy === 'yesterday_final_seal_time' ? 'primary' : 'default'" @click="setSortBy('yesterday_final_seal_time')">昨日终封</el-button>
+            <el-button :type="sortBy === 'yesterday_open_change_pct' ? 'primary' : 'default'" @click="setSortBy('yesterday_open_change_pct')">昨日竞价</el-button>
+            <el-button :type="sortBy === 'today_open_change_pct' ? 'primary' : 'default'" @click="setSortBy('today_open_change_pct')">今日竞价</el-button>
+            <el-button :type="sortBy === 'seal_amount' ? 'primary' : 'default'" @click="setSortBy('seal_amount')">封单</el-button>
+            <el-button :type="sortBy === 'continuous_days' ? 'primary' : 'default'" @click="setSortBy('continuous_days')">连板</el-button>
+          </el-button-group>
+        </el-form-item>
         <el-form-item v-if="displayTradeDate" class="filter-date-tag">
           <el-tag :type="isFallbackDate ? 'warning' : 'info'" size="small">
             数据日期 {{ displayTradeDate }}
@@ -80,7 +91,6 @@
           <el-tag type="info" size="small">昨日日期 {{ previousTradeDate }}</el-tag>
         </el-form-item>
         <el-form-item class="filter-actions">
-          <el-button type="primary" @click="applyFilters">查询</el-button>
           <el-button @click="resetFilters">重置</el-button>
           <el-button type="warning" @click="refreshData" :loading="refreshing">刷新数据</el-button>
           <el-button @click="exportData">导出</el-button>
@@ -97,12 +107,11 @@
         stripe
         height="calc(100vh - 260px)"
         @row-click="handleRowClick"
-        @sort-change="handleSortChange"
         :header-cell-style="{ background: '#fafafa', fontWeight: 500 }"
       >
         <el-table-column prop="stock_code" label="代码" width="95" fixed />
         <el-table-column prop="stock_name" label="名称" width="90" fixed />
-        <el-table-column prop="continuous_limit_up_days" label="连板" width="75" sortable="custom" align="center">
+        <el-table-column prop="continuous_limit_up_days" label="连板" width="75" align="center">
           <template #default="{ row }">
             <el-tag 
               v-if="row.continuous_limit_up_days > 1" 
@@ -112,7 +121,7 @@
             <span v-else>首板</span>
           </template>
         </el-table-column>
-        <el-table-column prop="first_limit_up_time" label="首封时间" width="95" sortable="custom" />
+        <el-table-column prop="first_limit_up_time" label="首封时间" width="95" />
         <el-table-column label="状态" width="80" align="center">
           <template #default="{ row }">
             <el-tag :type="row.is_sealed ? 'info' : 'warning'" size="small">
@@ -140,7 +149,7 @@
             {{ formatLimitUpContextTime(row.yesterday_first_limit_up_time) }}
           </template>
         </el-table-column>
-        <el-table-column prop="yesterday_final_seal_time" label="昨日终封" width="95" align="center" sortable="custom">
+        <el-table-column prop="yesterday_final_seal_time" label="昨日终封" width="95" align="center">
           <template #default="{ row }">
             {{ formatLimitUpContextTime(row.yesterday_final_seal_time) }}
           </template>
@@ -164,7 +173,7 @@
             {{ row.limit_up_price?.toFixed(2) }}
           </template>
         </el-table-column>
-        <el-table-column prop="seal_amount" label="封单(万)" width="95" sortable="custom" align="right">
+        <el-table-column prop="seal_amount" label="封单(万)" width="95" align="right">
           <template #default="{ row }">
             {{ row.seal_amount ? row.seal_amount.toFixed(0) : '-' }}
           </template>
@@ -198,7 +207,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref, reactive, onMounted, onUnmounted, nextTick, watch } from 'vue'
+import { computed, ref, reactive, onMounted, onUnmounted, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import dayjs from 'dayjs'
@@ -206,22 +215,24 @@ import { getRealtimeLimitUp } from '@/api/limit-up'
 import { useLimitUpStore } from '@/stores/limit-up'
 import type { LimitUpRealtime } from '@/types/limit-up'
 import MobileLimitUpCards from '@/components/stock/MobileLimitUpCards.vue'
-import { buildLimitUpCsv, formatLimitUpContextTime, formatOpeningChangePct, sortByYesterdayFinalSealTime } from '@/utils/limitUpContext'
+import { buildLimitUpCsv, formatLimitUpContextTime, formatOpeningChangePct, sortByYesterdayFinalSealTime, sortByOpeningChangePct, sortByLimitUpField } from '@/utils/limitUpContext'
 
 const router = useRouter()
 const limitUpStore = useLimitUpStore()
 
 const loading = ref(false)
 const refreshing = ref(false)
-const isFetching = ref(false)
 const tableRef = ref<any>()
 const selectedDate = ref(dayjs().format('YYYY-MM-DD'))
-const tableSort = ref<{ prop: string; order: 'ascending' | 'descending' | null }>({
-  prop: '',
-  order: null
-})
+const sortBy = ref<MonitorSort>('time')
 const RESYNC_INTERVAL = 90000
 let refreshTimer: number | null = null
+let priceQueryTimer: number | null = null
+let requestSequence = 0
+let disposed = false
+let activeRequest: { key: string; sequence: number; promise: Promise<boolean> } | null = null
+
+type MonitorSort = 'time' | 'reseal_time' | 'yesterday_final_seal_time' | 'yesterday_open_change_pct' | 'today_open_change_pct' | 'seal_amount' | 'continuous_days'
 
 type BoardScope = '' | 'first' | 'min-2' | 'min-3' | 'min-4' | 'min-5'
 
@@ -270,10 +281,29 @@ const reasonCategories = computed(() => {
 })
 
 const tableData = computed(() => {
-  if (tableSort.value.prop === 'yesterday_final_seal_time' && tableSort.value.order) {
-    return sortByYesterdayFinalSealTime(limitUpStore.realtimeList, tableSort.value.order === 'ascending' ? 'asc' : 'desc')
+  const list = [...limitUpStore.realtimeList]
+  switch (sortBy.value) {
+    case 'time':
+    case 'seal_amount':
+    case 'continuous_days':
+      return sortByLimitUpField(list, sortBy.value)
+    case 'yesterday_final_seal_time':
+      return sortByYesterdayFinalSealTime(list)
+    case 'yesterday_open_change_pct':
+    case 'today_open_change_pct':
+      return sortByOpeningChangePct(list, sortBy.value)
+    case 'reseal_time':
+      list.sort((a, b) => {
+        const aTime = a.final_seal_time || ''
+        const bTime = b.final_seal_time || ''
+        if (!aTime && !bTime) return 0
+        if (!aTime) return 1
+        if (!bTime) return -1
+        return aTime.localeCompare(bTime)
+      })
+      break
   }
-  return limitUpStore.realtimeList
+  return list
 })
 
 const boardFilter = computed(() => {
@@ -302,16 +332,15 @@ const hasInvalidPriceRange = computed(() => {
 })
 
 const apiSort = computed(() => {
-  if (tableSort.value.prop === 'yesterday_final_seal_time' && tableSort.value.order) {
-    return { sortBy: 'yesterday_final_seal_time', sortOrder: tableSort.value.order === 'ascending' ? 'asc' : 'desc' }
+  if (sortBy.value === 'yesterday_final_seal_time') {
+    return { sortBy: 'yesterday_final_seal_time', sortOrder: 'asc' }
   }
-  if (tableSort.value.prop === 'seal_amount') {
-    return { sortBy: 'seal_amount', sortOrder: tableSort.value.order === 'ascending' ? 'asc' : 'desc' }
+  if (sortBy.value === 'yesterday_open_change_pct' || sortBy.value === 'today_open_change_pct') {
+    return { sortBy: sortBy.value, sortOrder: 'desc' }
   }
-  if (tableSort.value.prop === 'continuous_limit_up_days') {
-    return { sortBy: 'continuous_days', sortOrder: tableSort.value.order === 'ascending' ? 'asc' : 'desc' }
-  }
-  return { sortBy: 'time', sortOrder: tableSort.value.order === 'descending' ? 'desc' : 'asc' }
+  if (sortBy.value === 'seal_amount') return { sortBy: 'seal_amount', sortOrder: 'desc' }
+  if (sortBy.value === 'continuous_days') return { sortBy: 'continuous_days', sortOrder: 'desc' }
+  return { sortBy: 'time', sortOrder: 'asc' }
 })
 
 function parsePriceInput(value: string): number | undefined {
@@ -329,59 +358,82 @@ function validatePriceRange(silent: boolean): boolean {
   return false
 }
 
-async function fetchData(options: FetchOptions = {}) {
+function cancelPriceQuery() {
+  if (priceQueryTimer !== null) {
+    window.clearTimeout(priceQueryTimer)
+    priceQueryTimer = null
+  }
+}
+
+async function fetchData(options: FetchOptions = {}): Promise<boolean> {
+  cancelPriceQuery()
+  if (disposed) return false
   const { showLoading = limitUpStore.realtimeList.length === 0, silent = false } = options
-  if (!validatePriceRange(silent)) return
-  if (isFetching.value) return
-
-  isFetching.value = true
-  if (showLoading) {
-    loading.value = true
+  const params = {
+    trade_date: selectedDate.value,
+    continuous_days: boardFilter.value.continuousDays,
+    continuous_days_exact: boardFilter.value.continuousDaysExact,
+    reason_category: filters.reasonCategory || undefined,
+    status: filters.status || undefined,
+    min_price: normalizedPriceRange.value.min,
+    max_price: normalizedPriceRange.value.max,
+    sort_by: apiSort.value.sortBy,
+    sort_order: apiSort.value.sortOrder
   }
-
-  try {
-    const response = await getRealtimeLimitUp({
-      trade_date: selectedDate.value,
-      continuous_days: boardFilter.value.continuousDays,
-      continuous_days_exact: boardFilter.value.continuousDaysExact,
-      reason_category: filters.reasonCategory || undefined,
-      status: filters.status || undefined,
-      min_price: normalizedPriceRange.value.min,
-      max_price: normalizedPriceRange.value.max,
-      sort_by: apiSort.value.sortBy,
-      sort_order: apiSort.value.sortOrder
-    })
-    limitUpStore.setSnapshot(response.trade_date, response.data || [])
-    if (response.is_fallback && !silent) {
-      ElMessage.warning(`未找到 ${selectedDate.value} 数据，已显示 ${response.trade_date}`)
-    }
-  } catch (e) {
-    console.error('Fetch error:', e)
-    if (!silent) {
-      ElMessage.error('获取数据失败')
-    }
-  } finally {
-    isFetching.value = false
-    if (showLoading) {
-      loading.value = false
-    }
+  const key = JSON.stringify(params)
+  if (activeRequest?.key === key && activeRequest.sequence === requestSequence) return activeRequest.promise
+  const sequence = ++requestSequence
+  if (!validatePriceRange(silent)) {
+    loading.value = false
+    return false
   }
+  loading.value = showLoading
+  const promise = Promise.resolve().then(async () => {
+    if (disposed || sequence !== requestSequence) return false
+    try {
+      const response = await getRealtimeLimitUp(params)
+      if (disposed || sequence !== requestSequence) return false
+      limitUpStore.setSnapshot(response.trade_date, response.data || [])
+      if (response.is_fallback && !silent) {
+        ElMessage.warning(`未找到 ${params.trade_date} 数据，已显示 ${response.trade_date}`)
+      }
+      return true
+    } catch (e) {
+      if (disposed || sequence !== requestSequence) return false
+      console.error('Fetch error:', e)
+      if (!silent) ElMessage.error('获取数据失败')
+      return false
+    } finally {
+      if (sequence === requestSequence) loading.value = false
+      if (activeRequest?.sequence === sequence) activeRequest = null
+    }
+  })
+  activeRequest = { key, sequence, promise }
+  return promise
 }
 
 function applyFilters() {
   resetTableScroll()
-  fetchData({ showLoading: true })
+  return fetchData({ showLoading: true })
 }
 
 function applyPriceRange(range: PriceRange) {
   filters.minPrice = String(range.min)
   filters.maxPrice = String(range.max)
   filters.activePriceRange = range.label
-  applyFilters()
+  return applyFilters()
 }
 
 function handleCustomPriceChange() {
   filters.activePriceRange = ''
+  cancelPriceQuery()
+  requestSequence += 1
+  loading.value = false
+  resetTableScroll()
+  priceQueryTimer = window.setTimeout(() => {
+    priceQueryTimer = null
+    fetchData({ showLoading: true })
+  }, 300)
 }
 
 function updateRealtimeMode() {
@@ -390,8 +442,7 @@ function updateRealtimeMode() {
 
 function handleDateChange() {
   updateRealtimeMode()
-  resetTableScroll()
-  fetchData({ showLoading: true })
+  return applyFilters()
 }
 
 function resetFilters() {
@@ -401,16 +452,16 @@ function resetFilters() {
   filters.minPrice = ''
   filters.maxPrice = ''
   filters.activePriceRange = ''
-  resetTableScroll()
-  fetchData({ showLoading: true })
+  return applyFilters()
 }
 
 async function refreshData() {
   try {
     refreshing.value = true
-    await fetchData({ showLoading: false, silent: false })
-    resetTableScroll()
-    ElMessage.success('数据已刷新')
+    if (await fetchData({ showLoading: false, silent: false })) {
+      resetTableScroll()
+      ElMessage.success('数据已刷新')
+    }
   } catch (e: any) {
     console.error('Refresh error:', e)
     ElMessage.error('刷新失败')
@@ -419,13 +470,10 @@ async function refreshData() {
   }
 }
 
-function handleSortChange({ prop, order }: { prop?: string; order?: 'ascending' | 'descending' | null }) {
-  tableSort.value = {
-    prop: prop || '',
-    order: order || null
-  }
-  resetTableScroll()
-  fetchData({ showLoading: true })
+function setSortBy(type: MonitorSort) {
+  if (sortBy.value === type) return
+  sortBy.value = type
+  return applyFilters()
 }
 
 function resetTableScroll() {
@@ -474,12 +522,11 @@ onMounted(() => {
   }, RESYNC_INTERVAL)
 })
 
-watch(
-  () => [filters.boardScope, filters.reasonCategory, filters.status, filters.minPrice, filters.maxPrice] as const,
-  () => resetTableScroll()
-)
 
 onUnmounted(() => {
+  disposed = true
+  requestSequence += 1
+  cancelPriceQuery()
   limitUpStore.setAcceptRealtimeUpdates(true)
   if (refreshTimer) {
     clearInterval(refreshTimer)
@@ -579,7 +626,8 @@ onUnmounted(() => {
       }
     }
 
-    .filter-date-tag {
+    .filter-date-tag,
+    .filter-sort {
       align-self: center;
     }
   }
@@ -639,6 +687,27 @@ onUnmounted(() => {
         width: 100% !important;
       }
 
+      :deep(.el-button-group) {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        width: 100%;
+      }
+
+      .filter-sort :deep(.el-form-item__content) {
+        display: block;
+        width: 100%;
+      }
+
+      .filter-sort :deep(.el-button) {
+        padding: 8px 4px;
+      }
+
+      .filter-sort :deep(.el-button-group::before),
+      .filter-sort :deep(.el-button-group::after) {
+        display: none;
+        content: none;
+      }
+
       :deep(.el-button) {
         min-width: 0;
         padding: 8px 10px;
@@ -646,6 +715,7 @@ onUnmounted(() => {
       }
 
       .filter-actions,
+      .filter-sort,
       .filter-date-tag,
       .price-filter {
         grid-column: 1 / -1;

@@ -11,13 +11,13 @@
 
 - Fields: yesterday_first_limit_up_time, yesterday_final_seal_time, yesterday_open_change_pct, today_open_change_pct.
 - Percent = (open / same-session reference pre_close - 1) * 100, finite positive price inputs; signed two decimals; 0.00% retained.
-- Comparison dates follow the requested date and exchange calendar, independently of the actual fallback API trade_date. Rows carry context_date and previous_trade_date. No schema migration required.
+- Comparison dates follow the actual API trade_date and exchange calendar, including fallback. Rows carry context_date (actual data date) and previous_trade_date. No schema migration required.
 - User authorized implementation; deploy only after full verification if completing online feature using existing authorized deployment workflow.
 
 ## Review Focus
 
 - Monday/holidays use preceding session, never previous calendar day.
-- Historical fallback retains actual row dates; yesterday/current opening metrics stay anchored to the requested date and never use another day's quotes.
+- Historical fallback retains actual row dates; yesterday/current opening metrics stay anchored to that actual date and never use another day's quotes.
 - Ex-right reference close uses same-day basis; missing values are null.
 - Snapshot/delta retains context fields, with day rollover isolation.
 - Bounded history fetches and retryable failures do not stall fast alerts.
@@ -32,7 +32,7 @@ Interface: async enrich(trade_date: date, rows: list[dict], quotes: dict | None 
 ### Task 2: Wire backend fields
 Files: backend/app/services/realtime_limit_up_service.py; backend/app/api/v1/limit_up.py; backend/app/schemas/limit_up.py; backend/tests/test_limit_up_context_integration.py.
 - [x] Write/run failing tests proving live and historical effective-date paths and schema preservation.
-- [x] Add optional response fields; enrich rich realtime rows with existing quotes and database fallback rows with the requested comparison date, retaining actual row dates.
+- [x] Add optional response fields; enrich rich realtime rows with existing quotes and database fallback rows with the actual comparison date, retaining actual row dates.
 - [x] Verify context, service, API and stream tests green.
 
 ### Task 3: Frontend presentation
@@ -79,11 +79,12 @@ Files: backend/app/services/opening_auction_archive_service.py; backend/tests/te
 - Added six provider/cache regressions and an end-to-end API regression: a Monday request with Friday coverage falls back to Friday, with current final seal 09:25:00 and Thursday final seal 10:52:37. The new behavior was observed failing before implementation.
 - Verification: full backend 1162 tests, 2 skipped, no failures; fresh frontend build passed with unchanged source. Independent review approved.
 
-### 2026-10-26: requested-date comparisons and yesterday seal sorting
+### 2026-10-26: clarified actual-date comparisons, unified sorting and automatic queries
 
-- User clarified that yesterday means the previous exchange session relative to the selected query date. This supersedes the earlier actual-data-date anchor: Monday 26 querying fallback Friday 23 compares with Friday 23, not Thursday 22. Shanghai Jiubai therefore shows 09:25:00 for yesterday final seal; 10:52:37 belongs to Thursday.
-- [x] Observe failing regressions, pass the requested date through database fallback enrichment, and find max(calendar date < requested) for weekends as well as exchange sessions. Preserve actual trade_date and add nullable context_date/previous_trade_date to HTTP, snapshots and deltas. Current opening stays null until the requested day's auction is final.
-- [x] Add yesterday_final_seal_time sorting to the backend (default ascending and explicit descending); missing/invalid times always last, stock-code ascending ties.
-- [x] Add Dashboard sort button and List ascending/descending header, reapply the chosen sort after realtime updates, show yesterday date on both pages, and include all three dates in CSV.
-- [x] Run full backend suite (1167 tests, 2 skipped, no failures) and frontend tests/build (139 tests, production build passed); complete independent review. A noted frontend/backend time-format sorting mismatch was repaired and frontend verification repeated.
-- [ ] Deploy origin/main and verify both pages and public API against the source dates.
+- The requested-date interpretation deployed in 37c65fc was an incorrect assumption. The user explicitly chose "10 月 22 日：10:52:37（行情日期的前一交易日）" for query 26 / actual 23. Actual-date semantics are authoritative: yesterday=22, current opening=23. Upstream Eastmoney and independently dated THS records confirm 22 final seal=10:52:37 and 23 final seal=09:25:00.
+- [x] Observe regressions and restore actual-date fallback enrichment while retaining date metadata and the provider coverage guard. context_date matches actual trade_date; previous_trade_date is the prior exchange session.
+- [x] Backend supports yesterday_final_seal_time (default asc), yesterday_open_change_pct and today_open_change_pct (default desc), explicit asc/desc, missing/invalid values last and stock-code ascending ties. Zero participates in numeric sorting.
+- [x] Both pages use a unified seven-option sort group and remove header sorting. Reapply all seven selected sorts after realtime snapshots/deltas, preserving the existing one-word seal-amount tie rule. CSV retains actual data and previous-session dates.
+- [x] Remove query buttons; automatically query all filter changes, debounce price input by 300ms, preserve reset/refresh/export, and prevent outdated responses/errors overwriting newer filter results. A→B→A and price-input reversions have behavior coverage.
+- [x] Run full backend suite (1169 tests, 2 skipped, no failures) and frontend tests/build (152 tests, production build passed); independent review approved after repairing the three existing sorts' realtime ordering.
+- Delivery verification: deploy origin/main and verify both pages, matching frontend assets, service supervision and public API sorting/date results; record the deployed commit and results in the task response.

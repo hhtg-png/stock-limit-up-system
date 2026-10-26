@@ -11,8 +11,8 @@ class LimitUpBase(BaseModel):
     stock_code: str = Field(..., description="股票代码")
     stock_name: str = Field(..., description="股票名称")
     trade_date: date = Field(..., description="交易日期")
-    context_date: Optional[date] = Field(None, description="竞价与昨日指标的查询基准日期")
-    previous_trade_date: Optional[date] = Field(None, description="查询基准日期之前的最近交易日")
+    context_date: Optional[date] = Field(None, description="竞价与昨日指标的基准日期（实际行情日期）")
+    previous_trade_date: Optional[date] = Field(None, description="实际行情日期之前的最近交易日")
 
 
 class LimitUpRecord(LimitUpBase):
@@ -45,7 +45,7 @@ class LimitUpRealtime(LimitUpBase):
     yesterday_first_limit_up_time: Optional[str] = Field(None, description="前一交易日首封时间(HH:MM:SS)")
     yesterday_final_seal_time: Optional[str] = Field(None, description="前一交易日终封时间(HH:MM:SS)")
     yesterday_open_change_pct: Optional[float] = Field(None, description="前一交易日开盘竞价涨幅(%)")
-    today_open_change_pct: Optional[float] = Field(None, description="查询基准日期开盘竞价涨幅(%)")
+    today_open_change_pct: Optional[float] = Field(None, description="实际行情日期开盘竞价涨幅(%)")
     limit_up_reason: Optional[str] = Field(None, description="涨停原因")
     reason_category: Optional[str] = Field(None, description="原因分类")
     continuous_limit_up_days: int = Field(1, description="连板天数")

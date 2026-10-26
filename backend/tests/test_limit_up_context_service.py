@@ -73,43 +73,37 @@ class LimitUpContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result[0]["context_date"], DAY)
         self.assertEqual(result[0]["previous_trade_date"], PREVIOUS)
 
-    async def test_requested_monday_context_keeps_friday_rows_and_uses_friday_seals(self):
+    async def test_actual_friday_context_uses_thursday_seals_before_monday_open(self):
         monday, friday, thursday = date(2026, 10, 26), date(2026, 10, 23), date(2026, 10, 22)
 
         async def pool(day):
-            return [{"stock_code": "600838", "first_limit_up_time": "09:25:00" if day == friday else "10:52:37",
-                     "final_seal_time": "09:25:00" if day == friday else "10:52:37", "is_final_sealed": True}]
+            self.assertEqual(day, thursday)
+            return [{"stock_code": "600838", "first_limit_up_time": "10:52:37",
+                     "final_seal_time": "10:52:37", "is_final_sealed": True}]
 
         async def history(code, start, end):
-            return {friday: {"open": 11, "pre_close": 10}}
+            self.assertEqual((start, end), (thursday, friday))
+            return {thursday: {"open": 10.25, "pre_close": 10}, friday: {"open": 11, "pre_close": 10}}
 
         service = self.service(calendar_loader=lambda *args: [thursday, friday, monday], pool_fetcher=pool,
                                history_fetcher=history, today_provider=lambda: monday,
                                now_provider=lambda: datetime(2026, 10, 26, 8, 11))
         row = {"stock_code": "600838", "trade_date": friday, "final_seal_time": "09:25:00"}
-        result = (await service.enrich(monday, [row]))[0]
+        result = (await service.enrich(friday, [row]))[0]
         self.assertEqual(result["trade_date"], friday)
-        self.assertEqual(result["context_date"], monday)
-        self.assertEqual(result["previous_trade_date"], friday)
-        self.assertEqual(result["yesterday_final_seal_time"], "09:25:00")
-        self.assertEqual(result["yesterday_open_change_pct"], 10)
-        self.assertIsNone(result["today_open_change_pct"])
+        self.assertEqual(result["context_date"], friday)
+        self.assertEqual(result["previous_trade_date"], thursday)
+        self.assertEqual(result["yesterday_final_seal_time"], "10:52:37")
+        self.assertEqual(result["yesterday_open_change_pct"], 2.5)
+        self.assertEqual(result["today_open_change_pct"], 10)
         self.assertNotIn("context_date", row)
 
-    async def test_sunday_context_uses_preceding_friday_without_guessing_a_session(self):
+    async def test_previous_session_lookup_handles_non_session_date_without_guessing(self):
         sunday, friday = date(2026, 10, 25), date(2026, 10, 23)
 
-        async def pool(day):
-            self.assertEqual(day, friday)
-            return [{"stock_code": "600838", "first_limit_up_time": "09:25:00", "final_seal_time": "09:25:00", "is_final_sealed": True}]
-
-        service = self.service(calendar_loader=lambda *args: [date(2026, 10, 22), friday], pool_fetcher=pool,
+        service = self.service(calendar_loader=lambda *args: [date(2026, 10, 22), friday],
                                today_provider=lambda: date(2026, 10, 26))
-        result = (await service.enrich(sunday, [{"stock_code": "600838", "trade_date": friday}]))[0]
-        self.assertEqual(result["context_date"], sunday)
-        self.assertEqual(result["previous_trade_date"], friday)
-        self.assertEqual(result["yesterday_final_seal_time"], "09:25:00")
-        self.assertIsNone(result["today_open_change_pct"])
+        self.assertEqual(await service._previous_session(sunday), friday)
 
     async def test_holiday_calendar_and_missing_calendar_never_guess_weekdays(self):
         calls = []

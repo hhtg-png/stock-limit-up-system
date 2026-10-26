@@ -30,6 +30,33 @@ export function sortByYesterdayFinalSealTime<T extends Pick<LimitUpRealtime, 'st
   })
 }
 
+type OpeningChangeField = 'yesterday_open_change_pct' | 'today_open_change_pct'
+
+export function sortByLimitUpField<T extends Pick<LimitUpRealtime, 'first_limit_up_time' | 'seal_amount' | 'is_one_word' | 'continuous_limit_up_days'>>(
+  items: readonly T[], field: 'time' | 'seal_amount' | 'continuous_days'
+): T[] {
+  return [...items].sort((a, b) => {
+    if (field === 'time') return (a.first_limit_up_time || '99:99:99').localeCompare(b.first_limit_up_time || '99:99:99')
+    if (field === 'seal_amount') {
+      return ((b.seal_amount || 0) - (a.seal_amount || 0)) || Number(Boolean(b.is_one_word)) - Number(Boolean(a.is_one_word))
+    }
+    return (b.continuous_limit_up_days || 0) - (a.continuous_limit_up_days || 0)
+  })
+}
+
+export function sortByOpeningChangePct<T extends Pick<LimitUpRealtime, 'stock_code' | OpeningChangeField>>(
+  items: readonly T[], field: OpeningChangeField, order: 'asc' | 'desc' = 'desc'
+): T[] {
+  return [...items].sort((a, b) => {
+    const aValue = a[field], bValue = b[field]
+    const aValid = typeof aValue === 'number' && Number.isFinite(aValue)
+    const bValid = typeof bValue === 'number' && Number.isFinite(bValue)
+    if (aValid !== bValid) return aValid ? -1 : 1
+    const difference = aValid && bValid ? (aValue - bValue) * (order === 'asc' ? 1 : -1) : 0
+    return difference || a.stock_code.localeCompare(b.stock_code)
+  })
+}
+
 function formatYi(value: number | undefined | null): string {
   return value == null || value === 0 ? '-' : (value / 10000).toFixed(2)
 }
@@ -41,13 +68,12 @@ function escapeCsvCell(value: string | number): string {
 
 export function buildLimitUpCsv(items: LimitUpRealtime[]): string {
   const headers = [
-    '代码', '名称', '查询日期', '行情日期', '昨日日期', '连板', '首封时间', '昨日首封', '昨日终封', '昨日竞价', '今日竞价',
+    '代码', '名称', '行情日期', '昨日日期', '连板', '首封时间', '昨日首封', '昨日终封', '昨日竞价', '今日竞价',
     '状态', '封单(万)', '成交额(亿)', '实际流通值(亿)', '涨停原因'
   ]
   const rows = items.map(item => [
     item.stock_code,
     item.stock_name,
-    item.context_date || '',
     item.trade_date || '',
     item.previous_trade_date || '',
     item.continuous_limit_up_days,
