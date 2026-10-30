@@ -99,15 +99,19 @@ export function ruleSummary(rules: DynamicRuleNode[], fields: DynamicField[], ma
   return rules.map(rule => {
     if (!isRuleLeaf(rule)) return `（${ruleSummary('all' in rule ? rule.all : rule.any, fields, 'all' in rule ? 'all' : 'any')}）`
     const field = fields.find(item => item.key === rule.field)
-    const value = typeof rule.value === 'boolean' ? (rule.value ? '是' : '否') : Array.isArray(rule.value) ? rule.value.join('、') : rule.value
-    return `${rule.days !== undefined ? `近${rule.days}个已完成交易日 · ` : ''}${field?.label ?? rule.field} ${operatorLabels[rule.op] ?? rule.op} ${value}${rule.op === 'between' ? ` 至 ${rule.value2}` : ''}${field?.unit ?? ''}`
+    const valueLabel = (item: string | number | boolean) => field?.options?.find(option => option.value === item)?.label ?? (typeof item === 'boolean' ? (item ? '是' : '否') : item)
+    const value = Array.isArray(rule.value) ? rule.value.map(valueLabel).join('、') : valueLabel(rule.value)
+    const rawLabel = field?.label ?? rule.field
+    const label = rule.days === undefined ? rawLabel : rawLabel.replace(/^近N个已完成交易日/, '')
+    return `${rule.days !== undefined ? `近${rule.days}个已完成交易日 · ` : ''}${label} ${operatorLabels[rule.op] ?? rule.op} ${value}${rule.op === 'between' ? ` 至 ${rule.value2}` : ''}${field?.unit ?? ''}`
   }).join(matchMode === 'any' ? ' 或 ' : ' 且 ')
 }
 
 export function rankingSummary(definition: DynamicDefinition, fields: DynamicField[]) {
   const ranking = definition.strategy?.ranking
   if (!ranking) return ''
-  const label = fields.find(field => field.key === ranking.field)?.label || ranking.field
+  const rawLabel = fields.find(field => field.key === ranking.field)?.label || ranking.field
+  const label = ranking.days ? rawLabel.replace(/^近N个已完成交易日/, '') : rawLabel
   return `按${ranking.days ? `近${ranking.days}个已完成交易日的` : ''}${label}${ranking.direction === 'asc' ? '由低到高' : '由高到低'}${ranking.limit ? `，保留前 ${ranking.limit} 只` : ''}`
 }
 
