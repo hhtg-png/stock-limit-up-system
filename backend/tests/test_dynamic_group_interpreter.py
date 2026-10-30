@@ -3,6 +3,7 @@ import importlib.util
 import json
 import unittest
 from types import SimpleNamespace
+from pathlib import Path
 
 import httpx
 from fastapi import FastAPI
@@ -328,6 +329,77 @@ class InterpreterTests(unittest.IsolatedAsyncioTestCase):
             result = await self.service.interpret(prompt)
             self.assertEqual(result["status"], "needs_clarification", result)
             self.assertIsNone(result["definition"])
+
+    async def test_model_format_example_does_not_request_duplicate_strategy_metadata(self):
+        result = await self.service.interpret(PROMPT)
+        self.assertEqual(result["status"], "ready")
+        system = self.calls[0]["messages"][0]["content"]
+        example_start = system.index("完整结构示例")
+        example, _ = json.JSONDecoder().raw_decode(system[system.index("{", example_start):])
+        strategy = example["definition"]["strategy"]
+        self.assertIn("summary", strategy)
+        self.assertNotIn("prompt", strategy)
+        self.assertNotIn("assumptions", strategy)
+        self.assertIn("assumptions", example)
+
+    async def test_real_bad_strategy_reply_is_sent_back_once_with_safe_error_location(self):
+        prompt = "主板非ST，近5个已完成交易日有过收盘涨停，今日竞价高开2%到5%，按成交额从高到低取前20只。"
+        bad = (Path(__file__).parent / "fixtures" / "dynamic_group_interpreter_bad_strategy.txt").read_text(encoding="utf-8").strip()
+        self.payload = proposal(prompt)
+        self.payload["definition"]["rules"] = [
+            {"field": "board_type", "op": "eq", "value": "main"},
+            {"field": "is_st", "op": "eq", "value": False},
+            {"field": "recent_limit_up_count", "days": 5, "op": "gte", "value": 1},
+            {"field": "today_open_change_pct", "op": "between", "value": 2, "value2": 5}]
+        self.payload["definition"]["strategy"] = {"summary": "主板非ST、近5日涨停、竞价2%-5%、成交额前20",
+            "ranking": {"field": "amount_yi", "direction": "desc", "limit": 20}}
+        self.payload["clauses"] = [{"text": prompt, "status": "implemented",
+            "references": ["board_type", "is_st", "recent_limit_up_count", "today_open_change_pct", "amount_yi", "strategy.ranking"]}]
+        async def reply(request):
+            content = bad if len(self.calls) == 1 else json.dumps(self.payload, ensure_ascii=False)
+            return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {"content": content}}]})
+        self.respond = reply
+        result = await self.service.interpret(prompt)
+        self.assertEqual(result["status"], "ready", result)
+        self.assertEqual(len(self.calls), 2)
+        repair = self.calls[1]["messages"]
+        self.assertEqual(repair[-2], {"role": "assistant", "content": bad})
+        self.assertIn("行", repair[-1]["content"])
+        self.assertIn("列", repair[-1]["content"])
+        self.assertIn("字符", repair[-1]["content"])
+        definition = result["definition"]
+        self.assertEqual(definition["strategy"]["prompt"], prompt)
+        self.assertEqual(definition["rules"], self.payload["definition"]["rules"])
+        self.assertEqual(definition["strategy"]["ranking"]["limit"], 20)
+        self.assertTrue(definition["strategy"]["assumptions"])
+
+    async def test_repair_does_not_echo_secret_truncated_or_oversized_content(self):
+        for content, finish in (("{private-test-secret", "stop"), ("{incomplete", "length"),
+                                ("{" + "x" * 13000, "stop")):
+            self.calls.clear()
+            async def reply(request):
+                return httpx.Response(200, json={"choices": [{"finish_reason": finish,
+                    "message": {"content": content}}]})
+            self.respond = reply
+            result = await self.service.interpret(PROMPT)
+            self.assertEqual(result["status"], "error")
+            self.assertIsNone(result["definition"])
+            self.assertEqual(len(self.calls), 2)
+            self.assertFalse(any(message["role"] == "assistant" for message in self.calls[1]["messages"]))
+            self.assertNotIn("private-test-secret", json.dumps(self.calls[1]))
+            self.assertNotIn(content, json.dumps(self.calls[1]))
+
+    async def test_duplicate_keys_and_nonfinite_values_are_never_locally_repaired(self):
+        for content in ('{"status":"ready","status":"error"}', '{"status":"ready","definition":{"n":NaN}}'):
+            self.calls.clear()
+            async def reply(request):
+                return httpx.Response(200, json={"choices": [{"finish_reason": "stop",
+                    "message": {"content": content}}]})
+            self.respond = reply
+            result = await self.service.interpret(PROMPT)
+            self.assertEqual(result["status"], "error")
+            self.assertIsNone(result["definition"])
+            self.assertEqual(len(self.calls), 2)
 
 
 class InterpreterAPI(unittest.IsolatedAsyncioTestCase):

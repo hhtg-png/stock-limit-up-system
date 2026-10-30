@@ -246,12 +246,15 @@ class DynamicGroupInterpreterService:
                 headers={"Authorization": f"Bearer {secret}", "Content-Type": "application/json"},
                 json=body, timeout=timeout)
             response.raise_for_status()
+            content = None
+            complete = False
             try:
                 if len(response.content) > 262144:
                     raise ValueError("Oversized model response")
                 data = response.json()
                 choice = data["choices"][0]
-                if choice.get("finish_reason") != "stop":
+                complete = choice.get("finish_reason") == "stop"
+                if not complete:
                     raise ValueError("Incomplete model output")
                 content = choice["message"]["content"]
                 if not isinstance(content, str) or not content.strip():
@@ -261,11 +264,33 @@ class DynamicGroupInterpreterService:
                 if not isinstance(parsed, dict):
                     raise ValueError("Expected JSON object")
                 return parsed
-            except (ValueError, KeyError, TypeError, IndexError):
+            except (ValueError, KeyError, TypeError, IndexError) as exc:
                 if attempt:
                     raise ValueError("Invalid model JSON") from None
-                body = {**body, "messages": [*body["messages"], {"role": "user", "content":
-                    "上次输出不是完整有效JSON。请重新按指定JSON格式输出完整方案，不要省略任何原文要求；不能实现的条件明确标为unsupported，禁止输出代码。"}]}
+                messages = list(body["messages"])
+                # Retain a complete, bounded failed reply so the repair call
+                # can fix the actual bracket/quote error instead of guessing.
+                # Token-truncated, oversized or secret-bearing output is never
+                # sent back, and duplicate/non-finite data is never guessed at
+                # by a permissive local parser.
+                if (complete and isinstance(content, str) and 0 < len(content) <= 12000
+                        and secret not in content and len(response.content) <= 262144):
+                    messages.append({"role": "assistant", "content": content})
+                if isinstance(exc, json.JSONDecodeError):
+                    detail = (f"JSON语法错误：{exc.msg}；第{exc.lineno}行，第{exc.colno}列，"
+                              f"字符位置{exc.pos}。")
+                elif isinstance(exc, ValueError) and str(exc) == "Duplicate JSON key":
+                    detail = "JSON含有重复对象键；请重新输出没有重复键的完整JSON。"
+                elif isinstance(exc, ValueError) and str(exc) == "Non-finite JSON number":
+                    detail = "JSON含有非有限数字；请输出有效的有限数值，不得猜测未知数据。"
+                elif not complete:
+                    detail = "上次响应没有完整结束，无法作为可执行方案。"
+                else:
+                    detail = "上次响应结构或JSON数据类型无效。"
+                messages.append({"role": "user", "content": detail +
+                    "请只修正JSON格式并返回完整对象。保留原始需求对应的全部条件、阈值、排名和clauses，不得通过删减或默认条件凑成有效格式。"
+                    "strategy仅输出summary和可选ranking；prompt和assumptions由系统填入。不能实现的条件明确标为unsupported，禁止输出代码。"})
+                body = {**body, "messages": messages}
 
     @staticmethod
     def _reject_constant(_value):
@@ -400,7 +425,8 @@ class DynamicGroupInterpreterService:
 历史days仅1..60，指最近已完成的交易日，排除当前未收盘交易日。历史缺失未知，不能当0。
 规则为原有rules数组和match_mode=all|any；叶为{field,op,value,value2?}，历史叶另必填days。
 允许嵌套{all:[节点]}或{any:[节点]}，单节点不得混合结构，叶最多30、节点深度最多4。
-strategy={prompt,summary,assumptions,ranking?}；ranking={field,direction:asc|desc,limit?:1..500,days?}。
+strategy只输出summary和可选ranking；不要重复prompt或assumptions，系统会从原始描述和顶层assumptions权威填入。
+ranking包含field、direction（asc或desc）、可选limit（整数1..500）及可选days（整数1..60）。
 仅sortable字段可排名，历史排名必须显式days1..60，普通字段不能days。不要以当前涨幅替代近几日表现。
 每项原文条件必须列入clauses：text逐字引用用户原文片段，status=implemented|needs_clarification|unsupported|removed，references数组引用实际用到的字段key（含排名字段）或strategy.ranking、universe、membership_mode、name、current_definition；reason可选。
 只有用户明确取消/删除/忽略该指标或说该指标不做要求时才能removed，保留该原文clause但不添加该执行条件；不要低于某均线是比较要求，绝不是取消均线。
@@ -410,7 +436,7 @@ clauses必须覆盖全部实质要求；连接词和标点可不单列。此自�
 status为ready|needs_clarification|unsupported|error；仅ready给出definition，且questions/unsupported为空；其余definition为null。
 definition为{name,description?,folder?,color?,pinned?,enabled?,universe:all_a|limit_up,membership_mode:retain|dynamic,match_mode:all|any,rules,strategy}。
 strategy.summary简述实际执行逻辑；assumptions只说明口径，不允许借此悄悄弱化用户要求。不要输出model字段。
-完整结构示例（仅展示格式，不是默认选股条件）：{"status":"ready","message":"已理解","definition":{"name":"示例","universe":"all_a","membership_mode":"dynamic","match_mode":"all","rules":[{"all":[{"field":"is_st","op":"eq","value":false},{"field":"change_pct","op":"gt","value":5}]}],"strategy":{"prompt":"排除ST且涨幅大于5%","summary":"排除ST且涨幅大于5%","assumptions":[]}},"assumptions":[],"questions":[],"unsupported":[],"clauses":[{"text":"排除ST","status":"implemented","references":["is_st"]},{"text":"涨幅大于5%","status":"implemented","references":["change_pct"]}]}。
+完整结构示例（仅展示格式，不是默认选股条件）：{"status":"ready","message":"已理解","definition":{"name":"示例","universe":"all_a","membership_mode":"dynamic","match_mode":"all","rules":[{"all":[{"field":"is_st","op":"eq","value":false},{"field":"change_pct","op":"gt","value":5}]}],"strategy":{"summary":"排除ST且涨幅大于5%"}},"assumptions":[],"questions":[],"unsupported":[],"clauses":[{"text":"排除ST","status":"implemented","references":["is_st"]},{"text":"涨幅大于5%","status":"implemented","references":["change_pct"]}]}。
 """
         return [{"role": "system", "content": instructions + "\n可用字段JSON：" +
                  json.dumps(FIELD_DEFINITIONS, ensure_ascii=False)},

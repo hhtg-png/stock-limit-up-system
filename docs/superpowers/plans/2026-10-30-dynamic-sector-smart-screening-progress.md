@@ -5,7 +5,7 @@
 - User clarified that fixed dropdown conditions are too rigid and expects intelligent recognition of natural-language screening requests.
 - Root asked for a real description asynchronously; no answer yet. Optional example is still pending; implementation proceeds with the stated example. User previously explicitly opted out of brainstorming and authorized direct implementation/deployment.
 - Branch `codex/dynamic-sector-smart-screening-20261030`, isolated worktree `C:/Users/Administrator/.codex/worktrees/monitor-auction-history/stock-limit-up-system`. Original dirty `D:/code/stock-limit-up-system` untouched.
-- Current local/GitHub/production base remains `33afbf1db01e1d037f742d7ed184f58516a04d4e`. New smart-screening files are UNCOMMITTED and NOT deployed.
+- Smart-screening feature was committed as `d960602` and deployed. Display labels were polished in `3c9713f0cebbc0f61c6cffc1ddaa03d6cc666ee1`, which is now local HEAD, GitHub main, and production HEAD. Backend code is identical between those two commits.
 - Design and plan are adjacent `2026-10-30-dynamic-sector-smart-screening*` documents. No approval gate remains.
 
 ## Worker implementation status
@@ -50,9 +50,10 @@ All six were fixed with RED→GREEN regressions. An additional cancelled-but-sti
 
 ## Remaining
 
-1. Interpreter repairs, independent recheck, real-model and actual-data candidate validation have passed.
-2. Root local desktop/mobile and interaction checks have passed; perform fresh public UI confirmation after deployment.
-3. Full backend and latest frontend tests/build passed; `.tmp` QA artifacts moved outside git. Final staged diff checked clean.
-4. Commit/push HEAD:main, managed deploy via `%TEMP%/monitor-context-requested-date-deploy.py` (clean tree, HEAD==origin/main, verified dist). Read stock-limit-up-deploy skill if needed. Never print/store server password.
-5. Verify public /interpret (real configured model), real preview/ranking/history coverage, baseline monitor APIs/assets/HEAD/service; no fixture groups in production. Save/EMBED fresh screenshot, reset viewport/close temp tabs.
-6. Final concise Chinese module link and natural-language workflow with supported boundaries, commit/ref/remote/API/assets verification. Do not claim completion until checks pass.
+1. Production browser verification passed: intelligent create interpreted the example and showed14 real matches; no group was saved. Production groups remain0. Screenshot saved at `C:/Users/Administrator/.codex/visualizations/2026/09/15/01a0a31f-768a-7aa1-93a2-5203b7f1bd82/smart-screening-online-3c9713f.png`. Browser viewport reset; verification tab closed; original3tabs untouched. Local QA server also stopped.
+2. Final repeat public probe on3c9713f found intermittent interpretation error. Further instrumented real calls proved malformed model JSON, specifically a `strategy.assumptions` array closed with `}` rather than `]`, with nesting/closing damage. Logs `%TEMP%/dynamic-groups-smart-diagnose-exact.log` and `...-repeat.log`. Multiple successful calls alone do not resolve this blocker.
+3. Minimal fix is implemented and independently reviewed: model no longer duplicates strategy.prompt/assumptions (local compiler fills both); single format repair receives safe failed output plus JSON line/column/character feedback. Max2 calls/total timeout and strict validation remain. Real broken-response fixture observed RED→GREEN;31 focused tests pass. Reviewer independently confirmed1.016s timeout on a1s total budget and that a repaired reply omitting ST still cannot execute. No open scoped findings.
+4. Root real-provider validation after this fix passed: two supported descriptions plus refinement all returned valid JSON on their first response; unsupported indicators still rejected. All3 executable plans passed positive and counterexample evaluation for board/ST/history/range/ranking/refinement preservation. Fresh frontend build passed6.54s. Fresh full backend PASSED1347tests in441.185s, exit0, OK(skipped2), log `%TEMP%/dynamic-groups-smart-repair-backend-full.log` (session36999 closed).
+5. Latest unchanged frontend181tests passed after label patch, and its new dist is verified. After backend success, update ledger, commit/push HEAD:main, managed deploy via `%TEMP%/monitor-context-requested-date-deploy.py` (clean tree, HEAD==origin/main, verified dist). Include new fixture in commit. Never print/store server password.
+6. Verify public /interpret (real configured model), real preview/ranking/history coverage, baseline monitor APIs/assets/HEAD/service; no fixture groups in production. Existing production screenshot is valid if UI unchanged. Do not claim complete until public probes pass.
+7. Final concise Chinese module link and natural-language workflow with supported boundaries, commit/ref/remote/API/assets verification, and embedded screenshot.
