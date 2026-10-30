@@ -66,6 +66,64 @@ function loadView(view, autoResolve = true) {
 }
 
 for (const view of ['Dashboard', 'LimitUpList']) {
+  test(`${view} queries fixed board counts exactly and clears threshold filters when switching`, async () => {
+    const state = loadView(view)
+    try {
+      await state.mount()
+      for (const [days, label] of [[2, '二板'], [3, '三板'], [4, '四板'], [5, '五板']]) {
+        assert.match(state.source, new RegExp(`label="${label}"\\s+value="exact-${days}"`))
+        state.filters.boardScope = `min-${days}`
+        await state.applyFilters()
+        assert.equal(state.requests.at(-1).params.continuous_days, days)
+        assert.equal(state.requests.at(-1).params.continuous_days_exact, undefined)
+        state.filters.boardScope = `exact-${days}`
+        const before = state.requests.length
+        await state.applyFilters()
+        assert.equal(state.requests.length, before + 1)
+        assert.equal(state.requests.at(-1).params.continuous_days_exact, days)
+        assert.equal(state.requests.at(-1).params.continuous_days, undefined)
+        state.filters.boardScope = ''
+        await state.applyFilters()
+        assert.equal(state.requests.at(-1).params.continuous_days_exact, undefined)
+        assert.equal(state.requests.at(-1).params.continuous_days, undefined)
+      }
+    } finally { state.dispose() }
+  })
+
+  test(`${view} keeps the selected board count after market-wide websocket snapshots and deltas`, async () => {
+    const state = loadView(view)
+    try {
+      await state.mount()
+      for (const days of [2, 3, 4, 5]) {
+        state.filters.boardScope = `exact-${days}`
+        await state.applyFilters()
+        const rows = [
+          { stock_code: '000001', continuous_limit_up_days: days },
+          { stock_code: '000002', continuous_limit_up_days: days + 1 },
+          { stock_code: '000003', continuous_limit_up_days: 1 },
+          { stock_code: '000005', continuous_limit_up_days: 0 }
+        ]
+        state.store.setRealtimeSnapshot('2026-10-26', rows)
+        assert.deepEqual(state.tableData.value.map(row => row.stock_code), ['000001'])
+        state.store.applyRealtimeDelta([
+          { stock_code: '000001', continuous_limit_up_days: days + 1 },
+          { stock_code: '000002', continuous_limit_up_days: days },
+          { stock_code: '000004', continuous_limit_up_days: days }
+        ], [], '2026-10-26')
+        assert.deepEqual(state.tableData.value.map(row => row.stock_code).sort(), ['000002', '000004'])
+        assert.deepEqual((await state.exportedCodes()).sort(), ['000002', '000004'])
+        state.filters.boardScope = `min-${days}`
+        await state.applyFilters()
+        state.store.setRealtimeSnapshot('2026-10-26', rows)
+        assert.deepEqual(state.tableData.value.map(row => row.stock_code).sort(), ['000001', '000002'])
+        state.filters.boardScope = 'first'
+        await state.applyFilters()
+        state.store.setRealtimeSnapshot('2026-10-26', rows)
+        assert.deepEqual(state.tableData.value.map(row => row.stock_code).sort(), ['000003', '000005'], 'first-board fallback must match the API for unknown zero counts')
+      }
+    } finally { state.dispose() }
+  })
+
   test(`${view} queries each filter change once and ignores websocket changes`, async () => {
     const state = loadView(view)
     try {

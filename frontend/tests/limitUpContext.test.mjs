@@ -200,12 +200,12 @@ for (const view of ['Dashboard', 'LimitUpList']) test(`${view} keeps yesterday s
   const script = source.match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1]
   const ast = ts.createSourceFile(`${view}.ts`, script, ts.ScriptTarget.ES2022, true, ts.ScriptKind.TS)
   const declarations = ast.statements.filter(node => ts.isVariableStatement(node) && node.declarationList.declarations.some(
-    item => ['tableData', 'apiSort', 'previousTradeDate', 'effectiveOrder'].includes(item.name.getText(ast))
+    item => ['tableData', 'apiSort', 'previousTradeDate', 'effectiveOrder', 'boardFilter'].includes(item.name.getText(ast))
   )).map(node => node.getText(ast)).join('\n')
   const executable = ts.transpileModule(declarations, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText
   const sortBy = ref('yesterday_final_seal_time')
   const tableSort = ref({ prop: 'yesterday_final_seal_time', order: 'ascending' })
-  const scope = { computed, limitUpStore: store, sortBy, sortDirection: ref(null), tableSort, sortByYesterdayFinalSealTime: helper.sortByYesterdayFinalSealTime, sortByOpeningChangePct: helper.sortByOpeningChangePct, sortByLimitUpField: helper.sortByLimitUpField }
+  const scope = { computed, filters: { boardScope: '' }, limitUpStore: store, sortBy, sortDirection: ref(null), tableSort, sortByYesterdayFinalSealTime: helper.sortByYesterdayFinalSealTime, sortByOpeningChangePct: helper.sortByOpeningChangePct, sortByLimitUpField: helper.sortByLimitUpField }
   const state = new Function(...Object.keys(scope), `${executable}\nreturn { tableData, apiSort, previousTradeDate: typeof previousTradeDate === 'undefined' ? undefined : previousTradeDate }`)(...Object.values(scope))
   store.setSnapshot('2026-10-23', [
     { ...richRow, stock_code: '000003', yesterday_final_seal_time: '11:00:00' },

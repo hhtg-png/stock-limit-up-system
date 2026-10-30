@@ -17,6 +17,10 @@
         <el-form-item label="连板天数">
           <el-select v-model="filters.boardScope" placeholder="全部" clearable style="width: 120px" @change="applyFilters">
             <el-option label="首板" value="first" />
+            <el-option label="二板" value="exact-2" />
+            <el-option label="三板" value="exact-3" />
+            <el-option label="四板" value="exact-4" />
+            <el-option label="五板" value="exact-5" />
             <el-option label="2板以上" value="min-2" />
             <el-option label="3板以上" value="min-3" />
             <el-option label="4板以上" value="min-4" />
@@ -241,7 +245,7 @@ let activeRequest: { key: string; sequence: number; promise: Promise<boolean> } 
 
 type MonitorSort = 'time' | 'reseal_time' | 'yesterday_final_seal_time' | 'yesterday_open_change_pct' | 'today_open_change_pct' | 'seal_amount' | 'continuous_days'
 
-type BoardScope = '' | 'first' | 'min-2' | 'min-3' | 'min-4' | 'min-5'
+type BoardScope = '' | 'first' | 'exact-2' | 'exact-3' | 'exact-4' | 'exact-5' | 'min-2' | 'min-3' | 'min-4' | 'min-5'
 
 interface PriceRange {
   label: string
@@ -292,7 +296,14 @@ const effectiveOrder = computed(() => sortDirection.value || (
 ))
 
 const tableData = computed(() => {
-  const list = limitUpStore.realtimeList
+  // Realtime snapshots cover the whole market; retain the selected board scope.
+  const { continuousDays, continuousDaysExact } = boardFilter.value
+  const list = limitUpStore.realtimeList.filter(item => {
+    const days = item.continuous_limit_up_days > 0 ? item.continuous_limit_up_days : 1
+    return continuousDaysExact !== undefined
+      ? days === continuousDaysExact
+      : continuousDays === undefined || days >= continuousDays
+  })
   switch (sortBy.value) {
     case 'time':
     case 'reseal_time':
@@ -311,6 +322,13 @@ const boardFilter = computed(() => {
   const scope = filters.boardScope || ''
   if (scope === 'first') {
     return { continuousDays: undefined, continuousDaysExact: 1 }
+  }
+  if (scope.startsWith('exact-')) {
+    const days = Number(scope.replace('exact-', ''))
+    return {
+      continuousDays: undefined,
+      continuousDaysExact: Number.isFinite(days) ? days : undefined
+    }
   }
   if (scope.startsWith('min-')) {
     const days = Number(scope.replace('min-', ''))
