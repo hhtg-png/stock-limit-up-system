@@ -5,6 +5,8 @@ from typing import Literal
 from fastapi import APIRouter, Query
 
 from app.schemas.dynamic_group import DynamicGroupDefinition, DynamicGroupUpdate
+from app.schemas.dynamic_group_interpreter import DynamicGroupInterpretRequest, DynamicGroupInterpretResponse
+from app.services.dynamic_group_interpreter_service import dynamic_group_interpreter_service
 from app.services.dynamic_group_service import dynamic_group_service
 
 router = APIRouter()
@@ -42,6 +44,11 @@ async def create(payload: DynamicGroupDefinition):
 @router.post("/preview")
 async def preview(payload: DynamicGroupDefinition):
     return await dynamic_group_service.preview(payload.model_dump())
+
+
+@router.post("/interpret", response_model=DynamicGroupInterpretResponse)
+async def interpret(payload: DynamicGroupInterpretRequest):
+    return await dynamic_group_interpreter_service.interpret(payload.prompt, payload.current_definition)
 
 
 @router.get("/{group_id}")

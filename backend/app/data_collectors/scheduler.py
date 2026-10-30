@@ -2102,6 +2102,18 @@ class DataScheduler:
             logger.warning("Dynamic group startup sampling failed; will retry: {}", exc)
         await self._refresh_dynamic_group_history()
 
+    def _queue_dynamic_group_archive_refresh(self):
+        """Re-evaluate completed-session conditions after a final archive commits."""
+        try:
+            self.scheduler.add_job(
+                self._recover_dynamic_groups,
+                DateTrigger(run_date=self._playbook_now() + timedelta(seconds=1), timezone=CN_TZ),
+                id="dynamic_group_archive_refresh", name="收盘归档后刷新动态板块",
+                replace_existing=True, max_instances=1, coalesce=True, misfire_grace_time=300,
+            )
+        except Exception as exc:
+            logger.warning("Dynamic group archive refresh could not be queued: {}", type(exc).__name__)
+
 
     async def _calculate_daily_analysis(self, trade_date: Optional[date] = None):
         """生成每日分析月表数据"""
@@ -2215,6 +2227,7 @@ class DataScheduler:
                 logger.warning("Recovering missing after-close market review for {}", trade_date)
                 await market_review_pipeline_service.run_for_date(trade_date, calc_version=1)
                 logger.info("Recovered after-close market review for {}", trade_date)
+                self._queue_dynamic_group_archive_refresh()
         except Exception:
             logger.exception("Market review recovery failed; will retry on next reconciliation")
 
@@ -2280,6 +2293,7 @@ class DataScheduler:
             async with self._market_review_build_lock:
                 await market_review_pipeline_service.run_for_date(resolved_trade_date, calc_version=1)
             logger.info("Market review build completed")
+            self._queue_dynamic_group_archive_refresh()
         except Exception as e:
             logger.error(f"Market review build error: {e}")
             raise
@@ -2294,6 +2308,7 @@ class DataScheduler:
             async with self._market_review_build_lock:
                 await market_review_pipeline_service.run_for_date(trade_date, calc_version=2)
             logger.info("Market review repair completed")
+            self._queue_dynamic_group_archive_refresh()
         except Exception as e:
             logger.error(f"Market review repair error: {e}")
             raise

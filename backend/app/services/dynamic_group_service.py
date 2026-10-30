@@ -55,10 +55,11 @@ def _json(value):
 
 
 class DynamicGroupService:
-    def __init__(self, *, session_factory=None, source=None, history=None, now=None):
+    def __init__(self, *, session_factory=None, source=None, history=None, features=None, now=None):
         self.session_factory = session_factory or async_session_maker
         self._source = source
         self._history = history
+        self._features = features
         self.now = now or (lambda: now_cn().replace(tzinfo=None))
         self._lock = asyncio.Lock()
         self._task = None
@@ -71,6 +72,13 @@ class DynamicGroupService:
             from app.services.dynamic_group_source_service import dynamic_group_source_service
             self._source = dynamic_group_source_service
         return self._source
+
+    @property
+    def features(self):
+        if self._features is None:
+            from app.services.dynamic_group_features_service import DynamicGroupFeatureService
+            self._features = DynamicGroupFeatureService(session_factory=self.session_factory, now_provider=self.now)
+        return self._features
 
     @property
     def history(self):
@@ -187,6 +195,8 @@ class DynamicGroupService:
                 raise HTTPException(409, "已归档板块不可修改")
             payload = DynamicGroupDefinition.model_validate(dict(self.definition(group), **changes)).model_dump()
             changed_rules = any(payload[key] != getattr(group, key) for key in RULE_KEYS)
+            changed_rules = changed_rules or ((payload.get("strategy") or {}).get("ranking") !=
+                                              (group.strategy or {}).get("ranking"))
             for key, value in payload.items():
                 setattr(group, key, value)
             group.updated_at = self.now()
@@ -295,7 +305,6 @@ class DynamicGroupService:
                 covered_count=r.covered_count, status=r.status, segment=r.segment) for r in rows]})
 
     async def preview(self, definition):
-        from app.services.dynamic_group_rules import evaluate_rules
         definition = DynamicGroupDefinition.model_validate(definition).model_dump()
         snapshot = self.source.peek_snapshot()
         self.source.request_refresh()
@@ -303,22 +312,79 @@ class DynamicGroupService:
             return {"items": [], "total": 0, "matched_count": 0, "unknown_count": 0, "covered_count": 0,
                     "trade_date": None, "previous_trade_date": None, "source_time": None,
                     "status": "pending", "warnings": ["行情快照正在后台加载，请稍后刷新预览"]}
-        missing = max(0, len(snapshot.get("universe_codes", [])) - len(snapshot.get("rows", [])))
-        items, unknown, covered, matched = [], missing, 0, 0
-        for row in snapshot.get("rows", []):
-            eligible = self._eligible(row, definition["universe"])
-            result = evaluate_rules(row, definition["rules"], definition["match_mode"]) if eligible is True else eligible
-            if result is None:
-                unknown += 1
-            else:
-                covered += 1
-            if result is True:
-                matched += 1
-                if len(items) < 100:
-                    items.append(_json(row))
+        snapshot = await self.features.enrich_snapshot(snapshot, [definition])
+        screen = self._screen_snapshot(snapshot, definition)
+        items = [screen["rows"][code] for code in screen["selected"]]
         return _json({key: snapshot.get(key) for key in ("trade_date", "previous_trade_date", "source_time", "status", "warnings")} | {
-            "items": items, "total": len(snapshot.get("universe_codes", [])), "matched_count": matched,
-            "unknown_count": unknown, "covered_count": covered})
+            "items": items[:100], "total": screen["total"], "matched_count": len(items),
+            "unknown_count": screen["unknown_count"], "covered_count": screen["total"] - screen["unknown_count"],
+            "status": "partial" if screen["unknown_count"] or snapshot.get("status") != "ready" else "ready",
+            "warnings": list(snapshot.get("warnings", [])) + screen["warnings"],
+            "historical_coverage": snapshot.get("historical_coverage", {}),
+            "ranking_coverage": screen["ranking_coverage"]})
+
+    @classmethod
+    def _screen_snapshot(cls, snapshot, definition):
+        """One deterministic result for preview and background membership changes."""
+        from app.services.dynamic_group_rules import evaluate_rules, rule_value
+        rows, decisions = {}, {}
+        try:
+            day, observed = _date(snapshot["trade_date"]), _datetime(snapshot["source_time"])
+        except (KeyError, ValueError, TypeError):
+            day, observed = None, None
+        universe = {str(code) for code in snapshot.get("universe_codes", [])}
+        for original in snapshot.get("rows", []):
+            row = _json(original)
+            code = str(row.get("stock_code") or row.get("code") or "")
+            if not code:
+                continue
+            universe.add(code)
+            decisions[code] = None
+            try:
+                quote_at = _datetime(row.get("quote_time") or row.get("source_time"))
+                fresh = bool(day and observed and quote_at.date() == day and
+                             abs((observed - quote_at).total_seconds()) <= 180)
+            except (ValueError, TypeError):
+                fresh = False
+            if not fresh:
+                continue
+            row["stock_code"] = code
+            row["ranking_position"] = None
+            rows[code] = row
+            eligible = cls._eligible(row, definition["universe"])
+            decisions[code] = (evaluate_rules(row, definition["rules"], definition["match_mode"])
+                               if eligible is True else eligible)
+        for code in universe - set(decisions):
+            decisions[code] = None
+        ranking = (definition.get("strategy") or {}).get("ranking")
+        candidates = sorted(code for code, result in decisions.items() if result is True)
+        coverage, warnings = None, []
+        if ranking:
+            ranked = []
+            values = {}
+            for code in candidates:
+                value = rule_value(rows[code], ranking)
+                if value is None:
+                    decisions[code] = None
+                else:
+                    ranked.append(code)
+                    values[code] = value
+            ranked.sort(key=lambda code: values[code], reverse=ranking["direction"] == "desc")
+            unknown = sum(result is None for result in decisions.values())
+            complete = not unknown and snapshot.get("status") == "ready"
+            coverage = dict(status="ready" if complete else "partial", candidate_count=len(candidates),
+                covered_count=len(ranked), unknown_count=unknown, field=ranking["field"],
+                **({"days": ranking["days"]} if "days" in ranking else {}))
+            for position, code in enumerate(ranked, 1):
+                rows[code]["ranking_position"] = position
+                if ranking.get("limit") is not None and position > ranking["limit"]:
+                    decisions[code] = False if complete else None
+            if not complete:
+                warnings.append("排序数据覆盖不完整，暂按已知候选排序；已有成员不会因不确定名次被移出")
+            candidates = ranked[:ranking["limit"]] if ranking.get("limit") else ranked
+        return dict(rows=rows, decisions=decisions, selected=candidates, total=len(universe),
+                    unknown_count=sum(result is None for result in decisions.values()),
+                    ranking_coverage=coverage, warnings=warnings)
 
     @staticmethod
     def _eligible(row, universe):
@@ -333,13 +399,15 @@ class DynamicGroupService:
         """Evaluate once per real source slot; each group's state and archives commit together."""
         # Context can recover after quotes stop changing (for example on a
         # weekend). Hash once for the shared scan rather than once per group.
-        snapshot = _json(snapshot)
-        input_signature = hashlib.sha256(json.dumps(snapshot, sort_keys=True, separators=(",", ":"),
-                                                    ensure_ascii=True).encode()).hexdigest()
         async with self._lock:
             async with self.session_factory() as session:
-                ids = list((await session.scalars(select(DynamicGroup.id).where(
+                groups = list((await session.scalars(select(DynamicGroup).where(
                     DynamicGroup.enabled.is_(True), DynamicGroup.archived.is_(False)))).all())
+                definitions = [self.definition(group) for group in groups]
+                ids = [group.id for group in groups]
+            snapshot = _json(await self.features.enrich_snapshot(snapshot, definitions))
+            input_signature = hashlib.sha256(json.dumps(snapshot, sort_keys=True, separators=(",", ":"),
+                                                        ensure_ascii=True).encode()).hexdigest()
             builds = []
             for group_id in ids:
                 try:
@@ -354,7 +422,6 @@ class DynamicGroupService:
                 self.history.request_build(batch_id, items)
 
     async def _evaluate_group(self, group_id, snapshot, input_signature):
-        from app.services.dynamic_group_rules import evaluate_rules
         async with self.session_factory() as session, session.begin():
             group = await self._require_group(session, group_id, lock=True)
             if not group.enabled or group.archived:
@@ -392,28 +459,11 @@ class DynamicGroupService:
             members = {m.stock_code: m for m in (await session.scalars(select(DynamicGroupMember).where(
                 DynamicGroupMember.group_id == group.id))).all()}
             before = set(members)
-            live_rows = {}
-            unknown = 0
-            for original in rows:
-                row = _json(original)
-                code = str(row.get("stock_code") or row.get("code") or "")
-                if not code:
-                    continue
-                row["stock_code"] = code
-                quote_time = row.get("quote_time") or row.get("source_time")
-                try:
-                    quote_at = _datetime(quote_time) if quote_time is not None else None
-                    fresh = quote_at is not None and quote_at.date() == day and abs((observed - quote_at).total_seconds()) <= 180
-                except (ValueError, TypeError):
-                    fresh = False
-                if not fresh:
-                    unknown += 1
-                    continue
-                live_rows[code] = row
-                eligible = self._eligible(row, group.universe)
-                result = evaluate_rules(row, group.rules, group.match_mode) if eligible is True else eligible
-                if result is None:
-                    unknown += 1
+            screen = self._screen_snapshot(snapshot, self.definition(group))
+            live_rows = screen["rows"]
+            unknown = screen["unknown_count"]
+            for code, row in live_rows.items():
+                result = screen["decisions"][code]
                 member = members.get(code)
                 if result is True and not member:
                     event = DynamicGroupEvent(group_id=group.id, version=group.version, stock_code=code,
@@ -437,7 +487,8 @@ class DynamicGroupService:
             for code in set(members) - set(live_rows):
                 members[code].data_status = "unknown"
             group.data_status = "partial" if unknown or set(members) - set(live_rows) or status != "ready" else "ready"
-            group.warnings = _json(list(snapshot.get("warnings", [])) + ([f"{unknown} 只股票条件数据未知，保留已有成员"] if unknown else []))
+            group.warnings = _json(list(snapshot.get("warnings", [])) + screen["warnings"] +
+                ([f"{unknown} 只股票条件或名次未知，保留已有成员"] if unknown else []))
             group.trade_date = day
             try:
                 previous = _date(snapshot.get("previous_trade_date"))

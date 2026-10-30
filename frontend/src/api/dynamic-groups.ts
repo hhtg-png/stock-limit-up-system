@@ -1,8 +1,9 @@
 import axios from 'axios'
 import { groupDefinition } from '@/utils/dynamicGroups'
-import type { DynamicCurrent, DynamicDefinition, DynamicDirectory, DynamicField, DynamicGroup, DynamicIntraday, DynamicMemberQuery, DynamicPreview, DynamicSelection, DynamicSelectionDetail, DynamicTemplate, DynamicTrend } from '@/types/dynamic-groups'
+import type { DynamicCurrent, DynamicDefinition, DynamicDirectory, DynamicField, DynamicGroup, DynamicInterpretation, DynamicIntraday, DynamicMemberQuery, DynamicPreview, DynamicSelection, DynamicSelectionDetail, DynamicTemplate, DynamicTrend } from '@/types/dynamic-groups'
 
 export const dynamicGroupsApi = axios.create({ baseURL: '/api/v1/dynamic-groups', timeout: 30000 })
+export const interpretDynamicGroup = async (prompt: string, currentDefinition?: DynamicDefinition) => (await dynamicGroupsApi.post<DynamicInterpretation>('/interpret', { prompt, ...(currentDefinition ? { current_definition: groupDefinition(currentDefinition) } : {}) }, { timeout: 60000 })).data
 export const getDynamicFields = async () => (await dynamicGroupsApi.get<{ fields: DynamicField[]; templates: DynamicTemplate[] }>('/fields')).data
 export const getDynamicGroups = async (params: { q?: string; folder?: string; state?: string; sort?: string; offset?: number; limit?: number }) => (await dynamicGroupsApi.get<DynamicDirectory>('/', { params: { ...params, folder: params.folder === '__unfiled__' ? '' : params.folder || undefined } })).data
 export const createDynamicGroup = async (definition: DynamicDefinition) => (await dynamicGroupsApi.post<DynamicGroup>('/', groupDefinition(definition))).data

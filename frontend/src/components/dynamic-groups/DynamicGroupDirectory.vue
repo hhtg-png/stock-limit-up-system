@@ -11,7 +11,7 @@
     <div v-loading="loading" class="groups">
       <button v-for="group in groups" :key="group.id" type="button" class="group" :class="{ selected: group.id === selectedId }" :aria-pressed="group.id === selectedId" @click="$emit('select', group)">
         <div class="group-title"><i :style="{ background: group.color || '#409eff' }" /><strong>{{ group.name }}</strong><span v-if="group.pinned" class="pin">置顶</span></div>
-        <p class="summary">{{ ruleSummary(group.rules, fields, group.match_mode) }}</p>
+        <p class="summary">{{ ruleSummary(group.rules, fields, group.match_mode) }}<span v-if="group.strategy?.ranking">；{{ rankingSummary(group, fields) }}</span></p>
         <div class="group-meta"><span>{{ group.folder || '未分类' }} · {{ group.member_count }} 只</span><span>{{ group.archived ? '已归档' : !group.enabled ? '已暂停' : statusLabel(group.data_status) }}</span></div>
         <div class="group-meta"><span>{{ group.membership_mode === 'retain' ? '持续跟踪' : '动态进出' }}</span><time>{{ timeText(group.last_evaluated_at || group.updated_at) }}</time></div>
       </button>
@@ -23,7 +23,7 @@
 
 <script setup lang="ts">
 import type { DynamicField, DynamicGroup } from '@/types/dynamic-groups'
-import { ruleSummary, statusLabel } from '@/utils/dynamicGroups'
+import { ruleSummary, rankingSummary, statusLabel } from '@/utils/dynamicGroups'
 export interface DirectoryQuery { q: string; folder: string; state: string; sort: string; page: number }
 const props = defineProps<{ groups: DynamicGroup[]; total: number; folders: string[]; fields: DynamicField[]; query: DirectoryQuery; selectedId: number | null; loading: boolean; error: string }>()
 const emit = defineEmits<{ select: [group: DynamicGroup]; create: []; query: [query: DirectoryQuery]; retry: [] }>()

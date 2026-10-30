@@ -30,6 +30,7 @@ def configure_sqlite_connection(dbapi_connection, _connection_record) -> None:
 
 def ensure_sqlite_schema_compat(sync_connection) -> None:
     """Apply lightweight SQLite compatibility migrations for existing local DBs."""
+    _add_sqlite_column_if_missing(sync_connection, "dynamic_groups", "strategy", "JSON")
     _add_sqlite_column_if_missing(
         sync_connection,
         "market_review_stock_daily",
@@ -149,6 +150,7 @@ def ensure_postgresql_schema_compat(sync_connection) -> None:
         )
     _ensure_postgresql_playbook_job_claims(sync_connection)
     _ensure_postgresql_obsidian_fact_lookup_index(sync_connection)
+    sync_connection.exec_driver_sql("ALTER TABLE IF EXISTS dynamic_groups ADD COLUMN IF NOT EXISTS strategy JSON")
 
 
 def _ensure_postgresql_obsidian_fact_lookup_index(sync_connection) -> None:

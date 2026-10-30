@@ -22,6 +22,7 @@ class DynamicGroup(Base):
     membership_mode: Mapped[str] = mapped_column(String(20), default="retain")
     match_mode: Mapped[str] = mapped_column(String(10), default="all")
     rules: Mapped[list] = mapped_column(JSON, default=list)
+    strategy: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     version: Mapped[int] = mapped_column(Integer, default=1)
     member_count: Mapped[int] = mapped_column(Integer, default=0)
     latest_selection_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
