@@ -1,6 +1,7 @@
 """
 市场复盘API
 """
+import asyncio
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Iterable
 
@@ -45,7 +46,7 @@ async def _resolve_review_trade_date(
         .order_by(desc(MarketReviewStockDaily.trade_date))
     )
     candidate_dates = result.scalars().all()
-    trading_dates = set(_filter_cn_trading_dates(candidate_dates))
+    trading_dates = set(await asyncio.to_thread(_filter_cn_trading_dates, candidate_dates))
     resolved_date = next((candidate for candidate in candidate_dates if candidate in trading_dates), None)
     if resolved_date is None:
         return requested_date, False
@@ -62,7 +63,7 @@ async def _resolve_latest_metric_trade_date(
 
     result = await db.execute(query)
     candidate_dates = result.scalars().all()
-    trading_dates = set(_filter_cn_trading_dates(candidate_dates))
+    trading_dates = set(await asyncio.to_thread(_filter_cn_trading_dates, candidate_dates))
     return next((candidate for candidate in candidate_dates if candidate in trading_dates), None)
 
 
@@ -551,7 +552,7 @@ async def get_market_review_intraday(
     """获取盘中实时复盘快照。"""
     target_date = trade_date or datetime.now(CN_TZ).date()
 
-    is_live = _should_collect_live_intraday(target_date)
+    is_live = await asyncio.to_thread(_should_collect_live_intraday, target_date)
     if is_live:
         try:
             return await _build_intraday_snapshot(target_date, is_live=True)
@@ -594,7 +595,7 @@ async def get_market_review_daily(
         result = await db.execute(
             query.order_by(MarketReviewDailyMetric.trade_date.desc())
         )
-        metric_rows = _filter_trading_metric_rows(result.scalars().all())
+        metric_rows = await asyncio.to_thread(_filter_trading_metric_rows, result.scalars().all())
         rows = await _attach_board_height_labels(db, list(reversed(metric_rows[:days])))
         return MarketReviewDailyResponse(
             data=MarketReviewDailyData(
@@ -616,7 +617,8 @@ async def get_market_review_daily(
         query = query.where(MarketReviewDailyMetric.trade_date <= resolved_end_date)
 
     result = await db.execute(query.order_by(MarketReviewDailyMetric.trade_date.asc()))
-    rows = await _attach_board_height_labels(db, _filter_trading_metric_rows(result.scalars().all()))
+    metric_rows = await asyncio.to_thread(_filter_trading_metric_rows, result.scalars().all())
+    rows = await _attach_board_height_labels(db, metric_rows)
 
     return MarketReviewDailyResponse(
         data=MarketReviewDailyData(

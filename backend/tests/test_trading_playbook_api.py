@@ -2228,268 +2228,9 @@ class TradingPlaybookApiTests(unittest.TestCase):
         )
         self.assertNotIn("secret", response.text)
 
-    def test_obsidian_status_uses_app_coordinator_and_explicit_contract(self):
-        response = self.client.get("/trading-playbook/obsidian/status")
+    def test_retired_obsidian_api_preserves_notes_and_business_data(self):
+        import tempfile
 
-        self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(
-            response.json(),
-            {
-                "enabled": True,
-                "configured": True,
-                "vault_exists": True,
-                "auto_git_enabled": False,
-                "last_success_at": "2026-07-16T15:31:00",
-                "last_trade_date": "2026-07-16",
-                "last_phase": "after_close",
-                "pending_count": 1,
-                "paused_count": 0,
-                "failed_count": 1,
-                "last_error": "safe export failure",
-                "recent_files": [
-                    "30_TradingPlaybook/Daily/Auto/2026/2026-07-16/index.md"
-                ],
-                "dashboard_path": "Dashboards/交易预案.md",
-                "dashboard_openable": True,
-            },
-        )
-        self.obsidian_sync.get_status.assert_awaited_once_with()
-
-    def test_obsidian_export_defaults_and_partial_result_contract(self):
-        response = self.client.post(
-            "/trading-playbook/obsidian/export",
-            json={"trade_date": "2026-07-16"},
-        )
-
-        self.assertEqual(response.status_code, 200, response.text)
-        self.obsidian_sync.export_trade_date.assert_awaited_once_with(
-            date(2026, 7, 16),
-            include_rules=False,
-            force=False,
-        )
-        self.assertEqual(
-            response.json(),
-            {
-                "trade_date": "2026-07-16",
-                "phase": "reconcile",
-                "written_files": [
-                    "30_TradingPlaybook/Daily/Auto/2026/2026-07-16/index.md"
-                ],
-                "skipped_files": ["Dashboards/交易预案.md"],
-                "pending_files": [
-                    "30_TradingPlaybook/Alerts/Auto/2026/2026-07-16.md"
-                ],
-                "failed_files": [
-                    "30_TradingPlaybook/Reviews/Auto/2026/review-7.md"
-                ],
-                "git_status": {
-                    "state": "git_error",
-                    "enabled": False,
-                    "committed": False,
-                },
-                "error_summary": "1 failed, 1 pending",
-            },
-        )
-
-    def test_obsidian_export_forwards_explicit_strict_flags(self):
-        response = self.client.post(
-            "/trading-playbook/obsidian/export",
-            json={
-                "trade_date": "2026-07-16",
-                "include_rules": True,
-                "force": True,
-            },
-        )
-
-        self.assertEqual(response.status_code, 200, response.text)
-        self.obsidian_sync.export_trade_date.assert_awaited_once_with(
-            date(2026, 7, 16),
-            include_rules=True,
-            force=True,
-        )
-
-    def test_obsidian_export_request_is_strict(self):
-        invalid_payloads = (
-            {},
-            {"trade_date": None},
-            {"trade_date": "2026-7-16"},
-            {"trade_date": "2026-07-16T00:00:00"},
-            {"trade_date": "2026-02-30"},
-            {"trade_date": "2026-07-16", "extra": True},
-            {"trade_date": "2026-07-16", "include_rules": 1},
-            {"trade_date": "2026-07-16", "include_rules": "true"},
-            {"trade_date": "2026-07-16", "include_rules": None},
-            {"trade_date": "2026-07-16", "force": 1},
-            {"trade_date": "2026-07-16", "force": "false"},
-            {"trade_date": "2026-07-16", "force": None},
-        )
-        for payload in invalid_payloads:
-            with self.subTest(payload=payload):
-                response = self.client.post(
-                    "/trading-playbook/obsidian/export",
-                    json=payload,
-                )
-                self.assertEqual(response.status_code, 422, response.text)
-        self.obsidian_sync.export_trade_date.assert_not_awaited()
-
-    def test_obsidian_unconfigured_status_is_a_normal_paused_response(self):
-        self.obsidian_sync.get_status.return_value = {
-            "enabled": True,
-            "configured": False,
-            "vault_exists": False,
-            "auto_git_enabled": False,
-            "last_success_at": None,
-            "last_trade_date": None,
-            "last_phase": None,
-            "pending_count": 0,
-            "paused_count": 3,
-            "failed_count": 0,
-            "last_error": None,
-            "recent_files": [],
-            "dashboard_path": "Dashboards/交易预案.md",
-            "dashboard_openable": False,
-        }
-
-        response = self.client.get("/trading-playbook/obsidian/status")
-
-        self.assertEqual(response.status_code, 200, response.text)
-        self.assertFalse(response.json()["configured"])
-        self.assertEqual(response.json()["paused_count"], 3)
-
-    def test_obsidian_dependency_and_failures_use_fixed_503(self):
-        cases = (
-            None,
-            SimpleNamespace(get_status=AsyncMock()),
-            SimpleNamespace(
-                get_status=AsyncMock(side_effect=RuntimeError("C:\\secret\\vault")),
-                export_trade_date=AsyncMock(),
-            ),
-        )
-        for coordinator in cases:
-            with self.subTest(coordinator=coordinator):
-                if coordinator is None:
-                    del self.app.state.trading_playbook_obsidian_sync
-                else:
-                    self.app.state.trading_playbook_obsidian_sync = coordinator
-                with TestClient(
-                    self.app,
-                    raise_server_exceptions=False,
-                ) as client:
-                    response = client.get(
-                        "/trading-playbook/obsidian/status"
-                    )
-                self.assertEqual(response.status_code, 503, response.text)
-                self.assertEqual(
-                    response.json(),
-                    {"detail": "Trading playbook service is unavailable"},
-                )
-                self.assertNotIn("secret", response.text)
-        self.app.state.trading_playbook_obsidian_sync = self.obsidian_sync
-
-    def test_obsidian_export_rejects_unsafe_response_without_path_leak(self):
-        unsafe_results = (
-            ObsidianSyncBatchResult(
-                trade_date=date(2026, 7, 16),
-                phase="reconcile",
-                written_files=("C:\\secret\\vault\\plan.md",),
-                skipped_files=(),
-                pending_files=(),
-                failed_files=(),
-                git_status={"state": "not_attempted"},
-            ),
-            ObsidianSyncBatchResult(
-                trade_date=date(2026, 7, 16),
-                phase="reconcile",
-                written_files=(),
-                skipped_files=(),
-                pending_files=(),
-                failed_files=(),
-                git_status={"C:\\secret\\vault": "unsafe-key"},
-            ),
-        )
-        for result in unsafe_results:
-            with self.subTest(result=result):
-                self.obsidian_sync.export_trade_date.return_value = result
-                with TestClient(
-                    self.app,
-                    raise_server_exceptions=False,
-                ) as client:
-                    response = client.post(
-                        "/trading-playbook/obsidian/export",
-                        json={"trade_date": "2026-07-16"},
-                    )
-
-                self.assertEqual(response.status_code, 503, response.text)
-                self.assertNotIn("secret", response.text)
-
-    def test_obsidian_status_rejects_delimited_posix_paths_without_leak(self):
-        base_status = dict(self.obsidian_sync.get_status.return_value)
-        errors = (
-            ("failed opening '/srv/private/vault/file.md'", "srv"),
-            ("failed(/home/admin/private/file.md)", "home"),
-            ("failed=/opt/private/file.md", "opt"),
-            ("failed='//server/share/private/file.md'", "server"),
-            (r"failed=(\Users\Admin\secret.md)", "Users"),
-            ("failed=file:///srv/private/file.md", "srv"),
-        )
-        for error, private_fragment in errors:
-            with self.subTest(error=error):
-                self.obsidian_sync.get_status.return_value = {
-                    **base_status,
-                    "last_error": error,
-                }
-
-                response = self.client.get(
-                    "/trading-playbook/obsidian/status"
-                )
-
-                self.assertEqual(response.status_code, 503, response.text)
-                self.assertEqual(
-                    response.json(),
-                    {"detail": "Trading playbook service is unavailable"},
-                )
-                self.assertNotIn(private_fragment, response.text)
-        self.obsidian_sync.get_status.return_value = base_status
-
-    def test_obsidian_export_redacts_delimited_posix_git_errors(self):
-        errors = (
-            ("failed opening '/srv/private/vault/file.md'", "srv"),
-            ("failed(/home/admin/private/file.md)", "home"),
-            ("failed=/opt/private/file.md", "opt"),
-            ("failed='//server/share/private/file.md'", "server"),
-            (r"failed=(\Users\Admin\secret.md)", "Users"),
-            ("failed=file:///srv/private/file.md", "srv"),
-        )
-        for error, private_fragment in errors:
-            with self.subTest(error=error):
-                self.obsidian_sync.export_trade_date.return_value = (
-                    ObsidianSyncBatchResult(
-                        trade_date=date(2026, 7, 16),
-                        phase="reconcile",
-                        written_files=(),
-                        skipped_files=(),
-                        pending_files=(),
-                        failed_files=(),
-                        git_status={
-                            "state": "git_error",
-                            "error": error,
-                        },
-                    )
-                )
-
-                response = self.client.post(
-                    "/trading-playbook/obsidian/export",
-                    json={"trade_date": "2026-07-16"},
-                )
-
-                self.assertEqual(response.status_code, 200, response.text)
-                self.assertEqual(
-                    response.json()["git_status"]["error"],
-                    "redacted",
-                )
-                self.assertNotIn(private_fragment, response.text)
-
-    def test_obsidian_api_does_not_mutate_trading_business_tables(self):
         async def business_state():
             async with self.Session() as db:
                 state = []
@@ -2500,48 +2241,33 @@ class TradingPlaybookApiTests(unittest.TestCase):
                     TradingExecutionReview,
                     TradingPlaybookSettings,
                 ):
-                    rows = (
-                        await db.execute(
-                            model.__table__.select().order_by(model.id)
-                        )
-                    ).mappings().all()
+                    rows = (await db.execute(model.__table__.select().order_by(model.id))).mappings().all()
                     state.append(tuple(dict(row) for row in rows))
                 return tuple(state)
 
         before = asyncio.run(business_state())
-        status = self.client.get("/trading-playbook/obsidian/status")
-        exported = self.client.post(
-            "/trading-playbook/obsidian/export",
-            json={"trade_date": "2026-07-16"},
-        )
-        after = asyncio.run(business_state())
+        with tempfile.TemporaryDirectory() as directory:
+            note = Path(directory) / "existing.md"
+            note.write_text("existing note", encoding="utf-8")
 
-        self.assertEqual(status.status_code, 200, status.text)
-        self.assertEqual(exported.status_code, 200, exported.text)
-        self.assertEqual(after, before)
+            async def legacy_export(*args, **kwargs):
+                note.write_text("overwritten", encoding="utf-8")
+                return self.obsidian_sync.export_trade_date.return_value
 
-    def test_obsidian_cancelled_error_propagates_from_handlers(self):
-        coordinator = SimpleNamespace(
-            get_status=AsyncMock(side_effect=asyncio.CancelledError()),
-            export_trade_date=AsyncMock(side_effect=asyncio.CancelledError()),
-        )
-        with self.assertRaises(asyncio.CancelledError):
-            asyncio.run(
-                trading_playbook_api.get_obsidian_status(
-                    coordinator=coordinator
-                )
+            self.obsidian_sync.export_trade_date.side_effect = legacy_export
+            status = self.client.get("/trading-playbook/obsidian/status")
+            exported = self.client.post(
+                "/trading-playbook/obsidian/export",
+                json={"trade_date": "2026-07-16", "include_rules": True, "force": True},
             )
-        with self.assertRaises(asyncio.CancelledError):
-            asyncio.run(
-                trading_playbook_api.export_obsidian_trade_date(
-                    request=SimpleNamespace(
-                        trade_date=date(2026, 7, 16),
-                        include_rules=False,
-                        force=False,
-                    ),
-                    coordinator=coordinator,
-                )
-            )
+            self.assertEqual(status.status_code, 200, status.text)
+            self.assertFalse(status.json()["enabled"])
+            self.assertFalse(status.json()["dashboard_openable"])
+            self.assertEqual(exported.status_code, 410, exported.text)
+            self.assertEqual(note.read_text(encoding="utf-8"), "existing note")
+            self.assertEqual(list(Path(directory).iterdir()), [note])
+
+        self.assertEqual(asyncio.run(business_state()), before)
 
     def test_router_is_mounted_once_under_api_v1_prefix(self):
         from app.api.v1 import api_router

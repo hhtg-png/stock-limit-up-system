@@ -91,6 +91,21 @@ class MarketReviewStockDaily(Base):
     stock = relationship("Stock")
 
 
+class BrokenBoardDailyArchive(Base):
+    """Completed daily points for the failed multi-board performance chart."""
+
+    __tablename__ = "broken_board_daily_archives"
+    __table_args__ = (UniqueConstraint("trade_date", name="uq_broken_board_archive_date"),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    trade_date = Column(Date, nullable=False)
+    previous_trade_date = Column(Date, nullable=False)
+    source_fingerprint = Column(String(64), nullable=False)
+    calc_version = Column(Integer, default=1, nullable=False)
+    point_json = Column(JSON, default=dict, nullable=False)
+    generated_at = Column(DateTime, default=datetime.now, nullable=False)
+
+
 class MarketReviewLimitUpEvent(Base):
     """市场复盘涨停事件轨迹表"""
 

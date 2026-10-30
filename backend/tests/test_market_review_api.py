@@ -1,6 +1,7 @@
 import asyncio
 import importlib.util
 import sys
+import threading
 import unittest
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -265,6 +266,26 @@ class MarketReviewApiTests(unittest.TestCase):
         self.review_module._load_cn_trading_dates = Mock(
             return_value={date(2026, 4, 26), date(2026, 4, 27), date(2026, 4, 28)}
         )
+
+    def test_cold_daily_calendar_lookup_keeps_the_event_loop_responsive(self):
+        heartbeat = threading.Event()
+        observed = []
+        def load_calendar(start_date, end_date):
+            observed.append(heartbeat.wait(timeout=0.5))
+            return {date(2026, 4, 27), date(2026, 4, 28)}
+        self.review_module._load_cn_trading_dates = load_calendar
+        async def check():
+            async def pulse():
+                await asyncio.sleep(0.02)
+                heartbeat.set()
+            task = asyncio.create_task(pulse())
+            async with self.session_factory() as db:
+                response = await self.review_module.get_market_review_daily(
+                    start_date=date(2026, 4, 27), end_date=date(2026, 4, 28), days=None, db=db)
+            await task
+            self.assertEqual(response.latest_trade_date, date(2026, 4, 28))
+        asyncio.run(check())
+        self.assertEqual(observed, [True])
 
     def test_daily_endpoint_returns_filtered_rows_and_ascending_series(self):
         response = self.client.get(

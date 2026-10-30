@@ -93,17 +93,23 @@ async def probe_daily_info(db: AsyncSession = Depends(get_db)):
     }
 
 
-@router.get("/obsidian/status", summary="获取 Obsidian 知识库状态")
+@router.get("/obsidian/status", summary="Obsidian 集成已下线", deprecated=True)
 async def get_obsidian_status():
-    return obsidian_knowledge_service.get_status()
+    return {
+        "enabled": False,
+        "retired": True,
+        "vault_configured": False,
+        "vault_exists": False,
+        "vault_path": "",
+        "auto_git_enabled": False,
+        "web_research_enabled": False,
+        "web_research_allowlist": [],
+    }
 
 
-@router.post("/obsidian/export", summary="导出自生长知识库到 Obsidian")
-async def export_obsidian_knowledge(
-    trade_date: Optional[date] = Query(None, description="交易日期，默认今天"),
-    db: AsyncSession = Depends(get_db),
-):
-    return await obsidian_knowledge_service.export_daily_knowledge(db, trade_date or today_cn())
+@router.post("/obsidian/export", summary="Obsidian 集成已下线", deprecated=True)
+async def export_obsidian_knowledge():
+    raise HTTPException(status_code=410, detail="Obsidian integration has been retired")
 
 
 @router.get("/trends", summary="获取产业趋势候选")

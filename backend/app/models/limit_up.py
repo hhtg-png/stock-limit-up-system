@@ -129,3 +129,21 @@ class LimitUpClassificationArchive(Base):
     archived_at = Column(DateTime, default=datetime.now, nullable=False, comment="归档时间")
     created_at = Column(DateTime, default=datetime.now, nullable=False, comment="创建时间")
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, nullable=False, comment="更新时间")
+
+
+class LimitUpMonitorArchive(Base):
+    """Unfiltered final monitor rows, including previous-session context."""
+
+    __tablename__ = "limit_up_monitor_archives"
+    __table_args__ = (UniqueConstraint("trade_date", name="uq_limit_up_monitor_archive_date"),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    trade_date = Column(Date, nullable=False, index=True)
+    previous_trade_date = Column(Date)
+    payload_json = Column(JSON, nullable=False, default=dict)
+    schema_version = Column(Integer, nullable=False, default=1)
+    status = Column(String(20), nullable=False, default="partial")
+    total_count = Column(Integer, nullable=False, default=0)
+    source_signature = Column(String(64), nullable=False, default="")
+    archived_at = Column(DateTime, nullable=False, default=datetime.now)
+    updated_at = Column(DateTime, nullable=False, default=datetime.now, onupdate=datetime.now)

@@ -3,27 +3,44 @@
 """
 from fastapi import APIRouter, Depends, Query, HTTPException, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, and_, update
-from typing import Optional, List, Dict
+from sqlalchemy import select, func, and_
+from typing import Optional, List
 from datetime import date, datetime
+import asyncio
 import math
 from loguru import logger
 
 from app.database import get_db, async_session_maker
 from app.models.stock import Stock
 from app.models.limit_up import LimitUpRecord, LimitUpStatusChange
-from app.models.market_review import MarketReviewStockDaily
 from app.schemas.limit_up import (
     LimitUpRealtime, LimitUpRecord as LimitUpRecordSchema,
     LimitUpDetail, LimitUpHistoryQuery, LimitUpReasonStats,
     LimitUpRealtimeResponse
 )
 from app.services.realtime_limit_up_service import realtime_limit_up_service
+from app.services.limit_up_monitor_archive_service import (
+    limit_up_monitor_archive_service, load_database_limit_up_items,
+)
 from app.services.ths_limit_up_classification_service import ths_limit_up_classification_service
 from app.utils.time_utils import today_cn
 from app.utils.trade_date import get_trade_date_with_fallback, is_a_share_trading_day
 
 router = APIRouter()
+_MONITOR_ARCHIVE_WAIT_SECONDS = 8.0
+
+
+async def _get_closed_monitor_archive(trade_date: date):
+    try:
+        return await asyncio.wait_for(
+            limit_up_monitor_archive_service.ensure_for_date(trade_date),
+            timeout=_MONITOR_ARCHIVE_WAIT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        # The service shields its shared build; the first browser request can
+        # return available rows while the durable backfill continues.
+        logger.debug("Monitor archive for {} is still building in the background", trade_date)
+        return None
 
 
 def _positive_int_or_default(value, default: int = 1) -> int:
@@ -190,145 +207,6 @@ def _filter_and_sort_limit_up_list(
     return limit_up_list
 
 
-def _record_to_realtime(
-    record: LimitUpRecord,
-    stock: Stock,
-    continuous_days_override: Optional[int] = None,
-) -> LimitUpRealtime:
-    is_final_sealed = getattr(record, "is_final_sealed", True)
-    if is_final_sealed is None:
-        is_final_sealed = True
-    current_status = getattr(record, "current_status", None)
-    if not current_status or current_status == "unknown":
-        current_status = "sealed" if is_final_sealed else "opened"
-    open_count = _positive_int_or_default(getattr(record, "open_count", 0), default=0)
-    first_limit_up_time = _format_hms(record.first_limit_up_time)
-    final_seal_time = _format_hms(getattr(record, "final_seal_time", None))
-
-    return LimitUpRealtime(
-        stock_code=stock.stock_code,
-        stock_name=stock.stock_name,
-        trade_date=record.trade_date,
-        first_limit_up_time=first_limit_up_time,
-        final_seal_time=final_seal_time,
-        limit_up_reason=getattr(record, "limit_up_reason", None),
-        reason_category=getattr(record, "reason_category", None),
-        continuous_limit_up_days=_positive_int_or_default(
-            continuous_days_override
-            if continuous_days_override is not None
-            else getattr(record, "continuous_limit_up_days", None)
-        ),
-        open_count=open_count,
-        is_sealed=is_final_sealed,
-        is_one_word=_is_one_word_limit_up(first_limit_up_time, open_count, is_final_sealed),
-        current_status=current_status,
-        seal_amount=getattr(record, "seal_amount", None),
-        seal_volume=getattr(record, "seal_volume", None),
-        limit_up_price=getattr(record, "limit_up_price", None) or 0,
-        current_price=(
-            getattr(record, "close_price", None)
-            or getattr(record, "limit_up_price", None)
-            or 0
-        ),
-        turnover_rate=getattr(record, "turnover_rate", None),
-        amount=getattr(record, "amount", None),
-        tradable_market_value=None,
-        market=stock.market,
-        industry=stock.industry,
-    )
-
-
-async def _calculate_strict_database_continuous_days(
-    db: AsyncSession,
-    actual_date: date,
-    rows,
-    lookback_days: int = 30,
-) -> Dict[int, int]:
-    stock_ids = [getattr(record, "stock_id", None) for record, _ in rows]
-    stock_ids = [stock_id for stock_id in stock_ids if stock_id is not None]
-    if not stock_ids:
-        return {}
-
-    date_result = await db.execute(
-        select(LimitUpRecord.trade_date)
-        .where(LimitUpRecord.trade_date <= actual_date)
-        .group_by(LimitUpRecord.trade_date)
-        .order_by(LimitUpRecord.trade_date.desc())
-        .limit(lookback_days)
-    )
-    trade_dates = [row[0] for row in date_result.all()]
-    if not trade_dates:
-        return {}
-
-    streak_result = await db.execute(
-        select(
-            LimitUpRecord.stock_id,
-            LimitUpRecord.trade_date,
-            LimitUpRecord.is_final_sealed,
-        )
-        .where(and_(
-            LimitUpRecord.stock_id.in_(stock_ids),
-            LimitUpRecord.trade_date.in_(trade_dates),
-        ))
-    )
-    sealed_dates_by_stock: Dict[int, set] = {}
-    for stock_id, trade_day, is_final_sealed in streak_result.all():
-        if is_final_sealed:
-            sealed_dates_by_stock.setdefault(stock_id, set()).add(trade_day)
-
-    strict_days: Dict[int, int] = {}
-    for record, _ in rows:
-        stock_id = getattr(record, "stock_id", None)
-        if stock_id is None:
-            continue
-        if not getattr(record, "is_final_sealed", True):
-            strict_days[stock_id] = 1
-            continue
-
-        sealed_dates = sealed_dates_by_stock.get(stock_id, set())
-        streak = 0
-        for trade_day in trade_dates:
-            if trade_day in sealed_dates:
-                streak += 1
-            else:
-                break
-        strict_days[stock_id] = max(streak, 1)
-
-    return strict_days
-
-
-async def _get_market_review_continuous_days(
-    db: AsyncSession,
-    actual_date: date,
-    rows,
-) -> Dict[int, int]:
-    stock_ids = [getattr(record, "stock_id", None) for record, _ in rows]
-    stock_ids = [stock_id for stock_id in stock_ids if stock_id is not None]
-    if not stock_ids:
-        return {}
-
-    result = await db.execute(
-        select(
-            MarketReviewStockDaily.stock_id,
-            MarketReviewStockDaily.today_sealed_close,
-            MarketReviewStockDaily.today_continuous_days,
-        )
-        .where(and_(
-            MarketReviewStockDaily.stock_id.in_(stock_ids),
-            MarketReviewStockDaily.trade_date == actual_date,
-            MarketReviewStockDaily.today_touched_limit_up.is_(True),
-        ))
-    )
-
-    review_days: Dict[int, int] = {}
-    for stock_id, today_sealed_close, today_continuous_days in result.all():
-        if today_sealed_close:
-            review_days[stock_id] = _positive_int_or_default(today_continuous_days)
-        else:
-            review_days[stock_id] = 1
-    return review_days
-
-
 async def _get_database_limit_up_response(
     db: AsyncSession,
     trade_date: date,
@@ -342,34 +220,18 @@ async def _get_database_limit_up_response(
     max_price: Optional[float] = None,
 ) -> LimitUpRealtimeResponse:
     actual_date, is_fallback = await get_trade_date_with_fallback(db, trade_date)
-    query = (
-        select(LimitUpRecord, Stock)
-        .join(Stock, LimitUpRecord.stock_id == Stock.id)
-        .where(LimitUpRecord.trade_date == actual_date)
-    )
-    result = await db.execute(query)
-    rows = result.all()
-    review_days = await _get_market_review_continuous_days(db, actual_date, rows)
-    strict_rows = [
-        (record, stock)
-        for record, stock in rows
-        if getattr(record, "stock_id", None) not in review_days
-    ]
-    strict_days = await _calculate_strict_database_continuous_days(
-        db,
-        actual_date,
-        strict_rows,
-    )
-    limit_up_list = [
-        _record_to_realtime(
-            record,
-            stock,
-            continuous_days_override=review_days.get(
-                getattr(record, "stock_id", None)
-            ) or strict_days.get(getattr(record, "stock_id", None)),
-        )
-        for record, stock in rows
-    ]
+    if isinstance(db, AsyncSession):
+        archive = await _get_closed_monitor_archive(actual_date)
+        if archive is not None:
+            return LimitUpRealtimeResponse(
+                trade_date=actual_date, is_fallback=is_fallback,
+                data=_filter_and_sort_limit_up_list(
+                    [LimitUpRealtime.model_validate(row) for row in archive.payload_json["data"]],
+                    continuous_days, reason_category, status, sort_by, sort_order,
+                    continuous_days_exact=continuous_days_exact, min_price=min_price, max_price=max_price,
+                ),
+            )
+    limit_up_list = await load_database_limit_up_items(db, actual_date)
 
     if limit_up_list:
         from app.services.limit_up_context_service import limit_up_context_service
@@ -435,6 +297,18 @@ async def get_realtime_limit_up(
             min_price=min_price,
             max_price=max_price,
         )
+
+    if isinstance(db, AsyncSession) and limit_up_monitor_archive_service.is_closed_session(trade_date):
+        archive = await _get_closed_monitor_archive(trade_date)
+        if archive is not None:
+            return LimitUpRealtimeResponse(
+                trade_date=trade_date, is_fallback=False,
+                data=_filter_and_sort_limit_up_list(
+                    [LimitUpRealtime.model_validate(row) for row in archive.payload_json["data"]],
+                    continuous_days, reason_category, status, sort_by, sort_order,
+                    continuous_days_exact=continuous_days_exact, min_price=min_price, max_price=max_price,
+                ),
+            )
 
     raw_data = await realtime_limit_up_service.get_realtime_limit_up_list(
         trade_date, include_monitor_context=True

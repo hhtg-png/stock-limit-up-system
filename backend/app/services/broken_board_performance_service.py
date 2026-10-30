@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import math
 from bisect import bisect_right
 import json
@@ -8,7 +9,7 @@ import os
 import time
 import uuid
 from pathlib import Path
-from datetime import date, datetime
+from datetime import date, datetime, time as clock_time
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -18,11 +19,15 @@ from sqlalchemy import select, func
 from app.database import async_session_maker
 from app.services.stock_suspension_service import stock_suspension_service
 from app.data_collectors.tencent_api import tencent_api
-from app.models.market_review import MarketReviewDailyMetric, MarketReviewStockDaily
+from app.models.market_review import BrokenBoardDailyArchive, MarketReviewDailyMetric, MarketReviewStockDaily
 
 
 def _today():
     return datetime.now(ZoneInfo("Asia/Shanghai")).date()
+
+
+def _now():
+    return datetime.now(ZoneInfo("Asia/Shanghai"))
 
 
 def _calendar():
@@ -34,8 +39,10 @@ def _calendar():
 class BrokenBoardPerformanceService:
     """Prior session's failed multi-board cohort, valued on each chart date."""
 
+    CALC_VERSION = 1
+
     def __init__(self, session_factory=async_session_maker, quote_fetcher=None,
-                 history_fetcher=None, calendar_loader=None, today_provider=_today, fallback_fetcher=None, cache_dir="data/broken-board-history", suspension_fetcher=None):
+                 history_fetcher=None, calendar_loader=None, today_provider=_today, fallback_fetcher=None, cache_dir="data/broken-board-history", suspension_fetcher=None, now_provider=_now):
         self.suspension_fetcher = suspension_fetcher or stock_suspension_service.get_codes
         self.session_factory = session_factory
         self.quote_fetcher = quote_fetcher or tencent_api.get_quotes_batch
@@ -43,6 +50,7 @@ class BrokenBoardPerformanceService:
         self.calendar_loader = calendar_loader or _calendar
         self.fallback_fetcher = fallback_fetcher or self._fetch_fallback_history
         self.today_provider = today_provider
+        self.now_provider = now_provider
         self._calendar_cache = None
         self._history_cache = {}
         self._cache_day = None
@@ -50,6 +58,103 @@ class BrokenBoardPerformanceService:
         self.cache_dir = Path(cache_dir)
         self._primary_retry_at = 0.0
         self._disk_ends = {}
+        self._inflight = {}
+
+    async def _singleflight(self, key, build):
+        task = self._inflight.get(key)
+        if task is None:
+            task = asyncio.create_task(build())
+            self._inflight[key] = task
+            def finished(completed):
+                if self._inflight.get(key) is completed:
+                    self._inflight.pop(key, None)
+                if not completed.cancelled():
+                    completed.exception()
+            task.add_done_callback(finished)
+        # One client's timeout must not cancel preparation shared by others.
+        return await asyncio.shield(task)
+
+    @staticmethod
+    def _source_fingerprint(previous_date, metric, cohort, valuation_metric=None):
+        if metric is None or metric.calc_version < 1 or metric.source_status not in {"primary", "partial"}:
+            return None
+        payload = {
+            "previous_trade_date": previous_date.isoformat(),
+            "calc_version": metric.calc_version,
+            "updated_at": metric.updated_at.isoformat() if metric.updated_at else None,
+            "source_status": metric.source_status,
+            "stocks": sorted((row.stock_code, row.stock_name, row.yesterday_continuous_days) for row in cohort),
+            "valuation_revision": None if valuation_metric is None else {
+                "calc_version": valuation_metric.calc_version,
+                "updated_at": valuation_metric.updated_at.isoformat() if valuation_metric.updated_at else None,
+                "source_status": valuation_metric.source_status,
+            },
+        }
+        return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+    async def _can_finalize_today(self, trade_date):
+        now = self.now_provider()
+        if now.date() != trade_date or now.time().replace(tzinfo=None) < clock_time(15, 5):
+            return False
+        async with self.session_factory() as db:
+            metric = (await db.execute(select(MarketReviewDailyMetric).where(
+                MarketReviewDailyMetric.trade_date == trade_date
+            ))).scalar_one_or_none()
+            if metric is None or metric.calc_version < 1 or metric.source_status not in {"primary", "partial"}:
+                return False
+            # A delayed intraday task must not make a 14:50 capture final.
+            if metric.updated_at is None or metric.updated_at.date() != trade_date or metric.updated_at.time() < clock_time(15, 5):
+                return False
+            touched = await db.scalar(select(func.count()).select_from(MarketReviewStockDaily).where(
+                MarketReviewStockDaily.trade_date == trade_date,
+                MarketReviewStockDaily.today_touched_limit_up.is_(True),
+            ))
+            return touched == metric.limit_up_count
+
+    async def has_after_close_data(self, trade_date: date) -> bool:
+        today = self.today_provider()
+        if trade_date > today or trade_date == today and not await self._can_finalize_today(trade_date):
+            return False
+        async with self.session_factory() as db:
+            archive = (await db.execute(select(BrokenBoardDailyArchive).where(
+                BrokenBoardDailyArchive.trade_date == trade_date
+            ))).scalar_one_or_none()
+            if archive is None or archive.calc_version != self.CALC_VERSION or archive.point_json.get("data_status") != "ready":
+                return False
+            metrics = {row.trade_date: row for row in (await db.execute(select(MarketReviewDailyMetric).where(
+                MarketReviewDailyMetric.trade_date.in_([archive.previous_trade_date, trade_date])
+            ))).scalars()}
+            cohort = list((await db.execute(select(MarketReviewStockDaily).where(
+                MarketReviewStockDaily.trade_date == archive.previous_trade_date,
+                MarketReviewStockDaily.yesterday_continuous_days >= 2,
+                MarketReviewStockDaily.today_sealed_close.is_(False),
+            ))).scalars())
+            return archive.source_fingerprint == self._source_fingerprint(
+                archive.previous_trade_date, metrics.get(archive.previous_trade_date), cohort, metrics.get(trade_date))
+
+    async def build_after_close(self, trade_date: date, force: bool = False):
+        today = self.today_provider()
+        if trade_date > today or trade_date == today and not await self._can_finalize_today(trade_date):
+            return None
+        result = await self.get_performance(1, trade_date, force=force)
+        point = next((row for row in result["points"] if row["trade_date"] == trade_date.isoformat()), None)
+        return point
+
+    async def _persist_archives(self, values):
+        if not values:
+            return
+        async with self.session_factory() as db:
+            if db.bind.dialect.name == "postgresql":
+                from sqlalchemy.dialects.postgresql import insert
+            else:
+                from sqlalchemy.dialects.sqlite import insert
+            for value in values:
+                statement = insert(BrokenBoardDailyArchive).values(**value)
+                await db.execute(statement.on_conflict_do_update(
+                    index_elements=["trade_date"],
+                    set_={key: getattr(statement.excluded, key) for key in value if key != "trade_date"},
+                ))
+            await db.commit()
 
     @staticmethod
     def _number(value):
@@ -109,6 +214,10 @@ class BrokenBoardPerformanceService:
                     pass
 
     async def _fetch_history(self, code, end_date):
+        return await self._singleflight(("primary", code, end_date),
+            lambda: self._load_history(code, end_date))
+
+    async def _load_history(self, code, end_date):
         key = (code, end_date)
         if key in self._history_cache:
             return self._history_cache[key]
@@ -141,6 +250,10 @@ class BrokenBoardPerformanceService:
             return history
 
     async def _fetch_fallback_history(self, code, end_date):
+        return await self._singleflight(("fallback", code, end_date),
+            lambda: self._load_fallback_history(code, end_date))
+
+    async def _load_fallback_history(self, code, end_date):
         key = ("fallback", code, end_date)
         if key in self._history_cache:
             return self._history_cache[key]
@@ -223,7 +336,11 @@ class BrokenBoardPerformanceService:
                     continue
         return result
 
-    async def get_performance(self, days: int, end_date: date):
+    async def get_performance(self, days: int, end_date: date, *, force: bool = False):
+        return await self._singleflight(("range", self.today_provider(), days, end_date, force),
+            lambda: self._get_performance(days, end_date, force=force))
+
+    async def _get_performance(self, days: int, end_date: date, *, force: bool = False):
         today = self.today_provider()
         if self._cache_day != today:
             self._history_cache.clear()
@@ -237,8 +354,11 @@ class BrokenBoardPerformanceService:
         selected = [day for day in dates if first_date is None or day >= first_date][-days:]
         previous = {day: dates[index - 1] for index, day in enumerate(dates) if index > 0 and day in selected}
         async with self.session_factory() as db:
+            archives = {row.trade_date: row for row in (await db.execute(
+                select(BrokenBoardDailyArchive).where(BrokenBoardDailyArchive.trade_date.in_(selected))
+            )).scalars()}
             metrics = {row.trade_date: row for row in (await db.execute(
-                select(MarketReviewDailyMetric).where(MarketReviewDailyMetric.trade_date.in_(previous.values()))
+                select(MarketReviewDailyMetric).where(MarketReviewDailyMetric.trade_date.in_(set(previous.values()) | set(selected)))
             )).scalars()}
             rows = list((await db.execute(select(MarketReviewStockDaily).where(
                 MarketReviewStockDaily.trade_date.in_(previous.values()),
@@ -246,23 +366,36 @@ class BrokenBoardPerformanceService:
                 MarketReviewStockDaily.today_sealed_close.is_(False),
             ).order_by(MarketReviewStockDaily.stock_code))).scalars())
         cohorts = {}
+        fingerprints = {}
         for day in selected:
             prior = previous.get(day)
             metric = metrics.get(prior)
-            if metric is not None and metric.calc_version >= 1:
-                cohorts[day] = [row for row in rows if row.trade_date == prior]
+            cohort = [row for row in rows if row.trade_date == prior]
+            fingerprint = self._source_fingerprint(prior, metric, cohort, metrics.get(day)) if prior else None
+            if fingerprint:
+                cohorts[day] = cohort
+                fingerprints[day] = fingerprint
+        finalize_today = today in selected and await self._can_finalize_today(today)
+        cached = {
+            day: archive.point_json for day, archive in archives.items()
+            if not force and (day < today or finalize_today)
+            and archive.calc_version == self.CALC_VERSION
+            and archive.source_fingerprint == fingerprints.get(day)
+            and archive.point_json.get("data_status") == "ready"
+        }
+        pending = [day for day in selected if day not in cached]
         live_codes = sorted({row.stock_code for row in cohorts.get(today, [])})
         quotes = {}
-        if live_codes:
+        if today in pending and live_codes:
             try:
                 quotes = await self.quote_fetcher(live_codes)
             except Exception as exc:
                 logger.warning("Broken-board live quotes unavailable: {}", exc)
-        historical_codes = sorted({row.stock_code for day, cohort in cohorts.items() if day < today for row in cohort})
-        historical_end = max((day for day in selected if day < today), default=end_date)
+        historical_codes = sorted({row.stock_code for day, cohort in cohorts.items() if day in pending and day < today for row in cohort})
+        historical_end = max((day for day in pending if day < today), default=end_date)
         results = await asyncio.gather(*(self.history_fetcher(code, historical_end) for code in historical_codes), return_exceptions=True)
         history = {code: value if isinstance(value, dict) else {} for code, value in zip(historical_codes, results)}
-        missing_codes = sorted({row.stock_code for day, cohort in cohorts.items() if day < today
+        missing_codes = sorted({row.stock_code for day, cohort in cohorts.items() if day in pending and day < today
                                 for row in cohort if day not in history.get(row.stock_code, {})})
         fallback_results = await asyncio.gather(
             *(self.fallback_fetcher(code, historical_end) for code in missing_codes), return_exceptions=True
@@ -270,17 +403,29 @@ class BrokenBoardPerformanceService:
         for code, extra in zip(missing_codes, fallback_results):
             if isinstance(extra, dict):
                 history[code] = {**extra, **history.get(code, {})}
-        check_days = sorted(day for day, cohort in cohorts.items() if cohort and (
+        check_days = sorted(day for day, cohort in cohorts.items() if day in pending and cohort and (
             day == today or any(day not in history.get(row.stock_code, {}) for row in cohort)))
         suspension_results = await asyncio.gather(*(self.suspension_fetcher(day) for day in check_days), return_exceptions=True)
         suspensions = {day: result if isinstance(result, set) else set() for day, result in zip(check_days, suspension_results)}
         points = []
+        archive_values = []
         for day in selected:
+            if day in cached:
+                points.append(cached[day])
+                continue
             stocks = []
             for row in cohorts.get(day, []):
                 if day == today:
                     quote = quotes.get(row.stock_code) or {}
-                    value = quote.get("change_pct") if str(quote.get("datetime", ""))[:8] == day.strftime("%Y%m%d") else None
+                    stamp = str(quote.get("datetime", ""))
+                    fresh = stamp[:8] == day.strftime("%Y%m%d")
+                    if finalize_today:
+                        try:
+                            captured_at = datetime.strptime(stamp, "%Y%m%d%H%M%S") if len(stamp) == 14 else None
+                        except ValueError:
+                            captured_at = None
+                        fresh = bool(captured_at and captured_at.date() == day and captured_at.time() >= clock_time(15))
+                    value = quote.get("change_pct") if fresh else None
                 else:
                     value = history.get(row.stock_code, {}).get(day)
                 suspended = row.stock_code in suspensions.get(day, set())
@@ -291,9 +436,17 @@ class BrokenBoardPerformanceService:
             changes = [stock["change_pct"] for stock in stocks if stock["change_pct"] is not None]
             suspended_count = sum(stock["quote_status"] == "suspended" for stock in stocks)
             complete = day in cohorts and len(changes) + suspended_count == len(stocks)
-            points.append({"trade_date": day.isoformat(), "average_change": round(sum(changes) / len(changes), 2) if complete and changes else None,
+            point = {"trade_date": day.isoformat(), "average_change": round(sum(changes) / len(changes), 2) if complete and changes else None,
                            "sample_count": len(stocks), "suspended_count": suspended_count, "priced_count": len(changes), "stocks": stocks,
-                           "data_status": "ready" if complete else "unavailable"})
+                           "data_status": "ready" if complete else "unavailable"}
+            points.append(point)
+            if complete and (day < today or finalize_today):
+                archive_values.append({
+                    "trade_date": day, "previous_trade_date": previous[day],
+                    "source_fingerprint": fingerprints[day], "calc_version": self.CALC_VERSION,
+                    "point_json": point, "generated_at": self.now_provider().replace(tzinfo=None),
+                })
+        await self._persist_archives(archive_values)
         return {"points": points}
 
 

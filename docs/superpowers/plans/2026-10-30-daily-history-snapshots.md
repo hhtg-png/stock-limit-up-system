@@ -1,0 +1,72 @@
+# Daily History Snapshots Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
+
+**Goal:** 下线 Obsidian 写出链路，并每日生成可跨重启复用的历史涨停监控与报表数据。
+
+**Architecture:** 保留现有行情与主报表事实表，新增一日一行的监控及断板表现归档；API 优先复用有效历史归档，盘中仍走实时。统一小批次后台任务生成和补齐，并将旧每日统计改为可重入的数据库汇总。
+
+**Tech Stack:** Python / FastAPI / SQLAlchemy / APScheduler / Vue 3。
+
+**Spec:** `docs/superpowers/specs/2026-10-30-daily-history-design.md`
+
+## Global Constraints
+
+- 原始工作树有无关修改；仅使用当前隔离工作树与 `codex/daily-history-snapshots-20261030`。
+- 所有日期按 Asia/Shanghai；昨日字段基于行情日期的前一交易日。
+- 保留历史笔记、数据库业务数据、实时行情与播报能力。
+- 仅部署已验证并推送 GitHub main 的代码。
+
+## Review Focus
+
+- 混合历史和今天的查询，今天盘中不得命中旧最终快照。
+- 数据修复、无数据、部分行情与超时不得产生永久错误缓存。
+- 同日期并发和补跑不得重复版本膨胀或覆盖完整结果。
+- 周末、节假日和日期回退必须沿用真实交易日语义。
+- 下线 Obsidian 不得误删仍被产业趋势/超短信号使用的数据库聚合。
+
+### Task 1: Retire Obsidian production integration
+
+**Files:** main.py、intelligence_service.py、相关 API、前端六个页面及 store；主代理集成 scheduler。
+- [x] 增加启动无 coordinator、自动同步和旧导出 API 不写临时 Vault 的失败测试。
+- [x] 停掉生产安装、调度和提交后 enqueue，旧 POST 返回 410，移除 UI 入口。
+- [x] 更新退役契约，核验业务分析与交易预案仍工作。
+
+### Task 2: Persist historical monitor responses
+
+**Files:** models/limit_up.py、limit_up_monitor_archive_service.py、limit_up_context_service.py、api/v1/limit_up.py。
+**Interface:** `await limit_up_monitor_archive_service.ensure_for_date(trade_date, force=False)`。
+- [x] 增加跨实例复用、实时 bypass、回退日期、排序筛选、部分/空/失败与源指纹变化测试并见红。
+- [x] 保存未筛选列表，批量复用竞价与前日事实，完整性和最终事实屏障确认后归档。
+- [x] 聚焦测试通过并交独立复核。
+
+### Task 3: Persist historical broken-board performance
+
+**Files:** models/market_review.py、broken_board_performance_service.py、api/v1/review.py。
+**Interface:** `await broken_board_performance_service.build_after_close(trade_date, force=False)`。
+- [x] 增加跨实例、混合日期、当前盘中、停牌/无样本、源修复及失败测试并见红。
+- [x] 逐日保存原有复权算法的完整结果，批读有效历史，仅缺失重算。
+- [x] 保留其余报表现有数据库链路，聚焦测试通过。
+
+### Task 4: Daily preparation, recovery and statistics
+
+**Files:** services/history_preparation_service.py、data_collectors/scheduler.py、models/__init__.py、相关 tests。
+- [x] 先验证统计在重复执行、不同日期、无源数据及盘中边界的失败测试。
+- [x] 以 SQL case 正确汇总并按日期更新；小批次、互斥、逐日容错生成归档。
+- [x] 注册 15:35 / 20:35、启动与每 5 分钟补齐；不阻塞实时请求。
+- [x] 更新 scheduler 的 Obsidian 退役契约；核验完整性屏障、重复调度与取消。
+
+### Task 5: Release
+
+- [ ] 独立审查、完整后端套件与前端构建通过。
+- [ ] 提交、推送 main、部署并核对线上 HEAD 与资源。
+- [ ] 预生成近期历史，实测历史接口冷查询/重启复用、盘中刷新、退役入口与调度状态。
+
+## Final pre-release verification
+
+- Backend: `python -m unittest discover tests -v`, 1208 tests, 328.116 seconds, exit 0, `OK (skipped=2)`.
+- Frontend: `npm test`, 152 tests, exit 0; `npm run build`, 6.33 seconds, exit 0. Existing large-chunk warning only.
+- Entry asset: `index-CV8nbHvv.js`; index SHA256 `ed2c89fd62872aeac040b7e0888efc5ea01e30c730d6d7d41fada9c457f7171a`.
+- Independent reviews found and verified fixes for archive retry starvation, stale ready rows, final quote timestamps and D/D-1 source revisions.
+- Retired scheduler/claim setup tests now retain database persistence/replay/lease assertions while rejecting any legacy export call. Targeted suites and final full discovery pass.
+- Production baseline: monitor historical cold 3.97–4.28 s; cached broken-board 30-session request 0.609 s. Initial DailyStatistics rows: 0; existing source dates: limit-up 169, review 136.

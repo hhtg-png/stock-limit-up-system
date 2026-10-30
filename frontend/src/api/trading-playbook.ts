@@ -7,9 +7,6 @@ import type {
   TradingPlanRevision,
   TradingPlanStage,
   TradingPlanVersion,
-  TradingPlaybookObsidianExportRequest,
-  TradingPlaybookObsidianExportResponse,
-  TradingPlaybookObsidianStatus,
   TradingPlaybookPersonalWechatStatus,
   TradingPlaybookSettings,
   TradingPlaybookSettingsUpdate
@@ -115,16 +112,4 @@ export async function getTradingPlaybookPersonalWechatStatus() {
     '/trading-playbook/notifications/personal-wechat/status'
   )
   return data as TradingPlaybookPersonalWechatStatus
-}
-
-export async function getObsidianStatus(): Promise<TradingPlaybookObsidianStatus> {
-  const { data } = await tradingPlaybookApi.get('/trading-playbook/obsidian/status')
-  return data
-}
-
-export async function exportToObsidian(
-  request: TradingPlaybookObsidianExportRequest
-): Promise<TradingPlaybookObsidianExportResponse> {
-  const { data } = await tradingPlaybookApi.post('/trading-playbook/obsidian/export', request)
-  return data
 }

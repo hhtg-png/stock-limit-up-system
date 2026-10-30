@@ -6,9 +6,6 @@
       </div>
       <div class="toolbar-actions">
         <el-button :icon="Refresh" @click="fetchData" :loading="loading">刷新</el-button>
-        <el-button :icon="Files" @click="openObsidianDashboard" :disabled="!obsidianReady">
-          Obsidian
-        </el-button>
       </div>
     </div>
 
@@ -80,24 +77,19 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
-import { Files, Refresh } from '@element-plus/icons-vue'
-import { getIndustryTrends, getObsidianStatus } from '@/api/intelligence'
-import type { IndustryTrend, ObsidianStatus } from '@/types/intelligence'
+import { Refresh } from '@element-plus/icons-vue'
+import { getIndustryTrends } from '@/api/intelligence'
+import type { IndustryTrend } from '@/types/intelligence'
 
 const router = useRouter()
 const trends = ref<IndustryTrend[]>([])
-const obsidianStatus = ref<ObsidianStatus | null>(null)
 const loading = ref(false)
 const errorMessage = ref('')
 
-const obsidianReady = computed(() => Boolean(obsidianStatus.value?.enabled && obsidianStatus.value?.vault_configured))
-
 onMounted(() => {
   fetchData()
-  refreshObsidianStatus()
 })
 
 async function fetchData() {
@@ -113,28 +105,6 @@ async function fetchData() {
   } finally {
     loading.value = false
   }
-}
-
-async function refreshObsidianStatus() {
-  try {
-    obsidianStatus.value = await getObsidianStatus()
-  } catch (error) {
-    console.warn('获取 Obsidian 状态失败:', error)
-    obsidianStatus.value = null
-  }
-}
-
-function openObsidianDashboard() {
-  if (!obsidianReady.value) {
-    ElMessage.warning('Obsidian 未启用')
-    return
-  }
-  window.location.href = obsidianUri('Dashboards/产业趋势.md')
-}
-
-function obsidianUri(filePath: string): string {
-  const vaultName = (obsidianStatus.value?.vault_path || '').split(/[\\/]/).filter(Boolean).pop() || ''
-  return `obsidian://open?vault=${encodeURIComponent(vaultName)}&file=${encodeURIComponent(filePath)}`
 }
 
 function goStock(stockCode?: string) {

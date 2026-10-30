@@ -13,11 +13,11 @@ from datetime import date, datetime, time as wall_time, timedelta
 
 import httpx
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.database import async_session_maker
 from app.models.limit_up import LimitUpRecord
-from app.models.market_review import MarketReviewStockDaily
+from app.models.market_review import MarketReviewDailyMetric, MarketReviewStockDaily
 from app.models.stock import Stock
 from app.services.opening_auction_archive_service import opening_auction_archive_service
 from app.utils.time_utils import now_cn, today_cn
@@ -76,6 +76,7 @@ class LimitUpContextService:
         self._http_client = http_client
         self._daily_cache = OrderedDict()
         self._seal_cache = OrderedDict()
+        self._seal_complete_cache = OrderedDict()
         self._calendar_cache = OrderedDict()
         self._pool_cache = OrderedDict()
         self._history_limit = asyncio.Semaphore(6)
@@ -147,6 +148,36 @@ class LimitUpContextService:
         return self._opening_pct(quote.get("open"), quote.get("pre_close"))
 
     async def enrich(self, trade_date: date, rows: list[dict], quotes: dict | None = None) -> list[dict]:
+        return await self._enrich(trade_date, rows, quotes, budget_seconds=self.budget_seconds)
+
+    async def enrich_for_archive(self, trade_date: date, rows: list[dict]) -> tuple[list[dict], bool]:
+        """Batch-fill a closed session outside the monitor's short live budget.
+
+        Missing percentages and unresolved seals remain retryable; a stock that
+        authoritatively did not touch a limit on the prior session has valid
+        null seal times.
+        """
+        result = await self._enrich(trade_date, rows, budget_seconds=120.0)
+        previous = result[0].get("previous_trade_date") if result else None
+        complete = bool(result and previous)
+        for row in result:
+            code = str(row.get("stock_code") or "")
+            complete = complete and all(self._number(row.get(field)) is not None for field in (
+                "today_open_change_pct", "yesterday_open_change_pct",
+            )) and self._get(self._seal_complete_cache, (previous, code))[1] is True
+        return result, bool(complete)
+
+    def invalidate_sessions(self, trade_date: date, previous: date | None, codes: list[str]) -> None:
+        """Discard facts that were derived before a persisted source repair."""
+        for day in (trade_date, previous):
+            for code in codes:
+                self._daily_cache.pop((day, code), None)
+                self._seal_cache.pop((day, code), None)
+                self._seal_complete_cache.pop((day, code), None)
+            self._pool_cache.pop(day, None)
+
+    async def _enrich(self, trade_date: date, rows: list[dict], quotes: dict | None = None,
+                      *, budget_seconds: float) -> list[dict]:
         """Enrich an actual market session with its opening and previous-session facts.
 
         Database fallbacks pass their actual row date as the comparison basis.
@@ -186,7 +217,7 @@ class LimitUpContextService:
             )
 
         try:
-            await asyncio.wait_for(populate(), timeout=self.budget_seconds)
+            await asyncio.wait_for(populate(), timeout=budget_seconds)
         except asyncio.TimeoutError:
             logger.debug("Opening context exceeded its time budget for {}", trade_date)
         except Exception as exc:
@@ -294,6 +325,7 @@ class LimitUpContextService:
             for code, seal in values.items():
                 partial = seal["touched"] and (not seal["first"] or (seal["sealed"] and not seal["final"]))
                 self._put(self._seal_cache, (day, code), (seal["first"], seal["final"]), missing=partial)
+                self._put(self._seal_complete_cache, (day, code), not partial, missing=partial)
             gaps = [code for code in missing if code not in values or (
                 values[code]["touched"] and (not values[code]["first"] or (
                     values[code]["sealed"] and not values[code]["final"]
@@ -320,7 +352,9 @@ class LimitUpContextService:
                         self._time(item.get("final_seal_time"))
                         if can_final and item.get("is_final_sealed") is not False else None
                     )
-                    self._put(self._seal_cache, (day, code), (first, final), missing=not first or (can_final and not final))
+                    partial = not first or (can_final and not final)
+                    self._put(self._seal_cache, (day, code), (first, final), missing=partial)
+                    self._put(self._seal_complete_cache, (day, code), not partial, missing=partial)
 
     async def _db_seals(self, day, codes):
         values = {}
@@ -348,6 +382,19 @@ class LimitUpContextService:
                     values[code]["first"] = values[code]["first"] or self._time(first)
                     if values[code]["sealed"] and sealed:
                         values[code]["final"] = values[code]["final"] or self._time(final)
+            metric = (await session.execute(select(MarketReviewDailyMetric).where(
+                MarketReviewDailyMetric.trade_date == day,
+            ))).scalar_one_or_none()
+            if metric is not None and metric.calc_version >= 1 and metric.source_status in {"primary", "partial"}:
+                touched_count = await session.scalar(select(func.count()).select_from(MarketReviewStockDaily).where(
+                    MarketReviewStockDaily.trade_date == day,
+                    MarketReviewStockDaily.today_touched_limit_up.is_(True),
+                ))
+                if touched_count == metric.limit_up_count:
+                    # The final review covers the entire touched pool. Absence
+                    # is a known negative, so it needs no historical network call.
+                    for code in codes:
+                        values.setdefault(code, {"first": None, "final": None, "sealed": False, "touched": False})
         return values
 
     async def _client(self):

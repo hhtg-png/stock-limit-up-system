@@ -759,7 +759,17 @@ class TradingPlaybookSchedulerClaimTests(unittest.IsolatedAsyncioTestCase):
             now_provider=lambda: now,
             calendar_service=self._calendar(),
         )
-        scheduler.install_trading_playbook_obsidian_sync(coordinator)
+        scheduler._trading_playbook_obsidian_sync = coordinator
+        scheduler._sync_trading_playbook_obsidian_after_commit = AsyncMock()
+        replayed_review_ids = []
+        validate_review = scheduler._validated_review_result_ids_in_session
+
+        async def record_validated_review(*args, **kwargs):
+            ids = await validate_review(*args, **kwargs)
+            replayed_review_ids.extend(ids)
+            return ids
+
+        scheduler._validated_review_result_ids_in_session = record_validated_review
         try:
             replayed_plan = await scheduler._build_trading_playbook_plan(
                 "auction",
@@ -778,35 +788,11 @@ class TradingPlaybookSchedulerClaimTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(replayed_review)
         orchestrator.build_stage.assert_not_awaited()
         review.build.assert_not_awaited()
-        self.assertEqual(
-            coordinator.enqueue_stage.await_args_list,
-            [
-                unittest.mock.call(
-                    now.date(),
-                    "auction",
-                    plan_version_ids=(degraded_id,),
-                    review_ids=(),
-                    include_rules=True,
-                ),
-                unittest.mock.call(
-                    now.date(),
-                    "initial_review",
-                    plan_version_ids=(),
-                    review_ids=(initial_one_id,),
-                    include_rules=False,
-                ),
-            ],
-        )
-        self.assertNotIn(
-            ready_id,
-            coordinator.enqueue_stage.await_args_list[0].kwargs[
-                "plan_version_ids"
-            ],
-        )
-        self.assertNotIn(
-            initial_two_id,
-            coordinator.enqueue_stage.await_args_list[1].kwargs["review_ids"],
-        )
+        self.assertEqual(replayed_review_ids, [initial_one_id])
+        self.assertNotIn(initial_two_id, replayed_review_ids)
+        scheduler._sync_trading_playbook_obsidian_after_commit.assert_not_awaited()
+        coordinator.enqueue_stage.assert_not_awaited()
+        coordinator.process_due.assert_not_awaited()
 
     async def test_first_plan_completion_rejects_unpersisted_multiple_and_mismatched_results(self):
         from sqlalchemy import select
@@ -898,7 +884,8 @@ class TradingPlaybookSchedulerClaimTests(unittest.IsolatedAsyncioTestCase):
                     now_provider=lambda: now,
                     calendar_service=self._calendar(),
                 )
-                scheduler.install_trading_playbook_obsidian_sync(coordinator)
+                scheduler._trading_playbook_obsidian_sync = coordinator
+                scheduler._sync_trading_playbook_obsidian_after_commit = AsyncMock()
                 try:
                     result = await scheduler._build_trading_playbook_plan(
                         "auction"
@@ -906,6 +893,7 @@ class TradingPlaybookSchedulerClaimTests(unittest.IsolatedAsyncioTestCase):
 
                     self.assertIsNone(result)
                     alert.notify_plan_ready.assert_not_awaited()
+                    scheduler._sync_trading_playbook_obsidian_after_commit.assert_not_awaited()
                     coordinator.enqueue_stage.assert_not_awaited()
                     coordinator.process_due.assert_not_awaited()
                     async with maker() as db:
@@ -1019,7 +1007,8 @@ class TradingPlaybookSchedulerClaimTests(unittest.IsolatedAsyncioTestCase):
                     session_factory=maker,
                     now_provider=lambda: now,
                 )
-                scheduler.install_trading_playbook_obsidian_sync(coordinator)
+                scheduler._trading_playbook_obsidian_sync = coordinator
+                scheduler._sync_trading_playbook_obsidian_after_commit = AsyncMock()
                 try:
                     result = await scheduler._run_trading_playbook_review_phase(
                         now.date(),
@@ -1027,6 +1016,7 @@ class TradingPlaybookSchedulerClaimTests(unittest.IsolatedAsyncioTestCase):
                     )
 
                     self.assertIsNone(result)
+                    scheduler._sync_trading_playbook_obsidian_after_commit.assert_not_awaited()
                     coordinator.enqueue_stage.assert_not_awaited()
                     coordinator.process_due.assert_not_awaited()
                     async with maker() as db:
@@ -1053,12 +1043,16 @@ class TradingPlaybookSchedulerClaimTests(unittest.IsolatedAsyncioTestCase):
                 finally:
                     await engine.dispose()
 
-    async def test_empty_review_manifest_retries_failed_obsidian_enqueue_without_rebuild(self):
+    async def test_empty_review_manifest_replays_without_rebuild_or_retired_export(self):
         from sqlalchemy import select
 
         from app.data_collectors.scheduler import DataScheduler
         from app.database import Base
-        from app.models.trading_playbook import TradingPlaybookJobResultManifest
+        from app.models.trading_playbook import (
+            TradingPlaybookJobClaim,
+            TradingPlaybookJobResult,
+            TradingPlaybookJobResultManifest,
+        )
         from app.utils.time_utils import CN_TZ
 
         engine = create_async_engine("sqlite+aiosqlite:///:memory:")
@@ -1072,7 +1066,7 @@ class TradingPlaybookSchedulerClaimTests(unittest.IsolatedAsyncioTestCase):
         )
         coordinator = SimpleNamespace(
             enqueue_stage=AsyncMock(
-                side_effect=[RuntimeError("first enqueue failed"), None]
+                side_effect=AssertionError("retired export must never run")
             ),
             process_due=AsyncMock(),
             reconcile_committed_facts=AsyncMock(),
@@ -1083,7 +1077,8 @@ class TradingPlaybookSchedulerClaimTests(unittest.IsolatedAsyncioTestCase):
             session_factory=maker,
             now_provider=lambda: now,
         )
-        scheduler.install_trading_playbook_obsidian_sync(coordinator)
+        scheduler._trading_playbook_obsidian_sync = coordinator
+        scheduler._sync_trading_playbook_obsidian_after_commit = AsyncMock()
         try:
             first = await scheduler._run_trading_playbook_review_phase(
                 now.date(),
@@ -1097,24 +1092,19 @@ class TradingPlaybookSchedulerClaimTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(first, [])
             self.assertIsNone(replay)
             review.build.assert_awaited_once()
-            self.assertEqual(coordinator.enqueue_stage.await_count, 2)
-            self.assertEqual(
-                coordinator.enqueue_stage.await_args_list[-1],
-                unittest.mock.call(
-                    now.date(),
-                    "initial_review",
-                    plan_version_ids=(),
-                    review_ids=(),
-                    include_rules=True,
-                ),
-            )
-            coordinator.process_due.assert_awaited_once_with()
+            scheduler._sync_trading_playbook_obsidian_after_commit.assert_not_awaited()
+            coordinator.enqueue_stage.assert_not_awaited()
+            coordinator.process_due.assert_not_awaited()
             async with maker() as db:
                 manifest = (
                     await db.scalars(select(TradingPlaybookJobResultManifest))
                 ).one()
                 self.assertEqual(manifest.entity_type, "review")
                 self.assertEqual(manifest.result_count, 0)
+                claim = (await db.scalars(select(TradingPlaybookJobClaim))).one()
+                self.assertEqual(claim.status, "completed")
+                self.assertEqual(claim.attempt_no, 1)
+                self.assertEqual((await db.scalars(select(TradingPlaybookJobResult))).all(), [])
         finally:
             await engine.dispose()
 

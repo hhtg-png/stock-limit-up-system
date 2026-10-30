@@ -1,6 +1,8 @@
 import asyncio
+import tempfile
 import unittest
 from datetime import date, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -762,7 +764,9 @@ class IntelligenceServiceTests(unittest.TestCase):
 
         self.assertEqual(names, ["SpaceX"])
 
-    def test_sync_all_rebuilds_changed_daily_history_dates(self):
+    def test_sync_all_rebuilds_changed_daily_history_without_external_vault_writes(self):
+        from app.services.obsidian_knowledge_service import ObsidianKnowledgeService
+
         today = today_cn()
         old_date = date(2026, 5, 17)
         today_title = f"{today.isoformat()}-复盘.md"
@@ -803,7 +807,21 @@ class IntelligenceServiceTests(unittest.TestCase):
                 digests = (await session.execute(select(DailyInfoDigest))).scalars().all()
                 return result, digests
 
-        result, digests = asyncio.run(run())
+        with tempfile.TemporaryDirectory() as directory:
+            vault = Path(directory)
+            existing_note = vault / "my-note.md"
+            existing_note.write_text("历史笔记", encoding="utf-8")
+            knowledge = ObsidianKnowledgeService(settings=SimpleNamespace(
+                OBSIDIAN_ENABLED=True,
+                OBSIDIAN_VAULT_PATH=directory,
+                OBSIDIAN_AUTO_GIT_ENABLED=False,
+            ))
+            with patch("app.services.obsidian_knowledge_service.obsidian_knowledge_service", knowledge):
+                result, digests = asyncio.run(run())
+            self.assertEqual(list(vault.iterdir()), [existing_note])
+            self.assertEqual(existing_note.read_text(encoding="utf-8"), "历史笔记")
+
+        self.assertNotIn("obsidian", result)
 
         self.assertEqual(result["sources"]["daily"]["changed_trade_dates"], [today.isoformat(), old_date.isoformat()])
         self.assertEqual(

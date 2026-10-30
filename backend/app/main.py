@@ -33,18 +33,7 @@ from app.services.trading_playbook.runtime import trading_playbook_runtime
 from app.services.trading_playbook.review_service import (
     TradingPlaybookReviewService,
 )
-from app.services.obsidian_vault_writer import ObsidianVaultWriter
-from app.services.obsidian_knowledge_service import obsidian_knowledge_service
-from app.services.trading_playbook.obsidian_exporter import (
-    TradingPlaybookObsidianExporter,
-)
-from app.services.trading_playbook.obsidian_snapshot_builder import (
-    TradingPlaybookObsidianSnapshotBuilder,
-)
-from app.services.trading_playbook.obsidian_sync import (
-    TradingPlaybookObsidianSyncCoordinator,
-)
-from app.utils.time_utils import now_cn, today_cn
+from app.utils.time_utils import today_cn
 
 
 def _clear_trading_playbook_runtime(app: FastAPI) -> None:
@@ -68,8 +57,6 @@ def _clear_trading_playbook_runtime(app: FastAPI) -> None:
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
     orchestrator = None
-    obsidian_writer = None
-    original_knowledge_writer = None
     shutdown_cancellation = None
     setup_logging()
     logger.info(f"Starting {settings.APP_NAME} v{settings.APP_VERSION}")
@@ -126,26 +113,6 @@ async def lifespan(app: FastAPI):
             data_scheduler.install_trading_playbook_review_service(
                 review_service
             )
-            obsidian_writer = ObsidianVaultWriter(
-                enabled=settings.OBSIDIAN_ENABLED,
-                vault_path=settings.OBSIDIAN_VAULT_PATH,
-                auto_git_enabled=settings.OBSIDIAN_AUTO_GIT_ENABLED,
-            )
-            original_knowledge_writer = obsidian_knowledge_service.writer
-            obsidian_knowledge_service.writer = obsidian_writer
-            obsidian_builder = TradingPlaybookObsidianSnapshotBuilder(
-                async_session_maker
-            )
-            obsidian_sync = TradingPlaybookObsidianSyncCoordinator(
-                session_factory=async_session_maker,
-                builder=obsidian_builder,
-                exporter=TradingPlaybookObsidianExporter(),
-                writer=obsidian_writer,
-                clock=now_cn,
-            )
-            data_scheduler.install_trading_playbook_obsidian_sync(
-                obsidian_sync
-            )
             trading_playbook_runtime.install_orchestrator(orchestrator)
             trading_playbook_runtime.install_review_service(review_service)
             app.state.trading_playbook_orchestrator = orchestrator
@@ -153,7 +120,6 @@ async def lifespan(app: FastAPI):
             app.state.trading_playbook_wxpusher_channel = wxpusher_channel
             app.state.trading_playbook_review_service = review_service
             app.state.trading_playbook_calendar = calendar
-            app.state.trading_playbook_obsidian_sync = obsidian_sync
 
         # 启动定时任务：盘中采集、盘后统计、市场复盘、每日分析
         data_scheduler.start()
@@ -188,14 +154,6 @@ async def lifespan(app: FastAPI):
             _clear_trading_playbook_runtime(app)
         except Exception as exc:
             logger.error(f"Trading playbook runtime cleanup failed: {exc}")
-        try:
-            if (
-                obsidian_writer is not None
-                and obsidian_knowledge_service.writer is obsidian_writer
-            ):
-                obsidian_knowledge_service.writer = original_knowledge_writer
-        except Exception as exc:
-            logger.error(f"Obsidian writer restoration failed: {exc}")
         try:
             await data_scheduler.get_trading_calendar_service().close()
         except asyncio.CancelledError as exc:

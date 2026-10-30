@@ -13,10 +13,12 @@ from .limit_up import (  # noqa: F401
     LimitUpClassificationDigest,
     LimitUpRecord,
     LimitUpStatusChange,
+    LimitUpMonitorArchive,
 )
 from .market_data import CrawlerTask, DailyStatistics, DataValidation, UserConfig  # noqa: F401
 from .market_review import (  # noqa: F401
     DailyAnalysisRecord,
+    BrokenBoardDailyArchive,
     MarketReviewDailyMetric,
     MarketReviewLimitUpEvent,
     MarketReviewStockDaily,
@@ -52,6 +54,8 @@ __all__ = [
     "JiegeTradingRule",
     "KnowledgeDocument",
     "LimitUpRecord",
+    "LimitUpMonitorArchive",
+    "BrokenBoardDailyArchive",
     "LimitUpStatusChange",
     "LimitUpClassificationArchive",
     "LimitUpClassificationDigest",

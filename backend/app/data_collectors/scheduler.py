@@ -14,6 +14,7 @@ from loguru import logger
 
 from app.config import settings
 from app.services.intelligence_service import intelligence_service
+from app.services.history_preparation_service import history_preparation_service
 from app.services.market_review_pipeline_service import market_review_pipeline_service
 from app.services.trading_playbook.calendar_service import (
     TradingCalendarLookupError,
@@ -129,8 +130,6 @@ class DataScheduler:
         self._trading_playbook_orchestrator = trading_playbook_orchestrator
         self._trading_playbook_alert_service = trading_playbook_alert_service
         self._trading_playbook_review_service = trading_playbook_review_service
-        self._trading_playbook_obsidian_sync = None
-        self._trading_playbook_obsidian_rules_enqueued = False
         self._playbook_session_factory = session_factory
         self._playbook_now_provider = now_provider or (
             lambda: datetime.now(CN_TZ)
@@ -351,8 +350,26 @@ class DataScheduler:
         if settings.TRADING_PLAYBOOK_ENABLED:
             self._register_trading_playbook_jobs()
 
-        if self._trading_playbook_obsidian_sync is not None:
-            self._register_trading_playbook_obsidian_jobs()
+        for hour in (15, 20):
+            self.scheduler.add_job(
+                self._prepare_daily_history,
+                CronTrigger(hour=hour, minute=35, timezone=CN_TZ),
+                id=f"history_daily_{hour}35",
+                name="历史监控与报表日终预生成",
+                max_instances=1, coalesce=True, misfire_grace_time=1800,
+            )
+        self.scheduler.add_job(
+            self._reconcile_history_snapshots,
+            IntervalTrigger(seconds=300, timezone=CN_TZ),
+            id="history_backfill", name="历史监控与报表缺口补齐",
+            max_instances=1, coalesce=True, misfire_grace_time=120,
+        )
+        self.scheduler.add_job(
+            self._reconcile_history_snapshots,
+            DateTrigger(run_date=datetime.now(CN_TZ) + timedelta(seconds=20), timezone=CN_TZ),
+            id="history_startup_backfill", name="历史监控与报表启动补齐",
+            max_instances=1, coalesce=True, replace_existing=True, misfire_grace_time=120,
+        )
 
         self.scheduler.add_job(
             self._run_after_close_catchup,
@@ -444,28 +461,6 @@ class DataScheduler:
             coalesce=True,
         )
 
-    def _register_trading_playbook_obsidian_jobs(self) -> None:
-        self.scheduler.add_job(
-            self._reconcile_trading_playbook_obsidian,
-            IntervalTrigger(seconds=60, timezone=CN_TZ),
-            id="trading_playbook_obsidian_reconcile",
-            name="交易作战手册 Obsidian 补偿同步",
-            max_instances=1,
-            coalesce=True,
-        )
-        self.scheduler.add_job(
-            self._startup_reconcile_trading_playbook_obsidian,
-            DateTrigger(
-                run_date=self._playbook_now() + timedelta(seconds=7),
-                timezone=CN_TZ,
-            ),
-            id="trading_playbook_obsidian_startup_reconcile",
-            name="交易作战手册 Obsidian 启动恢复",
-            max_instances=1,
-            replace_existing=True,
-            misfire_grace_time=60,
-            coalesce=True,
-        )
     
     def stop(self):
         """停止调度器"""
@@ -525,27 +520,11 @@ class DataScheduler:
             raise TypeError("review service must provide build")
         self._trading_playbook_review_service = service
 
-    def install_trading_playbook_obsidian_sync(self, coordinator: Any) -> None:
-        required = (
-            "enqueue_stage",
-            "reconcile_committed_facts",
-            "process_due",
-            "startup_reconcile",
-        )
-        if any(not callable(getattr(coordinator, name, None)) for name in required):
-            raise TypeError(
-                "Obsidian coordinator must provide enqueue_stage, "
-                "reconcile_committed_facts, process_due, and startup_reconcile"
-            )
-        self._trading_playbook_obsidian_sync = coordinator
-        self._trading_playbook_obsidian_rules_enqueued = False
 
     def reset_trading_playbook_services(self) -> None:
         self._trading_playbook_orchestrator = None
         self._trading_playbook_alert_service = None
         self._trading_playbook_review_service = None
-        self._trading_playbook_obsidian_sync = None
-        self._trading_playbook_obsidian_rules_enqueued = False
 
     def get_trading_playbook_orchestrator(self) -> Any:
         return self._trading_playbook_orchestrator
@@ -653,69 +632,8 @@ class DataScheduler:
             entity_ids.append(raw_id)
         return tuple(entity_ids)
 
-    async def _sync_trading_playbook_obsidian_after_commit(
-        self,
-        trade_date: date,
-        phase: str,
-        *,
-        plan_version_ids: Sequence[int] = (),
-        review_ids: Sequence[int] = (),
-    ) -> None:
-        coordinator = self._trading_playbook_obsidian_sync
-        if coordinator is None:
-            return
-        include_rules = not self._trading_playbook_obsidian_rules_enqueued
-        try:
-            await coordinator.enqueue_stage(
-                trade_date,
-                phase,
-                plan_version_ids=tuple(plan_version_ids),
-                review_ids=tuple(review_ids),
-                include_rules=include_rules,
-            )
-            if include_rules:
-                self._trading_playbook_obsidian_rules_enqueued = True
-            await coordinator.process_due()
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.error(
-                "Trading playbook Obsidian sync failed for {} {}: {}",
-                trade_date,
-                phase,
-                exc,
-            )
 
-    async def _reconcile_trading_playbook_obsidian(self) -> None:
-        coordinator = self._trading_playbook_obsidian_sync
-        if coordinator is None:
-            return
-        try:
-            await coordinator.reconcile_committed_facts()
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.error(
-                "Trading playbook Obsidian fact compensation failed: {}",
-                exc,
-            )
-        try:
-            await coordinator.process_due()
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.error("Trading playbook Obsidian retry failed: {}", exc)
 
-    async def _startup_reconcile_trading_playbook_obsidian(self) -> None:
-        coordinator = self._trading_playbook_obsidian_sync
-        if coordinator is None:
-            return
-        try:
-            await coordinator.startup_reconcile()
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.error("Trading playbook Obsidian startup recovery failed: {}", exc)
 
     async def _build_trading_playbook_plan(
         self,
@@ -879,13 +797,6 @@ class DataScheduler:
                 if not completed:
                     logger.error("Trading playbook build claim lost before completion")
                     return None
-        plan_ids = self._persisted_entity_ids(plan)
-        if plan_ids:
-            await self._sync_trading_playbook_obsidian_after_commit(
-                source_trade_date,
-                stage,
-                plan_version_ids=plan_ids,
-            )
         if send_notifications and plan is not None:
             await self._notify_trading_playbook_plan(plan)
         return plan
@@ -1374,11 +1285,6 @@ class DataScheduler:
                     return None
                 if not completed:
                     return None
-        await self._sync_trading_playbook_obsidian_after_commit(
-            review_date,
-            "final_review" if finalized else "initial_review",
-            review_ids=review_ids,
-        )
         return result
 
     async def _monitor_trading_playbook(self):
@@ -2127,54 +2033,28 @@ class DataScheduler:
             logger.error(f"KPL crawl error: {e}")
     
     async def _calculate_daily_stats(self):
-        """计算每日统计数据"""
+        """Idempotently persist the closed session's daily statistics."""
         try:
-            from app.database import async_session_maker
-            from app.models.limit_up import LimitUpRecord
-            from app.models.market_data import DailyStatistics
-            from sqlalchemy import select, func
-            from datetime import date
-            
-            today = date.today()
-            
-            async with async_session_maker() as db:
-                # 统计涨停数据
-                query = select(
-                    func.count(LimitUpRecord.id).label('total'),
-                    func.sum(func.case((LimitUpRecord.continuous_limit_up_days == 1, 1), else_=0)).label('new'),
-                    func.sum(func.case((LimitUpRecord.continuous_limit_up_days == 2, 1), else_=0)).label('c2'),
-                    func.sum(func.case((LimitUpRecord.continuous_limit_up_days == 3, 1), else_=0)).label('c3'),
-                    func.sum(func.case((LimitUpRecord.continuous_limit_up_days >= 4, 1), else_=0)).label('c4plus'),
-                    func.sum(func.case((LimitUpRecord.open_count > 0, 1), else_=0)).label('breaks')
-                ).where(LimitUpRecord.trade_date == today)
-                
-                result = await db.execute(query)
-                stats = result.one()
-                
-                # 计算炸板率
-                total = stats.total or 0
-                breaks = stats.breaks or 0
-                break_rate = round(breaks / total * 100, 2) if total > 0 else 0
-                
-                # 保存统计数据
-                daily_stats = DailyStatistics(
-                    trade_date=today,
-                    total_limit_up=total,
-                    new_limit_up=stats.new or 0,
-                    continuous_2=stats.c2 or 0,
-                    continuous_3=stats.c3 or 0,
-                    continuous_4_plus=stats.c4plus or 0,
-                    break_count=breaks,
-                    break_rate=break_rate
-                )
-                
-                db.add(daily_stats)
-                await db.commit()
-                
-                logger.info(f"Daily stats calculated: {total} limit up stocks")
-        
-        except Exception as e:
-            logger.error(f"Calculate daily stats error: {e}")
+            await history_preparation_service.refresh_statistics(today_cn())
+        except Exception as exc:
+            logger.warning("Daily statistics preparation failed: {}", exc)
+
+    async def _prepare_daily_history(self):
+        """Refresh the newest closed session after final facts or evening repairs."""
+        try:
+            result = await history_preparation_service.prepare_latest()
+            logger.info("Daily historical preparation completed: {}", result)
+        except Exception as exc:
+            logger.warning("Daily historical preparation failed; will retry: {}", exc)
+
+    async def _reconcile_history_snapshots(self):
+        """Recover small batches of persisted dates without fetching whole markets."""
+        try:
+            result = await history_preparation_service.prepare_pending(limit=2)
+            logger.info("Historical snapshot backfill completed: {}", result)
+        except Exception as exc:
+            logger.warning("Historical snapshot backfill failed; will retry: {}", exc)
+
 
     async def _calculate_daily_analysis(self, trade_date: Optional[date] = None):
         """生成每日分析月表数据"""

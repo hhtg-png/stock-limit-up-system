@@ -1,63 +1,48 @@
-import { readFileSync } from 'node:fs'
-import { resolve } from 'node:path'
 import assert from 'node:assert/strict'
+import test from 'node:test'
+import { resolve } from 'node:path'
+import { createServer } from 'vite'
+import vue from '@vitejs/plugin-vue'
+import { createSSRApp } from 'vue'
+import { renderToString } from '@vue/server-renderer'
+import { createPinia } from 'pinia'
+import ElementPlus, { ID_INJECTION_KEY, ZINDEX_INJECTION_KEY, zIndexContextKey } from 'element-plus'
+import { createMemoryHistory, createRouter } from 'vue-router'
 
 const root = resolve(import.meta.dirname, '..')
 
-function read(path) {
-  return readFileSync(resolve(root, path), 'utf8').replace(/\r\n/g, '\n')
-}
-
-const api = read('src/api/intelligence.ts')
-const types = read('src/types/intelligence.ts')
-const router = read('src/router/index.ts')
-const app = read('src/App.vue')
-const dailyInfo = read('src/views/DailyInfo.vue')
-const dailyAnalysis = read('src/views/DailyAnalysis.vue')
-const jiegeMode = read('src/views/JiegeMode.vue')
-const industryTrends = read('src/views/IndustryTrends.vue')
-const ultraShortSignals = read('src/views/UltraShortSignals.vue')
-
-for (const typeName of [
-  'ObsidianStatus',
-  'ObsidianExportResponse',
-  'IndustryTrend',
-  'UltraShortSignal',
-  'UltraShortSignalsResponse'
-]) {
-  assert.match(types, new RegExp(`interface ${typeName}`), `types should expose ${typeName}`)
-}
-
-for (const fnName of [
-  'getObsidianStatus',
-  'exportObsidianKnowledge',
-  'getIndustryTrends',
-  'getUltraShortSignals'
-]) {
-  assert.match(api, new RegExp(`function ${fnName}`), `intelligence API should expose ${fnName}`)
-}
-
-assert.match(router, /path:\s*'\/industry-trends'/, 'router should expose the industry trends view')
-assert.match(router, /path:\s*'\/ultra-short-signals'/, 'router should expose the ultra-short signals view')
-assert.match(app, /index="\/industry-trends"/, 'sidebar should link to industry trends')
-assert.match(app, /index="\/ultra-short-signals"/, 'sidebar should link to ultra-short signals')
-assert.match(app, /path:\s*'\/industry-trends'/, 'mobile nav should include industry trends')
-assert.match(app, /path:\s*'\/ultra-short-signals'/, 'mobile nav should include ultra-short signals')
-
-for (const [name, source] of Object.entries({ dailyInfo, dailyAnalysis, jiegeMode })) {
-  assert.match(source, /obsidianStatus/, `${name} should track Obsidian status`)
-  assert.match(source, /exportObsidianKnowledge/, `${name} should expose Obsidian export`)
-  assert.match(source, /Obsidian/, `${name} should render an Obsidian entry point`)
-}
-
-assert.match(industryTrends, /getIndustryTrends/, 'IndustryTrends should call the trends API')
-assert.match(industryTrends, /trend-list/, 'IndustryTrends should render a compact trend list')
-assert.match(industryTrends, /catch \(error\)/, 'IndustryTrends should degrade on API failure')
-assert.match(industryTrends, /openObsidianDashboard/, 'IndustryTrends should expose the Obsidian dashboard action')
-
-assert.match(ultraShortSignals, /getUltraShortSignals/, 'UltraShortSignals should call the signals API')
-assert.match(ultraShortSignals, /manual_required/, 'UltraShortSignals should surface manual confirmation')
-assert.match(ultraShortSignals, /signal-list/, 'UltraShortSignals should render a compact signal list')
-assert.match(ultraShortSignals, /catch \(error\)/, 'UltraShortSignals should degrade on API failure')
-
-console.log('obsidian knowledge source checks passed')
+test('business pages render without retired Obsidian controls', async () => {
+  const server = await createServer({
+    configFile: false,
+    root,
+    logLevel: 'silent',
+    plugins: [vue()],
+    optimizeDeps: { noDiscovery: true, include: [] },
+    server: { middlewareMode: true },
+    resolve: { alias: { '@': resolve(root, 'src') } }
+  })
+  try {
+    for (const [name, title] of [
+      ['DailyInfo', '每日资讯'],
+      ['DailyAnalysis', '每日分析'],
+      ['JiegeMode', '交易模式'],
+      ['IndustryTrends', '产业趋势'],
+      ['UltraShortSignals', '超短'],
+      ['TradingPlaybook', '交易预案']
+    ]) {
+      const { default: page } = await server.ssrLoadModule(`/src/views/${name}.vue`)
+      const router = createRouter({ history: createMemoryHistory(), routes: [{ path: '/', component: page }] })
+      await router.push('/')
+      await router.isReady()
+      const app = createSSRApp(page).use(createPinia()).use(router).use(ElementPlus)
+      app.provide(ID_INJECTION_KEY, { prefix: 100, current: 0 })
+      app.provide(ZINDEX_INJECTION_KEY, { current: 0 })
+      app.provide(zIndexContextKey, { current: 0 })
+      const html = await renderToString(app)
+      assert.match(html, new RegExp(title), `${name} retains its business content`)
+      assert.doesNotMatch(html, /Obsidian|obsidian:\/\/|打开笔记|导出到/, `${name} must not expose retired export controls`)
+    }
+  } finally {
+    await server.close()
+  }
+})

@@ -1,6 +1,9 @@
 import asyncio
+import tempfile
 import unittest
 from datetime import date, datetime, time
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi import FastAPI
@@ -253,45 +256,28 @@ class IntelligenceApiTests(unittest.TestCase):
         self.assertEqual(payload["sources"][0]["title"], "复盘.md")
         self.assertEqual(payload["sources"][0]["jump_url"], "https://example.test/review.md")
 
-    def test_get_obsidian_status_returns_configuration(self):
-        fake_service = Mock()
-        fake_service.get_status.return_value = {
-            "enabled": True,
-            "vault_configured": True,
-            "vault_exists": True,
-            "vault_path": "D:/Obsidian/stock",
-            "auto_git_enabled": False,
-            "web_research_enabled": True,
-            "web_research_allowlist": ["https://example.test"],
-        }
+    def test_retired_obsidian_api_preserves_existing_notes_even_when_configured(self):
+        from app.services.obsidian_knowledge_service import ObsidianKnowledgeService
 
-        with patch("app.api.v1.intelligence.obsidian_knowledge_service", fake_service):
-            response = self.client.get("/intelligence/obsidian/status")
+        with tempfile.TemporaryDirectory() as directory:
+            vault = Path(directory)
+            existing_note = vault / "my-note.md"
+            existing_note.write_text("历史笔记", encoding="utf-8")
+            service = ObsidianKnowledgeService(settings=SimpleNamespace(
+                OBSIDIAN_ENABLED=True,
+                OBSIDIAN_VAULT_PATH=directory,
+                OBSIDIAN_AUTO_GIT_ENABLED=False,
+            ))
+            with patch("app.api.v1.intelligence.obsidian_knowledge_service", service):
+                status = self.client.get("/intelligence/obsidian/status")
+                exported = self.client.post("/intelligence/obsidian/export", params={"trade_date": "2026-05-18"})
 
-        self.assertEqual(response.status_code, 200)
-        self.assertTrue(response.json()["enabled"])
-        self.assertTrue(response.json()["vault_exists"])
-        self.assertEqual(response.json()["web_research_allowlist"], ["https://example.test"])
-
-    def test_post_obsidian_export_returns_written_files(self):
-        fake_service = Mock()
-        fake_service.export_daily_knowledge = AsyncMock(
-            return_value={
-                "trade_date": "2026-05-18",
-                "written_files": [
-                    "50_Daily/2026/2026-05-18.md",
-                    "Dashboards/产业趋势.md",
-                ],
-                "vault_path": "D:/Obsidian/stock",
-            }
-        )
-
-        with patch("app.api.v1.intelligence.obsidian_knowledge_service", fake_service):
-            response = self.client.post("/intelligence/obsidian/export", params={"trade_date": "2026-05-18"})
-
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["written_files"][0], "50_Daily/2026/2026-05-18.md")
-        fake_service.export_daily_knowledge.assert_awaited_once()
+            self.assertEqual(status.status_code, 200, status.text)
+            self.assertFalse(status.json()["enabled"])
+            self.assertTrue(status.json()["retired"])
+            self.assertEqual(exported.status_code, 410, exported.text)
+            self.assertEqual(list(vault.iterdir()), [existing_note])
+            self.assertEqual(existing_note.read_text(encoding="utf-8"), "历史笔记")
 
     def test_get_industry_trends_returns_source_backed_items(self):
         response = self.client.get("/intelligence/trends", params={"limit": 10})

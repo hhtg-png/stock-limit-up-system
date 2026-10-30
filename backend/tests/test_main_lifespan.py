@@ -90,6 +90,7 @@ except ImportError:
     _install_stub("pytz", pytz_module)
 
 from app import main as app_main
+from app.services.obsidian_knowledge_service import obsidian_knowledge_service
 from app.services.trading_playbook.runtime import trading_playbook_runtime
 from app.services.trading_playbook.serialization import ValidatedPlanPayload
 
@@ -241,7 +242,7 @@ class MainLifespanTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_real_mounted_app_resolves_same_startup_orchestrator_and_cleans_up(self):
         scheduler = LifecycleScheduler()
-        original_knowledge_writer = app_main.obsidian_knowledge_service.writer
+        original_knowledge_writer = obsidian_knowledge_service.writer
         sentinel = types.SimpleNamespace(
             build_stage=AsyncMock(
                 return_value=ValidatedPlanPayload(
@@ -298,30 +299,9 @@ class MainLifespanTests(unittest.IsolatedAsyncioTestCase):
                     scheduler.alert_service.realtime_limit_up_loader,
                     app_main.load_production_realtime_limit_up,
                 )
-                coordinator = scheduler.obsidian_sync
-                self.assertIs(
-                    app_main.app.state.trading_playbook_obsidian_sync,
-                    coordinator,
-                )
-                self.assertIs(
-                    coordinator.session_factory,
-                    app_main.async_session_maker,
-                )
-                self.assertIs(
-                    coordinator.builder._session_factory,
-                    app_main.async_session_maker,
-                )
-                self.assertIs(coordinator.clock, app_main.now_cn)
-                self.assertTrue(coordinator.writer.enabled)
-                self.assertEqual(
-                    coordinator.writer.vault_path,
-                    "C:/temporary-test-vault",
-                )
-                self.assertTrue(coordinator.writer.auto_git_enabled)
-                self.assertIs(
-                    app_main.obsidian_knowledge_service.writer,
-                    coordinator.writer,
-                )
+                self.assertIsNone(scheduler.obsidian_sync)
+                self.assertFalse(hasattr(app_main.app.state, "trading_playbook_obsidian_sync"))
+                self.assertIs(obsidian_knowledge_service.writer, original_knowledge_writer)
                 transport = httpx.ASGITransport(app=app_main.app)
                 async with httpx.AsyncClient(
                     transport=transport,
@@ -357,7 +337,7 @@ class MainLifespanTests(unittest.IsolatedAsyncioTestCase):
             hasattr(app_main.app.state, "trading_playbook_obsidian_sync")
         )
         self.assertIs(
-            app_main.obsidian_knowledge_service.writer,
+            obsidian_knowledge_service.writer,
             original_knowledge_writer,
         )
 
@@ -561,13 +541,13 @@ class MainLifespanTests(unittest.IsolatedAsyncioTestCase):
         stop_bus.assert_awaited_once()
         close_db.assert_awaited_once()
 
-    async def test_partial_obsidian_startup_failure_closes_local_orchestrator_and_restores_writer(self):
+    async def test_retired_obsidian_dependency_cannot_block_core_startup(self):
         scheduler = LifecycleScheduler()
         sentinel = types.SimpleNamespace(
             build_stage=AsyncMock(),
             aclose=AsyncMock(),
         )
-        original_writer = app_main.obsidian_knowledge_service.writer
+        original_writer = obsidian_knowledge_service.writer
         patches = self._lifecycle_patches(scheduler)
         with patches[0], patches[1], patches[2] as close_db, patches[3], patches[4] as stop_bus, patches[5], patches[6], patches[7], patch.object(
             app_main.settings,
@@ -581,13 +561,15 @@ class MainLifespanTests(unittest.IsolatedAsyncioTestCase):
             app_main,
             "TradingPlaybookObsidianSnapshotBuilder",
             side_effect=RuntimeError("snapshot builder failed"),
+            create=True,
         ):
-            with self.assertRaisesRegex(RuntimeError, "snapshot builder failed"):
-                async with app_main.lifespan(app_main.app):
-                    self.fail("lifespan must not yield after partial startup failure")
+            async with app_main.lifespan(app_main.app):
+                self.assertIs(trading_playbook_runtime.get_orchestrator(), sentinel)
+                self.assertEqual(scheduler.start_calls, 1)
+                self.assertIsNone(scheduler.obsidian_sync)
 
         sentinel.aclose.assert_awaited_once_with()
-        self.assertIs(app_main.obsidian_knowledge_service.writer, original_writer)
+        self.assertIs(obsidian_knowledge_service.writer, original_writer)
         self.assertIsNone(scheduler.obsidian_sync)
         self.assertFalse(
             hasattr(app_main.app.state, "trading_playbook_obsidian_sync")
@@ -601,7 +583,7 @@ class MainLifespanTests(unittest.IsolatedAsyncioTestCase):
             build_stage=AsyncMock(),
             aclose=AsyncMock(side_effect=asyncio.CancelledError()),
         )
-        original_writer = app_main.obsidian_knowledge_service.writer
+        original_writer = obsidian_knowledge_service.writer
         patches = self._lifecycle_patches(scheduler)
         with patches[0], patches[1], patches[2] as close_db, patches[3], patches[4] as stop_bus, patches[5], patches[6], patches[7], patch.object(
             app_main.settings,
@@ -627,7 +609,7 @@ class MainLifespanTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(scheduler.reset_calls, 2)
         self.assertEqual(scheduler.calendar.close_calls, 1)
         self.assertIs(
-            app_main.obsidian_knowledge_service.writer,
+            obsidian_knowledge_service.writer,
             original_writer,
         )
 

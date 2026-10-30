@@ -106,7 +106,6 @@ export interface IntelligenceSyncResult {
   }>
   daily_info: DailyInfoResponse
   jiege_mode: JiegeModeResponse
-  obsidian?: ObsidianExportResponse | null
 }
 
 export interface JiegeRule {
@@ -165,31 +164,6 @@ export interface JiegeModeResponse {
   data: JiegeSignalData
   generated_at?: string | null
   cache_hit: boolean
-}
-
-export interface ObsidianStatus {
-  enabled: boolean
-  vault_configured: boolean
-  vault_exists: boolean
-  vault_path: string
-  auto_git_enabled: boolean
-  web_research_enabled: boolean
-  web_research_allowlist: string[]
-  required_directories?: string[]
-}
-
-export interface ObsidianExportResponse {
-  trade_date: string
-  vault_path: string
-  written_files: string[]
-  skipped?: boolean
-  reason?: string
-  git?: {
-    enabled: boolean
-    committed?: boolean
-    reason?: string
-    error?: string
-  }
 }
 
 export interface IndustryTrendSource {
