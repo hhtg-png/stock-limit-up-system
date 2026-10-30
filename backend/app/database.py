@@ -327,6 +327,17 @@ async def get_db() -> AsyncSession:
             await session.close()
 
 
+def ensure_obsidian_reconciliation_index(sync_connection) -> None:
+    """Upgrade existing outboxes; create_all only adds indexes for new tables."""
+    from app.models.trading_playbook import TradingPlaybookObsidianExport
+
+    index = next(
+        index for index in TradingPlaybookObsidianExport.__table__.indexes
+        if index.name == "ix_trading_playbook_obsidian_status_trade_id"
+    )
+    index.create(sync_connection, checkfirst=True)
+
+
 async def init_db():
     """初始化数据库（创建所有表）"""
     # Ensure all model modules are imported before metadata.create_all() runs.
@@ -338,6 +349,7 @@ async def init_db():
             await conn.run_sync(ensure_sqlite_schema_compat)
         elif settings.DATABASE_URL.startswith(("postgresql", "postgres")):
             await conn.run_sync(ensure_postgresql_schema_compat)
+        await conn.run_sync(ensure_obsidian_reconciliation_index)
 
 
 async def close_db():

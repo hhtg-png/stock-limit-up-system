@@ -11,13 +11,14 @@ import re
 import stat
 import unicodedata
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from functools import partial
 from pathlib import Path
 from typing import Any
 
 from loguru import logger
-from sqlalchemy import case, desc, exists, func, or_, select, text, update
+from sqlalchemy import Text, case, cast, desc, exists, func, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import aliased
@@ -55,6 +56,14 @@ _MAX_GIT_JSON_STRING = 512
 _MAX_GIT_JSON_BYTES = 32 * 1024
 _LOCK_ROOT = "30_TradingPlaybook/Daily/Auto/.sync-locks"
 _DASHBOARD_PATH = "Dashboards/交易预案.md"
+
+
+@dataclass(frozen=True)
+class _GitIntentRow:
+    id: int
+    trade_date: date
+    phase: str
+    target_path: str
 
 
 class _TargetFileLock:
@@ -530,37 +539,53 @@ class TradingPlaybookObsidianSyncCoordinator:
                     # version allocation that PostgreSQL's unique constraint
                     # and retry loop provide.
                     await session.execute(text("BEGIN IMMEDIATE"))
-                existing = list(
-                    (
-                        await session.execute(
-                            select(TradingPlaybookObsidianExport)
-                            .where(
-                                TradingPlaybookObsidianExport.snapshot_key
-                                == artifact.snapshot_key
-                            )
-                            .order_by(
-                                desc(
-                                    TradingPlaybookObsidianExport.snapshot_version
-                                )
+                latest = (
+                    await session.execute(
+                        select(
+                            TradingPlaybookObsidianExport.id,
+                            TradingPlaybookObsidianExport.snapshot_version,
+                            TradingPlaybookObsidianExport.source_hash,
+                            TradingPlaybookObsidianExport.immutable,
+                        )
+                        .where(
+                            TradingPlaybookObsidianExport.snapshot_key
+                            == artifact.snapshot_key
+                        )
+                        .order_by(
+                            desc(
+                                TradingPlaybookObsidianExport.snapshot_version
                             )
                         )
-                    ).scalars()
-                )
+                        .limit(1)
+                    )
+                ).first()
 
-                reusable = self._reusable_row(existing, artifact)
-                if reusable is not None:
-                    return reusable
+                reusable_id = None
+                if artifact.immutable:
+                    reusable_id = await session.scalar(
+                        select(TradingPlaybookObsidianExport.id)
+                        .where(
+                            TradingPlaybookObsidianExport.snapshot_key == artifact.snapshot_key,
+                            TradingPlaybookObsidianExport.source_hash == artifact.source_hash,
+                        )
+                        .order_by(desc(TradingPlaybookObsidianExport.snapshot_version))
+                        .limit(1)
+                    )
+                elif latest is not None and latest.source_hash == artifact.source_hash:
+                    reusable_id = latest.id
+                if reusable_id is not None:
+                    return await session.get(TradingPlaybookObsidianExport, reusable_id)
 
-                if existing and bool(existing[0].immutable) != artifact.immutable:
+                if latest is not None and bool(latest.immutable) != artifact.immutable:
                     raise ValueError(
                         "snapshot_key cannot change immutable classification"
                     )
 
                 snapshot_version = (
-                    int(existing[0].snapshot_version) + 1 if existing else 1
+                    int(latest.snapshot_version) + 1 if latest is not None else 1
                 )
-                is_conflict = artifact.immutable and bool(existing)
-                if existing and not artifact.immutable:
+                is_conflict = artifact.immutable and latest is not None
+                if latest is not None and not artifact.immutable:
                     lease_cap = database_now + self.CLAIM_LEASE
                     await session.execute(
                         update(TradingPlaybookObsidianExport)
@@ -1459,17 +1484,23 @@ class TradingPlaybookObsidianSyncCoordinator:
                 self.builder.build_review_artifact(review_id, phase=phase),
                 f"review {review_id} {phase}",
             )
-        for trade_date in await self._latest_plan_dates():
+        latest_dates = await self._latest_plan_dates()
+        for trade_date in latest_dates:
             mutable_builders = (
                 ("alerts", self.builder.build_alerts_artifact),
                 ("daily index", self.builder.build_daily_index_artifact),
-                ("dashboard", self.builder.build_dashboard_artifact),
             )
             for label, build in mutable_builders:
                 await build_one(
                     build(trade_date),
                     f"{label} {trade_date.isoformat()}",
                 )
+        if latest_dates:
+            latest_date = max(latest_dates)
+            await build_one(
+                self.builder.build_dashboard_artifact(latest_date),
+                f"dashboard {latest_date.isoformat()}",
+            )
         return tuple(rows)
 
     async def _pause_due(
@@ -1979,32 +2010,61 @@ class TradingPlaybookObsidianSyncCoordinator:
         row_ids: Sequence[int] | None,
         allowed_paths: tuple[str, ...] | None,
         limit: int,
-    ) -> tuple[TradingPlaybookObsidianExport, ...]:
-        async with self.session_factory() as session:
-            statement = (
-                select(TradingPlaybookObsidianExport)
-                .where(TradingPlaybookObsidianExport.status == "written")
-                .order_by(
-                    TradingPlaybookObsidianExport.trade_date,
-                    TradingPlaybookObsidianExport.id,
-                )
-            )
-            if row_ids is not None:
-                normalized_ids = tuple(dict.fromkeys(int(item) for item in row_ids))
-                if not normalized_ids:
-                    return ()
-                statement = statement.where(
-                    TradingPlaybookObsidianExport.id.in_(normalized_ids)
-                )
-            rows = list((await session.execute(statement)).scalars())
-        allowed = set(allowed_paths) if allowed_paths is not None else None
-        selected = [
-            row
-            for row in rows
-            if self._git_needs_retry(row.git_status_json)
-            and (allowed is None or row.target_path in allowed)
-        ]
-        return tuple(selected[:limit])
+    ) -> tuple[_GitIntentRow, ...]:
+        if limit <= 0:
+            return ()
+        export = TradingPlaybookObsidianExport
+        # Read only bounded metadata pages. Python retains the exact legacy
+        # JSON truthiness rules, including duplicate keys and embedded NULs.
+        statement = select(
+            export.id, export.trade_date, export.phase, export.target_path,
+            cast(export.git_status_json, Text).label("git_status_text"),
+        ).where(export.status == "written")
+        if row_ids is not None:
+            normalized_ids = tuple(dict.fromkeys(int(item) for item in row_ids))
+            if not normalized_ids:
+                return ()
+            statement = statement.where(export.id.in_(normalized_ids))
+        if allowed_paths is not None:
+            if not allowed_paths:
+                return ()
+            statement = statement.where(export.target_path.in_(allowed_paths))
+        selected: list[_GitIntentRow] = []
+        cursor = None
+        while len(selected) < limit:
+            async with self.session_factory() as session:
+                if cursor is None:
+                    rows = (await session.execute(
+                        statement.order_by(export.trade_date, export.id).limit(1000)
+                    )).all()
+                else:
+                    day, row_id = cursor
+                    # A tuple/OR range can seek only the date prefix in SQLite.
+                    # Equality on the date lets the composite index seek IDs too.
+                    rows = (await session.execute(
+                        statement.where(export.trade_date == day, export.id > row_id)
+                        .order_by(export.id).limit(1000)
+                    )).all()
+                    if len(rows) < 1000:
+                        rows.extend((await session.execute(
+                            statement.where(export.trade_date > day)
+                            .order_by(export.trade_date, export.id).limit(1000 - len(rows))
+                        )).all())
+            if not rows:
+                break
+            for row in rows:
+                try:
+                    status = json.loads(row.git_status_text) if row.git_status_text is not None else None
+                    retry = self._git_needs_retry(status)
+                except (TypeError, ValueError):
+                    retry = True
+                if retry:
+                    selected.append(_GitIntentRow(row.id, row.trade_date, row.phase, row.target_path))
+                    if len(selected) == limit:
+                        return tuple(selected)
+            cursor = rows[-1].trade_date, rows[-1].id
+            await asyncio.sleep(0)
+        return tuple(selected)
 
     async def _commit_git_intents(
         self,
@@ -2012,7 +2072,7 @@ class TradingPlaybookObsidianSyncCoordinator:
         row_ids: Sequence[int] | None,
         allowed_paths: tuple[str, ...] | None,
         limit: int,
-    ) -> tuple[tuple[TradingPlaybookObsidianExport, ...], dict[str, Any]]:
+    ) -> tuple[tuple[_GitIntentRow, ...], dict[str, Any]]:
         target_lock: _TargetFileLock | None = None
         try:
             target_lock = await self._acquire_named_lock("git:vault")
@@ -2305,7 +2365,7 @@ class TradingPlaybookObsidianSyncCoordinator:
 
     def _result_for_rows(
         self,
-        rows: Sequence[TradingPlaybookObsidianExport],
+        rows: Sequence[TradingPlaybookObsidianExport | _GitIntentRow],
         *,
         written_files: tuple[str, ...] = (),
         skipped_files: tuple[str, ...] = (),
@@ -2329,7 +2389,7 @@ class TradingPlaybookObsidianSyncCoordinator:
 
     def _batch_context(
         self,
-        rows: Sequence[TradingPlaybookObsidianExport],
+        rows: Sequence[TradingPlaybookObsidianExport | _GitIntentRow],
     ) -> tuple[date, str]:
         if not rows:
             return self._aware_now().astimezone(CN_TZ).date(), "reconcile"

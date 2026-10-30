@@ -838,6 +838,11 @@ class TradingPlaybookModelTests(unittest.TestCase):
                     False,
                 ),
                 (
+                    "ix_trading_playbook_obsidian_status_trade_id",
+                    ("status", "trade_date", "id"),
+                    False,
+                ),
+                (
                     "ix_trading_playbook_obsidian_trade_date",
                     ("trade_date", "phase"),
                     False,

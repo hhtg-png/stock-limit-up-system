@@ -3178,7 +3178,6 @@ class TradingPlaybookObsidianSyncTests(unittest.IsolatedAsyncioTestCase):
             [
                 ("alerts", source_latest),
                 ("index", source_latest),
-                ("dashboard", source_latest),
                 ("alerts", target_latest),
                 ("index", target_latest),
                 ("dashboard", target_latest),

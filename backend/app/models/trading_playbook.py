@@ -397,6 +397,12 @@ class TradingPlaybookObsidianExport(Base):
             "next_attempt_at",
         ),
         Index(
+            "ix_trading_playbook_obsidian_status_trade_id",
+            "status",
+            "trade_date",
+            "id",
+        ),
+        Index(
             "ix_trading_playbook_obsidian_trade_date",
             "trade_date",
             "phase",

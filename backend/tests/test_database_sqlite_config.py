@@ -236,6 +236,7 @@ class DatabasePostgresqlCompatTests(unittest.IsolatedAsyncioTestCase):
             connection.callbacks[1],
             database.ensure_postgresql_schema_compat,
         )
+        self.assertIs(connection.callbacks[2], database.ensure_obsidian_reconciliation_index)
 
 
 class FakeConnection:
