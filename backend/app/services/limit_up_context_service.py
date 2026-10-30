@@ -290,11 +290,11 @@ class LimitUpContextService:
                 if not missing:
                     return
                 try:
-                    # A provider can try both sources; the overall enrichment
+                    # A provider can try all three sources; the overall enrichment
                     # deadline still bounds all queued codes together.
                     history = await asyncio.wait_for(
                         self.history_fetcher(code, previous or day, day),
-                        timeout=self.request_timeout * 2 + 0.1,
+                        timeout=self.request_timeout * 3 + 0.1,
                     )
                 except Exception as exc:
                     logger.debug("Opening history unavailable for {}: {}", code, exc)
@@ -418,6 +418,8 @@ class LimitUpContextService:
                             "beg": start.strftime("%Y%m%d"), "end": end.strftime("%Y%m%d"), "lmt": "120"},
                 ), timeout=self.request_timeout)
                 response.raise_for_status()
+                if response.status_code != 200:
+                    raise ValueError(f"Unexpected opening history status {response.status_code}")
                 data = response.json().get("data") or {}
                 if data.get("code", code) == code:
                     for line in data.get("klines") or []:
@@ -434,33 +436,41 @@ class LimitUpContextService:
                 logger.debug("Unadjusted opening history unavailable for {}: {}", code, exc)
         if start in history and end in history:
             return history
-        try:
-            symbol = ("sh" if code.startswith("6") else "bj" if code.startswith(("4", "8", "92")) else "sz") + code
-            response = await asyncio.wait_for(client.get(
-                "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/fqkline/get",
-                params={"param": f"{symbol},day,{(start - timedelta(days=45)).isoformat()},{end.isoformat()},160,qfq"},
-                headers={"Referer": "https://gu.qq.com/"},
-            ), timeout=self.request_timeout)
-            response.raise_for_status()
-            data = (response.json().get("data") or {}).get(symbol) or {}
-            # Pair only prices from this single qfq series. Raw ``day`` rows
-            # would compare across corporate actions in incompatible bases.
-            previous_close = None
-            for row in sorted(data.get("qfqday") or [], key=lambda item: str(item[0])):
-                try:
-                    day = date.fromisoformat(row[0])
-                    opened, closed = self._number(row[1]), self._number(row[2])
-                except (ValueError, TypeError, IndexError):
-                    previous_close = None
-                    continue
-                if closed is None or closed <= 0:
-                    previous_close = None
-                    continue
-                if start <= day <= end and self._opening_pct(opened, previous_close) is not None:
-                    history.setdefault(day, {"open": opened, "pre_close": previous_close})
-                previous_close = closed
-        except Exception as exc:
-            logger.debug("Adjusted opening history unavailable for {}: {}", code, exc)
+        symbol = ("sh" if code.startswith("6") else "bj" if code.startswith(("4", "8", "92")) else "sz") + code
+        for endpoint in (
+            "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
+            "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/fqkline/get",
+        ):
+            try:
+                response = await asyncio.wait_for(client.get(
+                    endpoint,
+                    params={"param": f"{symbol},day,{(start - timedelta(days=45)).isoformat()},{end.isoformat()},160,qfq"},
+                    headers={"Referer": "https://gu.qq.com/"},
+                ), timeout=self.request_timeout)
+                response.raise_for_status()
+                if response.status_code != 200:
+                    raise ValueError(f"Unexpected opening history status {response.status_code}")
+                data = (response.json().get("data") or {}).get(symbol) or {}
+                # Pair only prices from this single qfq series. Raw ``day`` rows
+                # would compare across corporate actions in incompatible bases.
+                previous_close = None
+                for row in sorted(data.get("qfqday") or [], key=lambda item: str(item[0])):
+                    try:
+                        day = date.fromisoformat(row[0])
+                        opened, closed = self._number(row[1]), self._number(row[2])
+                    except (ValueError, TypeError, IndexError):
+                        previous_close = None
+                        continue
+                    if closed is None or closed <= 0:
+                        previous_close = None
+                        continue
+                    if start <= day <= end and self._opening_pct(opened, previous_close) is not None:
+                        history.setdefault(day, {"open": opened, "pre_close": previous_close})
+                    previous_close = closed
+            except Exception as exc:
+                logger.debug("Adjusted opening history unavailable from {} for {}: {}", endpoint, code, exc)
+            if start in history and end in history:
+                break
         return history
 
 

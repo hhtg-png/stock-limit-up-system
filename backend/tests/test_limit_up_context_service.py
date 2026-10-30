@@ -406,6 +406,70 @@ class LimitUpContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result[0]["yesterday_open_change_pct"], 0)
         self.assertEqual(result[0]["today_open_change_pct"], 5)
 
+    async def test_tencent_web_history_supplies_prices_when_public_proxy_returns_waf_501(self):
+        hosts = []
+
+        async def respond(request):
+            hosts.append(request.url.host)
+            if "eastmoney" in request.url.host:
+                raise httpx.RemoteProtocolError("Server disconnected without sending a response", request=request)
+            if request.url.host == "proxy.finance.qq.com":
+                return httpx.Response(501, text="<script>window.location.href='https://waf.tencent.com/'</script>")
+            self.assertEqual(request.url.host, "web.ifzq.gtimg.cn")
+            self.assertEqual(request.url.path, "/appstock/app/fqkline/get")
+            self.assertEqual(request.url.params["param"], "sz000001,day,2026-08-25,2026-10-12,160,qfq")
+            return httpx.Response(200, json={"code": 0, "data": {"sz000001": {"qfqday": [
+                ["2026-10-08", "10", "10"], ["2026-10-09", "10", "10"], ["2026-10-12", "10.5", "11"],
+            ]}}})
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+        self.addAsyncCleanup(client.aclose)
+        result = await self.service(history_fetcher=None, http_client=client).enrich(DAY, [{"stock_code": "000001"}])
+        self.assertEqual(result[0]["yesterday_open_change_pct"], 0)
+        self.assertEqual(result[0]["today_open_change_pct"], 5)
+        self.assertEqual(hosts, ["push2his.eastmoney.com", "web.ifzq.gtimg.cn"])
+
+    async def test_empty_or_malformed_tencent_web_responses_continue_to_public_proxy(self):
+        cases = [
+            {"json": {"data": None}},
+            {"json": {"data": {"sz000001": {"qfqday": []}}}},
+            {"json": {"data": {"sz000001": {"qfqday": [None]}}}},
+            {"text": "not JSON"},
+        ]
+        for payload in cases:
+            with self.subTest(payload=payload):
+                hosts = []
+
+                async def respond(request):
+                    hosts.append(request.url.host)
+                    if "eastmoney" in request.url.host:
+                        return httpx.Response(200, json={"data": None})
+                    if request.url.host == "web.ifzq.gtimg.cn":
+                        return httpx.Response(200, **payload)
+                    return httpx.Response(200, json={"data": {"sz000001": {"qfqday": [
+                        ["2026-10-08", "10", "10"], ["2026-10-09", "10", "10"], ["2026-10-12", "10.5", "11"],
+                    ]}}})
+
+                async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+                    result = await self.service(history_fetcher=None, http_client=client).enrich(DAY, [{"stock_code": "000001"}])
+                self.assertEqual(result[0]["today_open_change_pct"], 5)
+                self.assertEqual(hosts, ["push2his.eastmoney.com", "web.ifzq.gtimg.cn", "proxy.finance.qq.com"])
+
+    async def test_three_source_budget_finishes_fallback_without_extending_live_total_budget(self):
+        async def history(*args):
+            await asyncio.sleep(0.56)
+            return {PREVIOUS: {"open": 10, "pre_close": 10}, DAY: {"open": 10.5, "pre_close": 10}}
+
+        service = self.service(history_fetcher=history, request_timeout=0.2, budget_seconds=0.8)
+        result = await service.enrich(DAY, [{"stock_code": "000001"}])
+        self.assertEqual(result[0]["today_open_change_pct"], 5)
+        started = time.monotonic()
+        bounded = self.service(history_fetcher=history, request_timeout=0.2, budget_seconds=0.04)
+        result = await bounded.enrich(DAY, [{"stock_code": "000001"}])
+        self.assertIsNone(result[0]["today_open_change_pct"])
+        self.assertLess(time.monotonic() - started, 0.2)
+        self.assertEqual(self.service(budget_seconds=20).budget_seconds, 7.5)
+
     async def test_tencent_raw_candles_are_not_mixed_across_ex_right_days(self):
         async def respond(request):
             if "eastmoney" in request.url.host:

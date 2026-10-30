@@ -59,8 +59,14 @@
 ### Task 5: Release
 
 - [x] 独立审查、完整后端套件与前端构建通过。
-- [ ] 提交、推送 main、部署并核对线上 HEAD 与资源。
-- [ ] 预生成近期历史，实测历史接口冷查询/重启复用、盘中刷新、退役入口与调度状态。
+- [x] 提交、推送 main、部署并核对线上 HEAD 与资源。
+- [x] 预生成近期历史，实测历史接口冷查询/重启复用、盘中刷新、退役入口与调度状态。
+
+### Task 6: Repair historical opening-price failover
+
+- [x] 实测旧腾讯 proxy 返回 501/WAF，同参数 web 地址返回有效 qfqday；确认旧数据库开盘价为空，不能据此推算。
+- [x] 先红后绿覆盖 EM 断开、web 正常、proxy 501；保留反向兜底、除权同序列与 raw day 拒绝用例。
+- [x] 增加 web → proxy 自动兜底，三源单股等待预算保持在整体实时 7.5 秒上限内。
 
 ## Final pre-release verification
 
@@ -81,3 +87,7 @@
 - Fresh unchanged frontend build: exit 0, 6.17 seconds, same entry asset and index SHA256 above.
 - Production cross-process reuse (9303133, separate venv PID, SQLite query-only): real-calendar 30-session report query returned 30 ready points in 0.8417 s with history/fallback/quote/suspension provider calls all zero; monitor 2026-10-23 returned 94 ready rows in 0.0111 s with enrichment calls zero and no database write attempts. Shanghai 600838 previous session remains 2026-10-22, yesterday final seal 10:52:37.
 - Final frozen-source backend discovery: 1213 tests, 334.201 seconds, exit 0, `OK (skipped=2)`, including the stricter calendar outage recovery and latest partial fallback cases.
+- Release 2ff0697: GitHub main/remote HEAD and public index hash matched; managed backend active with no restarts, 52 current realtime items, TTS audio and WebSocket snapshot/delta verified. Corrected derived holiday caches have recoverable row backups; raw source counts unchanged, derived non-trading dates zero. Statistics 159 dates; monitor/report 30 dates each. Public historical monitor/report probes: 0.063/0.062 s.
+- Completeness audit found monitor 30-day rows 2296, missing yesterday/today opening percentages 1755/1733 (5 ready dates, 25 partial). Main cause: EM disconnect plus sole Tencent proxy returning 501/WAF. Same-parameter Tencent web queries returned valid adjusted series. Provider repair context suite: 28 tests, 1.859 s, exit 0; source/valuation algorithms unchanged.
+- A follow-up 1216-test run passed business assertions but failed Windows teardown for the 20 ms monitor timeout case: an initial NullPool/aiosqlite connection could still hold the temporary file. The test fixture now retains shielded session-close task ownership, waits for cleanup, and uses a real disk SQLite queue pool with 3 prewarmed connections for that case. The timeout/build/persistence assertions remain intact; the affected case and deterministic close-cancellation regression passed 5 consecutive rounds (10 checks). Production connection handling is unchanged.
+- Final acceptance with provider failover and fixture cleanup: `python -m unittest discover tests -v`, 1217 tests, 335.696 s, exit 0, `OK (skipped=2)`. Fresh frontend build: 6.18 s, exit 0, unchanged entry asset/hash; existing chunk-size warning only. Independent source/budget review and fixture review passed.

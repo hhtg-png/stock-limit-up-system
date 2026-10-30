@@ -2,12 +2,14 @@ import asyncio
 import importlib.util
 import tempfile
 import unittest
+from contextlib import AsyncExitStack
 from datetime import date, datetime, time
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from sqlalchemy import select, update
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import AsyncAdaptedQueuePool
 
 from app.database import Base
 from app.models.limit_up import LimitUpRecord
@@ -30,11 +32,26 @@ class LimitUpMonitorArchiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(LimitUpMonitorArchiveService, "durable monitor archives are missing")
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
-        self.engine = create_async_engine("sqlite+aiosqlite:///" + str(Path(self.directory.name) / "test.db"))
+        self.engine = create_async_engine("sqlite+aiosqlite:///" + str(Path(self.directory.name) / "test.db"),
+                                          poolclass=AsyncAdaptedQueuePool)
         self.addAsyncCleanup(self.engine.dispose)
         async with self.engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
-        self.sessions = async_sessionmaker(self.engine, expire_on_commit=False)
+        self._session_close_tasks = set()
+
+        class TrackedSession(AsyncSession):
+            async def __aexit__(session, *exc):
+                # Match SQLAlchemy's shielded close, retaining ownership when
+                # a timed-out request leaves its close task running.
+                task = asyncio.create_task(session.close())
+                self._session_close_tasks.add(task)
+                try:
+                    await asyncio.shield(task)
+                finally:
+                    if task.done():
+                        self._session_close_tasks.discard(task)
+
+        self.sessions = async_sessionmaker(self.engine, class_=TrackedSession, expire_on_commit=False)
         self.now = datetime(2026, 10, 26, 10)
         self.auctions = OpeningAuctionArchiveService(root_dir=Path(self.directory.name) / "auctions")
         await self.auctions.save_percentages(PREVIOUS, {"000001": 0, "000002": -2})
@@ -64,6 +81,10 @@ class LimitUpMonitorArchiveTests(unittest.IsolatedAsyncioTestCase):
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        while self._session_close_tasks:
+            closing = tuple(self._session_close_tasks)
+            await asyncio.gather(*closing)
+            self._session_close_tasks.difference_update(closing)
 
     def new_context(self):
         return LimitUpContextService(calendar_loader=lambda *args: [PREVIOUS, DAY, NEXT], session_factory=self.sessions,
@@ -321,6 +342,11 @@ class LimitUpMonitorArchiveTests(unittest.IsolatedAsyncioTestCase):
     async def test_slow_first_build_continues_in_background_after_bounded_api_wait(self):
         from app.api.v1 import limit_up
         from app.services.limit_up_context_service import limit_up_context_service
+        # The 20ms deadline exercises provider waiting, after SQLite's worker
+        # connections are established, rather than cancelling an OS connect.
+        async with AsyncExitStack() as stack:
+            for _ in range(3):
+                await stack.enter_async_context(self.engine.connect())
         entered, release = asyncio.Event(), asyncio.Event()
         original = self.context.enrich_for_archive
 
@@ -342,6 +368,36 @@ class LimitUpMonitorArchiveTests(unittest.IsolatedAsyncioTestCase):
             release.set()
             self.assertEqual((await self.service.ensure_for_date(DAY)).status, "ready")
             enrich.assert_awaited_once()
+
+    async def test_fixture_cleanup_waits_for_shielded_close_from_cancelled_session_scope(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        closing_tasks = []
+        original_close = AsyncSession.close
+
+        async def held_close(session):
+            closing_tasks.append(asyncio.current_task())
+            entered.set()
+            await release.wait()
+            await original_close(session)
+
+        async def scope():
+            async with self.sessions() as db:
+                await db.execute(select(1))
+
+        with patch.object(AsyncSession, "close", held_close):
+            user = asyncio.create_task(scope())
+            await asyncio.wait_for(entered.wait(), 1)
+            user.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await user
+            cleanup = asyncio.create_task(self.stop_builds())
+            try:
+                with self.assertRaises(asyncio.TimeoutError):
+                    await asyncio.wait_for(asyncio.shield(cleanup), timeout=0.02)
+            finally:
+                release.set()
+                await asyncio.gather(*closing_tasks)
+                await cleanup
 
     async def test_archive_batches_finish_all_openings_beyond_live_budget_with_bounded_concurrency(self):
         running, maximum = 0, 0
