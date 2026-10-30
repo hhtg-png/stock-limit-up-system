@@ -158,6 +158,94 @@ class LimitUpMonitorArchiveTests(unittest.IsolatedAsyncioTestCase):
             await fresh.ensure_for_date(DAY)
             enrich.assert_awaited_once()
 
+    async def test_valid_partial_api_returns_before_slow_refresh_and_background_finishes(self):
+        from app.api.v1 import limit_up
+        (self.auctions.root_dir / f"{DAY}.json").unlink()
+        stored = await self.service.ensure_for_date(DAY)
+        self.assertEqual(stored.status, "partial")
+        self.now = datetime(2026, 10, 26, 10, 1)
+        fresh_context = self.new_context()
+        self.service = self.new_service(fresh_context)
+        self.history.return_value = {DAY: {"open": 11, "pre_close": 10}}
+        entered, release = asyncio.Event(), asyncio.Event()
+        original = fresh_context.enrich_for_archive
+
+        async def slow(*args, **kwargs):
+            entered.set()
+            await release.wait()
+            return await original(*args, **kwargs)
+
+        with patch.object(limit_up, "limit_up_monitor_archive_service", self.service), \
+             patch.object(limit_up, "_MONITOR_ARCHIVE_WAIT_SECONDS", 1), \
+             patch.object(fresh_context, "enrich_for_archive", AsyncMock(side_effect=slow)) as enrich:
+            try:
+                async with self.sessions() as db:
+                    response = await asyncio.wait_for(limit_up._get_database_limit_up_response(
+                        db, DAY, None, None, None, "seal_amount", "desc"), timeout=0.4)
+                self.assertEqual([row.stock_code for row in response.data], ["000002", "000001"])
+                self.assertIsNone(response.data[0].today_open_change_pct)
+                await asyncio.wait_for(entered.wait(), 1)
+                self.assertIn(DAY, self.service._tasks)
+            except asyncio.TimeoutError:
+                self.fail("A valid partial snapshot must return without waiting for its slow provider refresh")
+            finally:
+                release.set()
+                completed = await self.service.ensure_for_date(DAY)
+            self.assertEqual(completed.status, "ready")
+            self.assertEqual(completed.payload_json["data"][0]["today_open_change_pct"], 10)
+            enrich.assert_awaited_once()
+
+    async def test_changed_source_does_not_return_obsolete_partial_while_rebuilding(self):
+        from app.api.v1 import limit_up
+        (self.auctions.root_dir / f"{DAY}.json").unlink()
+        await self.service.ensure_for_date(DAY)
+        async with self.sessions() as db:
+            await db.execute(update(LimitUpRecord).where(LimitUpRecord.trade_date == DAY).values(
+                seal_amount=999, updated_at=datetime(2026, 10, 26, 11)))
+            await db.commit()
+        self.now = datetime(2026, 10, 26, 10, 1)
+        fresh_context = self.new_context()
+        self.service = self.new_service(fresh_context)
+        self.history.return_value = {DAY: {"open": 11, "pre_close": 10}}
+        entered, release = asyncio.Event(), asyncio.Event()
+        original = fresh_context.enrich_for_archive
+
+        async def slow(*args, **kwargs):
+            entered.set()
+            await release.wait()
+            return await original(*args, **kwargs)
+
+        with patch.object(limit_up, "limit_up_monitor_archive_service", self.service), \
+             patch.object(fresh_context, "enrich_for_archive", AsyncMock(side_effect=slow)):
+            request = asyncio.create_task(limit_up._get_closed_monitor_archive(DAY))
+            try:
+                await asyncio.wait_for(entered.wait(), 1)
+                self.assertFalse(request.done(), "A changed source must not serve the old partial snapshot")
+            finally:
+                release.set()
+            archive = await request
+        self.assertEqual(archive.status, "ready")
+        self.assertEqual(archive.payload_json["data"][0]["seal_amount"], 999)
+
+    async def test_changed_source_and_provider_failure_fall_back_to_latest_database_rows(self):
+        from app.api.v1 import limit_up
+        from app.services.limit_up_context_service import limit_up_context_service
+        (self.auctions.root_dir / f"{DAY}.json").unlink()
+        stored = await self.service.ensure_for_date(DAY)
+        self.assertEqual(stored.status, "partial")
+        self.assertEqual(stored.payload_json["data"][0]["seal_amount"], 100)
+        async with self.sessions() as db:
+            await db.execute(update(LimitUpRecord).where(LimitUpRecord.trade_date == DAY).values(
+                seal_amount=999, updated_at=datetime(2026, 10, 26, 11)))
+            await db.commit()
+        with patch.object(self.context, "enrich_for_archive", AsyncMock(side_effect=RuntimeError("provider down"))), \
+             patch.object(limit_up, "limit_up_monitor_archive_service", self.service), \
+             patch.object(limit_up_context_service, "enrich", AsyncMock(side_effect=lambda day, rows: rows)):
+            self.assertIsNone(await self.service.get_for_display(DAY))
+            async with self.sessions() as db:
+                response = await limit_up._get_database_limit_up_response(db, DAY, None, None, None, "time", None)
+        self.assertTrue(all(row.seal_amount == 999 for row in response.data))
+
     async def test_both_session_and_previous_session_repairs_invalidate_cached_rows(self):
         original = await self.service.ensure_for_date(DAY)
         async with self.sessions() as db:

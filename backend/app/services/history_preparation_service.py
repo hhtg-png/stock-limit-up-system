@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import date, time
+from datetime import date, time, timedelta
 
 from loguru import logger
 from sqlalchemy import case, func, select, union
@@ -17,11 +17,16 @@ from app.utils.time_utils import CN_TZ, now_cn
 
 class HistoryPreparationService:
     def __init__(self, *, session_factory=async_session_maker, clock=now_cn,
-                 monitor_service=None, report_service=None):
+                 monitor_service=None, report_service=None, calendar_loader=None):
         self.session_factory = session_factory
         self.clock = clock
         self.monitor_service = monitor_service
         self.report_service = report_service
+        self.calendar_loader = calendar_loader
+        self._calendar_lock = asyncio.Lock()
+        self._calendar_day: date | None = None
+        self._calendar_dates: set[date] = set()
+        self._calendar_retry_at = None
         self._batch_lock = asyncio.Lock()
         self._last_attempt: dict[date, int] = {}
         self._attempt_sequence = 0
@@ -34,8 +39,41 @@ class HistoryPreparationService:
         now = self._now()
         return day < now.date() or day == now.date() and now.time().replace(tzinfo=None) >= time(15, 5)
 
+    async def _trading_dates(self) -> set[date]:
+        now = self._now()
+        today = now.date()
+        if self._calendar_day == today and (self._calendar_retry_at is None or now < self._calendar_retry_at):
+            return self._calendar_dates
+        async with self._calendar_lock:
+            if self._calendar_day == today and (self._calendar_retry_at is None or now < self._calendar_retry_at):
+                return self._calendar_dates
+
+            def load():
+                if self.calendar_loader is not None:
+                    return self.calendar_loader()
+                from app.data_collectors.scheduler import _get_cn_trading_dates
+                return _get_cn_trading_dates(date(1990, 1, 1), today)
+
+            try:
+                dates = set(await asyncio.wait_for(asyncio.to_thread(load), timeout=5))
+                if not dates:
+                    raise ValueError("Empty trading calendar")
+                self._calendar_dates = dates
+                self._calendar_retry_at = None
+            except Exception as exc:
+                # Legacy raw records and final review facts both contain some
+                # holiday rows. Skip generation until the calendar is verified.
+                self._calendar_dates = set()
+                self._calendar_retry_at = now + timedelta(minutes=5)
+                logger.warning("History preparation calendar unavailable; retrying in 5 minutes: {}", exc)
+            self._calendar_day = today
+            return self._calendar_dates
+
+    async def _is_trading_day(self, day: date) -> bool:
+        return day in await self._trading_dates()
+
     async def refresh_statistics(self, trade_date: date) -> bool:
-        if not self._closed(trade_date):
+        if not self._closed(trade_date) or not await self._is_trading_day(trade_date):
             return False
         record = LimitUpRecord
         async with self.session_factory() as db:
@@ -88,10 +126,12 @@ class HistoryPreparationService:
                 select(LimitUpRecord.trade_date),
                 select(MarketReviewDailyMetric.trade_date).where(MarketReviewDailyMetric.calc_version >= 1),
             )))
-        return sorted((day for day in dates if self._closed(day)), reverse=True)
+        trading_dates = await self._trading_dates()
+        return sorted((day for day in dates if day in trading_dates and self._closed(day)), reverse=True)
 
     async def prepare_for_date(self, trade_date: date, *, force=False) -> dict:
-        result = {"trade_date": trade_date.isoformat(), "skipped": not self._closed(trade_date),
+        result = {"trade_date": trade_date.isoformat(),
+                  "skipped": not self._closed(trade_date) or not await self._is_trading_day(trade_date),
                   "statistics_ready": False, "monitor_ready": False, "report_ready": False}
         if result["skipped"]:
             return result

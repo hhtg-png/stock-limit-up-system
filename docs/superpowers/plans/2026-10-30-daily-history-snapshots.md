@@ -58,7 +58,7 @@
 
 ### Task 5: Release
 
-- [ ] 独立审查、完整后端套件与前端构建通过。
+- [x] 独立审查、完整后端套件与前端构建通过。
 - [ ] 提交、推送 main、部署并核对线上 HEAD 与资源。
 - [ ] 预生成近期历史，实测历史接口冷查询/重启复用、盘中刷新、退役入口与调度状态。
 
@@ -70,3 +70,14 @@
 - Independent reviews found and verified fixes for archive retry starvation, stale ready rows, final quote timestamps and D/D-1 source revisions.
 - Retired scheduler/claim setup tests now retain database persistence/replay/lease assertions while rejecting any legacy export call. Targeted suites and final full discovery pass.
 - Production baseline: monitor historical cold 3.97–4.28 s; cached broken-board 30-session request 0.609 s. Initial DailyStatistics rows: 0; existing source dates: limit-up 169, review 136.
+
+## Production follow-up verification
+
+- First release `9303133` deployed successfully; automatic exports disabled, old export outbox MAX(id) unchanged at 187698.
+- Valid partial monitor archives now return immediately while a shared background task retries missing facts. Schema/source changes invalidate partial display, including provider failures after a source repair (100 → 999 regression).
+- Preparation uses the China A-share trading calendar off-thread, bounded to 5 seconds and cached per China calendar day. The production audit also found one final review on a public holiday, so final facts cannot establish trading-day validity. Calendar failures skip new generation and retry after 5 minutes; persisted historical reads remain available. The failure/recovery regression includes a legacy partial final review on a holiday.
+- Read-only production calendar audit found 9 invalid derived statistics rows and 6 invalid monitor cache rows; raw facts and old notes are retained. Correcting those derived caches requires an exact-date assertion and a recoverable row backup.
+- Full follow-up discovery: 1212 tests, 335.940 seconds, exit 0, `OK (skipped=2)`. Latest archive regression (including the subsequently added provider-failure case): 16 tests, 13.172 seconds, exit 0. History preparation: 10 tests, exit 0. Independent review resolved the stale partial failure and found no remaining blocking issue.
+- Fresh unchanged frontend build: exit 0, 6.17 seconds, same entry asset and index SHA256 above.
+- Production cross-process reuse (9303133, separate venv PID, SQLite query-only): real-calendar 30-session report query returned 30 ready points in 0.8417 s with history/fallback/quote/suspension provider calls all zero; monitor 2026-10-23 returned 94 ready rows in 0.0111 s with enrichment calls zero and no database write attempts. Shanghai 600838 previous session remains 2026-10-22, yesterday final seal 10:52:37.
+- Final frozen-source backend discovery: 1213 tests, 334.201 seconds, exit 0, `OK (skipped=2)`, including the stricter calendar outage recovery and latest partial fallback cases.

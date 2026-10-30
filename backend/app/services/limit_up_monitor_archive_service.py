@@ -63,6 +63,32 @@ class LimitUpMonitorArchiveService:
         """
         if not self.is_closed_session(trade_date):
             return None
+        return await asyncio.shield(self._start_build(trade_date, force=force))
+
+    async def get_for_display(self, trade_date: date) -> LimitUpMonitorArchive | None:
+        """Show valid partial rows immediately while their shared retry runs."""
+        if not self.is_closed_session(trade_date):
+            return None
+        task = self._start_build(trade_date)
+        async with self.session_factory() as db:
+            archive = await self._get_archive(db, trade_date)
+            if archive is not None and archive.status == "partial" and archive.schema_version == self.SCHEMA_VERSION:
+                if trade_date == self.now_provider().date() and not await self._has_final_review(db, trade_date):
+                    return None
+                signature = await self._source_signature(db, trade_date, archive.previous_trade_date)
+                if archive.source_signature == signature:
+                    return archive
+        archive = await asyncio.shield(task)
+        if archive is not None and archive.status == "partial":
+            if archive.schema_version != self.SCHEMA_VERSION:
+                return None
+            async with self.session_factory() as db:
+                signature = await self._source_signature(db, trade_date, archive.previous_trade_date)
+            if archive.source_signature != signature:
+                return None
+        return archive
+
+    def _start_build(self, trade_date: date, *, force: bool = False):
         task = self._tasks.get(trade_date)
         if task is None:
             task = asyncio.create_task(self._ensure_for_date(trade_date, force=force))
@@ -71,9 +97,11 @@ class LimitUpMonitorArchiveService:
             def finished(done):
                 if self._tasks.get(trade_date) is done:
                     self._tasks.pop(trade_date, None)
+                if not done.cancelled():
+                    done.exception()
 
             task.add_done_callback(finished)
-        return await asyncio.shield(task)
+        return task
 
     async def _ensure_for_date(self, day: date, *, force: bool):
         existing = None

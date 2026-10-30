@@ -33,7 +33,7 @@ _MONITOR_ARCHIVE_WAIT_SECONDS = 8.0
 async def _get_closed_monitor_archive(trade_date: date):
     try:
         return await asyncio.wait_for(
-            limit_up_monitor_archive_service.ensure_for_date(trade_date),
+            limit_up_monitor_archive_service.get_for_display(trade_date),
             timeout=_MONITOR_ARCHIVE_WAIT_SECONDS,
         )
     except asyncio.TimeoutError:

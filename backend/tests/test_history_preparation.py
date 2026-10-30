@@ -1,7 +1,7 @@
 import unittest
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -22,8 +22,12 @@ class HistoryPreparationTests(unittest.IsolatedAsyncioTestCase):
         self.clock = lambda: datetime(2026, 10, 30, 10, 30, tzinfo=CN_TZ)
         self.monitor = SimpleNamespace(ensure_for_date=AsyncMock(return_value=SimpleNamespace(status="ready")))
         self.report = SimpleNamespace(build_after_close=AsyncMock(return_value={"data_status": "ready"}))
+        self.calendar = [date(2026,9,1) + timedelta(days=n) for n in range(60)
+                         if (date(2026,9,1) + timedelta(days=n)).weekday() < 5
+                         and not date(2026,10,1) <= date(2026,9,1) + timedelta(days=n) <= date(2026,10,8)]
         self.service = HistoryPreparationService(session_factory=self.sessions, clock=self.clock,
-            monitor_service=self.monitor, report_service=self.report)
+            monitor_service=self.monitor, report_service=self.report,
+            calendar_loader=lambda: self.calendar)
 
     async def seed(self, day, boards=(1, 2, 3, 4), opens=(0, 1, 0, 2)):
         async with self.sessions() as db:
@@ -128,7 +132,7 @@ class HistoryPreparationTests(unittest.IsolatedAsyncioTestCase):
         from datetime import timedelta
         now = [self.clock()]
         self.service.clock = lambda: now[0]
-        days = [date(2026, 10, number) for number in range(20,30)]
+        days = [date(2026, 10, number) for number in (16,19,20,21,22,23,26,27,28,29)]
         for day in days:
             await self.seed(day)
         self.monitor.ensure_for_date.return_value = SimpleNamespace(status="partial")
@@ -153,6 +157,34 @@ class HistoryPreparationTests(unittest.IsolatedAsyncioTestCase):
                     stock_code=stock.stock_code, stock_name=stock.stock_name, today_touched_limit_up=True))
             await db.commit()
         self.assertTrue(await self.service.refresh_statistics(day))
+
+    async def test_legacy_holiday_rows_are_never_generated_as_trading_sessions(self):
+        for day in (date(2026,9,30), date(2026,10,1), date(2026,10,9)):
+            await self.seed(day)
+        self.assertEqual(await self.service.available_dates(), [date(2026,10,9), date(2026,9,30)])
+        self.assertFalse(await self.service.refresh_statistics(date(2026,10,1)))
+        self.assertTrue((await self.service.prepare_for_date(date(2026,10,1)))["skipped"])
+
+    async def test_calendar_outage_skips_legacy_final_holiday_facts_then_recovers_after_five_minutes(self):
+        from app.models import MarketReviewDailyMetric
+        loader = Mock(side_effect=[RuntimeError("calendar offline"), self.calendar])
+        self.service.calendar_loader = loader
+        now = [self.clock()]
+        self.service.clock = lambda: now[0]
+        for day in (date(2026,10,1), date(2026,10,28), date(2026,10,29)):
+            await self.seed(day)
+        async with self.sessions() as db:
+            for day in (date(2026,10,1), date(2026,10,28)):
+                db.add(MarketReviewDailyMetric(trade_date=day, calc_version=1, source_status="partial"))
+            await db.commit()
+        self.assertEqual(await self.service.available_dates(), [])
+        self.assertFalse(await self.service.refresh_statistics(date(2026,10,1)))
+        self.assertTrue((await self.service.prepare_for_date(date(2026,10,28)))["skipped"])
+        loader.assert_called_once()
+        now[0] += timedelta(minutes=6)
+        self.assertEqual(await self.service.available_dates(), [date(2026,10,29), date(2026,10,28)])
+        self.assertTrue(await self.service.refresh_statistics(date(2026,10,29)))
+        self.assertEqual(loader.call_count, 2)
 
 
 if __name__ == "__main__":
