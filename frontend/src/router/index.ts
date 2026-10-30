@@ -119,6 +119,12 @@ const router = createRouter({
     },
 
     {
+      path: '/dynamic-groups',
+      name: 'DynamicGroups',
+      component: () => import('@/views/DynamicGroups.vue'),
+      meta: { title: '动态板块' }
+    },
+    {
       path: '/settings',
       name: 'Settings',
       component: () => import('@/views/Settings.vue'),

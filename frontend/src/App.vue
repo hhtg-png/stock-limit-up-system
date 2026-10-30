@@ -37,6 +37,10 @@
               <el-icon><Grid /></el-icon>
               <span>涨停分类</span>
             </el-menu-item>
+            <el-menu-item index="/dynamic-groups">
+              <el-icon><Collection /></el-icon>
+              <span>动态板块</span>
+            </el-menu-item>
             <el-menu-item index="/jiege-mode">
               <el-icon><TrendCharts /></el-icon>
               <span>交易模式</span>
@@ -122,7 +126,7 @@
 
       <nav class="mobile-bottom-nav" aria-label="移动端主导航">
         <router-link
-          v-for="item in mobileNavItems"
+          v-for="item in visibleMobileNavItems"
           :key="item.path"
           :to="item.path"
           class="mobile-nav-item"
@@ -133,7 +137,11 @@
           </el-icon>
           <span>{{ item.label }}</span>
         </router-link>
+        <button type="button" class="mobile-nav-item mobile-more-button" :class="{ active: moreMenuActive }" :aria-expanded="showMobileMore" @click="showMobileMore = true"><el-icon><MoreFilled /></el-icon><span>更多</span></button>
       </nav>
+      <el-drawer v-model="showMobileMore" title="全部功能" direction="btt" size="auto" class="mobile-more-drawer">
+        <div class="mobile-more-grid"><router-link v-for="item in mobileNavItems" :key="item.path" :to="item.path" :class="{ active: isMobileNavActive(item.path) }" @click="showMobileMore = false"><el-icon><component :is="item.icon" /></el-icon><span>{{ item.label }}</span></router-link></div>
+      </el-drawer>
     </div>
   </el-config-provider>
 </template>
@@ -143,7 +151,7 @@ import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   DataBoard, PieChart, Setting,
-  Fold, Expand, Bell, TrendCharts, Calendar, Document, Grid
+  Fold, Expand, Bell, TrendCharts, Calendar, Document, Grid, Collection, MoreFilled
 } from '@element-plus/icons-vue'
 import zhCn from 'element-plus/dist/locale/zh-cn.mjs'
 import AlertPanel from '@/components/alert/AlertPanel.vue'
@@ -163,6 +171,7 @@ const { unlockSpeech, speechUnlocked } = useSpeech()
 
 const isCollapsed = ref(false)
 const showAlertPanel = ref(false)
+const showMobileMore = ref(false)
 const alertEnabled = ref(true)
 const currentTime = ref(dayjs().format('HH:mm:ss'))
 const mobileNavItems = [
@@ -171,6 +180,7 @@ const mobileNavItems = [
   { path: '/daily-analysis', label: '分析', icon: Calendar },
   { path: '/daily-info', label: '资讯', icon: Document },
   { path: '/limit-up-classification', label: '分类', icon: Grid },
+  { path: '/dynamic-groups', label: '动态板块', icon: Collection },
   { path: '/jiege-mode', label: '交易', icon: TrendCharts },
   { path: '/trading-playbook', label: '预案', icon: Document },
   { path: '/industry-trends', label: '趋势', icon: TrendCharts },
@@ -178,6 +188,8 @@ const mobileNavItems = [
   { path: '/continuous', label: '连板', icon: TrendCharts },
   { path: '/settings', label: '设置', icon: Setting }
 ]
+const visibleMobileNavItems = mobileNavItems.filter(item => ['/', '/limit-up-classification', '/dynamic-groups', '/continuous'].includes(item.path))
+const moreMenuActive = computed(() => !visibleMobileNavItems.some(item => isMobileNavActive(item.path)))
 
 // 当前路由
 const currentRoute = computed(() => route.path)
@@ -409,6 +421,11 @@ onUnmounted(() => {
 .mobile-bottom-nav {
   display: none;
 }
+.mobile-more-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; padding-bottom: env(safe-area-inset-bottom); }
+.mobile-more-grid a { display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 17px 6px; text-decoration: none; color: #64748b; background: #f6f8fc; border-radius: 10px; font-size: 12px; }
+.mobile-more-grid a.active { color: #1677ff; background: #edf5ff; }
+.mobile-more-grid .el-icon { font-size: 21px; }
+.mobile-more-button { font-family: inherit; border: 0; background: transparent; cursor: pointer; }
 
 .mobile-speech-unlock {
   display: none;
@@ -496,8 +513,8 @@ onUnmounted(() => {
 
   .mobile-nav-item {
     display: flex;
-    flex: 0 0 64px;
-    min-width: 64px;
+    flex: 1 1 0;
+    min-width: 0;
     flex-direction: column;
     align-items: center;
     justify-content: center;

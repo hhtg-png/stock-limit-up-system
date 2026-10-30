@@ -143,6 +143,18 @@ async def lifespan(app: FastAPI):
                 shutdown_cancellation = exc
         except Exception as exc:
             logger.error(f"Trading playbook provider cleanup failed: {exc}")
+        # Drain the feature's owned work before shared quotes and DB are closed.
+        from app.services.dynamic_group_service import dynamic_group_service
+        from app.services.dynamic_group_history_service import dynamic_group_history_service
+        from app.services.dynamic_group_source_service import dynamic_group_source_service
+        for resource in (dynamic_group_service, dynamic_group_history_service, dynamic_group_source_service):
+            try:
+                await resource.close()
+            except asyncio.CancelledError as exc:
+                if shutdown_cancellation is None:
+                    shutdown_cancellation = exc
+            except Exception as exc:
+                logger.error(f"Dynamic group cleanup failed: {exc}")
         try:
             await tencent_api.close()
         except asyncio.CancelledError as exc:

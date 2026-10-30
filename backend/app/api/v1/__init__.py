@@ -1,9 +1,10 @@
 # API v1 package
 from fastapi import APIRouter
 
-from app.api.v1 import config, daily_analysis, intelligence, limit_up, market, review, statistics, tdx_plugins, trading_playbook, tts, websocket
+from app.api.v1 import config, daily_analysis, dynamic_groups, intelligence, limit_up, market, review, statistics, tdx_plugins, trading_playbook, tts, websocket
 
 api_router = APIRouter()
+api_router.include_router(dynamic_groups.router, prefix="/dynamic-groups", tags=["动态板块"])
 
 api_router.include_router(limit_up.router, prefix="/limit-up", tags=["涨停"])
 api_router.include_router(statistics.router, prefix="/statistics", tags=["统计"])

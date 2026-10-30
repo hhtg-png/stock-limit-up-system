@@ -1,6 +1,14 @@
 """Models package."""
 
 from .big_order import BigOrder  # noqa: F401
+from .dynamic_group import (  # noqa: F401
+    DynamicGroup, DynamicGroupVersion, DynamicGroupMember, DynamicGroupEvent,
+    DynamicGroupSelection, DynamicGroupSelectionItem, DynamicGroupIntradayPoint, DynamicGroupSampleClaim,
+)
+from .dynamic_group_history import (  # noqa: F401
+    DynamicGroupStockHistoryRevision, DynamicGroupStockHistoryCache,
+    DynamicGroupHistoryJob, DynamicGroupHistoryRevision,
+)
 from .intelligence import (  # noqa: F401
     DailyInfoDigest,
     DailyInfoDigestVersion,
@@ -43,6 +51,10 @@ from .trading_playbook import (  # noqa: F401
 )
 
 __all__ = [
+    "DynamicGroupStockHistoryRevision", "DynamicGroupStockHistoryCache",
+    "DynamicGroupHistoryJob", "DynamicGroupHistoryRevision",
+    "DynamicGroup", "DynamicGroupVersion", "DynamicGroupMember", "DynamicGroupEvent",
+    "DynamicGroupSelection", "DynamicGroupSelectionItem", "DynamicGroupIntradayPoint", "DynamicGroupSampleClaim",
     "BigOrder",
     "CrawlerTask",
     "DailyAnalysisRecord",

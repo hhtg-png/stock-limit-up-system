@@ -372,6 +372,23 @@ class DataScheduler:
         )
 
         self.scheduler.add_job(
+            self._refresh_dynamic_groups, IntervalTrigger(seconds=30, timezone=CN_TZ),
+            id="dynamic_group_sample", name="动态板块规则与盘中采样",
+            max_instances=1, coalesce=True, misfire_grace_time=30,
+        )
+        self.scheduler.add_job(
+            self._refresh_dynamic_group_history, IntervalTrigger(seconds=60, timezone=CN_TZ),
+            id="dynamic_group_history", name="动态板块历史指数与缺口恢复",
+            max_instances=1, coalesce=True, misfire_grace_time=60,
+        )
+        self.scheduler.add_job(
+            self._recover_dynamic_groups,
+            DateTrigger(run_date=datetime.now(CN_TZ) + timedelta(seconds=15), timezone=CN_TZ),
+            id="dynamic_group_startup", name="动态板块启动恢复",
+            max_instances=1, coalesce=True, replace_existing=True, misfire_grace_time=120,
+        )
+
+        self.scheduler.add_job(
             self._run_after_close_catchup,
             DateTrigger(
                 run_date=datetime.now(CN_TZ) + timedelta(seconds=5),
@@ -2054,6 +2071,36 @@ class DataScheduler:
             logger.info("Historical snapshot backfill completed: {}", result)
         except Exception as exc:
             logger.warning("Historical snapshot backfill failed; will retry: {}", exc)
+
+    async def _refresh_dynamic_groups(self):
+        """Sample real sessions without requiring an open browser."""
+        from app.services.dynamic_group_service import dynamic_group_service
+        from app.services.dynamic_group_source_service import dynamic_group_source_service
+        now = self._playbook_now()
+        clock_time = now.time().replace(tzinfo=None)
+        if not (time(9, 25) <= clock_time <= time(11, 30) or time(13) <= clock_time <= time(15, 5)):
+            return
+        try:
+            actual, _ = await dynamic_group_source_service.sessions()
+            if actual == now.date():
+                await dynamic_group_service.tick()
+        except Exception as exc:
+            logger.warning("Dynamic group sampling failed; will retry: {}", exc)
+
+    async def _refresh_dynamic_group_history(self):
+        from app.services.dynamic_group_history_service import dynamic_group_history_service
+        try:
+            await dynamic_group_history_service.tick()
+        except Exception as exc:
+            logger.warning("Dynamic group history recovery failed; will retry: {}", exc)
+
+    async def _recover_dynamic_groups(self):
+        from app.services.dynamic_group_service import dynamic_group_service
+        try:
+            await dynamic_group_service.tick()
+        except Exception as exc:
+            logger.warning("Dynamic group startup sampling failed; will retry: {}", exc)
+        await self._refresh_dynamic_group_history()
 
 
     async def _calculate_daily_analysis(self, trade_date: Optional[date] = None):
