@@ -32,14 +32,23 @@ User explicitly opted out of brainstorming and requested direct implementation, 
 - Real temporary browser screenshot artifacts in visualization workspace: `dynamic-groups-real-history-desktop.png`, `dynamic-groups-real-history-mobile.png`. They show LOCAL verification data, not online deployment.
 - Temporary API server exec session 82308 was stopped (Ctrl-C; exit 1); 8175 has no listener.
 
+## Initial deployment and production verification
+
+- Feature commit `f6a2df50f915b7b5f9e3a71831f5250615da5f4f` was pushed to GitHub main and deployed through the managed deployment wrapper. Remote HEAD matched and systemd was active.
+- Public route, frontend asset/hash, 12 new tables, 23 rule fields, empty directory, real 5223-stock preview and baseline stock/fixed-board APIs passed. Production groups remain empty; capacity fixtures were never inserted.
+- Actual production desktop/mobile UI verified. At 390px, document scrollWidth was 390 with no horizontal overflow; mobile navigation reached the module. Production screenshots saved as `dynamic-groups-online-f6a2df5-desktop.png` and `dynamic-groups-online-f6a2df5-mobile.png` in the visualization workspace. User's original tabs remain untouched.
+- Extra server-side history smoke uses a temporary SQLite database, never production data. It exposed HTTP 501 from Tencent's old `fqkline` endpoint. Response HTML explicitly identified Tencent WAF; browser UA, raw commas and alternate old-endpoint host also failed.
+- A read-only server comparison verified the primary AkShare `newfqkline` endpoint. Injected into the temporary database, it produced ready history with 727 points, base 2023-10-30, latest 2026-10-29, coverage 2/2. It ignores the requested start and has different precision, so the formal fix must filter dates and use one endpoint throughout each acquisition.
+- Formal provider fix now uses that one endpoint for every page, records `tencent_newfqkline`, keeps raw 800-row lengths until pagination finishes, filters the requested start afterward, and rejects end-date violations. Historical coverage/overlap validation and preservation of previous successful revisions remain intact.
+- Fix verification: 20 history tests passed; independent review passed. Candidate code in an isolated server process retrieved 1652 real historical prices across multiple pages (2020-01-02 to 2026-10-29) and built the real 727-point, 2/2-coverage basket. No production database writes.
+- Fresh frontend build after the provider fix passed. Fresh full backend suite passed: 1294 tests in 433.393 seconds, exit 0, OK (skipped=2), log `%TEMP%/dynamic-groups-provider-backend-full.log`. This includes both new provider regressions and the prior public-trend projection.
+
 ## Remaining
 
-1. Full backend exit/results read and confirmed; focused post-projection tests also passed. No open review findings.
-2. Final diff/status checked, only intended source/tests/docs staged; `.tmp` artifacts moved outside git. Commit all intended feature files. Fetched origin/main still b2206db and an ancestor. Push verified current HEAD to GitHub main without force.
-3. Deploy via existing `%TEMP%/monitor-context-requested-date-deploy.py` wrapper from clean isolated root; it requires HEAD==origin/main and fresh verified frontend/dist, copies dist and deploys managed service.
-4. Verify remote HEAD/service, frontend assets/public route `/dynamic-groups`, new table presence, field schema/list/preview API, baseline stock/monitor/TDX endpoints. Don't populate production with capacity test data.
-5. Open fresh background production tab and verify final UI/mobile; save/EMBED fresh production screenshot in final, reset viewport, close temp tab or mark deliverable intentionally.
-6. Final Chinese concise outcome/link, brief features (many groups/mobile, archives, pre-generation historical index), deployed commit/ref and checks. No further permission request.
+1. Fresh full backend run, frontend build and independent provider review have passed.
+2. Commit, push GitHub main and deploy through the same wrapper.
+3. Rerun public probes and the temporary server-side history smoke using `get_series(window_days=0)` so the default 250-point display limit does not invalidate a full-history assertion.
+4. Final browser check/screenshot, reset viewport and close temporary tab. Final Chinese outcome/link, many-group/mobile support, archives, pre-generation historical index and deployment checks. No further permission request.
 
 ## Operational helpers
 

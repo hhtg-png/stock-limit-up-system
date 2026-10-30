@@ -374,3 +374,24 @@ class DynamicGroupHistoryTests(unittest.IsolatedAsyncioTestCase):
         async with self.sessions() as session:
             count = await session.scalar(select(func.count()).select_from(DynamicGroupStockHistoryRevision))
             self.assertEqual(count, 1)
+
+    async def test_verified_newfq_endpoint_filters_ignored_start_and_records_its_source(self):
+        def response(request):
+            close = "10" if request.url.path.endswith("/newfqkline/get") else "99"
+            rows = [["2023-07-11", "5", "5"], ["2026-10-29", close, close]]
+            return httpx.Response(200, json={"code": 0, "data": {"sz000001": {"qfqday": rows}}})
+        async with httpx.AsyncClient(transport=httpx.MockTransport(response)) as client:
+            service = self.service(http_client=client)
+            raw = await service._fetch_history("000001", date(2023, 10, 30), date(2026, 10, 30))
+            self.assertEqual(raw["prices"], {"2026-10-29": "10"})
+            validated = service._validate(raw, date(2023, 10, 30), date(2026, 10, 30))
+            self.assertEqual(validated["source"], "tencent_newfqkline")
+
+    async def test_endpoint_that_ignores_pagination_end_is_rejected(self):
+        def response(request):
+            return httpx.Response(200, json={"code": 0, "data": {"sz000001": {"qfqday": [
+                ["2026-10-29", "10", "10"]]}}})
+        async with httpx.AsyncClient(transport=httpx.MockTransport(response)) as client:
+            service = self.service(http_client=client)
+            with self.assertRaises(ValueError):
+                await service._fetch_history("000001", date(2020, 1, 1), date(2024, 12, 31))

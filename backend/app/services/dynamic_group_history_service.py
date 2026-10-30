@@ -1,4 +1,4 @@
-"""Durable fixed-basket history using whole Tencent qfq series revisions.
+"""Durable fixed-basket history using whole Tencent newfqkline qfq revisions.
 
 Reads never fetch. Bounded workers share per-stock snapshots. Refreshes rebuild
 the entire adjusted series, retaining old revisions and their exact baselines.
@@ -311,7 +311,8 @@ class DynamicGroupHistoryService:
 
     @staticmethod
     def _validate(raw, start, end):
-        if not isinstance(raw, dict) or raw.get("source") != "tencent_fqkline" or raw.get("adjustment") != "qfq":
+        if (not isinstance(raw, dict) or raw.get("source") not in
+                {"tencent_fqkline", "tencent_newfqkline"} or raw.get("adjustment") != "qfq"):
             raise ValueError("Expected one complete Tencent qfq price series; raw fallback forbidden")
         prices = {}
         for day, raw_price in (raw.get("prices") or {}).items():
@@ -324,7 +325,7 @@ class DynamicGroupHistoryService:
             prices[parsed.isoformat()] = price
         if not prices:
             raise ValueError("Adjusted history is empty; retry required")
-        return {"source": "tencent_fqkline", "adjustment": "qfq", "prices": dict(sorted(prices.items()))}
+        return {"source": raw["source"], "adjustment": "qfq", "prices": dict(sorted(prices.items()))}
 
     @staticmethod
     def _compose(codes, revisions, previous, calendar):
@@ -435,7 +436,11 @@ class DynamicGroupHistoryService:
             prices.update(chunk)
         if self._now().time() < time(15, 5):
             prices.pop(self._now().date().isoformat(), None)
-        return {"source": "tencent_fqkline", "adjustment": "qfq", "prices": prices}
+        # newfqkline ignores start and returns up to 800 rows before end. Keep
+        # raw lengths for pagination above, then filter the completed revision.
+        prices = {day: price for day, price in prices.items()
+                  if start.isoformat() <= day <= end.isoformat()}
+        return {"source": "tencent_newfqkline", "adjustment": "qfq", "prices": prices}
 
     async def _fetch_chunk(self, code, start, end):
         if self._client is None:
@@ -444,7 +449,9 @@ class DynamicGroupHistoryService:
         # No old cached prices enter this acquisition.
         # Values above 800 silently make Tencent return only its default 640.
         count = 800
-        response = await self._client.get("https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
+        # Use this one endpoint for every chunk of a revision. The older web
+        # endpoint is WAF-blocked on the server and uses different precision.
+        response = await self._client.get("https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get",
             params={"param": f"{symbol},day,{start.isoformat()},{end.isoformat()},{count},qfq"},
             headers={"Referer": "https://gu.qq.com/"})
         response.raise_for_status()
@@ -454,10 +461,14 @@ class DynamicGroupHistoryService:
         data = (payload.get("data") or {}).get(symbol)
         if not isinstance(data, dict) or not data.get("qfqday"):
             raise ValueError("Tencent response lacks the requested symbol/qfq series")
+        if len(data["qfqday"]) > count:
+            raise ValueError("Tencent adjusted response exceeds the requested page size")
         prices = {}
         for row in data["qfqday"]:
             if not isinstance(row, list) or len(row) < 3 or row[0] in prices:
                 raise ValueError("Malformed or duplicate adjusted price row")
+            if date.fromisoformat(row[0]) > end:
+                raise ValueError("行情源未遵守历史截止日，保留旧修订等待重试")
             prices[row[0]] = row[2]
         return prices
 
