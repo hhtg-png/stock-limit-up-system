@@ -61,7 +61,7 @@ for (const path of [
   )
   assert.match(
     source,
-    /if \(!enqueuePluginSpeech\(speechText,\s*key,\s*\{\s*force:\s*true,\s*urgent:\s*true\s*\}\)\) \{[\s\S]*forgetLimitUpSpeech\(item,\s*speechText\)[\s\S]*continue[\s\S]*\}[\s\S]*seenSpeechKeys\.add\(key\)[\s\S]*rememberTouchedStock\(item\)/,
+    /if \(!enqueuePluginSpeech\(speechText,\s*key,\s*\{\s*force:\s*true,\s*urgent:\s*true(?:,\s*scope:\s*'tdx-composite:limit_up')?\s*\}\)\) \{[\s\S]*forgetLimitUpSpeech\(item,\s*speechText\)[\s\S]*continue[\s\S]*\}[\s\S]*seenSpeechKeys\.add\(key\)[\s\S]*rememberTouchedStock\(item\)/,
     `${path} should only mark eligible events handled after they enter the speech queue`
   )
 }

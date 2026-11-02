@@ -27,6 +27,7 @@
         <input v-model="hideOpened" type="checkbox" />
         <span>隐藏</span>
       </label>
+      <TdxCompositeSourceSettings v-model="sourcePreferences" />
     </div>
 
     <section
@@ -126,6 +127,8 @@ import { useTdxStockLink } from '@/composables/useTdxStockLink'
 import { installTdxStockSelectionBridge } from '@/composables/useTdxStockSelection'
 import { clearTdxPluginRealtime, useTdxPluginRealtime } from '@/composables/useWebSocket'
 import { useLimitUpStore } from '@/stores/limit-up'
+import TdxCompositeSourceSettings from '@/components/tdx/TdxCompositeSourceSettings.vue'
+import { COMPOSITE_SPEECH_SOURCES, readCompositeSpeechSources, writeCompositeSpeechSources, resolveCompositeNewsSpeechSource } from '@/utils/tdxCompositeSources'
 import { formatTdxSealAmount, resolveTdxBoardLabel, pickDisplayChangePct, resolveTdxMergedDisplayState } from '@/utils/tdxLimitUpDisplay'
 import type { LimitUpRealtime } from '@/types/limit-up'
 import type { TdxLimitUpEvent, TdxNewsItem, TdxPluginPayload, TdxStockMove } from '@/types/tdx-plugins'
@@ -152,6 +155,7 @@ const payload = ref<TdxPluginPayload<TdxLimitUpEvent> | null>(null)
 const statusPayload = ref<TdxPluginPayload<TdxLimitUpEvent> | null>(null)
 const activePlate = ref('')
 const hideOpened = ref(false)
+const sourcePreferences = ref(readCompositeSpeechSources())
 const loading = ref(false)
 const errorText = ref('')
 const activeTradeDate = ref('')
@@ -169,7 +173,7 @@ const isPlateDragging = ref(false)
 const ztPanel = ref<HTMLElement | null>(null)
 const movePanelPercent = ref(readStoredMovePanelPercent())
 const isMovePanelResizing = ref(false)
-const { enqueuePluginSpeech, unlockSpeech, lockSpeech, speechUnlocked } = useSpeech()
+const { enqueuePluginSpeech, cancelPluginSpeech, unlockSpeech, lockSpeech, speechUnlocked } = useSpeech()
 const { openStock } = useTdxStockLink()
 const { realtimeLimitUpEvents, realtimeNewsItems } = useTdxPluginRealtime()
 const limitUpStore = useLimitUpStore()
@@ -308,6 +312,11 @@ function announceNewStatusEvents(items: TdxLimitUpEvent[]) {
   for (const item of items) {
     const key = limitUpEventSpeechKey(item)
     if (!key || seenSpeechKeys.has(key)) continue
+    if (!sourcePreferences.value.limit_up) {
+      seenSpeechKeys.add(key)
+      rememberTouchedStock(item)
+      continue
+    }
     const isFirstTouch = isFirstTouchedStock(item)
     if (!isFirstTouch && isPlainSealedStatusEvent(item)) {
       seenSpeechKeys.add(key)
@@ -318,7 +327,7 @@ function announceNewStatusEvents(items: TdxLimitUpEvent[]) {
       seenSpeechKeys.add(key)
       continue
     }
-    if (!enqueuePluginSpeech(speechText, key, { force: true, urgent: true })) {
+    if (!enqueuePluginSpeech(speechText, key, { force: true, urgent: true, scope: 'tdx-composite:limit_up' })) {
       forgetLimitUpSpeech(item, speechText)
       continue
     }
@@ -373,10 +382,16 @@ function rememberKnownNews(items: readonly TdxNewsItem[]) {
 }
 
 function speakNews(item: TdxNewsItem) {
-  if (!item.news_id || !item.title || !speechUnlocked.value) return false
+  if (!item.news_id || !item.title) return false
+  const source = resolveCompositeNewsSpeechSource(item.source)
+  if (!sourcePreferences.value[source]) {
+    knownNewsKeys.add(newsKey(item))
+    return false
+  }
+  if (!speechUnlocked.value) return false
   const key = newsKey(item)
   if (spokenNewsKeys.has(key)) return false
-  const queued = enqueuePluginSpeech(newsSpeechText(item), key, { force: true })
+  const queued = enqueuePluginSpeech(newsSpeechText(item), key, { force: true, scope: `tdx-composite:${source}` })
   if (!queued) return false
   spokenNewsKeys.add(key)
   knownNewsKeys.add(key)
@@ -817,6 +832,13 @@ onMounted(() => {
   snapshotTimer = window.setInterval(refreshSnapshotWhenStructureChanged, SNAPSHOT_REFRESH_MS)
   quoteTimer = window.setInterval(loadQuoteStatus, QUOTE_REFRESH_MS)
 })
+
+watch(sourcePreferences, (next, previous) => {
+  writeCompositeSpeechSources(next)
+  for (const { key } of COMPOSITE_SPEECH_SOURCES) {
+    if (previous[key] && !next[key]) cancelPluginSpeech(`tdx-composite:${key}`)
+  }
+}, { flush: 'sync' })
 
 watch(realtimeNewsItems, (nextItems, previousItems) => {
   const previousKeys = new Set(previousItems.map(newsKey))

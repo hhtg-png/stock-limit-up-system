@@ -46,6 +46,7 @@ type UnlockSpeechOptions = {
 type PluginSpeechOptions = {
   force?: boolean
   urgent?: boolean
+  scope?: string
 }
 
 type SpeechPlaybackMode = 'auto' | 'web-speech'
@@ -54,6 +55,7 @@ type SpeechQueueItem = {
   text: string
   mode: SpeechPlaybackMode
   urgent?: boolean
+  scope?: string
 }
 
 type SpeechPlaybackLogDetail = Record<string, string | number | boolean | null | undefined>
@@ -84,6 +86,8 @@ const speechQueue: SpeechQueueItem[] = []
 let isSpeaking = false
 let currentSpeechToken = 0
 let currentSpeechUrgent = false
+let currentSpeechScope: string | undefined
+let currentSpeechCleanup: (() => void) | null = null
 
 // 已播报的股票记录（防止重复播报）
 const announcedStocks = new Set<string>()
@@ -350,8 +354,11 @@ function isSimilarRecentNewsSpeech(text: string, speechKey: string, now = Date.n
 
 function finishSpeechItem(token = currentSpeechToken) {
   if (token !== currentSpeechToken) return
+  currentSpeechCleanup?.()
+  currentSpeechCleanup = null
   isSpeaking = false
   currentSpeechUrgent = false
+  currentSpeechScope = undefined
   processQueue()
 }
 
@@ -427,7 +434,7 @@ function playWithAudioFallback(text: string, onFailure?: () => void, token = cur
     audio.oncanplay = null
   }
   const finishOnce = () => {
-    if (settled) return
+    if (settled || token !== currentSpeechToken) return
     settled = true
     reportSpeechPlaybackStatus('audio_ended', text, {
       elapsed_ms: elapsedDetail(),
@@ -441,7 +448,7 @@ function playWithAudioFallback(text: string, onFailure?: () => void, token = cur
     error?: unknown,
     shouldReport = true
   ) => {
-    if (settled) return
+    if (settled || token !== currentSpeechToken) return
     settled = true
     const reason = typeof reasonOrEvent === 'string' ? reasonOrEvent : 'audio_error'
     if (shouldReport) {
@@ -457,6 +464,7 @@ function playWithAudioFallback(text: string, onFailure?: () => void, token = cur
     else finishSpeechItem(token)
   }
   const markCanPlay = () => {
+    if (settled || token !== currentSpeechToken) return
     reportSpeechPlaybackStatus('audio_canplay', text, {
       elapsed_ms: elapsedDetail(),
       token
@@ -464,6 +472,7 @@ function playWithAudioFallback(text: string, onFailure?: () => void, token = cur
     clearStartTimeout()
   }
   const markStarted = () => {
+    if (settled || token !== currentSpeechToken) return
     reportSpeechPlaybackStatus('audio_playing', text, {
       elapsed_ms: elapsedDetail(),
       token
@@ -471,13 +480,14 @@ function playWithAudioFallback(text: string, onFailure?: () => void, token = cur
     clearStartTimeout()
   }
 
+  currentSpeechCleanup = cleanupAudioHandlers
   audio.onended = finishOnce
   audio.onerror = (event) => failOnce('audio_error', event)
   audio.onplaying = markStarted
   audio.oncanplay = markCanPlay
   audio.src = buildTargetTtsUrl(text)
   startTimeoutId = setTimeout(() => {
-    if (settled) return
+    if (settled || token !== currentSpeechToken) return
     reportSpeechPlaybackStatus('audio_timeout', text, {
       elapsed_ms: elapsedDetail(),
       timeout_ms: NEURAL_TTS_START_TIMEOUT_MS,
@@ -568,8 +578,11 @@ function primeTargetTtsAudio() {
 
 function stopCurrentSpeechPlayback() {
   currentSpeechToken += 1
+  currentSpeechCleanup?.()
+  currentSpeechCleanup = null
   isSpeaking = false
   currentSpeechUrgent = false
+  currentSpeechScope = undefined
 
   if (hasWebSpeechSupport()) {
     window.speechSynthesis.cancel()
@@ -586,11 +599,12 @@ function stopCurrentSpeechPlayback() {
   }
 }
 
-function queueSpeechItem(text: string, options: { urgent?: boolean; mode?: SpeechPlaybackMode } = {}) {
+function queueSpeechItem(text: string, options: { urgent?: boolean; mode?: SpeechPlaybackMode; scope?: string } = {}) {
   const item: SpeechQueueItem = {
     text,
     mode: options.mode || 'auto',
-    urgent: options.urgent
+    urgent: options.urgent,
+    scope: options.scope
   }
 
   if (options.urgent) {
@@ -639,11 +653,22 @@ function enqueuePluginSpeech(text: string, key?: string, options: PluginSpeechOp
   pluginSpeechKeys.add(speechKey)
   if (isSimilarRecentNewsSpeech(text, speechKey)) return false
   if (options.urgent) {
-    queueSpeechItem(text, { urgent: true })
+    queueSpeechItem(text, { urgent: true, scope: options.scope })
   } else {
-    queueSpeechItem(text)
+    queueSpeechItem(text, { scope: options.scope })
   }
   return true
+}
+
+function cancelPluginSpeech(scope: string) {
+  if (!scope.trim()) return
+  for (let index = speechQueue.length - 1; index >= 0; index -= 1) {
+    if (speechQueue[index].scope === scope) speechQueue.splice(index, 1)
+  }
+  if (isSpeaking && currentSpeechScope === scope) {
+    stopCurrentSpeechPlayback()
+    processQueue()
+  }
 }
 
 function processQueue() {
@@ -654,6 +679,7 @@ function processQueue() {
   
   isSpeaking = true
   currentSpeechUrgent = Boolean(item.urgent)
+  currentSpeechScope = item.scope
   const token = ++currentSpeechToken
 
   try {
@@ -764,6 +790,7 @@ export function useSpeech() {
     speechUnlocked,
     speak,
     enqueuePluginSpeech,
+    cancelPluginSpeech,
     unlockSpeech,
     lockSpeech,
     announceStock,
