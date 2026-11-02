@@ -1,6 +1,7 @@
 <template>
   <main class="target-ztlive" id="dark">
     <div id="plates">
+      <TdxCompositeSourceSettings v-model="sourcePreferences" />
       <div
         ref="plateScroller"
         class="scroll-container"
@@ -27,7 +28,6 @@
         <input v-model="hideOpened" type="checkbox" />
         <span>隐藏</span>
       </label>
-      <TdxCompositeSourceSettings v-model="sourcePreferences" />
     </div>
 
     <section

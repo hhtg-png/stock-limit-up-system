@@ -58,7 +58,7 @@ function positionPanel() {
   const anchor = trigger.value.getBoundingClientRect()
   const bounds = panel.value.getBoundingClientRect()
   const width = Math.min(bounds.width, window.innerWidth - 16)
-  const left = Math.max(8, Math.min(anchor.right - width, window.innerWidth - width - 8))
+  const left = Math.max(8, Math.min(anchor.left, window.innerWidth - width - 8))
   const top = Math.max(8, Math.min(anchor.bottom + 4, window.innerHeight - bounds.height - 8))
   panelStyle.value = { left: `${left}px`, top: `${top}px` }
 }
@@ -117,9 +117,9 @@ onBeforeUnmount(() => {
 <style scoped>
 .composite-source-settings {
   display: inline-flex;
+  flex: 0 0 24px;
   width: 24px;
   height: 24px;
-  margin-left: 4px;
   vertical-align: middle;
   text-align: left;
   font-weight: 400;
