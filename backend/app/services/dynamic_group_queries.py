@@ -1,7 +1,9 @@
 """Bounded member pages and database aggregates for large/mobile groups."""
 from __future__ import annotations
 
-from sqlalchemy import case, func, or_, select
+from typing import Literal, get_args
+
+from sqlalchemy import Float, case, cast, func, or_, select
 
 from app.models.dynamic_group import DynamicGroupMember, DynamicGroupSelectionItem
 from app.services.dynamic_group_rules import iter_rule_leaves
@@ -14,16 +16,61 @@ _PUBLIC_FIELDS = {
     "concepts", "quote_time", "is_sealed", "limit_up_price", "today_touched_limit_up", "yesterday_limit_up",
     "continuous_limit_up_days", "yesterday_continuous_days", "yesterday_first_limit_up_time",
     "yesterday_final_seal_time", "first_limit_up_time", "final_seal_time", "reason_category", "limit_up_reason",
-    "selected_at", "batch_selected_at", "entry_event_id", "trigger_version", "data_status",
+    "selected_at", "first_selected_at", "batch_selected_at", "entry_event_id", "trigger_version", "data_status",
     "historical_features", "ranking_position",
 }
+
+
+MemberSortField = Literal[
+    "stock_name", "stock_code", "current_price", "change_pct", "today_open_change_pct",
+    "yesterday_open_change_pct", "turnover_rate", "amount_yi", "continuous_limit_up_days",
+    "yesterday_continuous_days", "yesterday_first_limit_up_time", "yesterday_final_seal_time", "selected_at",
+]
+MemberSortOrder = Literal["asc", "desc"]
+_SORT_FIELDS = frozenset(get_args(MemberSortField))
+_NUMERIC_SORT_FIELDS = frozenset({
+    "current_price", "change_pct", "today_open_change_pct", "yesterday_open_change_pct",
+    "turnover_rate", "amount_yi", "continuous_limit_up_days", "yesterday_continuous_days",
+})
+
+
+def _member_ordering(model, sort_by, sort_order):
+    if sort_by is not None and (not isinstance(sort_by, str) or sort_by not in _SORT_FIELDS):
+        raise ValueError("Unsupported member sort field")
+    if sort_order not in ("asc", "desc"):
+        raise ValueError("Unsupported member sort order")
+    payload = model.payload
+    if sort_by is None:
+        position = payload["ranking_position"].as_integer()
+        return (case((position.is_(None), 1), else_=0), position, model.stock_code)
+
+    if sort_by == "stock_code":
+        value = model.stock_code
+    elif sort_by == "current_price":
+        # Match the displayed current_price ?? price, including a valid zero.
+        value = func.coalesce(payload["current_price"].as_string(), payload["price"].as_string())
+    elif sort_by == "selected_at":
+        # Archive batch time and model timestamps are not member display values.
+        value = func.coalesce(func.nullif(func.trim(payload["selected_at"].as_string()), ""),
+                              payload["first_selected_at"].as_string())
+    else:
+        value = payload[sort_by].as_string()
+    value = func.nullif(func.trim(value), "")
+    if sort_by in _NUMERIC_SORT_FIELDS:
+        value = cast(value, Float)
+    # Clock values arrive as normalized HH:MM:SS; ISO member timestamps sort
+    # chronologically as text. Both stay separate from numeric quote fields.
+    return (case((value.is_(None), 1), else_=0),
+            value.desc() if sort_order == "desc" else value.asc(), model.stock_code.asc())
 
 
 def compact_item(payload):
     return {key: value for key, value in payload.items() if key in _PUBLIC_FIELDS}
 
 
-async def _page(session, model, condition, day, *, q, offset, limit, current=False, trigger_keys=()):
+async def _page(session, model, condition, day, *, q, offset, limit, sort_by=None, sort_order="asc",
+                current=False, trigger_keys=()):
+    ordering = _member_ordering(model, sort_by, sort_order)
     payload = model.payload
     change = payload["change_pct"].as_float()
     valid = payload["quote_time"].as_string().like(f"{day.isoformat()}%") if day else False
@@ -44,9 +91,7 @@ async def _page(session, model, condition, day, *, q, offset, limit, current=Fal
                            payload["stock_name"].as_string().ilike(pattern, escape="\\")))
     total = await session.scalar(select(func.count()).select_from(model).where(*filters))
     statement = (select(model.payload, model.data_status) if current else select(model.payload))
-    position = payload["ranking_position"].as_integer()
-    result = await session.execute(statement.where(*filters).order_by(
-        case((position.is_(None), 1), else_=0), position, model.stock_code)
+    result = await session.execute(statement.where(*filters).order_by(*ordering)
         .offset(max(0, int(offset))).limit(min(200, max(1, int(limit)))))
     items = []
     for row in result:
@@ -60,16 +105,17 @@ async def _page(session, model, condition, day, *, q, offset, limit, current=Fal
     return dict(items=items, total=int(total or 0), summary=summary)
 
 
-async def member_page(session, group, *, q="", offset=0, limit=50):
+async def member_page(session, group, *, q="", offset=0, limit=50, sort_by=None, sort_order="asc"):
     return await _page(session, DynamicGroupMember, DynamicGroupMember.group_id == group.id,
-                       group.trade_date, q=q, offset=offset, limit=limit, current=True)
+                       group.trade_date, q=q, offset=offset, limit=limit, current=True,
+                       sort_by=sort_by, sort_order=sort_order)
 
 
-async def selection_page(session, batch, *, q="", offset=0, limit=50):
+async def selection_page(session, batch, *, q="", offset=0, limit=50, sort_by=None, sort_order="asc"):
     trigger_keys = {rule["field"] for rule in iter_rule_leaves(batch.definition.get("rules", []))}
     ranking = (batch.definition.get("strategy") or {}).get("ranking")
     if ranking:
         trigger_keys.add(ranking["field"])
     return await _page(session, DynamicGroupSelectionItem, DynamicGroupSelectionItem.selection_id == batch.id,
                        batch.trade_date, q=q, offset=offset, limit=limit,
-                       trigger_keys=trigger_keys | {"historical_features"})
+                       trigger_keys=trigger_keys | {"historical_features"}, sort_by=sort_by, sort_order=sort_order)

@@ -42,9 +42,135 @@ function loadView({ deferMembers = false } = {}) {
     setTimeout(callback) { const id = ++nextTimer; timers.set(id, callback); return id }, clearTimeout(id) { timers.delete(id) }
   }
   const effects = vue.effectScope()
-  const state = effects.run(() => new Function(...Object.keys(scope), `${code}\nreturn { selectGroup, loadBatch, mode, selectedDate, changeMode, selectedBatchId, selectedBatch, current, selectedId, activeGroup, trend, poll, batchLoading, detailLoading, memberPage, memberSearch, averageChange, rising, falling, stockCount, memberTotal, pagedMembers, changeMemberPage }`)(...Object.values(scope)))
+  const state = effects.run(() => new Function(...Object.keys(scope), `${code}\nreturn { selectGroup, loadBatch, mode, selectedDate, changeMode, selectedBatchId, selectedBatch, current, selectedId, activeGroup, trend, poll, batchLoading, detailLoading, memberPage, memberSearch, averageChange, rising, falling, stockCount, memberTotal, pagedMembers, changeMemberPage, changeMemberSort: typeof changeMemberSort === 'undefined' ? undefined : changeMemberSort, memberSort: typeof memberSort === 'undefined' ? undefined : memberSort, memberSortLabel: typeof memberSortLabel === 'undefined' ? undefined : memberSortLabel, memberHeader: typeof memberHeader === 'undefined' ? undefined : memberHeader }`)(...Object.values(scope)))
   return { ...state, requests, async advance() { const pending = [...timers.values()]; timers.clear(); pending.forEach(callback => callback()); await flush() }, dispose() { unmounted.forEach(callback => callback()); effects.stop() }, request(method, ...args) { return requests.find(request => request.method === method && JSON.stringify(request.args.slice(0, args.length)) === JSON.stringify(args)) } }
 }
+
+test('header sorting resets to page one, cycles server order and clears back to strategy order', async () => {
+  const view = loadView()
+  try {
+    const load = view.selectGroup(group(1)); view.request('current', 1).resolve(current(1)); await load
+    assert.equal(typeof view.changeMemberSort, 'function', 'member headers need a server sorting handler')
+    view.memberPage.value = 3
+    view.memberSearch.value = ' 测试 '
+    const ascending = view.changeMemberSort('current_price')
+    let request = view.requests.filter(request => request.method === 'current').at(-1)
+    assert.deepEqual(request.args[1], { offset: 0, limit: 50, q: '测试', sort_by: 'current_price', sort_order: 'asc' })
+    request.resolve({ ...current(1), items: [{ stock_code: 'server-first', current_price: 20 }, { stock_code: 'server-second', current_price: 10 }] }); await ascending
+    assert.equal(view.memberPage.value, 1)
+    assert.deepEqual(view.pagedMembers.value.map(item => item.stock_code), ['server-first', 'server-second'], 'the returned server page must keep its order')
+    assert.match(view.memberSortLabel('current_price', '价格'), /升序/)
+    const descending = view.changeMemberSort('current_price')
+    request = view.requests.filter(request => request.method === 'current').at(-1)
+    assert.equal(request.args[1].sort_order, 'desc')
+    request.resolve(current(1)); await descending
+    const refresh = view.poll(); await flush()
+    request = view.requests.filter(request => request.method === 'current').at(-1)
+    assert.deepEqual(request.args[1], { offset: 0, limit: 50, q: '测试', sort_by: 'current_price', sort_order: 'desc' })
+    request.resolve(current(1)); await refresh
+    const cleared = view.changeMemberSort('current_price')
+    request = view.requests.filter(request => request.method === 'current').at(-1)
+    assert.deepEqual(request.args[1], { offset: 0, limit: 50, q: '测试' }, 'clear must omit sorting so strategy ranking resumes')
+    request.resolve(current(1)); await cleared
+    assert.equal(view.memberSort.value, null)
+    await view.advance()
+    assert.equal(view.requests.filter(request => request.method === 'current').length, 5, 'sorting cancels the pending search debounce')
+    assert.equal(view.requests.filter(request => request.method === 'trend' || request.method === 'members').length, 0, 'display sorting does not reload archives or charts')
+  } finally { view.dispose() }
+})
+
+test('current and history keep independent header directions through mode changes and reset for another group', async () => {
+  const view = loadView()
+  try {
+    const load = view.selectGroup(group(1)); view.request('current', 1).resolve(current(1)); await load
+    assert.equal(typeof view.changeMemberSort, 'function')
+    for (let index = 0; index < 2; index++) {
+      const sorted = view.changeMemberSort('turnover_rate')
+      view.requests.filter(request => request.method === 'current').at(-1).resolve(current(1)); await sorted
+    }
+    view.mode.value = 'history'; view.selectedDate.value = '2026-10-30'
+    let switchMode = view.changeMode(); await flush()
+    view.requests.filter(request => request.method === 'trend').at(-1).resolve({ selection_id: 7, points: [] }); await switchMode
+    assert.equal(view.memberSort.value, null)
+    await view.changeMemberSort('yesterday_final_seal_time')
+    assert.deepEqual(view.requests.filter(request => request.method === 'members').at(-1).args, [1, 7, { offset: 0, limit: 50, q: '', sort_by: 'yesterday_final_seal_time', sort_order: 'asc' }])
+    await view.changeMemberPage(2)
+    assert.deepEqual(view.requests.filter(request => request.method === 'members').at(-1).args[2], { offset: 50, limit: 50, q: '', sort_by: 'yesterday_final_seal_time', sort_order: 'asc' })
+    view.mode.value = 'current'; switchMode = view.changeMode()
+    let request = view.requests.filter(request => request.method === 'current').at(-1)
+    assert.equal(request.args[1].sort_by, 'turnover_rate'); assert.equal(request.args[1].sort_order, 'desc')
+    request.resolve(current(1)); await switchMode
+    assert.match(view.memberSortLabel('turnover_rate', '换手'), /当前降序/)
+    view.mode.value = 'history'; switchMode = view.changeMode(); await flush()
+    view.requests.filter(request => request.method === 'trend').at(-1).resolve({ selection_id: 7, points: [] }); await switchMode
+    assert.equal(view.requests.filter(request => request.method === 'members').at(-1).args[2].sort_by, 'yesterday_final_seal_time')
+    assert.match(view.memberSortLabel('yesterday_final_seal_time', '昨日终封'), /当前升序/)
+    const other = view.selectGroup(group(2)); request = view.requests.filter(request => request.method === 'current').at(-1)
+    assert.deepEqual(request.args[1], { offset: 0, limit: 50, q: '' })
+    request.resolve(current(2)); await other
+    assert.equal(view.memberSort.value, null)
+  } finally { view.dispose() }
+})
+
+test('clearing a header sort prevents slower sorted and paged responses from replacing default order', async () => {
+  const view = loadView()
+  try {
+    const load = view.selectGroup(group(1)); view.request('current', 1).resolve(current(1)); await load
+    assert.equal(typeof view.changeMemberSort, 'function')
+    const page = view.changeMemberPage(2)
+    const ascending = view.changeMemberSort('change_pct')
+    const descending = view.changeMemberSort('change_pct')
+    const cleared = view.changeMemberSort('change_pct')
+    const calls = view.requests.filter(request => request.method === 'current')
+    calls.at(-1).resolve({ ...current(1), items: [{ stock_code: 'strategy-first' }] }); await cleared
+    calls.at(-2).resolve({ ...current(1), items: [{ stock_code: 'descending-first' }] }); await descending
+    calls.at(-3).resolve({ ...current(1), items: [{ stock_code: 'ascending-first' }] }); await ascending
+    calls.at(-4).resolve({ ...current(1), items: [{ stock_code: 'old-page' }] }); await page
+    assert.equal(view.pagedMembers.value[0].stock_code, 'strategy-first')
+    assert.equal(view.memberSort.value, null)
+    assert.equal(view.memberPage.value, 1)
+  } finally { view.dispose() }
+})
+
+test('sorting historical members wins over an earlier batch load while its chart can finish', async () => {
+  const view = loadView({ deferMembers: true })
+  try {
+    const load = view.selectGroup(group(1)); view.request('current', 1).resolve(current(1)); await load
+    assert.equal(typeof view.changeMemberSort, 'function')
+    view.mode.value = 'history'; view.selectedBatchId.value = 7
+    const archive = view.loadBatch(1, 7)
+    const sorted = view.changeMemberSort('selected_at')
+    const calls = view.requests.filter(request => request.method === 'members')
+    assert.deepEqual(calls.at(-1).args[2], { offset: 0, limit: 50, q: '', sort_by: 'selected_at', sort_order: 'asc' })
+    calls.at(-1).resolve({ id: 7, total: 2, summary: current(1).summary, items: [{ stock_code: 'sorted-frozen' }] }); await sorted
+    calls.at(-2).resolve({ id: 7, total: 2, summary: current(1).summary, items: [{ stock_code: 'old-frozen' }] })
+    view.request('trend', 1, 7).resolve({ selection_id: 7, points: [{ date: '2026-10-30', value: 1000 }] }); await archive
+    assert.equal(view.selectedBatch.value.items[0].stock_code, 'sorted-frozen')
+    assert.equal(view.trend.value.points[0].value, 1000)
+    assert.equal(view.requests.filter(request => request.method === 'trend').length, 1)
+  } finally { view.dispose() }
+})
+
+test('compound header buttons sort their own field and expose the active direction to keyboard users', async () => {
+  const view = loadView()
+  try {
+    const load = view.selectGroup(group(1)); view.request('current', 1).resolve(current(1)); await load
+    const buttons = () => view.memberHeader([['stock_name', '股票'], ['stock_code', '代码']]).children.filter(node => node.type === 'button')
+    let stopped = 0
+    buttons()[1].props.onClick({ stopPropagation() { stopped++ } })
+    const request = view.requests.filter(request => request.method === 'current').at(-1)
+    assert.equal(request.args[1].sort_by, 'stock_code', 'the code button must not accidentally sort stock names')
+    request.resolve(current(1)); await flush()
+    assert.equal(stopped, 1)
+    assert.equal(buttons()[0].props['aria-pressed'], false)
+    assert.equal(buttons()[1].props['aria-pressed'], true)
+    assert.match(buttons()[1].props['aria-label'], /当前升序/)
+    view.mode.value = 'history'
+    assert.equal(buttons()[1].props['aria-pressed'], false, 'switching to another mode must not leave a stale sorting arrow')
+    view.mode.value = 'current'
+    assert.equal(buttons()[1].props['aria-pressed'], true)
+  } finally { view.dispose() }
+})
 
 test('server paging keeps full-basket statistics and prevents a slow earlier page from replacing the new page', async () => {
   const view = loadView()

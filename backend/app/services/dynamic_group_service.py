@@ -227,11 +227,12 @@ class DynamicGroupService:
             group.archived, group.enabled, group.updated_at = True, False, self.now()
             return self.group_dict(group)
 
-    async def get_current(self, group_id, *, q="", offset=0, limit=50):
+    async def get_current(self, group_id, *, q="", offset=0, limit=50, sort_by=None, sort_order="asc"):
         from app.services.dynamic_group_queries import member_page
         async with self.session_factory() as session:
             group = await self._require_group(session, group_id)
-            page = await member_page(session, group, q=q, offset=offset, limit=limit)
+            page = await member_page(session, group, q=q, offset=offset, limit=limit,
+                                     sort_by=sort_by, sort_order=sort_order)
             return _json(dict(group=self.group_dict(group), **page,
                               trade_date=group.trade_date, previous_trade_date=group.previous_trade_date,
                               source_time=group.source_time, status=group.data_status, warnings=group.warnings,
@@ -259,7 +260,7 @@ class DynamicGroupService:
                 DynamicGroupSelection.selected_at.desc(), DynamicGroupSelection.id.desc()).offset(max(0, offset)).limit(min(100, max(1, limit))))).all()
             return {"items": [self.selection_dict(r) for r in rows], "total": count}
 
-    async def get_selection(self, group_id, selection_id, *, q="", offset=0, limit=50):
+    async def get_selection(self, group_id, selection_id, *, q="", offset=0, limit=50, sort_by=None, sort_order="asc"):
         from app.services.dynamic_group_queries import selection_page
         async with self.session_factory() as session:
             await self._require_group(session, group_id)
@@ -267,7 +268,8 @@ class DynamicGroupService:
                 DynamicGroupSelection.id == selection_id, DynamicGroupSelection.group_id == group_id))
             if not batch:
                 raise HTTPException(404, "入选批次不存在")
-            page = await selection_page(session, batch, q=q, offset=offset, limit=limit)
+            page = await selection_page(session, batch, q=q, offset=offset, limit=limit,
+                                        sort_by=sort_by, sort_order=sort_order)
             return dict(self.selection_dict(batch), **batch.definition, definition=batch.definition,
                         **page)
 

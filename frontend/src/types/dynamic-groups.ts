@@ -24,7 +24,9 @@ export interface DynamicMember {
   yesterday_final_seal_time?: string | null; selected_at?: string | null; first_selected_at?: string | null; quote_time?: string | null
   status?: string; [key: string]: unknown
 }
-export interface DynamicMemberQuery { offset?: number; limit?: number; q?: string }
+export type DynamicMemberSortField = 'stock_name' | 'stock_code' | 'current_price' | 'change_pct' | 'today_open_change_pct' | 'yesterday_open_change_pct' | 'turnover_rate' | 'amount_yi' | 'continuous_limit_up_days' | 'yesterday_continuous_days' | 'yesterday_first_limit_up_time' | 'yesterday_final_seal_time' | 'selected_at'
+export type DynamicMemberSortOrder = 'asc' | 'desc'
+export interface DynamicMemberQuery { offset?: number; limit?: number; q?: string; sort_by?: DynamicMemberSortField; sort_order?: DynamicMemberSortOrder }
 export interface DynamicMemberSummary { stock_count: number; valid_change_count: number; average_change_pct: number | null; up_count: number; down_count: number }
 export interface DynamicCurrent { group: DynamicGroup; items: DynamicMember[]; total: number; summary: DynamicMemberSummary; trade_date: string | null; previous_trade_date?: string | null; source_time: string | null; status: string; warnings: string[]; selection_id: number | null }
 export interface DynamicSelection { id: number; trade_date: string; selected_at: string; member_count: number; version: number; kind: string; data_status?: string }

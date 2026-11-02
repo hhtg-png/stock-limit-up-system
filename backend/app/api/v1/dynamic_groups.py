@@ -7,6 +7,7 @@ from fastapi import APIRouter, Query
 from app.schemas.dynamic_group import DynamicGroupDefinition, DynamicGroupUpdate
 from app.schemas.dynamic_group_interpreter import DynamicGroupInterpretRequest, DynamicGroupInterpretResponse
 from app.services.dynamic_group_interpreter_service import dynamic_group_interpreter_service
+from app.services.dynamic_group_queries import MemberSortField, MemberSortOrder
 from app.services.dynamic_group_service import dynamic_group_service
 
 router = APIRouter()
@@ -77,8 +78,10 @@ async def refresh(group_id: int):
 
 @router.get("/{group_id}/current")
 async def current(group_id: int, q: str = Query("", max_length=100),
+                  sort_by: MemberSortField | None = None, sort_order: MemberSortOrder = "asc",
                   offset: int = Query(0, ge=0), limit: int = Query(50, ge=1, le=200)):
-    return await dynamic_group_service.get_current(group_id, q=q, offset=offset, limit=limit)
+    return await dynamic_group_service.get_current(group_id, q=q, offset=offset, limit=limit,
+                                                   sort_by=sort_by, sort_order=sort_order)
 
 
 @router.get("/{group_id}/dates")
@@ -94,8 +97,10 @@ async def selections(group_id: int, trade_date: date | None = None,
 
 @router.get("/{group_id}/selections/{selection_id}")
 async def selection(group_id: int, selection_id: int, q: str = Query("", max_length=100),
+                    sort_by: MemberSortField | None = None, sort_order: MemberSortOrder = "asc",
                     offset: int = Query(0, ge=0), limit: int = Query(50, ge=1, le=200)):
-    return await dynamic_group_service.get_selection(group_id, selection_id, q=q, offset=offset, limit=limit)
+    return await dynamic_group_service.get_selection(group_id, selection_id, q=q, offset=offset, limit=limit,
+                                                     sort_by=sort_by, sort_order=sort_order)
 
 
 @router.get("/{group_id}/trend")
