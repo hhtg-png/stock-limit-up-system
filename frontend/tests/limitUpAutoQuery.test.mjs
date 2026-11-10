@@ -27,6 +27,8 @@ function loadView(view, autoResolve = true) {
     ...vue, ...context,
     onMounted(callback) { mounted.push(callback) }, onUnmounted(callback) { unmounted.push(callback) },
     useLimitUpStore: () => store, useRouter: () => ({ push() {} }), dayjs: () => ({ format: () => '2026-10-26' }),
+    getChinaDateString: () => '2026-10-26',
+    getLimitUpDates: async () => ({ dates: ['2026-10-22', '2026-10-23', '2026-10-26'], today: '2026-10-26' }),
     ElMessage: Object.fromEntries(['warning', 'error', 'success'].map(type => [type, value => messages.push([type, value])])),
     console: { error() {} }, document: { visibilityState: 'visible', createElement: () => ({ click() {} }) },
     Blob, URL: { createObjectURL(blob) { exportedBlob = blob; return 'blob:csv' }, revokeObjectURL() {} },
@@ -50,7 +52,10 @@ function loadView(view, autoResolve = true) {
     setSortBy: typeof setSortBy === 'undefined' ? undefined : setSortBy,
     setSortOrder: typeof setSortOrder === 'undefined' ? undefined : setSortOrder,
     effectiveOrder: typeof effectiveOrder === 'undefined' ? undefined : effectiveOrder,
-    exportData
+    exportData,
+    moveDate: typeof moveDate === 'undefined' ? undefined : moveDate,
+    previousDate: typeof previousDate === 'undefined' ? undefined : previousDate,
+    nextDate: typeof nextDate === 'undefined' ? undefined : nextDate
   }`)(...Object.values(scope)))
   return {
     ...state, source, requests, messages, store,
@@ -64,6 +69,79 @@ function loadView(view, autoResolve = true) {
     dispose() { unmounted.forEach(callback => callback()); effects.stop() }
   }
 }
+
+test('LimitUpList date arrows query adjacent sessions and retain filters and explicit ordering', async () => {
+  const state = loadView('LimitUpList')
+  try {
+    await state.mount()
+    assert.equal(typeof state.moveDate, 'function')
+    assert.equal(state.nextDate.value, '')
+    state.filters.boardScope = 'exact-2'
+    state.filters.reasonCategory = '机器人'
+    await state.setSortOrder('desc')
+    const before = state.requests.length
+    await state.moveDate(-1)
+    assert.equal(state.selectedDate.value, '2026-10-23', 'Monday goes to Friday')
+    assert.equal(state.requests.length, before + 1)
+    assert.equal(state.requests.at(-1).params.continuous_days_exact, 2)
+    assert.equal(state.requests.at(-1).params.reason_category, '机器人')
+    assert.equal(state.requests.at(-1).params.sort_order, 'desc')
+    assert.equal(state.store.acceptRealtimeUpdates, false)
+    await state.moveDate(1)
+    assert.equal(state.selectedDate.value, '2026-10-26')
+    assert.equal(state.store.acceptRealtimeUpdates, true)
+    const latest = state.requests.length
+    await state.moveDate(1)
+    assert.equal(state.requests.length, latest, 'no future-day request')
+    await state.moveDate(-1)
+    await state.moveDate(-1)
+    assert.equal(state.previousDate.value, '')
+    const oldest = state.requests.length
+    await state.moveDate(-1)
+    assert.equal(state.requests.length, oldest, 'no request before the first archived session')
+  } finally { state.dispose() }
+})
+
+test('LimitUpList date arrows use the displayed session after fallback and block duplicate clicks while loading', async () => {
+  const state = loadView('LimitUpList', false)
+  try {
+    await state.mount()
+    state.requests[0].resolve({ trade_date: '2026-10-23', is_fallback: true, data: [] })
+    await flush()
+    assert.equal(typeof state.moveDate, 'function')
+    assert.equal(state.previousDate.value, '2026-10-22', 'fallback Friday goes directly to Thursday')
+    const pending = state.moveDate(-1)
+    await flush()
+    assert.equal(state.requests.at(-1).params.trade_date, '2026-10-22')
+    const before = state.requests.length
+    await state.moveDate(-1)
+    assert.equal(state.requests.length, before)
+    state.requests.at(-1).resolve({ trade_date: '2026-10-22', data: [] })
+    await pending
+    assert.equal(state.nextDate.value, '2026-10-23')
+  } finally { state.dispose() }
+})
+
+test('LimitUpList retries the adjacent session after a failed request instead of skipping an unseen date', async () => {
+  const state = loadView('LimitUpList', false)
+  try {
+    await state.mount()
+    state.requests[0].resolve({ trade_date: '2026-10-26', data: [] })
+    await flush()
+    const first = state.moveDate(-1)
+    await flush()
+    assert.equal(state.requests.at(-1).params.trade_date, '2026-10-23')
+    state.requests.at(-1).reject(new Error('temporary network failure'))
+    await first
+    assert.equal(state.previousDate.value, '2026-10-23')
+    const retry = state.moveDate(-1)
+    await flush()
+    assert.equal(state.requests.at(-1).params.trade_date, '2026-10-23')
+    state.requests.at(-1).resolve({ trade_date: '2026-10-23', data: [] })
+    await retry
+    assert.equal(state.previousDate.value, '2026-10-22')
+  } finally { state.dispose() }
+})
 
 for (const view of ['Dashboard', 'LimitUpList']) {
   test(`${view} queries fixed board counts exactly and clears threshold filters when switching`, async () => {

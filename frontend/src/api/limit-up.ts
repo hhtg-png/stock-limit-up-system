@@ -12,6 +12,11 @@ const api = axios.create({
   timeout: 30000
 })
 
+export async function getLimitUpDates(): Promise<{ dates: string[]; today: string }> {
+  const { data } = await api.get('/limit-up/dates')
+  return data
+}
+
 // 获取实时涨停列表（带日期回退信息）
 export async function getRealtimeLimitUp(params?: {
   trade_date?: string

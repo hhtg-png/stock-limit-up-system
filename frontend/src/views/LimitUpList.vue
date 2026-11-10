@@ -3,8 +3,16 @@
     <!-- 筛选区 -->
     <div class="filter-bar card">
       <el-form class="filter-form" inline>
-        <el-form-item label="交易日期">
-          <el-date-picker
+        <el-form-item label="交易日期" class="date-filter">
+          <div class="date-navigation">
+            <el-button
+              :icon="ArrowLeft"
+              aria-label="前一交易日"
+              title="前一交易日"
+              :disabled="datesLoading || loading || !previousDate"
+              @click="moveDate(-1)"
+            />
+            <el-date-picker
             v-model="selectedDate"
             type="date"
             value-format="YYYY-MM-DD"
@@ -12,7 +20,15 @@
             :clearable="false"
             style="width: 150px"
             @change="handleDateChange"
-          />
+            />
+            <el-button
+              :icon="ArrowRight"
+              aria-label="后一交易日"
+              title="后一交易日"
+              :disabled="datesLoading || loading || !nextDate"
+              @click="moveDate(1)"
+            />
+          </div>
         </el-form-item>
         <el-form-item label="连板天数">
           <el-select v-model="filters.boardScope" placeholder="全部" clearable style="width: 120px" @change="applyFilters">
@@ -220,8 +236,9 @@
 import { computed, ref, reactive, onMounted, onUnmounted, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import dayjs from 'dayjs'
-import { getRealtimeLimitUp } from '@/api/limit-up'
+import { ArrowLeft, ArrowRight } from '@element-plus/icons-vue'
+import { getRealtimeLimitUp, getLimitUpDates } from '@/api/limit-up'
+import { getChinaDateString } from '@/utils/chinaDate'
 import { useLimitUpStore } from '@/stores/limit-up'
 import type { LimitUpRealtime } from '@/types/limit-up'
 import MobileLimitUpCards from '@/components/stock/MobileLimitUpCards.vue'
@@ -233,7 +250,9 @@ const limitUpStore = useLimitUpStore()
 const loading = ref(false)
 const refreshing = ref(false)
 const tableRef = ref<any>()
-const selectedDate = ref(dayjs().format('YYYY-MM-DD'))
+const selectedDate = ref(getChinaDateString())
+const navigationDates = ref<string[]>([])
+const datesLoading = ref(true)
 const sortBy = ref<MonitorSort>('time')
 const sortDirection = ref<'asc' | 'desc' | null>(null)
 const RESYNC_INTERVAL = 90000
@@ -276,7 +295,12 @@ interface FetchOptions {
 
 const displayTradeDate = computed(() => limitUpStore.tradeDate)
 const previousTradeDate = computed(() => limitUpStore.realtimeList.find(item => item.previous_trade_date)?.previous_trade_date || '')
-const isSelectedToday = computed(() => selectedDate.value === dayjs().format('YYYY-MM-DD'))
+const isSelectedToday = computed(() => selectedDate.value === getChinaDateString())
+// A weekend selection can show Friday. Step from that displayed session so
+// "previous" reaches Thursday rather than requesting Friday a second time.
+const navigationAnchor = computed(() => displayTradeDate.value || selectedDate.value)
+const previousDate = computed(() => navigationDates.value.filter(day => day < navigationAnchor.value).pop() || '')
+const nextDate = computed(() => navigationDates.value.find(day => day > navigationAnchor.value) || '')
 const isFallbackDate = computed(
   () => Boolean(displayTradeDate.value && displayTradeDate.value !== selectedDate.value)
 )
@@ -457,6 +481,27 @@ function handleDateChange() {
   return applyFilters()
 }
 
+async function loadNavigationDates() {
+  datesLoading.value = true
+  try {
+    const response = await getLimitUpDates()
+    if (disposed) return
+    navigationDates.value = [...new Set(response.dates)].filter(day => day <= response.today).sort()
+  } catch (error) {
+    if (!disposed) ElMessage.warning('日期导航加载失败，刷新页面可重试')
+  } finally {
+    if (!disposed) datesLoading.value = false
+  }
+}
+
+function moveDate(direction: -1 | 1) {
+  if (datesLoading.value || loading.value) return
+  const target = direction < 0 ? previousDate.value : nextDate.value
+  if (!target) return
+  selectedDate.value = target
+  return handleDateChange()
+}
+
 function setSortOrder(order: 'asc' | 'desc') {
   if (sortDirection.value === order) return
   const changed = effectiveOrder.value !== order
@@ -532,6 +577,7 @@ function exportData() {
 }
 
 onMounted(() => {
+  loadNavigationDates()
   updateRealtimeMode()
   fetchData({ showLoading: limitUpStore.realtimeList.length === 0 })
   refreshTimer = window.setInterval(() => {
@@ -564,6 +610,19 @@ onUnmounted(() => {
       flex-wrap: wrap;
       align-items: flex-start;
       gap: 12px 14px;
+    }
+
+    .date-navigation {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+
+      :deep(.el-button) {
+        width: 32px;
+        flex: 0 0 32px;
+        margin-left: 0;
+        padding: 8px;
+      }
     }
 
     :deep(.el-form-item) {
@@ -740,9 +799,23 @@ onUnmounted(() => {
       .filter-actions,
       .filter-sort,
       .filter-date-tag,
+      .date-filter,
       .price-filter {
         grid-column: 1 / -1;
         min-width: 0;
+      }
+
+      .date-navigation {
+        width: 100%;
+
+        :deep(.el-date-editor) {
+          flex: 1;
+        }
+
+        :deep(.el-button) {
+          width: 36px;
+          flex-basis: 36px;
+        }
       }
 
       .filter-break {

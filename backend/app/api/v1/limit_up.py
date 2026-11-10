@@ -261,6 +261,33 @@ async def _get_database_limit_up_response(
     )
 
 
+@router.get("/dates", summary="获取涨停监控可切换的交易日期")
+async def get_limit_up_dates(db: AsyncSession = Depends(get_db)):
+    """Offer stored exchange sessions plus the current live session."""
+    current_date = today_cn()
+    result = await db.execute(
+        select(LimitUpRecord.trade_date)
+        .where(LimitUpRecord.trade_date <= current_date)
+        .distinct()
+    )
+    available_dates = set(result.scalars().all()) | {current_date}
+    try:
+        # Keep scheduler imports lazy and synchronous provider I/O off the event loop.
+        from app.data_collectors.scheduler import _get_cn_trading_dates
+
+        trading_dates = set(await asyncio.wait_for(
+            asyncio.to_thread(_get_cn_trading_dates, min(available_dates), current_date),
+            timeout=6.0,
+        ))
+    except Exception as exc:
+        logger.warning("Unable to load monitor navigation calendar: {}", exc)
+        raise HTTPException(status_code=503, detail="交易日历暂不可用，请稍后重试") from exc
+    return {
+        "dates": [day.isoformat() for day in sorted(available_dates & trading_dates)],
+        "today": current_date.isoformat(),
+    }
+
+
 @router.get("/realtime", response_model=LimitUpRealtimeResponse, summary="获取实时涨停列表")
 async def get_realtime_limit_up(
     trade_date: Optional[date] = Query(None, description="交易日期，默认今天"),
