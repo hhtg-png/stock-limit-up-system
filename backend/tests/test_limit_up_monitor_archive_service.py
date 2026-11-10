@@ -167,6 +167,35 @@ class LimitUpMonitorArchiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(recovered.payload_json["data"][0]["today_open_change_pct"], 7)
         self.assertIsNone(recovered.payload_json["data"][1]["yesterday_final_seal_time"])
 
+    async def test_first_historical_backfill_persists_openings_and_completes_same_build(self):
+        for day in (PREVIOUS, DAY):
+            (self.auctions.root_dir / f"{day}.json").unlink()
+        self.history.return_value = {PREVIOUS: {"open": 10, "pre_close": 10}, DAY: {"open": 9.75, "pre_close": 10}}
+        archive = await self.service.ensure_for_date(DAY)
+        self.assertIsNotNone(archive)
+        self.assertEqual(archive.status, "ready")
+        self.assertTrue(all(row["yesterday_open_change_pct"] == 0 and row["today_open_change_pct"] == -2.5
+                            for row in archive.payload_json["data"]))
+        fresh = self.new_context()
+        with patch.object(fresh, "enrich_for_archive", side_effect=AssertionError("Completed archive must survive restart")):
+            reloaded = await self.new_service(fresh).ensure_for_date(DAY)
+        self.assertEqual(reloaded.payload_json, archive.payload_json)
+
+    async def test_archive_import_after_enrichment_cannot_commit_stale_values_with_new_signature(self):
+        original = await self.service.ensure_for_date(DAY)
+        enrich = self.context.enrich_for_archive
+
+        async def imported_after_read(*args):
+            result = await enrich(*args)
+            await self.auctions.save_percentages(DAY, {"000001": 0})
+            return result
+
+        with patch.object(self.context, "enrich_for_archive", side_effect=imported_after_read):
+            kept = await self.service.ensure_for_date(DAY, force=True)
+        self.assertEqual(kept.payload_json, original.payload_json)
+        updated = await self.new_service(self.new_context()).ensure_for_date(DAY)
+        self.assertEqual(updated.payload_json["data"][0]["today_open_change_pct"], 0)
+
     async def test_partial_retry_after_restart_is_bounded_but_not_frozen(self):
         (self.auctions.root_dir / f"{DAY}.json").unlink()
         partial = await self.service.ensure_for_date(DAY)

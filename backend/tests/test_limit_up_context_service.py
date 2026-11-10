@@ -386,13 +386,35 @@ class LimitUpContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(result[0]["yesterday_open_change_pct"], 0)
         self.assertAlmostEqual(result[0]["today_open_change_pct"], 5)
 
+    async def test_historical_auctions_recover_when_legacy_tencent_routes_are_waf_blocked(self):
+        candles = {
+            "sh605287": [["2026-10-08", "36.53", "36.53"], ["2026-10-09", "36.78", "40.18"], ["2026-10-12", "44.20", "44.20"]],
+            "sh605136": [["2026-10-08", "8.58", "8.58"], ["2026-10-09", "8.58", "9.44"], ["2026-10-12", "10.38", "10.38"]],
+            "sh603096": [["2026-10-08", "15.75", "15.75"], ["2026-10-09", "15.75", "17.33"], ["2026-10-12", "19.06", "19.06"]],
+        }
+
+        async def respond(request):
+            if "eastmoney" in request.url.host:
+                raise httpx.RemoteProtocolError("Server disconnected without sending a response", request=request)
+            if not request.url.path.endswith("/newfqkline/get"):
+                return httpx.Response(501, text="<script>location='https://waf.tencent.com/501page.html'</script>")
+            symbol = request.url.params["param"].split(",")[0]
+            return httpx.Response(200, json={"code": 0, "data": {symbol: {"qfqday": candles[symbol]}}})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+            service = self.service(history_fetcher=None, http_client=client,
+                                   today_provider=lambda: date(2026, 11, 10))
+            result = await service.enrich(DAY, [{"stock_code": code} for code in ("605287", "605136", "603096")])
+        self.assertEqual([row["today_open_change_pct"] for row in result], [10.005, 9.9576, 9.9827])
+        self.assertEqual([row["yesterday_open_change_pct"] for row in result], [0.6844, 0.0, 0.0])
+
     async def test_tencent_public_api_supplies_history_when_web_frontend_is_unavailable(self):
         async def respond(request):
             if "eastmoney" in request.url.host:
                 raise httpx.ConnectError("primary unavailable", request=request)
             if request.url.host != "proxy.finance.qq.com":
                 return httpx.Response(501, text="Web frontend unavailable")
-            self.assertEqual(request.url.path, "/ifzqgtimg/appstock/app/fqkline/get")
+            self.assertEqual(request.url.path, "/ifzqgtimg/appstock/app/newfqkline/get")
             self.assertEqual(request.headers["Referer"], "https://gu.qq.com/")
             return httpx.Response(200, json={"data": {"sz000001": {"qfqday": [
                 ["2026-10-08", "10", "10", "10", "10", "100"],
@@ -416,8 +438,8 @@ class LimitUpContextTests(unittest.IsolatedAsyncioTestCase):
             if request.url.host == "proxy.finance.qq.com":
                 return httpx.Response(501, text="<script>window.location.href='https://waf.tencent.com/'</script>")
             self.assertEqual(request.url.host, "web.ifzq.gtimg.cn")
-            self.assertEqual(request.url.path, "/appstock/app/fqkline/get")
-            self.assertEqual(request.url.params["param"], "sz000001,day,2026-08-25,2026-10-12,160,qfq")
+            self.assertEqual(request.url.path, "/appstock/app/newfqkline/get")
+            self.assertEqual(request.url.params["param"], "sz000001,day,,2026-10-12,160,qfq")
             return httpx.Response(200, json={"code": 0, "data": {"sz000001": {"qfqday": [
                 ["2026-10-08", "10", "10"], ["2026-10-09", "10", "10"], ["2026-10-12", "10.5", "11"],
             ]}}})

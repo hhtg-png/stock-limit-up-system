@@ -299,6 +299,7 @@ class LimitUpContextService:
                 except Exception as exc:
                     logger.debug("Opening history unavailable for {}: {}", code, exc)
                     history = {}
+                fetched = {}
                 for value in missing:
                     # Another request may have loaded a new archive or quote
                     # while this provider request was in flight.
@@ -307,8 +308,40 @@ class LimitUpContextService:
                     prices = (history or {}).get(value) or {}
                     percentage = self._opening_pct(prices.get("open"), prices.get("pre_close"))
                     self._put(self._daily_cache, (value, code), percentage, missing=percentage is None)
+                    if percentage is not None:
+                        fetched[value] = percentage
+                # Publish every usable result before optional disk I/O. A slow
+                # archive must not hide prices already fetched within the budget.
+                await self._persist_history_openings(code, fetched)
 
         await asyncio.gather(*(one(code) for code in codes))
+
+    async def _persist_history_openings(self, code, values):
+        if self.archive_service is None:
+            return
+        for day, percentage in values.items():
+            if not self._opening_finished(day):
+                continue
+            try:
+                # A file import can finish while the network request is pending.
+                # Keep it ahead of the older provider response, including zero.
+                archived = await self.archive_service.get_percentages(day)
+                imported = self._number(archived.get(code))
+                current = self._get(self._daily_cache, (day, code))[1]
+                if imported is not None:
+                    if current == percentage:
+                        self._put(self._daily_cache, (day, code), imported)
+                    continue
+                if current == percentage:
+                    await self.archive_service.save_percentages(day, {code: percentage}, overwrite=False)
+                    # The atomic merge may have kept a file imported after our
+                    # read. Reflect its winner unless a fresher quote arrived.
+                    saved = await self.archive_service.get_percentages(day)
+                    winner = self._number(saved.get(code))
+                    if winner is not None and self._get(self._daily_cache, (day, code))[1] == percentage:
+                        self._put(self._daily_cache, (day, code), winner)
+            except Exception as exc:
+                logger.debug("Opening history persistence unavailable for {} on {}: {}", code, day, exc)
 
     async def _load_seals(self, day, codes):
         async with self._seal_lock:
@@ -438,13 +471,15 @@ class LimitUpContextService:
             return history
         symbol = ("sh" if code.startswith("6") else "bj" if code.startswith(("4", "8", "92")) else "sz") + code
         for endpoint in (
-            "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
-            "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/fqkline/get",
+            "https://web.ifzq.gtimg.cn/appstock/app/newfqkline/get",
+            "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get",
         ):
             try:
                 response = await asyncio.wait_for(client.get(
                     endpoint,
-                    params={"param": f"{symbol},day,{(start - timedelta(days=45)).isoformat()},{end.isoformat()},160,qfq"},
+                    # This route returns the requested tail ending on ``end``;
+                    # unlike the legacy fqkline route it is reachable from the server.
+                    params={"param": f"{symbol},day,,{end.isoformat()},160,qfq"},
                     headers={"Referer": "https://gu.qq.com/"},
                 ), timeout=self.request_timeout)
                 response.raise_for_status()

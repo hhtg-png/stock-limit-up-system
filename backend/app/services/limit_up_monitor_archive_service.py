@@ -113,6 +113,7 @@ class LimitUpMonitorArchiveService:
                 previous = existing.previous_trade_date if existing is not None else None
                 previous = previous or await self.context_service._previous_session(day)
                 signature = await self._source_signature(db, day, previous)
+                database_signature = await self._source_signature(db, day, previous, include_openings=False)
                 now = self.now_provider().replace(tzinfo=None)
                 if existing is not None and existing.schema_version == self.SCHEMA_VERSION:
                     if not force and existing.source_signature == signature:
@@ -137,9 +138,16 @@ class LimitUpMonitorArchiveService:
                 return existing
             payload = {"trade_date": day.isoformat(), "data": [row.model_dump(mode="json") for row in validated]}
             async with self.session_factory() as db:
-                if signature != await self._source_signature(db, day, previous):
-                    logger.info("Monitor sources changed while building {}; retrying on the next request", day)
-                    return existing
+                latest_signature = await self._source_signature(db, day, previous)
+                if signature != latest_signature:
+                    # Fetching historical openings now persists its own source files.
+                    # Accept that revision only while DB facts stayed unchanged and
+                    # the current files agree with every value about to be archived.
+                    if (database_signature != await self._source_signature(db, day, previous, include_openings=False)
+                            or not await self._opening_values_match(day, previous, validated)):
+                        logger.info("Monitor sources changed while building {}; retrying on the next request", day)
+                        return existing
+                    signature = latest_signature
                 values = dict(trade_date=day, previous_trade_date=previous, payload_json=payload,
                               schema_version=self.SCHEMA_VERSION, status="ready" if complete else "partial",
                               total_count=len(validated), source_signature=signature, archived_at=now, updated_at=now)
@@ -182,7 +190,22 @@ class LimitUpMonitorArchiveService:
         ))
         return count == metric.limit_up_count
 
-    async def _source_signature(self, db, day, previous):
+    async def _opening_values_match(self, day, previous, rows):
+        archive = getattr(self.context_service, "archive_service", None)
+        if archive is None:
+            return False
+        for value, field in ((day, "today_open_change_pct"), (previous, "yesterday_open_change_pct")):
+            if value is None:
+                continue
+            percentages = await archive.get_percentages(value)
+            for row in rows:
+                # Include nulls so a concurrent import of zero or a negative
+                # opening cannot be silently omitted from a new partial archive.
+                if percentages.get(row.stock_code) != getattr(row, field):
+                    return False
+        return True
+
+    async def _source_signature(self, db, day, previous, *, include_openings=True):
         days = [value for value in (previous, day) if value is not None]
         revision = {"schema": self.SCHEMA_VERSION, "days": [value.isoformat() for value in days]}
         for model in (LimitUpRecord, MarketReviewStockDaily, MarketReviewDailyMetric):
@@ -192,7 +215,7 @@ class LimitUpMonitorArchiveService:
             revision[model.__tablename__] = [[str(value) for value in row] for row in rows]
         archive = getattr(self.context_service, "archive_service", None)
         root = getattr(archive, "root_dir", None)
-        if root is not None:
+        if include_openings and root is not None:
             def fingerprints():
                 result = []
                 for value in days:

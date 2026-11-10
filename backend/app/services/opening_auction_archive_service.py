@@ -58,11 +58,11 @@ class OpeningAuctionArchiveService:
                 logger.exception("Unable to read opening auction archive for %s", day)
                 return {}
 
-    def _save(self, day, values):
+    def _save(self, day, values, *, overwrite=True):
         # A cancelled async caller leaves its worker running; lock the whole merge in that worker.
         with self._write_lock:
             previous = self._read(day)
-            merged = {**previous, **values}
+            merged = {**previous, **values} if overwrite else {**values, **previous}
             if merged == previous:
                 return
             self.root_dir.mkdir(parents=True, exist_ok=True)
@@ -75,11 +75,11 @@ class OpeningAuctionArchiveService:
             finally:
                 Path(temporary).unlink(missing_ok=True)
 
-    async def save_percentages(self, day: date, values: dict[str, float]) -> None:
+    async def save_percentages(self, day: date, values: dict[str, float], *, overwrite=True) -> None:
         valid = self._finite_values(values)
         if valid:
             async with self._lock:
-                await asyncio.to_thread(self._save, day, valid)
+                await asyncio.to_thread(self._save, day, valid, overwrite=overwrite)
 
     def _quote_percentages(self, day, quotes):
         values = {}
