@@ -21,6 +21,18 @@ from sqlalchemy.orm import relationship
 from app.database import Base
 
 
+class MarketReviewArchiveSample(Base):
+    """Historical monitor sample kept separate from formal market reviews."""
+
+    __tablename__ = "market_review_archive_samples"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    trade_date = Column(Date, nullable=False, unique=True)
+    metric_json = Column(JSON, nullable=False)
+    stocks_json = Column(JSON, nullable=False)
+    generated_at = Column(DateTime, nullable=False, default=datetime.now)
+
+
 class MarketReviewDailyMetric(Base):
     """市场复盘日级指标表"""
 

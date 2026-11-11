@@ -77,16 +77,16 @@ test('limit and broken amount chart uses hundred-million unit', () => {
   assert.match(optionSource, /formatter:\s*\(value: number\) => formatYiAmount\(value\)/)
   assert.match(optionSource, /data:\s*dailyRows\.value\.map\(row => toYiFromWanAmount\(row\.limit_up_amount\)\)/)
   assert.match(optionSource, /data:\s*dailyRows\.value\.map\(row => toYiFromWanAmount\(row\.broken_amount\)\)/)
-  assert.match(optionSource, /valueFormatter:\s*\(value: unknown\) => formatYiAmount\(Number\(value\)\)/)
+  assert.match(optionSource, /valueFormatter:\s*\(value: unknown\) => value == null \? '—' : formatYiAmount\(Number\(value\)\)/)
 })
 
 test('ladder groups show stats in a separate compact metrics row', () => {
-  const match = source.match(/<div class="ladder-metrics">[\s\S]*?<\/div>/)
+  const match = source.match(/<div [^>]*class="ladder-metrics">[\s\S]*?<\/div>/)
   assert.ok(match, 'ladder metrics row should exist')
   const metricsSource = match[0]
 
   assert.match(metricsSource, /封板[\s\S]*getSealedCount\(ladder\)/)
-  assert.match(metricsSource, /炸板[\s\S]*getOpenedCount\(ladder\)/)
+  assert.match(metricsSource, /炸板[\s\S]*ladder\.cohort_opened_count/)
   assert.match(metricsSource, /封板率[\s\S]*getLadderSealRate\(ladder\)/)
   assert.match(metricsSource, /均涨[\s\S]*getLadderAverageChange\(ladder\)/)
   assert.match(source, /function getLadderSealRate\(ladder: MarketReviewLadderLevel\)/)

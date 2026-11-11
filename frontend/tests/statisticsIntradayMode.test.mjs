@@ -1,59 +1,158 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
+import ts from 'typescript'
+import * as vue from 'vue'
+import dayjs from 'dayjs'
 
-const statisticsSource = readFileSync('src/views/Statistics.vue', 'utf8')
-const apiSource = readFileSync('src/api/review.ts', 'utf8')
-const typeSource = readFileSync('src/types/market.ts', 'utf8')
+const source = readFileSync(new URL('../src/views/Statistics.vue', import.meta.url), 'utf8')
+const transpile = text => ts.transpileModule(text, {
+  compilerOptions: { module: ts.ModuleKind.ES2022, target: ts.ScriptTarget.ES2022 }
+}).outputText
+const { buildReviewRange } = await import(`data:text/javascript,${encodeURIComponent(transpile(
+  readFileSync(new URL('../src/utils/reviewRange.ts', import.meta.url), 'utf8')
+))}`)
+const script = source.match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1]
+const ast = ts.createSourceFile('Statistics.ts', script, ts.ScriptTarget.ES2022, true)
+const code = transpile(ast.statements.filter(statement => !ts.isImportDeclaration(statement))
+  .map(statement => statement.getText(ast)).join('\n'))
 
-test('market review API exposes intraday snapshot with detail and ladder payloads', () => {
-  assert.match(apiSource, /getMarketReviewIntraday/, 'intraday API function should be exported')
-  assert.match(apiSource, /\/statistics\/review\/intraday/, 'intraday API should call the backend intraday endpoint')
-  assert.match(typeSource, /interface MarketReviewIntradayResponse/, 'intraday response type should be explicit')
-  assert.match(typeSource, /is_live:\s*boolean/, 'intraday response should tell whether the snapshot is live market data')
-  assert.match(typeSource, /detail:\s*MarketReviewDetailResponse/, 'intraday response should carry live detail data')
-  assert.match(typeSource, /ladder:\s*MarketReviewLadderResponse/, 'intraday response should carry live ladder data')
+const today = '2026-11-11'
+const monday = '2026-11-09'
+const friday = '2026-11-06'
+const row = (day, extra = {}) => ({
+  trade_date: day, limit_up_count: 3, limit_down_count: 1, continuous_count: 1,
+  max_board_height: 2, first_to_second_rate: 20, seal_rate: 66.67,
+  market_turnover: 17000, up_count_ex_st: 3100, down_count_ex_st: 1700,
+  ...extra
+})
+const daily = (...rows) => ({ data: { series: rows.map(item => item.trade_date), rows } })
+const snapshot = (day, extra = {}) => ({
+  ...daily(row(day, extra)), data_status: 'ready', is_fallback: false,
+  is_live: day === today, snapshot_time: `${day}T10:06:15+08:00`,
+  detail: { trade_date: day, is_fallback: false, stocks: [{ stock_code: day, today_sealed_close: true }] },
+  ladder: { trade_date: day, is_fallback: false, ladders: [{ continuous_days: 2 }] }
+})
+const flush = () => new Promise(resolve => setImmediate(resolve))
+
+function loadReport(auto = true) {
+  const mounted = [], unmounted = [], requests = [], intervals = new Map()
+  let timerId = 0
+  function request(kind, day, response, query) {
+    return new Promise(resolve => {
+      requests.push({ kind, day, query, resolve })
+      if (auto) resolve(response)
+    })
+  }
+  const scope = {
+    ...vue, dayjs, buildReviewRange,
+    useRouter: () => ({ push() {} }), getChinaDateString: () => today,
+    onMounted(callback) { mounted.push(callback) },
+    onUnmounted(callback) { unmounted.push(callback) },
+    getLimitUpDates: async () => ({ today, dates: [friday, monday, today] }),
+    getMarketReviewDaily: query => request('daily', query.end_date, daily(row(friday)), query),
+    getMarketReviewIntraday: day => request('snapshot', day, snapshot(day)),
+    getBrokenBoardPerformance: query => request('broken', query.end_date, { points: [] }, query),
+    document: { visibilityState: 'visible' },
+    window: {
+      setInterval(callback, delay) { intervals.set(++timerId, { callback, delay }); return timerId },
+      clearInterval(id) { intervals.delete(id) },
+      addEventListener() {}, removeEventListener() {}
+    }
+  }
+  const effects = vue.effectScope()
+  const state = effects.run(() => new Function(...Object.keys(scope), `${code}\nreturn {
+    selectedDate: typeof selectedDate === 'undefined' ? undefined : selectedDate,
+    moveDate: typeof moveDate === 'undefined' ? undefined : moveDate,
+    goToToday: typeof goToToday === 'undefined' ? undefined : goToToday,
+    overviewMetrics: typeof overviewMetrics === 'undefined' ? undefined : overviewMetrics,
+    dailyRows, detailStocks, ladderLevels, isLiveIntraday, loading,
+    currentDataUnavailable, brokenBoardPoints
+  }`)(...Object.values(scope)))
+  return {
+    ...state, requests,
+    forDate(day, kind) { return requests.find(item => item.day === day && item.kind === kind) },
+    async mount() { mounted.forEach(callback => callback()); await flush() },
+    async tick() { for (const timer of intervals.values()) {
+      assert.equal(timer.delay, 60000)
+      timer.callback()
+    } await flush() },
+    async select(day) {
+      assert.ok(state.selectedDate, 'report needs a selected date')
+      state.selectedDate.value = day
+      await flush()
+    },
+    dispose() { unmounted.forEach(callback => callback()); effects.stop() }
+  }
+}
+
+test('selected date scopes trend, snapshot and broken-board comparison, with arrows and return to live today', async () => {
+  const state = loadReport()
+  try {
+    await state.mount()
+    assert.equal(state.isLiveIntraday.value, true)
+    await state.select(monday)
+    assert.deepEqual(state.requests.slice(-3).map(item => [item.kind, item.day]), [
+      ['broken', monday], ['daily', monday], ['snapshot', monday]
+    ])
+    assert.equal(state.detailStocks.value[0].stock_code, monday)
+    assert.equal(state.isLiveIntraday.value, false)
+    const historicalRequestCount = state.requests.length
+    await state.tick()
+    assert.equal(state.requests.length, historicalRequestCount, 'historical dates never poll')
+    state.moveDate(-1)
+    await flush()
+    assert.equal(state.selectedDate.value, friday, 'previous skips the weekend')
+    state.goToToday()
+    await flush()
+    assert.equal(state.detailStocks.value[0].stock_code, today)
+    await state.tick()
+    assert.equal(state.requests.at(-1).day, today)
+    assert.equal(state.isLiveIntraday.value, true)
+    assert.equal(state.loading.value, false, 'automatic refresh does not hide current data')
+  } finally { state.dispose() }
 })
 
-test('statistics view automatically merges live intraday data into the selected daily range', () => {
-  assert.doesNotMatch(statisticsSource, /reviewMode/, 'manual close-review/intraday mode state should be removed')
-  assert.doesNotMatch(statisticsSource, /label="intraday"/, 'manual intraday button should not be rendered')
-  assert.doesNotMatch(statisticsSource, /label="daily"/, 'manual daily button should not be rendered')
-  assert.match(statisticsSource, /<el-radio-group v-model="timeRange" size="small">/, 'range picker should always be available')
-  assert.match(statisticsSource, /label="6m"[\s\S]*近6月/, 'range picker should include a half-year shortcut')
-  assert.match(statisticsSource, /label="1y"[\s\S]*近1年/, 'range picker should include a one-year shortcut')
-  assert.match(statisticsSource, /getMarketReviewDaily\(query\)/, 'daily history should be fetched for the selected range')
-  assert.match(statisticsSource, /getMarketReviewIntraday\(today\)/, 'today intraday snapshot should be checked automatically')
-  assert.match(
-    statisticsSource,
-    /intradayRow\?\.trade_date === today/,
-    'only an exact current-day snapshot may supply current data'
-  )
-  assert.match(statisticsSource, /mergeIntradayDailyRows/, 'today intraday row should be merged into historical rows')
-  assert.match(statisticsSource, /detailResponse\.value = intradayResult\.detail/)
-  assert.match(statisticsSource, /ladderResponse\.value = intradayResult\.ladder/)
+test('late responses and fallback details never appear under the newly selected date', async () => {
+  const state = loadReport(false)
+  try {
+    await state.mount()
+    await state.select(monday)
+    state.forDate(monday, 'daily').resolve(daily(row(friday), row(today)))
+    state.forDate(monday, 'snapshot').resolve({ ...snapshot(friday), is_fallback: true })
+    state.forDate(monday, 'broken').resolve({ points: [{ trade_date: monday }, { trade_date: today }] })
+    await flush()
+    assert.deepEqual(state.dailyRows.value.map(item => item.trade_date), [friday])
+    assert.deepEqual(state.detailStocks.value, [])
+    assert.deepEqual(state.ladderLevels.value, [])
+    assert.equal(state.currentDataUnavailable.value, true)
+    assert.deepEqual(state.brokenBoardPoints.value.map(item => item.trade_date), [monday])
+    state.forDate(today, 'daily').resolve(daily(row(today)))
+    state.forDate(today, 'snapshot').resolve(snapshot(today))
+    state.forDate(today, 'broken').resolve({ points: [{ trade_date: today }] })
+    await flush()
+    assert.deepEqual(state.dailyRows.value.map(item => item.trade_date), [friday])
+    assert.deepEqual(state.detailStocks.value, [])
+    assert.deepEqual(state.brokenBoardPoints.value.map(item => item.trade_date), [monday])
+    assert.equal(state.loading.value, false)
+  } finally { state.dispose() }
 })
 
-test('statistics view refreshes automatically without hiding historical comparison data', () => {
-  assert.match(statisticsSource, /window\.setInterval\(refreshReviewSilently, 60000\)/, 'report should re-check market status every minute')
-  assert.match(statisticsSource, /fetchData\(\{ silent: true \}\)/, 'timer refresh should not show the full-page loading mask')
-  assert.match(statisticsSource, /const shouldShowLoading = !options\.silent/)
-  assert.match(statisticsSource, /if \(shouldShowLoading\) \{\s*loading\.value = true\s*\}/)
-  assert.match(statisticsSource, /clearReviewRefreshTimer\(\)/, 'timer should be cleared when view unmounts')
-  assert.doesNotMatch(statisticsSource, /v-if="reviewMode === 'daily'"/, 'range picker should not be scoped to a removed mode')
-  assert.match(statisticsSource, /盘中实时/, 'summary should identify live intraday data')
-  assert.match(statisticsSource, /实时更新/, 'summary should display live snapshot update time')
-})
-
-test('statistics view requests intraday data using China trading date instead of browser local date', () => {
-  assert.match(
-    statisticsSource,
-    /getChinaDateString/,
-    'report should derive today from Asia/Shanghai so live intraday works outside China time zones'
-  )
-  assert.doesNotMatch(
-    statisticsSource,
-    /dayjs\(\)\.format\('YYYY-MM-DD'\)/,
-    'browser-local today can point at the previous day during China trading hours'
-  )
+test('old monitoring samples only contribute verified selected-day metrics and stay out of market trends', async () => {
+  const state = loadReport(false)
+  try {
+    await state.mount()
+    await state.select(monday)
+    const sample = { source_status: 'monitor_archive', market_turnover: 0, up_count_ex_st: 0, limit_down_count: 0 }
+    state.forDate(monday, 'daily').resolve(daily(row(friday), row(monday, sample)))
+    state.forDate(monday, 'snapshot').resolve(snapshot(monday, sample))
+    state.forDate(monday, 'broken').resolve({ points: [] })
+    await flush()
+    assert.equal(state.currentDataUnavailable.value, false)
+    assert.deepEqual(state.dailyRows.value.map(item => item.trade_date), [friday])
+    assert.deepEqual(state.overviewMetrics.value.map(item => item.label), [
+      '触板家数', '封板家数', '炸板家数', '连板家数', '最高板', '封板率'
+    ])
+    assert.equal(state.detailStocks.value[0].stock_code, monday)
+  } finally { state.dispose() }
 })

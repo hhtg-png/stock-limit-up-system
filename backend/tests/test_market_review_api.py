@@ -15,7 +15,7 @@ from sqlalchemy.pool import StaticPool
 
 import app.models  # noqa: F401
 from app.database import Base, get_db
-from app.models.market_review import MarketReviewDailyMetric, MarketReviewStockDaily
+from app.models.market_review import MarketReviewArchiveSample, MarketReviewDailyMetric, MarketReviewStockDaily
 from app.models.stock import Stock
 
 
@@ -644,6 +644,7 @@ class MarketReviewApiTests(unittest.TestCase):
         collect_mock = AsyncMock(
             return_value={
                 "is_authoritative": True,
+                "source_status": "partial",
                 "stock_rows": [
                     {
                         "stock_code": "600010",
@@ -656,6 +657,12 @@ class MarketReviewApiTests(unittest.TestCase):
                         "yesterday_continuous_days": 2,
                         "today_continuous_days": 3,
                         "change_pct": 10.01,
+                        "first_limit_time": time(9, 29, 8),
+                        "final_seal_time": time(9, 40, 9),
+                        "open_count": 0,
+                        "turnover_rate": 3.4,
+                        "close_price": 11.0,
+                        "pre_close": 10.0,
                         "amount": 120000.0,
                         "limit_up_reason": "AI",
                     },
@@ -753,6 +760,16 @@ class MarketReviewApiTests(unittest.TestCase):
         self.assertIsNotNone(payload["snapshot_time"])
         self.assertEqual(payload["data"]["series"], ["2026-05-06"])
         row = payload["data"]["rows"][0]
+        self.assertEqual(payload.get("source_status"), "partial")
+        self.assertEqual(row["source_status"], "partial")
+        stock = next(stock for stock in payload["detail"]["stocks"] if stock["stock_code"] == "600010")
+        self.assertEqual(stock["first_limit_time"], "09:29:08")
+        self.assertEqual(stock["final_seal_time"], "09:40:09")
+        self.assertEqual(stock["open_count"], 0)
+        self.assertEqual(stock["yesterday_continuous_days"], 2)
+        self.assertEqual(stock["turnover_rate"], 3.4)
+        self.assertEqual(stock["close_price"], 11.0)
+        self.assertEqual(stock["pre_close"], 10.0)
         self.assertEqual(row["max_board_label"], "LiveAlpha3")
         self.assertEqual(row["second_board_label"], "LiveGamma2")
         self.assertEqual(row["gem_board_label"], "LiveGamma2")
@@ -784,9 +801,139 @@ class MarketReviewApiTests(unittest.TestCase):
         self.assertFalse(payload["is_fallback"])
         self.assertEqual(payload["data"]["series"], ["2026-04-28"])
         self.assertEqual(payload["data"]["rows"][0]["max_board_label"], "Alpha4")
-        self.assertEqual(payload["detail"]["stocks"][0]["stock_code"], "600002")
+        self.assertEqual(payload.get("source_status"), "primary")
+        self.assertEqual(payload["data"]["rows"][0]["source_status"], "primary")
+        self.assertEqual(payload["detail"]["trade_date"], "2026-04-28")
+        self.assertEqual(payload["ladder"]["trade_date"], "2026-04-28")
+        stock = payload["detail"]["stocks"][0]
+        self.assertEqual(stock["stock_code"], "600002")
+        self.assertEqual(stock["first_limit_time"], "09:29:00")
+        self.assertIsNone(stock["final_seal_time"])
+        self.assertEqual(stock["open_count"], 0)
+        self.assertEqual(stock["yesterday_continuous_days"], 3)
         self.assertEqual(payload["ladder"]["ladders"][0]["continuous_days"], 4)
         self.review_module._collect_intraday_source.assert_not_awaited()
+
+    async def _seed_monitor_archive_sample(self, trade_date, *, payload_date=None):
+        async with self.session_factory() as session:
+            session.add(MarketReviewArchiveSample(
+                trade_date=trade_date,
+                metric_json={
+                    "trade_date": (payload_date or trade_date).isoformat(),
+                    "source_status": "monitor_archive",
+                    "limit_up_count": 1,
+                    "limit_down_count": None,
+                    "continuous_count": 1,
+                    "max_board_height": 2,
+                    "second_board_height": 0,
+                    "gem_board_height": 0,
+                    "first_to_second_rate": None,
+                    "continuous_promotion_rate": None,
+                    "seal_rate": 100.0,
+                    "yesterday_limit_up_avg_change": None,
+                    "yesterday_continuous_avg_change": None,
+                    "market_turnover": 9001.25,
+                    "up_count_ex_st": None,
+                    "down_count_ex_st": None,
+                    "limit_up_amount": None,
+                    "broken_amount": 0.0,
+                },
+                stocks_json=[{
+                    "stock_code": "600001",
+                    "stock_name": "Archive Alpha",
+                    "trade_date": trade_date.isoformat(),
+                    "today_touched_limit_up": True,
+                    "today_continuous_days": 2,
+                    "today_sealed_close": True,
+                    "today_opened_close": False,
+                    "first_limit_time": "09:30:00",
+                    "yesterday_continuous_days": None,
+                    "amount": None,
+                    "data_quality_flag": "monitor_archive",
+                }],
+            ))
+            await session.commit()
+        self.review_module._TRADING_DAY_CACHE[trade_date] = True
+
+    def test_intraday_exposes_verified_monitor_archive_data_with_unknown_fields(self):
+        trade_date = date(2026, 4, 24)
+        asyncio.run(self._seed_monitor_archive_sample(trade_date))
+        response = self.client.get(
+            "/api/v1/statistics/review/intraday",
+            params={"trade_date": trade_date.isoformat()},
+        )
+        payload = response.json()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(payload["data_status"], "ready")
+        self.assertEqual(payload["source_status"], "monitor_archive")
+        self.assertFalse(payload["is_intraday"])
+        self.assertFalse(payload["is_live"])
+        self.assertFalse(payload["is_fallback"])
+        self.assertEqual(payload["detail"]["trade_date"], trade_date.isoformat())
+        self.assertEqual(payload["ladder"]["trade_date"], trade_date.isoformat())
+        row, = payload["data"]["rows"]
+        self.assertEqual(row["source_status"], "monitor_archive")
+        self.assertEqual(row["limit_up_count"], 1)
+        self.assertEqual(row["market_turnover"], 9001.25)
+        self.assertEqual(row["broken_amount"], 0.0)
+        self.assertIsNone(row["limit_down_count"])
+        self.assertIsNone(row["up_count_ex_st"])
+        self.assertIsNone(row["continuous_promotion_rate"])
+        self.assertIsNone(row["limit_up_amount"])
+        stock, = payload["detail"]["stocks"]
+        self.assertEqual(stock["first_limit_time"], "09:30:00")
+        self.assertTrue(stock["today_touched_limit_up"])
+        self.assertIsNone(stock["amount"])
+        self.assertIsNone(stock["yesterday_continuous_days"])
+        ladder, = payload["ladder"]["ladders"]
+        self.assertEqual(ladder["count"], 1)
+        self.assertIsNone(ladder["cohort_count"])
+        self.assertIsNone(ladder["cohort_seal_rate"])
+        self.assertEqual(ladder["cohort_stocks"], [])
+
+    def test_monitor_archive_does_not_replace_a_formal_review_or_enter_trends(self):
+        asyncio.run(self._seed_monitor_archive_sample(date(2026, 4, 24)))
+        asyncio.run(self._seed_monitor_archive_sample(date(2026, 4, 28)))
+        base = "/api/v1/statistics/review"
+        snapshot = self.client.get(f"{base}/intraday", params={"trade_date": "2026-04-28"}).json()
+        self.assertEqual(snapshot.get("source_status"), "primary")
+        self.assertEqual(snapshot["data"]["rows"][0]["limit_up_count"], 8)
+        trend = self.client.get(f"{base}/daily", params={"days": 7, "end_date": "2026-04-28"}).json()
+        self.assertEqual(trend["data"]["series"], ["2026-04-27", "2026-04-28"])
+        detail = self.client.get(f"{base}/detail", params={"trade_date": "2026-04-24"}).json()
+        ladder = self.client.get(f"{base}/ladder", params={"trade_date": "2026-04-24"}).json()
+        self.assertEqual(detail["stocks"], [])
+        self.assertEqual(ladder["ladders"], [])
+
+    def test_intraday_rejects_monitor_archive_with_mismatched_payload_date(self):
+        trade_date = date(2026, 4, 24)
+        asyncio.run(self._seed_monitor_archive_sample(trade_date, payload_date=date(2026, 4, 23)))
+        response = self.client.get(
+            "/api/v1/statistics/review/intraday",
+            params={"trade_date": trade_date.isoformat()},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["data_status"], "unavailable")
+        self.assertEqual(response.json()["detail"]["stocks"], [])
+
+    def test_intraday_rejects_live_inputs_declaring_a_different_trade_date(self):
+        self.review_module._should_collect_live_intraday = Mock(return_value=True)
+        self.review_module._collect_intraday_source = AsyncMock(return_value={
+            "is_authoritative": True,
+            "trade_date": date(2026, 5, 5),
+            "stock_rows": [],
+        })
+
+        response = self.client.get(
+            "/api/v1/statistics/review/intraday",
+            params={"trade_date": "2026-05-06"},
+        )
+        payload = response.json()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(payload["data_status"], "unavailable")
+        self.assertEqual(payload["detail"]["trade_date"], "2026-05-06")
+        self.assertEqual(payload["ladder"]["trade_date"], "2026-05-06")
+        self.assertEqual(payload["data"]["rows"], [])
 
     def test_intraday_source_wrapper_uses_market_review_source_service_collect_for_date(self):
         service = SimpleNamespace(

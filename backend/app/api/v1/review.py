@@ -11,7 +11,7 @@ from sqlalchemy import desc, distinct, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.models.market_review import MarketReviewDailyMetric, MarketReviewStockDaily
+from app.models.market_review import MarketReviewArchiveSample, MarketReviewDailyMetric, MarketReviewStockDaily
 from app.schemas.market_review import (
     MarketReviewDailyData,
     MarketReviewDailyMetricRow,
@@ -27,6 +27,7 @@ from app.services.market_review_metrics_service import market_review_metrics_ser
 router = APIRouter()
 CN_TZ = timezone(timedelta(hours=8))
 _TRADING_DAY_CACHE: dict[date, bool] = {}
+_MONITOR_ARCHIVE_SOURCE = "monitor_archive"
 
 
 async def _collect_intraday_source(trade_date: date) -> dict[str, Any]:
@@ -94,10 +95,10 @@ async def _resolve_daily_metric_range(
 
 def _format_board_height_label(
     stock_rows: list[MarketReviewStockDaily | dict[str, Any]],
-    height: int,
+    height: int | None,
     board_types: set[str] | None = None,
 ) -> str | None:
-    if height <= 0:
+    if height is None or height <= 0:
         return None
 
     names = [
@@ -134,16 +135,28 @@ def _get_stock_float(row: MarketReviewStockDaily | dict[str, Any], key: str) -> 
 
 
 def _build_stock_item_from_source(row: dict[str, Any]) -> MarketReviewStockItem:
-    change_pct = _get_stock_float(row, "change_pct")
+    data_quality_flag = row.get("data_quality_flag")
+    amount = _get_stock_float(row, "amount")
+    if amount is None and data_quality_flag != _MONITOR_ARCHIVE_SOURCE:
+        amount = 0.0
     return MarketReviewStockItem(
         stock_code=str(row.get("stock_code") or ""),
         stock_name=str(row.get("stock_name") or row.get("stock_code") or ""),
         today_continuous_days=_get_stock_int(row, "today_continuous_days"),
+        today_touched_limit_up=row.get("today_touched_limit_up"),
         today_sealed_close=bool(row.get("today_sealed_close")),
         today_opened_close=bool(row.get("today_opened_close") or row.get("today_broken")),
-        change_pct=change_pct,
-        amount=float(row.get("amount") or 0.0),
+        change_pct=_get_stock_float(row, "change_pct"),
+        amount=amount,
         limit_up_reason=row.get("limit_up_reason") or None,
+        first_limit_time=row.get("first_limit_time"),
+        final_seal_time=row.get("final_seal_time"),
+        open_count=row.get("open_count"),
+        yesterday_continuous_days=row.get("yesterday_continuous_days"),
+        turnover_rate=_get_stock_float(row, "turnover_rate"),
+        close_price=_get_stock_float(row, "close_price"),
+        pre_close=_get_stock_float(row, "pre_close"),
+        data_quality_flag=data_quality_flag,
     )
 
 
@@ -158,7 +171,7 @@ def _build_intraday_detail(trade_date: date, stock_rows: list[dict[str, Any]]) -
     stocks.sort(
         key=lambda stock: (
             -stock.today_continuous_days,
-            -stock.amount,
+            -(stock.amount or 0.0),
             stock.stock_code,
         )
     )
@@ -251,6 +264,8 @@ def _build_ladder_response_from_rows(
     trade_date: date,
     is_fallback: bool,
     stock_rows: list[MarketReviewStockDaily | dict[str, Any]],
+    *,
+    include_cohort: bool = True,
 ) -> MarketReviewLadderResponse:
     ladder_rows = [row for row in stock_rows if _is_ladder_display_row(row)]
     ladder_rows.sort(
@@ -269,14 +284,18 @@ def _build_ladder_response_from_rows(
             current_ladder = MarketReviewLadderItem(
                 continuous_days=stock.today_continuous_days,
                 count=0,
-                stocks=[],
+                cohort_count=0 if include_cohort else None,
+                cohort_sealed_count=0 if include_cohort else None,
+                cohort_opened_count=0 if include_cohort else None,
+                cohort_seal_rate=0.0 if include_cohort else None,
             )
             ladders.append(current_ladder)
 
         current_ladder.stocks.append(stock)
         current_ladder.count = len(current_ladder.stocks)
 
-    _apply_ladder_cohort_metrics(ladders, stock_rows)
+    if include_cohort:
+        _apply_ladder_cohort_metrics(ladders, stock_rows)
 
     return MarketReviewLadderResponse(
         trade_date=trade_date,
@@ -371,6 +390,8 @@ async def _build_intraday_snapshot(trade_date: date, is_live: bool = True) -> Ma
     normalized_data = await _collect_intraday_source(trade_date)
     if normalized_data.get("is_authoritative") is not True:
         raise ValueError("Current market review source unavailable")
+    if normalized_data.get("trade_date", trade_date) not in (trade_date, trade_date.isoformat()):
+        raise ValueError("Market review source date does not match the requested date")
     stock_rows = normalized_data.get("stock_rows") or []
     metric = market_review_metrics_service.aggregate_daily_metrics(
         trade_date,
@@ -380,7 +401,11 @@ async def _build_intraday_snapshot(trade_date: date, is_live: bool = True) -> Ma
         int(normalized_data.get("up_count_ex_st") or 0),
         int(normalized_data.get("down_count_ex_st") or 0),
     )
-    metric_row = MarketReviewDailyMetricRow.model_validate(metric)
+    metric_row = MarketReviewDailyMetricRow.model_validate({
+        **metric, "source_status": normalized_data.get("source_status"),
+    })
+    if metric_row.trade_date != trade_date:
+        raise ValueError("Market review metric date does not match the requested date")
     labels = {
         "max_board_label": _format_board_height_label(stock_rows, metric_row.max_board_height),
         "second_board_label": _format_board_height_label(stock_rows, metric_row.second_board_height),
@@ -408,6 +433,7 @@ async def _build_intraday_snapshot(trade_date: date, is_live: bool = True) -> Ma
         is_fallback=False,
         is_live=is_live,
         snapshot_time=datetime.now(CN_TZ),
+        source_status=metric_row.source_status,
         detail=detail,
         ladder=ladder,
     )
@@ -462,20 +488,16 @@ async def _build_stored_intraday_snapshot(
     db: AsyncSession,
     requested_date: date,
 ) -> MarketReviewIntradayResponse | None:
-    resolved_date = await _resolve_latest_metric_trade_date(db, requested_date)
-    if resolved_date != requested_date:
-        return None
-
     result = await db.execute(
         select(MarketReviewDailyMetric)
-        .where(MarketReviewDailyMetric.trade_date == resolved_date)
+        .where(MarketReviewDailyMetric.trade_date == requested_date)
         .limit(1)
     )
     metric_row = result.scalar_one_or_none()
-    if metric_row is None:
+    if metric_row is None or not await asyncio.to_thread(_is_cn_trading_day, requested_date):
         return None
 
-    is_fallback = metric_row.trade_date != requested_date
+    is_fallback = False
     rows = await _attach_board_height_labels(db, [metric_row])
     daily_row = rows[0] if rows else MarketReviewDailyMetricRow.model_validate(metric_row)
     detail = await _build_detail_response_from_db(db, daily_row.trade_date, is_fallback)
@@ -494,6 +516,60 @@ async def _build_stored_intraday_snapshot(
         is_fallback=is_fallback,
         is_live=False,
         snapshot_time=datetime.now(CN_TZ),
+        source_status=daily_row.source_status,
+        detail=detail,
+        ladder=ladder,
+    )
+
+
+async def _build_archive_sample_snapshot(
+    db: AsyncSession,
+    trade_date: date,
+) -> MarketReviewIntradayResponse | None:
+    result = await db.execute(
+        select(MarketReviewArchiveSample).where(MarketReviewArchiveSample.trade_date == trade_date)
+    )
+    sample = result.scalar_one_or_none()
+    if sample is None or not await asyncio.to_thread(_is_cn_trading_day, trade_date):
+        return None
+
+    try:
+        daily_row = MarketReviewDailyMetricRow.model_validate(sample.metric_json)
+        if daily_row.trade_date != trade_date or daily_row.source_status != _MONITOR_ARCHIVE_SOURCE:
+            raise ValueError("Invalid archive metric date or source")
+
+        stock_rows = sample.stocks_json
+        if not isinstance(stock_rows, list) or not stock_rows or any(
+            not isinstance(row, dict)
+            or not row.get("stock_code")
+            or row.get("trade_date") != trade_date.isoformat()
+            for row in stock_rows
+        ):
+            raise ValueError("Invalid archive stock rows")
+
+        stock_rows = [{**row, "data_quality_flag": _MONITOR_ARCHIVE_SOURCE} for row in stock_rows]
+        daily_row = daily_row.model_copy(update={
+            "max_board_label": _format_board_height_label(stock_rows, daily_row.max_board_height),
+            "second_board_label": _format_board_height_label(stock_rows, daily_row.second_board_height),
+            "gem_board_label": _format_board_height_label(stock_rows, daily_row.gem_board_height, {"gem", "star"}),
+        })
+        detail = _build_intraday_detail(trade_date, stock_rows)
+        ladder = _build_ladder_response_from_rows(trade_date, False, stock_rows, include_cohort=False)
+    except (TypeError, ValueError) as exc:
+        logger.warning("Invalid market review archive sample for {}: {}", trade_date, type(exc).__name__)
+        return None
+
+    return MarketReviewIntradayResponse(
+        data=MarketReviewDailyData(series=[trade_date], rows=[daily_row]),
+        requested_start_date=trade_date,
+        requested_end_date=trade_date,
+        start_date=trade_date,
+        end_date=trade_date,
+        latest_trade_date=trade_date,
+        is_intraday=False,
+        is_live=False,
+        snapshot_time=datetime.now(CN_TZ),
+        source_status=_MONITOR_ARCHIVE_SOURCE,
         detail=detail,
         ladder=ladder,
     )
@@ -562,6 +638,9 @@ async def get_market_review_intraday(
         stored_snapshot = await _build_stored_intraday_snapshot(db, target_date)
         if stored_snapshot is not None:
             return stored_snapshot
+        sample_snapshot = await _build_archive_sample_snapshot(db, target_date)
+        if sample_snapshot is not None:
+            return sample_snapshot
 
     return MarketReviewIntradayResponse(
         data=MarketReviewDailyData(series=[], rows=[]),

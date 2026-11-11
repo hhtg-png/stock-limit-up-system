@@ -1,7 +1,7 @@
 """
 市场复盘接口响应模型
 """
-from datetime import date, datetime
+from datetime import date, datetime, time
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -12,25 +12,26 @@ class MarketReviewDailyMetricRow(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     trade_date: date
-    limit_up_count: int
-    limit_down_count: int
-    continuous_count: int
-    max_board_height: int
-    second_board_height: int
-    gem_board_height: int
+    source_status: str | None = None
+    limit_up_count: int | None
+    limit_down_count: int | None
+    continuous_count: int | None
+    max_board_height: int | None
+    second_board_height: int | None
+    gem_board_height: int | None
     max_board_label: str | None = None
     second_board_label: str | None = None
     gem_board_label: str | None = None
-    first_to_second_rate: float
-    continuous_promotion_rate: float
-    seal_rate: float
-    yesterday_limit_up_avg_change: float
-    yesterday_continuous_avg_change: float
-    market_turnover: float
-    up_count_ex_st: int
-    down_count_ex_st: int
-    limit_up_amount: float
-    broken_amount: float
+    first_to_second_rate: float | None
+    continuous_promotion_rate: float | None
+    seal_rate: float | None
+    yesterday_limit_up_avg_change: float | None
+    yesterday_continuous_avg_change: float | None
+    market_turnover: float | None
+    up_count_ex_st: int | None
+    down_count_ex_st: int | None
+    limit_up_amount: float | None
+    broken_amount: float | None
 
 
 class MarketReviewDailyData(BaseModel):
@@ -60,11 +61,20 @@ class MarketReviewStockItem(BaseModel):
     stock_code: str
     stock_name: str
     today_continuous_days: int
+    today_touched_limit_up: bool | None = None
     today_sealed_close: bool
     today_opened_close: bool
     change_pct: float | None = None
-    amount: float
+    amount: float | None
     limit_up_reason: str | None = None
+    first_limit_time: time | None = None
+    final_seal_time: time | None = None
+    open_count: int | None = None
+    yesterday_continuous_days: int | None = None
+    turnover_rate: float | None = None
+    close_price: float | None = None
+    pre_close: float | None = None
+    data_quality_flag: str | None = None
 
 
 class MarketReviewDetailResponse(BaseModel):
@@ -80,10 +90,10 @@ class MarketReviewLadderItem(BaseModel):
 
     continuous_days: int
     count: int
-    cohort_count: int = Field(0, description="同梯队样本数量，包含未晋级个股")
-    cohort_sealed_count: int = Field(0, description="同梯队封板数量")
-    cohort_opened_count: int = Field(0, description="同梯队炸板数量")
-    cohort_seal_rate: float = Field(0.0, description="同梯队封板率")
+    cohort_count: int | None = Field(0, description="同梯队样本数量，包含未晋级个股")
+    cohort_sealed_count: int | None = Field(0, description="同梯队封板数量")
+    cohort_opened_count: int | None = Field(0, description="同梯队炸板数量")
+    cohort_seal_rate: float | None = Field(0.0, description="同梯队封板率")
     cohort_avg_change: float | None = Field(None, description="同梯队平均涨幅")
     stocks: list[MarketReviewStockItem] = Field(default_factory=list)
     cohort_stocks: list[MarketReviewStockItem] = Field(default_factory=list, description="同梯队样本股票，包含未晋级个股")
@@ -104,5 +114,6 @@ class MarketReviewIntradayResponse(MarketReviewDailyResponse):
     is_intraday: bool = Field(True, description="是否为盘中实时快照")
     is_live: bool = Field(False, description="是否为交易时段实时采集")
     snapshot_time: datetime
+    source_status: str | None = None
     detail: MarketReviewDetailResponse
     ladder: MarketReviewLadderResponse

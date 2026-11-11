@@ -1,5 +1,5 @@
 <template>
-  <div class="statistics" v-loading="loading">
+  <div class="statistics" :aria-busy="loading">
     <div class="card summary-card">
       <div class="summary-main">
         <div class="summary-copy">
@@ -7,6 +7,32 @@
         </div>
 
         <div class="summary-controls">
+          <div class="review-date-navigation" role="group" aria-label="查看日期">
+            <el-button
+              :icon="ArrowLeft"
+              aria-label="前一交易日"
+              title="前一交易日"
+              :disabled="!previousDate"
+              @click="moveDate(-1)"
+            />
+            <el-date-picker
+              v-model="selectedDate"
+              type="date"
+              value-format="YYYY-MM-DD"
+              format="YYYY-MM-DD"
+              aria-label="查看日期"
+              :clearable="false"
+              :disabled-date="isFutureReviewDate"
+            />
+            <el-button
+              :icon="ArrowRight"
+              aria-label="后一交易日"
+              title="后一交易日"
+              :disabled="!nextDate"
+              @click="moveDate(1)"
+            />
+            <el-button :disabled="selectedDate === todayDate" @click="goToToday">今天</el-button>
+          </div>
           <el-radio-group v-model="timeRange" size="small">
             <el-radio-button label="7">近7天</el-radio-button>
             <el-radio-button label="30">近30天</el-radio-button>
@@ -18,29 +44,224 @@
       </div>
 
       <div class="summary-meta">
-        <span>区间 {{ activeStartDate }} 至 {{ activeEndDate }}</span>
-        <span>明细日期 {{ resolvedTradeDate }}</span>
+        <span v-if="dailyRows.length">趋势区间 {{ activeStartDate }} 至 {{ activeEndDate }}</span>
+        <span>查看日期 {{ selectedDate }}</span>
         <span v-if="isLiveIntraday && intradaySnapshotTime">
           实时更新 {{ formatSnapshotTime(intradaySnapshotTime) }}
         </span>
-        <el-tag v-if="isLiveIntraday" type="success" size="small">
+        <el-tag v-if="loading" type="info" size="small">正在加载</el-tag>
+        <el-tag v-else-if="isLiveIntraday" type="success" size="small">
           盘中实时
         </el-tag>
-        <el-tag v-else-if="!currentDataUnavailable" type="info" size="small">
-          收盘复盘
+        <el-tag v-else-if="isMonitoringSample" type="warning" size="small">
+          已有监控样本
         </el-tag>
-        <el-tag v-if="currentDataUnavailable" type="warning" size="small">
-          当日数据暂不可用，等待更新
+        <el-tag v-else-if="selectedDayRow" type="info" size="small">
+          收盘复盘
         </el-tag>
       </div>
     </div>
 
-    <el-alert v-if="currentDataUnavailable" title="当日数据暂不可用；曲线仅保留历史对照，明细不会回退到上一交易日。" type="warning" :closable="false" show-icon />
+    <el-alert
+      v-if="currentDataUnavailable"
+      :title="selectedDate === todayDate
+        ? '今日暂无复盘数据，页面会自动检查更新。'
+        : '所选日期暂无复盘数据，可能是休市日或尚未归档。'"
+      description="趋势仅展示此前已有的数据，明细按所选日期显示。"
+      type="warning"
+      :closable="false"
+      show-icon
+    />
+
+    <section v-if="selectedDayRow" class="card day-overview" aria-label="当日总览">
+      <div class="card-header">
+        <h3>当日总览</h3>
+        <span v-if="isMonitoringSample" class="cohort-description">已有监控样本 · 全市场指标未补齐</span>
+      </div>
+      <dl class="overview-metrics">
+        <div v-for="metric in overviewMetrics" :key="metric.label" class="overview-metric">
+          <dt>{{ metric.label }}</dt>
+          <dd>{{ metric.value }}</dd>
+        </div>
+      </dl>
+    </section>
+
+    <el-row :gutter="16">
+      <el-col :xs="24" :lg="9">
+        <div class="card detail-card">
+          <div class="card-header">
+            <h3>连板梯队</h3>
+          </div>
+
+          <div v-if="ladderLevels.length" class="ladder-list">
+            <div v-for="ladder in ladderLevels" :key="ladder.continuous_days" class="ladder-group">
+              <div class="ladder-header">
+                <span class="days-badge" :class="'days-' + Math.min(ladder.continuous_days, 10)">
+                  {{ ladder.continuous_days }}连板
+                </span>
+                <span v-if="isMonitoringSample" class="count">样本封板 {{ ladder.count }}只</span>
+                <span v-else class="count">晋级 {{ ladder.count }}只 / 样本 {{ getLadderDisplayStocks(ladder).length }}只</span>
+              </div>
+
+              <div v-if="!isMonitoringSample" class="ladder-metrics">
+                <span class="metric-pill metric-sealed">
+                  封板 <strong>{{ formatCount(getSealedCount(ladder)) }}</strong>
+                </span>
+                <span class="metric-pill metric-opened">
+                  炸板 <strong>{{ formatCount(ladder.cohort_opened_count) }}</strong>
+                </span>
+                <span class="metric-pill metric-rate">
+                  封板率 <strong>{{ getLadderSealRate(ladder) }}</strong>
+                </span>
+                <span class="metric-pill metric-average" :class="getChangeClass(getLadderAverageChangeValue(ladder))">
+                  均涨 <strong>{{ getLadderAverageChange(ladder) }}</strong>
+                </span>
+              </div>
+
+              <div class="stock-chip-list">
+                <button
+                  v-for="stock in getLadderDisplayStocks(ladder)"
+                  :key="stock.stock_code"
+                  type="button"
+                  class="stock-chip"
+                  @click="goToDetail(stock.stock_code)"
+                >
+                  <span class="code">{{ stock.stock_code }}</span>
+                  <span class="name">{{ stock.stock_name }}</span>
+                  <el-tag :type="getLadderStockStatusType(stock)" size="small">
+                    {{ getLadderStockStatusLabel(stock) }}
+                  </el-tag>
+                  <span class="stock-change" :class="getChangeClass(stock.change_pct)">
+                    {{ formatPercent(stock.change_pct) }}
+                  </span>
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <el-empty v-else description="暂无连板梯队数据" />
+        </div>
+      </el-col>
+
+      <el-col :xs="24" :lg="15">
+        <div class="card detail-card">
+          <div class="card-header">
+            <h3>复盘明细</h3>
+          </div>
+
+          <div class="detail-summary">
+            <div class="summary-item">
+              <span class="label">复盘个股</span>
+              <strong>{{ detailStocks.length }}</strong>
+            </div>
+            <div class="summary-item">
+              <span class="label">封板</span>
+              <strong>{{ sealedCloseCount }}</strong>
+            </div>
+            <div class="summary-item">
+              <span class="label">炸板</span>
+              <strong>{{ openedCloseCount }}</strong>
+            </div>
+            <div class="summary-item">
+              <span class="label">主导题材</span>
+              <strong :title="strongestReason">{{ strongestReason }}</strong>
+            </div>
+          </div>
+
+          <el-table
+            :data="detailStocks"
+            size="small"
+            stripe
+            max-height="420"
+            empty-text="暂无复盘明细"
+            @row-click="handleRowClick"
+          >
+            <el-table-column prop="stock_name" label="个股" min-width="180">
+              <template #default="{ row }">
+                <div class="stock-cell">
+                  <span class="name">{{ row.stock_name }}</span>
+                  <span class="code">{{ row.stock_code }}</span>
+                </div>
+              </template>
+            </el-table-column>
+            <el-table-column prop="today_continuous_days" label="连板" width="80" align="center">
+              <template #default="{ row }">
+                <span>{{ formatBoardCount(row.today_continuous_days) }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column :label="isLiveIntraday ? '当前状态' : '收盘状态'" width="100" align="center">
+              <template #default="{ row }">
+                <el-tag :type="getStockStatusType(row)" size="small">
+                  {{ getStockStatusLabel(row) }}
+                </el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column prop="change_pct" label="涨跌幅" width="100" align="right">
+              <template #default="{ row }">
+                <span :class="getChangeClass(row.change_pct)">
+                  {{ formatPercent(row.change_pct) }}
+                </span>
+              </template>
+            </el-table-column>
+            <el-table-column prop="amount" label="成交额" width="120" align="right">
+              <template #default="{ row }">
+                {{ formatYiAmount(toYiFromWanAmount(row.amount)) }}
+              </template>
+            </el-table-column>
+            <el-table-column prop="first_limit_time" label="首封时间" width="105" align="center">
+              <template #default="{ row }">
+                {{ formatSealTime(row.first_limit_time) }}
+              </template>
+            </el-table-column>
+            <el-table-column prop="final_seal_time" label="终封时间" width="105" align="center">
+              <template #default="{ row }">
+                {{ formatSealTime(row.final_seal_time) }}
+              </template>
+            </el-table-column>
+            <el-table-column prop="open_count" label="开板次数" width="95" align="right">
+              <template #default="{ row }">
+                {{ formatCount(row.open_count) }}
+              </template>
+            </el-table-column>
+            <el-table-column prop="yesterday_continuous_days" label="昨连板" width="85" align="right">
+              <template #default="{ row }">
+                {{ formatBoardCount(row.yesterday_continuous_days) }}
+              </template>
+            </el-table-column>
+            <el-table-column prop="turnover_rate" label="换手率" width="95" align="right">
+              <template #default="{ row }">
+                {{ formatRate(row.turnover_rate) }}
+              </template>
+            </el-table-column>
+            <el-table-column prop="close_price" :label="isLiveIntraday ? '现价' : '收盘价'" width="90" align="right">
+              <template #default="{ row }">
+                {{ formatPrice(row.close_price) }}
+              </template>
+            </el-table-column>
+            <el-table-column prop="pre_close" label="昨收价" width="90" align="right">
+              <template #default="{ row }">
+                {{ formatPrice(row.pre_close) }}
+              </template>
+            </el-table-column>
+            <el-table-column prop="limit_up_reason" label="涨停原因" min-width="160" show-overflow-tooltip>
+              <template #default="{ row }">
+                {{ row.limit_up_reason || '-' }}
+              </template>
+            </el-table-column>
+          </el-table>
+        </div>
+      </el-col>
+    </el-row>
 
     <div class="card chart-card broken-board-card">
       <div class="card-header">
-        <h3>昨日连板断板股今日平均涨幅</h3>
+        <h3>昨日连板断板股当日平均涨幅</h3>
         <span class="cohort-description">前日 ≥ 2 连板 · 昨日未封涨停 · 悬停查看个股</span>
+      </div>
+      <div v-if="selectedBrokenBoardPoint" class="broken-board-day-summary">
+        <span>{{ selectedDate }} 平均涨幅 <strong>{{ formatPercent(selectedBrokenBoardPoint.average_change) }}</strong></span>
+        <span>有效行情 {{ selectedBrokenBoardPoint.priced_count }} / {{ selectedBrokenBoardPoint.sample_count - (selectedBrokenBoardPoint.suspended_count || 0) }} 只</span>
+        <span v-if="selectedBrokenBoardPoint.suspended_count">停牌 {{ selectedBrokenBoardPoint.suspended_count }} 只</span>
       </div>
       <div ref="brokenBoardChartRef" class="chart-container"></div>
     </div>
@@ -101,137 +322,6 @@
         </div>
       </el-col>
     </el-row>
-
-    <el-row :gutter="16">
-      <el-col :xs="24" :lg="9">
-        <div class="card detail-card">
-          <div class="card-header">
-            <h3>连板梯队</h3>
-          </div>
-
-          <div v-if="ladderLevels.length" class="ladder-list">
-            <div v-for="ladder in ladderLevels" :key="ladder.continuous_days" class="ladder-group">
-              <div class="ladder-header">
-                <span class="days-badge" :class="'days-' + Math.min(ladder.continuous_days, 10)">
-                  {{ ladder.continuous_days }}连板
-                </span>
-                <span class="count">晋级 {{ ladder.count }}只 / 样本 {{ getLadderDisplayStocks(ladder).length }}只</span>
-              </div>
-
-              <div class="ladder-metrics">
-                <span class="metric-pill metric-sealed">
-                  封板 <strong>{{ getSealedCount(ladder) }}</strong>
-                </span>
-                <span class="metric-pill metric-opened">
-                  炸板 <strong>{{ getOpenedCount(ladder) }}</strong>
-                </span>
-                <span class="metric-pill metric-rate">
-                  封板率 <strong>{{ getLadderSealRate(ladder) }}</strong>
-                </span>
-                <span class="metric-pill metric-average" :class="getChangeClass(getLadderAverageChangeValue(ladder))">
-                  均涨 <strong>{{ getLadderAverageChange(ladder) }}</strong>
-                </span>
-              </div>
-
-              <div class="stock-chip-list">
-                <button
-                  v-for="stock in getLadderDisplayStocks(ladder)"
-                  :key="stock.stock_code"
-                  type="button"
-                  class="stock-chip"
-                  @click="goToDetail(stock.stock_code)"
-                >
-                  <span class="code">{{ stock.stock_code }}</span>
-                  <span class="name">{{ stock.stock_name }}</span>
-                  <el-tag :type="getLadderStockStatusType(stock)" size="small">
-                    {{ getLadderStockStatusLabel(stock) }}
-                  </el-tag>
-                  <span class="stock-change" :class="getChangeClass(stock.change_pct)">
-                    {{ formatPercent(stock.change_pct) }}
-                  </span>
-                </button>
-              </div>
-            </div>
-          </div>
-
-          <el-empty v-else description="暂无连板梯队数据" />
-        </div>
-      </el-col>
-
-      <el-col :xs="24" :lg="15">
-        <div class="card detail-card">
-          <div class="card-header">
-            <h3>复盘明细</h3>
-          </div>
-
-          <div class="detail-summary">
-            <div class="summary-item">
-              <span class="label">复盘个股</span>
-              <strong>{{ detailStocks.length }}</strong>
-            </div>
-            <div class="summary-item">
-              <span class="label">封板收盘</span>
-              <strong>{{ sealedCloseCount }}</strong>
-            </div>
-            <div class="summary-item">
-              <span class="label">炸板收盘</span>
-              <strong>{{ openedCloseCount }}</strong>
-            </div>
-            <div class="summary-item">
-              <span class="label">主导题材</span>
-              <strong>{{ strongestReason }}</strong>
-            </div>
-          </div>
-
-          <el-table
-            :data="detailStocks"
-            size="small"
-            stripe
-            max-height="420"
-            empty-text="暂无复盘明细"
-            @row-click="handleRowClick"
-          >
-            <el-table-column prop="stock_name" label="个股" min-width="180">
-              <template #default="{ row }">
-                <div class="stock-cell">
-                  <span class="name">{{ row.stock_name }}</span>
-                  <span class="code">{{ row.stock_code }}</span>
-                </div>
-              </template>
-            </el-table-column>
-            <el-table-column prop="today_continuous_days" label="连板" width="80" align="center">
-              <template #default="{ row }">
-                <span>{{ row.today_continuous_days }}板</span>
-              </template>
-            </el-table-column>
-            <el-table-column label="收盘状态" width="100" align="center">
-              <template #default="{ row }">
-                <el-tag :type="getStockStatusType(row)" size="small">
-                  {{ getStockStatusLabel(row) }}
-                </el-tag>
-              </template>
-            </el-table-column>
-            <el-table-column prop="change_pct" label="涨跌幅" width="100" align="right">
-              <template #default="{ row }">
-                <span :class="getChangeClass(row.change_pct)">
-                  {{ formatPercent(row.change_pct) }}
-                </span>
-              </template>
-            </el-table-column>
-            <el-table-column prop="amount" label="成交额" width="120" align="right">
-              <template #default="{ row }">
-                {{ formatAmount(row.amount) }}
-              </template>
-            </el-table-column>
-            <el-table-column prop="limit_up_reason" label="涨停原因" min-width="160" show-overflow-tooltip>
-              <template #default="{ row }">
-                {{ row.limit_up_reason || '-' }}
-              </template>
-            </el-table-column>
-          </el-table>
-        </div>
-      </el-col>
-    </el-row>
   </div>
 </template>
 
@@ -240,7 +330,8 @@ import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import * as echarts from 'echarts'
 import dayjs from 'dayjs'
-import { getMarketReviewDaily, getMarketReviewIntraday } from '@/api'
+import { ArrowLeft, ArrowRight } from '@element-plus/icons-vue'
+import { getLimitUpDates, getMarketReviewDaily, getMarketReviewIntraday } from '@/api'
 import { getChinaDateString } from '@/utils/chinaDate'
 import { getBrokenBoardPerformance, type BrokenBoardPoint } from '@/api/review'
 import { buildReviewRange } from '@/utils/reviewRange'
@@ -256,13 +347,15 @@ const router = useRouter()
 
 const timeRange = ref('30')
 const loading = ref(false)
-const initialReviewDate = getChinaDateString()
-const activeStartDate = ref(initialReviewDate)
-const activeEndDate = ref(initialReviewDate)
+const todayDate = ref(getChinaDateString())
+const selectedDate = ref(todayDate.value)
+const activeStartDate = ref(todayDate.value)
+const activeEndDate = ref(todayDate.value)
+const navigationDates = ref<string[]>([])
 
 const dailySeries = ref<string[]>([])
 const dailyRows = ref<MarketReviewDailyRow[]>([])
-const dailyHasFallback = ref(false)
+const selectedDayRow = ref<MarketReviewDailyRow | null>(null)
 const detailResponse = ref<MarketReviewDetailResponse | null>(null)
 const ladderResponse = ref<MarketReviewLadderResponse | null>(null)
 const isLiveIntraday = ref(false)
@@ -286,6 +379,8 @@ let limitTrendChart: echarts.ECharts | null = null
 let breadthChart: echarts.ECharts | null = null
 let amountChart: echarts.ECharts | null = null
 let fetchSequence = 0
+let requestInFlight = false
+let disposed = false
 let reviewRefreshTimer: number | null = null
 let brokenBoardRequestKey = ''
 let brokenBoardRequestPending = false
@@ -293,15 +388,52 @@ let brokenBoardRequestSequence = 0
 
 const detailStocks = computed(() => detailResponse.value?.stocks ?? [])
 const ladderLevels = computed(() => ladderResponse.value?.ladders ?? [])
-const resolvedTradeDate = computed(
-  () => detailResponse.value?.trade_date || ladderResponse.value?.trade_date || activeEndDate.value
-)
+const isMonitoringSample = computed(() => selectedDayRow.value?.source_status === 'monitor_archive')
+const availableDates = computed(() => [...new Set([
+  ...navigationDates.value, ...dailyRows.value.map(row => row.trade_date)
+])].filter(day => day <= todayDate.value).sort())
+const previousDate = computed(() => availableDates.value.filter(day => day < selectedDate.value).pop())
+const nextDate = computed(() => availableDates.value.find(day => day > selectedDate.value))
+const selectedBrokenBoardPoint = computed(() => brokenBoardPoints.value.find(point => point.trade_date === selectedDate.value))
 const sealedCloseCount = computed(
   () => detailStocks.value.filter(stock => stock.today_sealed_close).length
 )
 const openedCloseCount = computed(
   () => detailStocks.value.filter(stock => stock.today_opened_close).length
 )
+const overviewMetrics = computed(() => {
+  const row = selectedDayRow.value
+  if (!row) return []
+  const core = [
+    { label: '触板家数', value: formatCount(row.limit_up_count) },
+    { label: '封板家数', value: formatCount(detailResponse.value ? sealedCloseCount.value : null) },
+    { label: '炸板家数', value: formatCount(detailResponse.value ? openedCloseCount.value : null) },
+    { label: '连板家数', value: formatCount(row.continuous_count) },
+    { label: '最高板', value: formatBoardCount(row.max_board_height) },
+    { label: '封板率', value: formatRate(row.seal_rate) }
+  ]
+  if (isMonitoringSample.value) {
+    if (row.market_turnover != null && Number.isFinite(row.market_turnover) && row.market_turnover > 0) {
+      core.push({ label: '沪深成交额（交易所）', value: formatYiAmount(row.market_turnover) })
+    }
+    return core
+  }
+  return [
+    ...core,
+    { label: '跌停家数', value: formatCount(row.limit_down_count) },
+    { label: '次高板', value: formatBoardCount(row.second_board_height) },
+    { label: '创业／科创最高板', value: formatBoardCount(row.gem_board_height) },
+    { label: '首板晋级率', value: formatRate(row.first_to_second_rate) },
+    { label: '连板晋级率', value: formatRate(row.continuous_promotion_rate) },
+    { label: '昨日涨停均涨', value: formatPercent(row.yesterday_limit_up_avg_change) },
+    { label: '昨日连板均涨', value: formatPercent(row.yesterday_continuous_avg_change) },
+    { label: '沪深成交额', value: formatYiAmount(row.market_turnover) },
+    { label: '非ST上涨家数', value: formatCount(row.up_count_ex_st) },
+    { label: '非ST下跌家数', value: formatCount(row.down_count_ex_st) },
+    { label: '触板成交额', value: formatYiAmount(toYiFromWanAmount(row.limit_up_amount)) },
+    { label: '炸板成交额', value: formatYiAmount(toYiFromWanAmount(row.broken_amount)) }
+  ]
+})
 const strongestReason = computed(() => {
   const counter = new Map<string, number>()
 
@@ -324,29 +456,26 @@ const strongestReason = computed(() => {
   return winner
 })
 
-function getDateRange() {
-  return buildReviewRange(timeRange.value, getChinaDateString())
+function isFutureReviewDate(value: Date) {
+  return dayjs(value).format('YYYY-MM-DD') > todayDate.value
 }
 
-function mergeIntradayDailyRows(
-  series: string[],
-  rows: MarketReviewDailyRow[],
-  intradayRow: MarketReviewDailyRow
-) {
-  const nextSeries = [...series]
-  const nextRows = [...rows]
-  const rowIndex = nextRows.findIndex(row => row.trade_date === intradayRow.trade_date)
+function moveDate(direction: -1 | 1) {
+  const next = direction < 0 ? previousDate.value : nextDate.value
+  if (next) selectedDate.value = next
+}
 
-  if (rowIndex >= 0) {
-    nextRows[rowIndex] = intradayRow
-  } else {
-    nextSeries.push(intradayRow.trade_date)
-    nextRows.push(intradayRow)
-  }
+function goToToday() {
+  todayDate.value = getChinaDateString()
+  selectedDate.value = todayDate.value
+}
 
-  return {
-    series: nextSeries,
-    rows: nextRows
+async function loadNavigationDates() {
+  try {
+    const result = await getLimitUpDates()
+    if (!disposed) navigationDates.value = result.dates
+  } catch {
+    // The calendar still accepts a typed or picked date when the date list is unavailable.
   }
 }
 
@@ -359,18 +488,34 @@ function formatSnapshotTime(value: string) {
 }
 
 function formatPercent(value: number | null | undefined) {
-  if (value == null) {
-    return '-'
+  if (value == null || !Number.isFinite(value)) {
+    return '—'
   }
   const sign = value > 0 ? '+' : ''
   return `${sign}${value.toFixed(2)}%`
 }
 
 function formatRate(value: number | null | undefined) {
-  if (value == null) {
-    return '-'
+  if (value == null || !Number.isFinite(value)) {
+    return '—'
   }
   return `${value.toFixed(2)}%`
+}
+
+function formatCount(value: number | null | undefined) {
+  return value == null || !Number.isFinite(value) ? '—' : value.toLocaleString('zh-CN')
+}
+
+function formatBoardCount(value: number | null | undefined) {
+  return value == null || !Number.isFinite(value) ? '—' : `${value}板`
+}
+
+function formatSealTime(value: string | null | undefined) {
+  return value ? value.slice(0, 8) : '—'
+}
+
+function formatPrice(value: number | null | undefined) {
+  return value == null || !Number.isFinite(value) || value <= 0 ? '—' : value.toFixed(2)
 }
 
 function formatPercentAxisLabel(value: number | string | null | undefined) {
@@ -382,6 +527,7 @@ function formatPercentAxisLabel(value: number | string | null | undefined) {
 }
 
 function formatPercentPointLabel(value: number | string | null | undefined, signed = false) {
+  if (value == null) return '—'
   const numericValue = Number(value)
   if (!Number.isFinite(numericValue)) {
     return '-'
@@ -390,24 +536,13 @@ function formatPercentPointLabel(value: number | string | null | undefined, sign
   return `${sign}${numericValue.toFixed(1)}%`
 }
 
-function formatAmount(value: number) {
-  if (Math.abs(value) >= 100000000) {
-    return `${(value / 100000000).toFixed(2)}亿`
-  }
-  if (Math.abs(value) >= 10000) {
-    return `${(value / 10000).toFixed(2)}万`
-  }
-  return value.toFixed(0)
-}
-
 function toYiFromWanAmount(value: number | null | undefined) {
-  if (value == null) {
-    return 0
-  }
+  if (value == null || !Number.isFinite(value)) return null
   return Number((value / 10000).toFixed(2))
 }
 
 function formatYiAmount(value: number | string | null | undefined) {
+  if (value == null) return '—'
   const numericValue = Number(value)
   if (!Number.isFinite(numericValue)) {
     return '-'
@@ -438,6 +573,9 @@ function getStockStatusLabel(stock: MarketReviewDetailStock) {
   }
   if (stock.today_opened_close) {
     return '炸板'
+  }
+  if (stock.today_touched_limit_up) {
+    return '触板'
   }
   return '观察'
 }
@@ -470,11 +608,7 @@ function getLadderStockStatusLabel(stock: MarketReviewDetailStock) {
 }
 
 function getSealedCount(ladder: MarketReviewLadderLevel) {
-  return ladder.stocks.filter(stock => stock.today_sealed_close).length
-}
-
-function getOpenedCount(ladder: MarketReviewLadderLevel) {
-  return ladder.stocks.filter(stock => stock.today_opened_close).length
+  return ladder.cohort_sealed_count ?? ladder.stocks.filter(stock => stock.today_sealed_close).length
 }
 
 function getLadderSealRate(ladder: MarketReviewLadderLevel) {
@@ -639,7 +773,7 @@ function getYiAmountLabelOption() {
   return {
     show: true,
     position: 'top',
-    formatter: (params: { value?: number | string }) => formatYiAmount(Number(params.value)),
+    formatter: (params: { value?: number | string | null }) => formatYiAmount(params.value),
     color: '#595959',
     fontSize: 11,
     distance: 4
@@ -697,7 +831,7 @@ function formatBoardHeightTooltip(params: unknown) {
   const stockLines = [
     row.max_board_label ? formatBoardTooltipStockLine('最高板', row.max_board_label) : '',
     row.second_board_label ? formatBoardTooltipStockLine('次高板', row.second_board_label) : '',
-    row.gem_board_label ? formatBoardTooltipStockLine('创业板', row.gem_board_label) : ''
+    row.gem_board_label ? formatBoardTooltipStockLine('创业／科创', row.gem_board_label) : ''
   ].filter(Boolean)
 
   return [
@@ -727,7 +861,7 @@ function updateBrokenBoardChart() {
       extraCssText: 'max-height:360px;overflow-y:auto;', formatter: formatBrokenBoardTooltip },
     xAxis: { type: 'category', data: brokenBoardPoints.value.map(row => row.trade_date), axisLabel: { formatter: formatDateLabel } },
     yAxis: { type: 'value', axisLabel: { formatter: formatPercentAxisLabel } },
-    series: [{ name: '昨日连板断板股今日平均涨幅', type: 'line', smooth: false, connectNulls: false,
+    series: [{ name: '昨日连板断板股当日平均涨幅', type: 'line', smooth: false, connectNulls: false,
       symbol: 'circle', symbolSize: 7, itemStyle: { color: '#8b5cf6' },
       data: brokenBoardPoints.value.map(row => row.average_change),
       label: getPercentPointLabelOption('top', true),
@@ -797,7 +931,7 @@ function updateCharts() {
           label: getBoardHeightLabelOption('second_board_label', 'bottom', [0, 16])
         },
         {
-          name: '创业板高度',
+          name: '创业／科创高度',
           type: 'line',
           smooth: true,
           symbol: 'circle',
@@ -939,7 +1073,7 @@ function updateCharts() {
           itemStyle: { color: '#722ed1' }
         },
         {
-          name: '涨停数',
+          name: '触板数',
           type: 'bar',
           data: dailyRows.value.map(row => row.limit_up_count),
           itemStyle: { color: '#f5222d' },
@@ -965,7 +1099,7 @@ function updateCharts() {
           type: 'value',
           name: '成交额',
           axisLabel: {
-            formatter: (value: number) => formatAmount(value)
+            formatter: (value: number) => formatYiAmount(value)
           }
         },
         {
@@ -1009,7 +1143,7 @@ function updateCharts() {
       ...getBaseGridOption(true),
       tooltip: {
         trigger: 'axis',
-        valueFormatter: (value: unknown) => formatYiAmount(Number(value))
+        valueFormatter: (value: unknown) => value == null ? '—' : formatYiAmount(Number(value))
       },
       yAxis: {
         type: 'value',
@@ -1020,7 +1154,7 @@ function updateCharts() {
       },
       series: [
         {
-          name: '涨停成交额',
+          name: '触板成交额',
           type: 'bar',
           data: dailyRows.value.map(row => toYiFromWanAmount(row.limit_up_amount)),
           itemStyle: { color: '#f5222d' },
@@ -1098,13 +1232,17 @@ type FetchDataOptions = {
 async function fetchBrokenBoardData(query: { days: number; end_date: string }) {
   const key = JSON.stringify(query)
   if (brokenBoardRequestPending && brokenBoardRequestKey === key) return
+  if (brokenBoardRequestKey !== key) {
+    brokenBoardPoints.value = []
+    updateBrokenBoardChart()
+  }
   brokenBoardRequestKey = key
   brokenBoardRequestPending = true
   const request = ++brokenBoardRequestSequence
   try {
     const result = await getBrokenBoardPerformance(query)
     if (request !== brokenBoardRequestSequence) return
-    brokenBoardPoints.value = result.points
+    brokenBoardPoints.value = result.points.filter(point => point.trade_date <= query.end_date)
   } catch {
     if (request !== brokenBoardRequestSequence) return
     brokenBoardPoints.value = []
@@ -1117,53 +1255,75 @@ async function fetchBrokenBoardData(query: { days: number; end_date: string }) {
 }
 
 async function fetchData(options: FetchDataOptions = {}) {
+  if (disposed || (options.silent && requestInFlight)) return
   const currentSequence = ++fetchSequence
+  const targetDate = selectedDate.value
+  const { startDate, endDate, query } = buildReviewRange(timeRange.value, targetDate)
   const shouldShowLoading = !options.silent
+  requestInFlight = true
   if (shouldShowLoading) {
     loading.value = true
-  }
-  const today = getChinaDateString()
-  const { startDate, endDate, query } = getDateRange()
-  void fetchBrokenBoardData(query)
-  const [history, snapshot] = await Promise.allSettled([
-    getMarketReviewDaily(query), getMarketReviewIntraday(today)
-  ])
-  if (currentSequence !== fetchSequence) return
-
-  if (history.status === 'fulfilled') {
-    dailySeries.value = history.value.data.series
-    dailyRows.value = history.value.data.rows
-    activeStartDate.value = history.value.start_date || dailySeries.value[0] || startDate
-  } else {
-    dailySeries.value = []
     dailyRows.value = []
+    dailySeries.value = []
+    selectedDayRow.value = null
+    detailResponse.value = null
+    ladderResponse.value = null
+    intradaySnapshotTime.value = null
+    isLiveIntraday.value = false
+    currentDataUnavailable.value = false
     activeStartDate.value = startDate
+    activeEndDate.value = endDate
   }
-  dailyHasFallback.value = false
-  activeEndDate.value = endDate
+  void fetchBrokenBoardData(query)
+  if (shouldShowLoading) updateCharts()
+  const [history, snapshot] = await Promise.allSettled([
+    getMarketReviewDaily(query), getMarketReviewIntraday(targetDate)
+  ])
+  if (currentSequence !== fetchSequence || targetDate !== selectedDate.value) return
+
+  // The latest market snapshot is authoritative for today. A stored current-day
+  // row can be stale while the exchange is open, so only exact historical rows
+  // may fill in when the single-day request is unavailable.
+  const isToday = targetDate === todayDate.value
+  const trendRows = new Map<string, MarketReviewDailyRow>()
+  const historyRows = history.status === 'fulfilled' ? history.value.data.rows : dailyRows.value
+  for (const row of historyRows) {
+    if (row.trade_date <= targetDate && (!isToday || row.trade_date !== targetDate)
+      && row.source_status !== 'monitor_archive') {
+      trendRows.set(row.trade_date, row)
+    }
+  }
+
+  selectedDayRow.value = trendRows.get(targetDate) ?? null
   detailResponse.value = null
   ladderResponse.value = null
   intradaySnapshotTime.value = null
-  isLiveIntraday.value = snapshot.status === 'fulfilled' && snapshot.value.is_live
-  currentDataUnavailable.value = true
-  // History remains a comparison only. Never keep a stale current-day point.
-  dailyRows.value = dailyRows.value.filter(row => row.trade_date !== today)
-  dailySeries.value = dailyRows.value.map(row => row.trade_date)
+  isLiveIntraday.value = false
   if (snapshot.status === 'fulfilled') {
-    const intradayResult = snapshot.value
-    const intradayRow = intradayResult.data.rows[0]
-    if (intradayResult.data_status !== 'unavailable' && !intradayResult.is_fallback && intradayRow?.trade_date === today) {
-      const mergedDaily = mergeIntradayDailyRows(dailySeries.value, dailyRows.value, intradayRow)
-      dailySeries.value = mergedDaily.series
-      dailyRows.value = mergedDaily.rows
-      detailResponse.value = intradayResult.detail
-      ladderResponse.value = intradayResult.ladder
-      intradaySnapshotTime.value = intradayResult.snapshot_time
-      currentDataUnavailable.value = false
+    const result = snapshot.value
+    const exactRow = result.data.rows.find(row => row.trade_date === targetDate)
+    if (result.data_status === 'ready' && !result.is_fallback && exactRow) {
+      const isSample = exactRow.source_status === 'monitor_archive' || result.source_status === 'monitor_archive'
+      selectedDayRow.value = isSample ? { ...exactRow, source_status: 'monitor_archive' } : exactRow
+      if (!isSample) trendRows.set(targetDate, exactRow)
+      if (!result.detail.is_fallback && result.detail.trade_date === targetDate) {
+        detailResponse.value = result.detail
+      }
+      if (!result.ladder.is_fallback && result.ladder.trade_date === targetDate) {
+        ladderResponse.value = result.ladder
+      }
+      isLiveIntraday.value = isToday && !isSample && result.is_live
+      if (isLiveIntraday.value) intradaySnapshotTime.value = result.snapshot_time
     }
   }
+  dailyRows.value = [...trendRows.values()].sort((a, b) => a.trade_date.localeCompare(b.trade_date)).slice(-query.days)
+  dailySeries.value = dailyRows.value.map(row => row.trade_date)
+  activeStartDate.value = dailySeries.value[0] || startDate
+  activeEndDate.value = dailySeries.value[dailySeries.value.length - 1] || endDate
+  currentDataUnavailable.value = selectedDayRow.value == null
+  requestInFlight = false
+  loading.value = false
   updateCharts()
-  if (shouldShowLoading) loading.value = false
 }
 
 function goToDetail(stockCode: string) {
@@ -1174,7 +1334,7 @@ function handleRowClick(row: MarketReviewDetailStock) {
   goToDetail(row.stock_code)
 }
 
-watch(timeRange, () => fetchData())
+watch([timeRange, selectedDate], () => fetchData())
 
 function clearReviewRefreshTimer() {
   if (reviewRefreshTimer != null) {
@@ -1184,9 +1344,17 @@ function clearReviewRefreshTimer() {
 }
 
 function refreshReviewSilently() {
-  if (loading.value) {
-    return
+  const today = getChinaDateString()
+  if (today !== todayDate.value) {
+    const wasViewingToday = selectedDate.value === todayDate.value
+    todayDate.value = today
+    void loadNavigationDates()
+    if (wasViewingToday) {
+      selectedDate.value = today
+      return
+    }
   }
+  if (selectedDate.value !== today || document.visibilityState === 'hidden') return
   void fetchData({ silent: true })
 }
 
@@ -1198,12 +1366,16 @@ function resetReviewRefreshTimer() {
 onMounted(() => {
   initCharts()
   updateCharts()
+  void loadNavigationDates()
   fetchData()
   resetReviewRefreshTimer()
   window.addEventListener('resize', resizeCharts)
 })
 
 onUnmounted(() => {
+  disposed = true
+  fetchSequence += 1
+  brokenBoardRequestSequence += 1
   clearReviewRefreshTimer()
   window.removeEventListener('resize', resizeCharts)
   disposeCharts()
@@ -1267,6 +1439,60 @@ onUnmounted(() => {
     flex-wrap: wrap;
     row-gap: 6px;
   }
+}
+
+.review-date-navigation {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+
+  :deep(.el-button) {
+    flex-shrink: 0;
+    margin-left: 0;
+  }
+
+  :deep(.el-date-editor) {
+    width: 144px;
+    min-width: 0;
+  }
+}
+
+.overview-metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 8px;
+  margin: 0;
+}
+
+.overview-metric {
+  min-width: 0;
+  border-radius: 6px;
+  background: #f7f9fc;
+  padding: 8px 10px;
+
+  dt {
+    color: #606266;
+    font-size: 12px;
+  }
+
+  dd {
+    margin: 4px 0 0;
+    color: #262626;
+    font-size: 16px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    overflow-wrap: anywhere;
+  }
+}
+
+.broken-board-day-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+  padding: 0 0 8px;
+  font-size: 12px;
+  color: #606266;
 }
 
 .chart-card,
@@ -1507,6 +1733,25 @@ onUnmounted(() => {
 @media (max-width: 767px) {
   .card {
     padding: 12px;
+  }
+
+  .summary-controls,
+  .review-date-navigation {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  .review-date-navigation :deep(.el-date-editor) {
+    flex: 1;
+    width: auto;
+  }
+
+  .summary-controls :deep(.el-radio-group) {
+    justify-content: flex-start;
+  }
+
+  .overview-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .chart-container {

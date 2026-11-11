@@ -10,19 +10,17 @@ function setup(intraday, dailyError = false) {
   const ref = value => ({ value })
   const today = '2026-09-11'
   const context = {
-    console: { error() {}, warn() {} }, fetchSequence: 0,
+    console: { error() {}, warn() {} }, fetchSequence: 0, disposed: false, requestInFlight: false,
     loading: ref(false), isLiveIntraday: ref(false), intradaySnapshotTime: ref(null),
     currentDataUnavailable: ref(false), brokenBoardPoints: ref([]),
-    dailySeries: ref([today]), dailyRows: ref([{ trade_date: today }]), dailyHasFallback: ref(false),
+    dailySeries: ref([today]), dailyRows: ref([{ trade_date: today }]), selectedDayRow: ref({ trade_date: today }),
     activeStartDate: ref(today), activeEndDate: ref(today), detailResponse: ref({ trade_date: '2026-09-10' }), ladderResponse: ref(null),
-    getChinaDateString: () => today, getDateRange: () => ({ startDate: today, endDate: today, query: { days: 30 } }),
+    todayDate: ref(today), selectedDate: ref(today), timeRange: ref('30'),
+    buildReviewRange: (_range, date) => ({ startDate: date, endDate: date, query: { days: 30, end_date: date } }),
     getMarketReviewDaily: async () => { if (dailyError) throw Error('history down'); return { data: { series: ['2026-09-10'], rows: [{ trade_date: '2026-09-10' }] }, end_date: '2026-09-10', is_fallback: true } },
     getMarketReviewIntraday: async () => { if (intraday instanceof Error) throw intraday; return intraday },
     fetchBrokenBoardData() {},
     getBrokenBoardPerformance: async () => ({ points: [] }),
-    getMarketReviewDetail: async () => ({ trade_date: '2026-09-10' }),
-    getMarketReviewLadder: async () => ({ trade_date: '2026-09-10' }),
-    mergeIntradayDailyRows: (series, rows, row) => ({ series: [...series, row.trade_date], rows: [...rows, row] }),
     updateCharts() {}, ElMessage: { error() {} }
   }
   vm.createContext(context)
@@ -33,9 +31,10 @@ test('unavailable live snapshot clears old details and keeps current date withou
   const c = setup({ is_live: true, data_status: 'unavailable', data: { rows: [] } })
   await c.fetchData({ silent: true })
   assert.equal(c.detailResponse.value, null)
-  assert.equal(c.activeEndDate.value, '2026-09-11')
+  assert.equal(c.selectedDate.value, '2026-09-11')
+  assert.equal(c.activeEndDate.value, '2026-09-10', 'comparison range ends on the last displayed historical day')
   assert.equal(c.currentDataUnavailable.value, true)
-  assert.equal(c.dailyHasFallback.value, false)
+  assert.equal(c.isLiveIntraday.value, false)
   assert.equal(c.dailyRows.value.some(row => row.trade_date === '2026-09-11'), false)
 })
 test('live data still appears when historical request fails', async () => {

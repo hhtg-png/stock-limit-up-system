@@ -166,25 +166,26 @@ export interface StockSearchItem {
 // 市场复盘相关类型
 export interface MarketReviewDailyRow {
   trade_date: string
-  limit_up_count: number
-  limit_down_count: number
-  continuous_count: number
-  max_board_height: number
-  second_board_height: number
-  gem_board_height: number
+  source_status?: string | null
+  limit_up_count: number | null
+  limit_down_count: number | null
+  continuous_count: number | null
+  max_board_height: number | null
+  second_board_height: number | null
+  gem_board_height: number | null
   max_board_label?: string | null
   second_board_label?: string | null
   gem_board_label?: string | null
-  first_to_second_rate: number
-  continuous_promotion_rate: number
-  seal_rate: number
-  yesterday_limit_up_avg_change: number
-  yesterday_continuous_avg_change: number
-  market_turnover: number
-  up_count_ex_st: number
-  down_count_ex_st: number
-  limit_up_amount: number
-  broken_amount: number
+  first_to_second_rate: number | null
+  continuous_promotion_rate: number | null
+  seal_rate: number | null
+  yesterday_limit_up_avg_change: number | null
+  yesterday_continuous_avg_change: number | null
+  market_turnover: number | null
+  up_count_ex_st: number | null
+  down_count_ex_st: number | null
+  limit_up_amount: number | null
+  broken_amount: number | null
 }
 
 export interface MarketReviewDailyResponse {
@@ -204,11 +205,20 @@ export interface MarketReviewDetailStock {
   stock_code: string
   stock_name: string
   today_continuous_days: number
+  today_touched_limit_up?: boolean | null
   today_sealed_close: boolean
   today_opened_close: boolean
   change_pct: number | null
-  amount: number
+  amount: number | null
   limit_up_reason: string | null
+  first_limit_time?: string | null
+  final_seal_time?: string | null
+  open_count?: number | null
+  yesterday_continuous_days?: number | null
+  turnover_rate?: number | null
+  close_price?: number | null
+  pre_close?: number | null
+  data_quality_flag?: string | null
 }
 
 export interface MarketReviewDetailResponse {
@@ -220,10 +230,10 @@ export interface MarketReviewDetailResponse {
 export interface MarketReviewLadderLevel {
   continuous_days: number
   count: number
-  cohort_count: number
-  cohort_sealed_count: number
-  cohort_opened_count: number
-  cohort_seal_rate: number
+  cohort_count: number | null
+  cohort_sealed_count: number | null
+  cohort_opened_count: number | null
+  cohort_seal_rate: number | null
   cohort_avg_change: number | null
   stocks: MarketReviewDetailStock[]
   cohort_stocks: MarketReviewDetailStock[]
@@ -237,7 +247,8 @@ export interface MarketReviewLadderResponse {
 
 export interface MarketReviewIntradayResponse extends MarketReviewDailyResponse {
   data_status: 'ready' | 'unavailable'
-  is_intraday: true
+  source_status?: string | null
+  is_intraday: boolean
   is_live: boolean
   snapshot_time: string
   detail: MarketReviewDetailResponse
