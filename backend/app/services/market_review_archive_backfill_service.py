@@ -5,8 +5,10 @@ import math
 import re
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, time
+from typing import Literal
 
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -22,6 +24,7 @@ from app.utils.time_utils import CN_TZ, today_cn
 
 
 SOURCE_STATUS = "monitor_archive"
+TURNOVER_SOURCE_STATUS = "exchange_turnover_archive"
 _PRICE_FIELDS = {"close_price", "pre_close"}
 _NONNEGATIVE_FIELDS = {"amount", "turnover_rate"}
 _QUOTE_FIELDS = _PRICE_FIELDS | _NONNEGATIVE_FIELDS | {"change_pct"}
@@ -32,6 +35,35 @@ class ArchiveBackfillDay:
     trade_date: date
     status: str
     stock_count: int = 0
+
+
+class _MonitorSourceRow(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    trade_date: str
+    stock_code: str = Field(pattern=r"^[0-9]{6}$")
+    stock_name: str = Field(min_length=1, max_length=50)
+    market: Literal["SH", "SZ", "BJ"]
+    first_limit_up_time: str | None
+    final_seal_time: str | None
+    continuous_limit_up_days: int | None = Field(ge=0)
+    open_count: int | None = Field(ge=0)
+    is_final_sealed: bool | int | None
+    current_status: Literal["unknown", "sealed", "resealed", "opened", "broken"] | None
+    amount: float | None = Field(ge=0, allow_inf_nan=False)
+    turnover_rate: float | None = Field(ge=0, allow_inf_nan=False)
+    close_price: float | None = Field(ge=0, allow_inf_nan=False)
+    limit_up_reason: str | None
+    data_source: str | None
+
+
+class _MonitorSourceFile(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    source_table: Literal["limit_up_records JOIN stocks"]
+    amount_unit: Literal["CNY_10000"]
+    trade_dates: list[str] = Field(min_length=1)
+    rows: list[_MonitorSourceRow] = Field(min_length=1)
 
 
 def _number(value: object) -> float | None:
@@ -101,6 +133,62 @@ def _same_session_time(value: datetime | None, day: date) -> str | None:
     return local.time().isoformat(timespec="seconds") if local.date() == day else None
 
 
+def _monitor_source_time(raw: str | None, day: date) -> datetime | None:
+    if raw is None:
+        return None
+    if len(raw) < 19 or raw[10] not in {"T", " "}:
+        raise ValueError(f"Invalid monitor source timestamp for {day}")
+    value = datetime.fromisoformat(raw)
+    local = value.astimezone(CN_TZ) if value.tzinfo is not None else value
+    if local.date() != day or not time(9, 15) <= local.time() < time(15, 1):
+        raise ValueError(f"Monitor source timestamp is outside the session for {day}")
+    return value
+
+
+def _validate_monitor_source(
+    raw: Mapping[str, object] | None, sessions: set[date],
+) -> dict[date, list[tuple[LimitUpRecord, Stock]]]:
+    if raw is None:
+        return {}
+    source = _MonitorSourceFile.model_validate(raw)
+    day_by_text = {day.isoformat(): day for day in sessions}
+    declared = set(source.trade_dates)
+    if len(declared) != len(source.trade_dates) or not declared.issubset(day_by_text):
+        raise ValueError("Monitor source requires unique requested trading dates")
+    found: dict[date, dict[str, tuple[LimitUpRecord, Stock]]] = {}
+    for row in source.rows:
+        if row.trade_date not in declared:
+            raise ValueError(f"Monitor source row has undeclared trading date: {row.trade_date}")
+        day = day_by_text[row.trade_date]
+        rows = found.setdefault(day, {})
+        if row.stock_code in rows or row.is_final_sealed not in (None, 0, 1):
+            raise ValueError(f"Duplicate stock or invalid seal status for {day}/{row.stock_code}")
+        first_time = _monitor_source_time(row.first_limit_up_time, day)
+        final_time = _monitor_source_time(row.final_seal_time, day)
+        first_clock = _same_session_time(first_time, day)
+        final_clock = _same_session_time(final_time, day)
+        if first_clock and final_clock and first_clock > final_clock:
+            raise ValueError(f"Monitor source first seal follows final seal for {day}/{row.stock_code}")
+        record = LimitUpRecord(
+            trade_date=day,
+            first_limit_up_time=first_time,
+            final_seal_time=final_time,
+            continuous_limit_up_days=row.continuous_limit_up_days,
+            open_count=row.open_count,
+            is_final_sealed=None if row.is_final_sealed is None else bool(row.is_final_sealed),
+            current_status=row.current_status,
+            amount=row.amount,
+            turnover_rate=row.turnover_rate,
+            close_price=row.close_price,
+            limit_up_reason=row.limit_up_reason,
+        )
+        stock = Stock(stock_code=row.stock_code, stock_name=row.stock_name, market=row.market)
+        rows[row.stock_code] = (record, stock)
+    if len(found) != len(declared):
+        raise ValueError("Monitor source must include stock rows for every declared trading date")
+    return {day: [rows[code] for code in sorted(rows)] for day, rows in found.items()}
+
+
 def _board_type(code: str) -> str:
     if code.startswith(("300", "301")):
         return "gem"
@@ -154,7 +242,7 @@ def _sum_amounts(rows: list[dict]) -> float | None:
 def _sample_metrics(day: date, rows: list[dict], turnover: float | None) -> dict:
     sealed = [row for row in rows if row["today_sealed_close"]]
     broken = [row for row in rows if row["today_opened_close"]]
-    status_known = len(sealed) + len(broken) == len(rows)
+    status_known = bool(rows) and len(sealed) + len(broken) == len(rows)
     boards_known = status_known and all(row["today_continuous_days"] > 0 for row in sealed)
     heights = sorted({row["today_continuous_days"] for row in sealed}, reverse=True)
     gem_heights = [row["today_continuous_days"] for row in sealed if row["board_type"] in {"gem", "star"}]
@@ -173,8 +261,8 @@ def _sample_metrics(day: date, rows: list[dict], turnover: float | None) -> dict
 
     return {
         "trade_date": day.isoformat(),
-        "source_status": SOURCE_STATUS,
-        "limit_up_count": len(rows),
+        "source_status": SOURCE_STATUS if rows else TURNOVER_SOURCE_STATUS,
+        "limit_up_count": len(rows) if rows else None,
         "limit_down_count": None,
         "continuous_count": sum(row["today_continuous_days"] >= 2 for row in sealed) if boards_known else None,
         "max_board_height": max_height,
@@ -191,7 +279,7 @@ def _sample_metrics(day: date, rows: list[dict], turnover: float | None) -> dict
         "market_turnover": turnover,
         "up_count_ex_st": None,
         "down_count_ex_st": None,
-        "limit_up_amount": _sum_amounts(rows),
+        "limit_up_amount": _sum_amounts(rows) if rows else None,
         "broken_amount": _sum_amounts(broken) if status_known else None,
     }
 
@@ -203,6 +291,8 @@ async def _process_day(
     execute: bool,
     turnover: float | None,
     quotes: Mapping[str, Mapping[str, float]],
+    monitor_source: list[tuple[LimitUpRecord, Stock]],
+    include_turnover_only: bool,
 ) -> ArchiveBackfillDay:
     if db.get_bind().dialect.name != "sqlite":
         raise ValueError("Historical monitor backfill only supports SQLite")
@@ -222,8 +312,10 @@ async def _process_day(
         .join(Stock, Stock.id == LimitUpRecord.stock_id)
         .where(LimitUpRecord.trade_date == day)
         .order_by(Stock.stock_code)
-    )).all()
+    )).tuples().all()
     if not source:
+        source = monitor_source
+    if not source and not (include_turnover_only and turnover is not None):
         return ArchiveBackfillDay(day, "no_source")
     rows = [_sample_stock(record, stock, quotes.get(stock.stock_code, {})) for record, stock in source]
     if execute:
@@ -246,6 +338,8 @@ async def backfill_market_review_archive(
     execute: bool = False,
     turnover_by_date: Mapping[date, float] | None = None,
     quotes_by_date: Mapping[date, Mapping[str, Mapping[str, float | None]]] | None = None,
+    monitor_source: Mapping[str, object] | None = None,
+    include_turnover_only: bool = False,
 ) -> list[ArchiveBackfillDay]:
     today = current_date or today_cn()
     if start_date > end_date or end_date >= today:
@@ -255,10 +349,12 @@ async def backfill_market_review_archive(
         if type(day) is date and start_date <= day <= end_date and day.weekday() < 5
     }
     turnover, quotes = _validate_evidence(sessions, turnover_by_date or {}, quotes_by_date or {})
+    monitor_rows = _validate_monitor_source(monitor_source, sessions)
     results = []
     for day in sorted(sessions):
         async with session_factory() as db:
             results.append(await _process_day(
                 db, day, execute=execute, turnover=turnover.get(day), quotes=quotes.get(day, {}),
+                monitor_source=monitor_rows.get(day, []), include_turnover_only=include_turnover_only,
             ))
     return results

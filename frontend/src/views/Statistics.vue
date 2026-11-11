@@ -56,6 +56,9 @@
         <el-tag v-else-if="isMonitoringSample" type="warning" size="small">
           已有监控样本
         </el-tag>
+        <el-tag v-else-if="isExchangeTurnoverArchive" type="info" size="small">
+          交易所成交额档案
+        </el-tag>
         <el-tag v-else-if="selectedDayRow" type="info" size="small">
           收盘复盘
         </el-tag>
@@ -77,6 +80,7 @@
       <div class="card-header">
         <h3>当日总览</h3>
         <span v-if="isMonitoringSample" class="cohort-description">已有监控样本 · 全市场指标未补齐</span>
+        <span v-else-if="isExchangeTurnoverArchive" class="cohort-description">该日已核验沪深成交额，其他复盘数据暂缺</span>
       </div>
       <dl class="overview-metrics">
         <div v-for="metric in overviewMetrics" :key="metric.label" class="overview-metric">
@@ -139,7 +143,7 @@
             </div>
           </div>
 
-          <el-empty v-else description="暂无连板梯队数据" />
+          <el-empty v-else :description="isExchangeTurnoverArchive ? '该日暂无连板梯队档案' : '暂无连板梯队数据'" />
         </div>
       </el-col>
 
@@ -149,7 +153,7 @@
             <h3>复盘明细</h3>
           </div>
 
-          <div class="detail-summary">
+          <div v-if="detailResponse" class="detail-summary">
             <div class="summary-item">
               <span class="label">复盘个股</span>
               <strong>{{ detailStocks.length }}</strong>
@@ -169,6 +173,7 @@
           </div>
 
           <el-table
+            v-if="!isExchangeTurnoverArchive"
             :data="detailStocks"
             size="small"
             stripe
@@ -249,6 +254,7 @@
               </template>
             </el-table-column>
           </el-table>
+          <el-empty v-else description="该日暂无个股复盘档案" />
         </div>
       </el-col>
     </el-row>
@@ -331,7 +337,7 @@ import { useRouter } from 'vue-router'
 import * as echarts from 'echarts'
 import dayjs from 'dayjs'
 import { ArrowLeft, ArrowRight } from '@element-plus/icons-vue'
-import { getLimitUpDates, getMarketReviewDaily, getMarketReviewIntraday } from '@/api'
+import { getLimitUpDates, getMarketReviewArchiveDates, getMarketReviewDaily, getMarketReviewIntraday } from '@/api'
 import { getChinaDateString } from '@/utils/chinaDate'
 import { getBrokenBoardPerformance, type BrokenBoardPoint } from '@/api/review'
 import { buildReviewRange } from '@/utils/reviewRange'
@@ -352,6 +358,7 @@ const selectedDate = ref(todayDate.value)
 const activeStartDate = ref(todayDate.value)
 const activeEndDate = ref(todayDate.value)
 const navigationDates = ref<string[]>([])
+const archiveDates = ref<string[]>([])
 
 const dailySeries = ref<string[]>([])
 const dailyRows = ref<MarketReviewDailyRow[]>([])
@@ -379,6 +386,7 @@ let limitTrendChart: echarts.ECharts | null = null
 let breadthChart: echarts.ECharts | null = null
 let amountChart: echarts.ECharts | null = null
 let fetchSequence = 0
+let navigationSequence = 0
 let requestInFlight = false
 let disposed = false
 let reviewRefreshTimer: number | null = null
@@ -389,8 +397,9 @@ let brokenBoardRequestSequence = 0
 const detailStocks = computed(() => detailResponse.value?.stocks ?? [])
 const ladderLevels = computed(() => ladderResponse.value?.ladders ?? [])
 const isMonitoringSample = computed(() => selectedDayRow.value?.source_status === 'monitor_archive')
+const isExchangeTurnoverArchive = computed(() => selectedDayRow.value?.source_status === 'exchange_turnover_archive')
 const availableDates = computed(() => [...new Set([
-  ...navigationDates.value, ...dailyRows.value.map(row => row.trade_date)
+  ...navigationDates.value, ...archiveDates.value, ...dailyRows.value.map(row => row.trade_date)
 ])].filter(day => day <= todayDate.value).sort())
 const previousDate = computed(() => availableDates.value.filter(day => day < selectedDate.value).pop())
 const nextDate = computed(() => availableDates.value.find(day => day > selectedDate.value))
@@ -404,6 +413,8 @@ const openedCloseCount = computed(
 const overviewMetrics = computed(() => {
   const row = selectedDayRow.value
   if (!row) return []
+  const exchangeTurnover = { label: '沪深成交额（交易所）', value: formatYiAmount(row.market_turnover) }
+  if (isExchangeTurnoverArchive.value) return [exchangeTurnover]
   const core = [
     { label: '触板家数', value: formatCount(row.limit_up_count) },
     { label: '封板家数', value: formatCount(detailResponse.value ? sealedCloseCount.value : null) },
@@ -414,7 +425,7 @@ const overviewMetrics = computed(() => {
   ]
   if (isMonitoringSample.value) {
     if (row.market_turnover != null && Number.isFinite(row.market_turnover) && row.market_turnover > 0) {
-      core.push({ label: '沪深成交额（交易所）', value: formatYiAmount(row.market_turnover) })
+      core.push(exchangeTurnover)
     }
     return core
   }
@@ -471,12 +482,15 @@ function goToToday() {
 }
 
 async function loadNavigationDates() {
-  try {
-    const result = await getLimitUpDates()
-    if (!disposed) navigationDates.value = result.dates
-  } catch {
-    // The calendar still accepts a typed or picked date when the date list is unavailable.
-  }
+  const request = ++navigationSequence
+  await Promise.allSettled([
+    getLimitUpDates().then(({ dates }) => {
+      if (!disposed && request === navigationSequence) navigationDates.value = dates
+    }),
+    getMarketReviewArchiveDates().then(({ dates }) => {
+      if (!disposed && request === navigationSequence) archiveDates.value = dates
+    })
+  ])
 }
 
 function formatDateLabel(value: string) {
@@ -1254,6 +1268,10 @@ async function fetchBrokenBoardData(query: { days: number; end_date: string }) {
   }
 }
 
+function isPartialReviewSource(source: string | null | undefined) {
+  return source === 'monitor_archive' || source === 'exchange_turnover_archive'
+}
+
 async function fetchData(options: FetchDataOptions = {}) {
   if (disposed || (options.silent && requestInFlight)) return
   const currentSequence = ++fetchSequence
@@ -1289,7 +1307,7 @@ async function fetchData(options: FetchDataOptions = {}) {
   const historyRows = history.status === 'fulfilled' ? history.value.data.rows : dailyRows.value
   for (const row of historyRows) {
     if (row.trade_date <= targetDate && (!isToday || row.trade_date !== targetDate)
-      && row.source_status !== 'monitor_archive') {
+      && !isPartialReviewSource(row.source_status)) {
       trendRows.set(row.trade_date, row)
     }
   }
@@ -1303,16 +1321,22 @@ async function fetchData(options: FetchDataOptions = {}) {
     const result = snapshot.value
     const exactRow = result.data.rows.find(row => row.trade_date === targetDate)
     if (result.data_status === 'ready' && !result.is_fallback && exactRow) {
-      const isSample = exactRow.source_status === 'monitor_archive' || result.source_status === 'monitor_archive'
-      selectedDayRow.value = isSample ? { ...exactRow, source_status: 'monitor_archive' } : exactRow
-      if (!isSample) trendRows.set(targetDate, exactRow)
-      if (!result.detail.is_fallback && result.detail.trade_date === targetDate) {
+      const source = isPartialReviewSource(result.source_status) ? result.source_status : exactRow.source_status
+      const isPartial = isPartialReviewSource(source)
+      const hasStockReport = source !== 'exchange_turnover_archive'
+      selectedDayRow.value = isPartial ? { ...exactRow, source_status: source } : exactRow
+      if (isPartial) {
+        trendRows.delete(targetDate)
+      } else {
+        trendRows.set(targetDate, exactRow)
+      }
+      if (hasStockReport && !result.detail.is_fallback && result.detail.trade_date === targetDate) {
         detailResponse.value = result.detail
       }
-      if (!result.ladder.is_fallback && result.ladder.trade_date === targetDate) {
+      if (hasStockReport && !result.ladder.is_fallback && result.ladder.trade_date === targetDate) {
         ladderResponse.value = result.ladder
       }
-      isLiveIntraday.value = isToday && !isSample && result.is_live
+      isLiveIntraday.value = isToday && !isPartial && result.is_live
       if (isLiveIntraday.value) intradaySnapshotTime.value = result.snapshot_time
     }
   }

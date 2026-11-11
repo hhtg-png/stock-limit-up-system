@@ -28,6 +28,7 @@ router = APIRouter()
 CN_TZ = timezone(timedelta(hours=8))
 _TRADING_DAY_CACHE: dict[date, bool] = {}
 _MONITOR_ARCHIVE_SOURCE = "monitor_archive"
+_EXCHANGE_TURNOVER_ARCHIVE_SOURCE = "exchange_turnover_archive"
 
 
 async def _collect_intraday_source(trade_date: date) -> dict[str, Any]:
@@ -522,6 +523,53 @@ async def _build_stored_intraday_snapshot(
     )
 
 
+def _read_archive_sample(
+    sample: MarketReviewArchiveSample,
+) -> tuple[MarketReviewDailyMetricRow, list[dict[str, Any]]] | None:
+    trade_date = sample.trade_date
+    try:
+        metric_data = sample.metric_json
+        if not isinstance(metric_data, dict):
+            raise ValueError("Invalid archive metric")
+        source_status = metric_data.get("source_status")
+        stock_rows = sample.stocks_json
+        if source_status == _EXCHANGE_TURNOVER_ARCHIVE_SOURCE:
+            turnover = metric_data.get("market_turnover")
+            if (
+                type(turnover) not in (int, float)
+                or not 0 < turnover < float("inf")
+                or stock_rows != []
+            ):
+                raise ValueError("Invalid exchange turnover archive")
+            other_metrics = {
+                field: metric_data.get(field)
+                for field in MarketReviewDailyMetricRow.model_fields
+                if field not in {"trade_date", "source_status", "market_turnover"}
+            }
+            if any(value is not None for value in other_metrics.values()):
+                raise ValueError("Unexpected metrics in exchange turnover archive")
+            metric_data = {**other_metrics, **metric_data}
+        elif source_status == _MONITOR_ARCHIVE_SOURCE:
+            if not isinstance(stock_rows, list) or not stock_rows or any(
+                not isinstance(row, dict)
+                or not row.get("stock_code")
+                or row.get("trade_date") != trade_date.isoformat()
+                for row in stock_rows
+            ):
+                raise ValueError("Invalid archive stock rows")
+            stock_rows = [{**row, "data_quality_flag": _MONITOR_ARCHIVE_SOURCE} for row in stock_rows]
+        else:
+            raise ValueError("Invalid archive source")
+
+        daily_row = MarketReviewDailyMetricRow.model_validate(metric_data)
+        if daily_row.trade_date != trade_date:
+            raise ValueError("Invalid archive metric date")
+        return daily_row, stock_rows
+    except (TypeError, ValueError) as exc:
+        logger.warning("Invalid market review archive sample for {}: {}", trade_date, type(exc).__name__)
+        return None
+
+
 async def _build_archive_sample_snapshot(
     db: AsyncSession,
     trade_date: date,
@@ -533,21 +581,14 @@ async def _build_archive_sample_snapshot(
     if sample is None or not await asyncio.to_thread(_is_cn_trading_day, trade_date):
         return None
 
+    archive = _read_archive_sample(sample)
+    if archive is None:
+        return None
+    daily_row, stock_rows = archive
+    if daily_row.source_status == _EXCHANGE_TURNOVER_ARCHIVE_SOURCE and trade_date >= datetime.now(CN_TZ).date():
+        return None
+
     try:
-        daily_row = MarketReviewDailyMetricRow.model_validate(sample.metric_json)
-        if daily_row.trade_date != trade_date or daily_row.source_status != _MONITOR_ARCHIVE_SOURCE:
-            raise ValueError("Invalid archive metric date or source")
-
-        stock_rows = sample.stocks_json
-        if not isinstance(stock_rows, list) or not stock_rows or any(
-            not isinstance(row, dict)
-            or not row.get("stock_code")
-            or row.get("trade_date") != trade_date.isoformat()
-            for row in stock_rows
-        ):
-            raise ValueError("Invalid archive stock rows")
-
-        stock_rows = [{**row, "data_quality_flag": _MONITOR_ARCHIVE_SOURCE} for row in stock_rows]
         daily_row = daily_row.model_copy(update={
             "max_board_label": _format_board_height_label(stock_rows, daily_row.max_board_height),
             "second_board_label": _format_board_height_label(stock_rows, daily_row.second_board_height),
@@ -556,7 +597,7 @@ async def _build_archive_sample_snapshot(
         detail = _build_intraday_detail(trade_date, stock_rows)
         ladder = _build_ladder_response_from_rows(trade_date, False, stock_rows, include_cohort=False)
     except (TypeError, ValueError) as exc:
-        logger.warning("Invalid market review archive sample for {}: {}", trade_date, type(exc).__name__)
+        logger.warning("Invalid market review archive stocks for {}: {}", trade_date, type(exc).__name__)
         return None
 
     return MarketReviewIntradayResponse(
@@ -569,7 +610,7 @@ async def _build_archive_sample_snapshot(
         is_intraday=False,
         is_live=False,
         snapshot_time=datetime.now(CN_TZ),
-        source_status=_MONITOR_ARCHIVE_SOURCE,
+        source_status=daily_row.source_status,
         detail=detail,
         ladder=ladder,
     )
@@ -651,6 +692,25 @@ async def get_market_review_intraday(
         detail=MarketReviewDetailResponse(trade_date=target_date, stocks=[]),
         ladder=MarketReviewLadderResponse(trade_date=target_date, ladders=[]),
     )
+
+
+@router.get("/archive-dates", summary="获取可查看的历史复盘归档日期")
+async def get_market_review_archive_dates(
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, list[date]]:
+    today = datetime.now(CN_TZ).date()
+    samples = (await db.scalars(
+        select(MarketReviewArchiveSample)
+        .where(MarketReviewArchiveSample.trade_date < today)
+        .order_by(desc(MarketReviewArchiveSample.trade_date))
+    )).all()
+    trading_dates = set(await asyncio.to_thread(_filter_cn_trading_dates, [sample.trade_date for sample in samples]))
+    return {
+        "dates": [
+            sample.trade_date for sample in samples
+            if sample.trade_date in trading_dates and _read_archive_sample(sample) is not None
+        ],
+    }
 
 
 @router.get("/daily", response_model=MarketReviewDailyResponse, summary="获取复盘日级指标")

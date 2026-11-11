@@ -20,6 +20,7 @@ const code = transpile(ast.statements.filter(statement => !ts.isImportDeclaratio
 const today = '2026-11-11'
 const monday = '2026-11-09'
 const friday = '2026-11-06'
+const archiveDay = '2026-03-31'
 const row = (day, extra = {}) => ({
   trade_date: day, limit_up_count: 3, limit_down_count: 1, continuous_count: 1,
   max_board_height: 2, first_to_second_rate: 20, seal_rate: 66.67,
@@ -35,7 +36,7 @@ const snapshot = (day, extra = {}) => ({
 })
 const flush = () => new Promise(resolve => setImmediate(resolve))
 
-function loadReport(auto = true) {
+function loadReport(auto = true, getMarketReviewArchiveDates = async () => ({ dates: [] })) {
   const mounted = [], unmounted = [], requests = [], intervals = new Map()
   let timerId = 0
   function request(kind, day, response, query) {
@@ -50,6 +51,7 @@ function loadReport(auto = true) {
     onMounted(callback) { mounted.push(callback) },
     onUnmounted(callback) { unmounted.push(callback) },
     getLimitUpDates: async () => ({ today, dates: [friday, monday, today] }),
+    getMarketReviewArchiveDates,
     getMarketReviewDaily: query => request('daily', query.end_date, daily(row(friday)), query),
     getMarketReviewIntraday: day => request('snapshot', day, snapshot(day)),
     getBrokenBoardPerformance: query => request('broken', query.end_date, { points: [] }, query),
@@ -67,7 +69,8 @@ function loadReport(auto = true) {
     goToToday: typeof goToToday === 'undefined' ? undefined : goToToday,
     overviewMetrics: typeof overviewMetrics === 'undefined' ? undefined : overviewMetrics,
     dailyRows, detailStocks, ladderLevels, isLiveIntraday, loading,
-    currentDataUnavailable, brokenBoardPoints
+    currentDataUnavailable, brokenBoardPoints, availableDates, detailResponse,
+    isExchangeTurnoverArchive: typeof isExchangeTurnoverArchive === 'undefined' ? undefined : isExchangeTurnoverArchive
   }`)(...Object.values(scope)))
   return {
     ...state, requests,
@@ -154,5 +157,54 @@ test('old monitoring samples only contribute verified selected-day metrics and s
       '触板家数', '封板家数', '炸板家数', '连板家数', '最高板', '封板率'
     ])
     assert.equal(state.detailStocks.value[0].stock_code, monday)
+  } finally { state.dispose() }
+})
+
+test('navigation merges archive dates without delaying the existing trading calendar', async () => {
+  let resolveArchive
+  const state = loadReport(true, () => new Promise(resolve => { resolveArchive = resolve }))
+  try {
+    await state.mount()
+    assert.deepEqual(state.availableDates.value, [friday, monday, today])
+    assert.equal(typeof resolveArchive, 'function', 'loads the archive dates API')
+    resolveArchive({ dates: [archiveDay, friday, '2099-01-01'] })
+    await flush()
+    assert.deepEqual(state.availableDates.value, [archiveDay, friday, monday, today])
+    await state.select(friday)
+    state.moveDate(-1)
+    await flush()
+    assert.equal(state.selectedDate.value, archiveDay)
+    state.moveDate(1)
+    await flush()
+    assert.equal(state.selectedDate.value, friday)
+  } finally { state.dispose() }
+
+  const fallback = loadReport(true, async () => { throw Error('archive dates unavailable') })
+  try {
+    await fallback.mount()
+    assert.deepEqual(fallback.availableDates.value, [friday, monday, today])
+  } finally { fallback.dispose() }
+})
+
+test('verified exchange archive shows only turnover and never becomes a full report', async () => {
+  const state = loadReport(false)
+  try {
+    await state.mount()
+    await state.select(archiveDay)
+    const archived = { trade_date: archiveDay, source_status: 'exchange_turnover_archive', market_turnover: 14567.89 }
+    state.forDate(archiveDay, 'daily').resolve(daily(archived))
+    state.forDate(archiveDay, 'snapshot').resolve({
+      ...snapshot(archiveDay), ...daily(archived), source_status: archived.source_status,
+      detail: { trade_date: archiveDay, is_fallback: false, stocks: [] },
+      ladder: { trade_date: archiveDay, is_fallback: false, ladders: [] }
+    })
+    state.forDate(archiveDay, 'broken').resolve({ points: [] })
+    await flush()
+    assert.equal(state.currentDataUnavailable.value, false)
+    assert.equal(state.isExchangeTurnoverArchive?.value, true)
+    assert.deepEqual(state.overviewMetrics.value, [{ label: '沪深成交额（交易所）', value: '14567.89亿' }])
+    assert.deepEqual(state.dailyRows.value, [])
+    assert.equal(state.detailResponse.value, null, 'no zero-count summary for an unavailable report')
+    assert.deepEqual(state.ladderLevels.value, [])
   } finally { state.dispose() }
 })

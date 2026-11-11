@@ -224,6 +224,87 @@ class MarketReviewArchiveBackfillTests(unittest.IsolatedAsyncioTestCase):
                 await self.backfill(day, date(2026, 3, 7), [day], execute=True, quotes_by_date=quotes)
         self.assertEqual(await self.samples(), [])
 
+    def monitor_source(self, *days):
+        return {
+            "source_table": "limit_up_records JOIN stocks",
+            "amount_unit": "CNY_10000",
+            "trade_dates": [day.isoformat() for day in days],
+            "rows": [
+                {
+                    "trade_date": day.isoformat(), "stock_code": "600099",
+                    "stock_name": "Sample", "market": "SH",
+                    "first_limit_up_time": f"{day} 09:35:05.000000",
+                    "final_seal_time": f"{day} 09:38:05.000000",
+                    "continuous_limit_up_days": 2, "open_count": 1,
+                    "is_final_sealed": 1, "current_status": "unknown",
+                    "amount": 1350.25, "turnover_rate": 1.1, "close_price": 20.25,
+                    "limit_up_reason": None, "data_source": "THS+EM",
+                }
+                for day in days
+            ],
+        }
+
+    async def test_imports_monitor_file_and_turnover_only_without_copying_source_tables(self):
+        live_db_day, file_day, turnover_day, empty_day = (
+            date(2026, 3, day) for day in (6, 9, 10, 11)
+        )
+        await self.seed(live_db_day)
+        days = [live_db_day, file_day, turnover_day, empty_day]
+        args = dict(
+            monitor_source=self.monitor_source(live_db_day, file_day),
+            turnover_by_date={file_day: 12345.67, turnover_day: 22222.22},
+            include_turnover_only=True,
+        )
+        preview = await self.backfill(live_db_day, empty_day, days, **args)
+        self.assertEqual([(r.status, r.stock_count) for r in preview], [
+            ("would_insert", 2), ("would_insert", 1), ("would_insert", 0), ("no_source", 0),
+        ])
+        self.assertEqual(await self.samples(), [])
+        applied = await self.backfill(live_db_day, empty_day, days, execute=True, **args)
+        self.assertEqual([r.status for r in applied], ["inserted", "inserted", "inserted", "no_source"])
+        snapshots = {sample.trade_date: sample for sample in await self.samples()}
+        self.assertEqual({s["stock_code"] for s in snapshots[live_db_day].stocks_json}, {"600001", "300001"})
+        row, = snapshots[file_day].stocks_json
+        self.assertEqual(row["stock_code"], "600099")
+        self.assertEqual(row["first_limit_time"], "09:35:05")
+        self.assertEqual(row["final_seal_time"], "09:38:05")
+        self.assertEqual(row["amount"], 1350.25)
+        self.assertEqual(snapshots[file_day].metric_json["market_turnover"], 12345.67)
+        turnover_sample = snapshots[turnover_day]
+        self.assertEqual(turnover_sample.stocks_json, [])
+        self.assertEqual(
+            {k: v for k, v in turnover_sample.metric_json.items() if v is not None},
+            {"trade_date": turnover_day.isoformat(), "source_status": "exchange_turnover_archive",
+             "market_turnover": 22222.22},
+        )
+        repeated = await self.backfill(live_db_day, empty_day, days, execute=True, **args)
+        self.assertEqual([r.status for r in repeated], ["has_sample", "has_sample", "has_sample", "no_source"])
+        async with self.sessions() as db:
+            self.assertEqual(len((await db.scalars(select(LimitUpRecord))).all()), 2)
+            self.assertEqual(len((await db.scalars(select(Stock))).all()), 2)
+            self.assertEqual((await db.scalars(select(MarketReviewDailyMetric))).all(), [])
+            self.assertEqual((await db.scalars(select(MarketReviewStockDaily))).all(), [])
+
+    async def test_invalid_monitor_source_rejected_before_writes(self):
+        day, holiday, end = date(2026, 4, 3), date(2026, 4, 6), date(2026, 4, 7)
+        invalid_fields = {
+            "stock_code": "60000X", "first_limit_up_time": "2026-04-02T09:35:00",
+            "final_seal_time": "2026-04-03 09:36:00.000000", "amount": float("nan"),
+            "open_count": True, "is_final_sealed": 2, "turnover_rate": -1,
+        }
+        for name, value in invalid_fields.items():
+            source = self.monitor_source(day, end)
+            source["rows"][1][name] = value
+            with self.subTest(field=name), self.assertRaises(ValueError):
+                await self.backfill(day, end, [day, end], monitor_source=source, execute=True)
+        duplicate = self.monitor_source(day)
+        duplicate["rows"] *= 2
+        with self.assertRaises(ValueError):
+            await self.backfill(day, end, [day, end], monitor_source=duplicate, execute=True)
+        with self.assertRaises(ValueError):
+            await self.backfill(day, end, [day, end], monitor_source=self.monitor_source(holiday), execute=True)
+        self.assertEqual(await self.samples(), [])
+
     async def test_generated_sample_is_available_from_the_exact_date_endpoint(self):
         day = date(2026, 3, 6)
         await self.seed(day)

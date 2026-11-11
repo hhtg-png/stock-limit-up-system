@@ -41,6 +41,11 @@ export async function getMarketReviewIntraday(tradeDate?: string): Promise<Marke
   return data
 }
 
+export async function getMarketReviewArchiveDates(): Promise<{ dates: string[] }> {
+  const { data } = await api.get<{ dates: string[] }>('/statistics/review/archive-dates')
+  return data
+}
+
 export interface BrokenBoardPoint {
   trade_date: string
   average_change: number | null

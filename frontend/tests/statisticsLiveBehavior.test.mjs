@@ -5,7 +5,7 @@ import vm from 'node:vm'
 import ts from 'typescript'
 
 const source = readFileSync('src/views/Statistics.vue', 'utf8')
-const fetchSource = source.slice(source.indexOf('async function fetchData('), source.indexOf('function goToDetail('))
+const fetchSource = source.slice(source.indexOf('function isPartialReviewSource('), source.indexOf('function goToDetail('))
 function setup(intraday, dailyError = false) {
   const ref = value => ({ value })
   const today = '2026-09-11'

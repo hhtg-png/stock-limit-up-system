@@ -916,6 +916,103 @@ class MarketReviewApiTests(unittest.TestCase):
         self.assertEqual(response.json()["data_status"], "unavailable")
         self.assertEqual(response.json()["detail"]["stocks"], [])
 
+    async def _seed_exchange_turnover_archive(
+        self, trade_date, *, metric_overrides=None, stocks=None, trading_day=True,
+    ):
+        async with self.session_factory() as session:
+            session.add(MarketReviewArchiveSample(
+                trade_date=trade_date,
+                metric_json={
+                    "trade_date": trade_date.isoformat(),
+                    "source_status": "exchange_turnover_archive",
+                    "market_turnover": 23913.0,
+                    **(metric_overrides or {}),
+                },
+                stocks_json=[] if stocks is None else stocks,
+            ))
+            await session.commit()
+        self.review_module._TRADING_DAY_CACHE[trade_date] = trading_day
+
+    def test_intraday_exposes_exchange_turnover_only_for_the_exact_session(self):
+        trade_date = date(2026, 3, 5)
+        asyncio.run(self._seed_exchange_turnover_archive(trade_date))
+        base = "/api/v1/statistics/review"
+        response = self.client.get(f"{base}/intraday", params={"trade_date": "2026-03-05"})
+        payload = response.json()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(payload["data_status"], "ready")
+        self.assertEqual(payload["source_status"], "exchange_turnover_archive")
+        self.assertEqual(payload["data"]["series"], ["2026-03-05"])
+        self.assertFalse(payload["is_intraday"])
+        self.assertFalse(payload["is_live"])
+        self.assertFalse(payload["is_fallback"])
+        self.assertEqual(payload["detail"], {
+            "trade_date": "2026-03-05", "is_fallback": False, "stocks": [],
+        })
+        self.assertEqual(payload["ladder"], {
+            "trade_date": "2026-03-05", "is_fallback": False, "ladders": [],
+        })
+        row, = payload["data"]["rows"]
+        self.assertEqual(row.pop("trade_date"), "2026-03-05")
+        self.assertEqual(row.pop("source_status"), "exchange_turnover_archive")
+        self.assertEqual(row.pop("market_turnover"), 23913.0)
+        self.assertTrue(row)
+        self.assertTrue(all(value is None for value in row.values()))
+
+        nearby = self.client.get(f"{base}/intraday", params={"trade_date": "2026-03-04"}).json()
+        self.assertEqual(nearby["data_status"], "unavailable")
+        self.assertEqual(nearby["data"]["rows"], [])
+
+    def test_exchange_turnover_archive_does_not_replace_formal_review_or_enter_trends(self):
+        asyncio.run(self._seed_exchange_turnover_archive(date(2026, 3, 5)))
+        asyncio.run(self._seed_exchange_turnover_archive(date(2026, 4, 28)))
+        base = "/api/v1/statistics/review"
+        snapshot = self.client.get(f"{base}/intraday", params={"trade_date": "2026-04-28"}).json()
+        self.assertEqual(snapshot["source_status"], "primary")
+        self.assertEqual(snapshot["data"]["rows"][0]["limit_up_count"], 8)
+        trend = self.client.get(f"{base}/daily", params={"days": 7, "end_date": "2026-04-28"}).json()
+        self.assertEqual(trend["data"]["series"], ["2026-04-27", "2026-04-28"])
+
+    def test_archive_dates_only_lists_readable_past_archive_sessions_newest_first(self):
+        now = datetime.now(self.review_module.CN_TZ).date()
+        asyncio.run(self._seed_monitor_archive_sample(date(2026, 4, 24)))
+        asyncio.run(self._seed_exchange_turnover_archive(date(2026, 3, 5)))
+        asyncio.run(self._seed_exchange_turnover_archive(date(2026, 3, 4)))
+        asyncio.run(self._seed_exchange_turnover_archive(date(2026, 4, 6), trading_day=False))
+        asyncio.run(self._seed_exchange_turnover_archive(now))
+        asyncio.run(self._seed_exchange_turnover_archive(now + timedelta(days=1)))
+        asyncio.run(self._seed_exchange_turnover_archive(
+            date(2026, 3, 3), metric_overrides={"trade_date": "2026-03-02"},
+        ))
+        asyncio.run(self._seed_exchange_turnover_archive(
+            date(2026, 3, 2), metric_overrides={"market_turnover": 0},
+        ))
+        response = self.client.get("/api/v1/statistics/review/archive-dates")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"dates": ["2026-04-24", "2026-03-05", "2026-03-04"]})
+
+    def test_intraday_rejects_unverified_exchange_turnover_rows(self):
+        cases = [
+            (date(2026, 3, 2), {"market_turnover": float("inf")}, None),
+            (date(2026, 3, 3), {"market_turnover": True}, None),
+            (date(2026, 3, 4), {"market_turnover": -1}, None),
+            (date(2026, 3, 5), {"limit_up_count": 0}, None),
+            (date(2026, 3, 6), {}, [{"stock_code": "600001"}]),
+            (datetime.now(self.review_module.CN_TZ).date() + timedelta(days=1), {}, None),
+        ]
+        for trade_date, metric_overrides, stocks in cases:
+            with self.subTest(trade_date=trade_date):
+                asyncio.run(self._seed_exchange_turnover_archive(
+                    trade_date, metric_overrides=metric_overrides, stocks=stocks,
+                ))
+                response = self.client.get(
+                    "/api/v1/statistics/review/intraday",
+                    params={"trade_date": trade_date.isoformat()},
+                )
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()["data_status"], "unavailable")
+                self.assertEqual(response.json()["data"]["rows"], [])
+
     def test_intraday_rejects_live_inputs_declaring_a_different_trade_date(self):
         self.review_module._should_collect_live_intraday = Mock(return_value=True)
         self.review_module._collect_intraday_source = AsyncMock(return_value={

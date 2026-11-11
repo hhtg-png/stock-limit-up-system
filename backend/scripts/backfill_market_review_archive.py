@@ -1,8 +1,9 @@
-"""Recover historical monitor samples; run from the backend directory.
+"""Recover historical review data; run from the backend directory.
 
 Without --execute, SQLite is opened in read-only mode. Optional evidence files
 contain {YYYY-MM-DD: turnover_in_yi} and {YYYY-MM-DD: {stock_code: quote_fields}}.
 Quote amounts are in 万元 and the quote fields use the review API's names.
+An exported monitor source is used when the database lacks records for the day.
 """
 
 import argparse
@@ -32,13 +33,17 @@ def _iso_date(value: str) -> date:
     return day
 
 
+def _read_json_object(path: Path) -> dict:
+    content = json.loads(path.read_text(encoding="utf-8-sig"))
+    if not isinstance(content, dict):
+        raise ValueError(f"Expected a JSON object in {path}")
+    return content
+
+
 def _read_evidence(path: Path | None) -> dict:
     if path is None:
         return {}
-    content = json.loads(path.read_text(encoding="utf-8-sig"))
-    if not isinstance(content, dict):
-        raise ValueError(f"Expected a JSON object keyed by YYYY-MM-DD in {path}")
-    return {_iso_date(day): value for day, value in content.items()}
+    return {_iso_date(day): value for day, value in _read_json_object(path).items()}
 
 
 def _database_url(configured_url: str, execute: bool) -> URL:
@@ -58,6 +63,7 @@ def _database_url(configured_url: str, execute: bool) -> URL:
 async def _run(args: argparse.Namespace) -> None:
     turnover = _read_evidence(args.turnover_file)
     quotes = _read_evidence(args.quotes_file)
+    monitor_source = _read_json_object(args.monitor_source_file) if args.monitor_source_file else None
     engine = create_async_engine(_database_url(settings.DATABASE_URL, args.execute), connect_args={"timeout": 30})
     try:
         rows = await backfill_market_review_archive(
@@ -68,6 +74,8 @@ async def _run(args: argparse.Namespace) -> None:
             execute=args.execute,
             turnover_by_date=turnover,
             quotes_by_date=quotes,
+            monitor_source=monitor_source,
+            include_turnover_only=args.include_turnover_only,
         )
     finally:
         await engine.dispose()
@@ -87,7 +95,9 @@ def main() -> None:
     parser.add_argument("--end", type=_iso_date, required=True, help="last date (YYYY-MM-DD, before today)")
     parser.add_argument("--turnover-file", type=Path, help="verified exchange turnover by date (亿元)")
     parser.add_argument("--quotes-file", type=Path, help="verified unadjusted daily quote fields by date and stock")
-    parser.add_argument("--execute", action="store_true", help="insert missing monitor samples after dry-run review")
+    parser.add_argument("--monitor-source-file", type=Path, help="verified export of historical monitor rows")
+    parser.add_argument("--include-turnover-only", action="store_true", help="archive exchange turnover when stock records are missing")
+    parser.add_argument("--execute", action="store_true", help="insert missing archive rows after dry-run review")
     args = parser.parse_args()
     try:
         asyncio.run(_run(args))
