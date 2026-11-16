@@ -47,8 +47,12 @@ async def _load_archive_limit_up_items(trade_date: date, archive) -> List[LimitU
     from app.services.limit_up_context_service import limit_up_context_service
 
     rows = archive.payload_json["data"]
+    context_options = {}
+    previous = getattr(archive, "previous_trade_date", None)
+    if previous is not None:
+        context_options["previous_trade_date"] = previous
     try:
-        rows = await limit_up_context_service.enrich_previous_boards(trade_date, rows)
+        rows = await limit_up_context_service.enrich_previous_boards(trade_date, rows, **context_options)
     except Exception as exc:
         logger.warning("Archived previous board context failed for {}: {}", trade_date, exc)
     return [LimitUpRealtime.model_validate(row) for row in rows]

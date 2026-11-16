@@ -160,7 +160,9 @@ class LimitUpContextService:
     async def enrich(self, trade_date: date, rows: list[dict], quotes: dict | None = None) -> list[dict]:
         return await self._enrich(trade_date, rows, quotes, budget_seconds=self.budget_seconds)
 
-    async def enrich_previous_boards(self, trade_date: date, rows: list[dict]) -> list[dict]:
+    async def enrich_previous_boards(
+        self, trade_date: date, rows: list[dict], *, previous_trade_date: date | None = None,
+    ) -> list[dict]:
         """Refresh previous-session board facts for old archived monitor rows."""
         result = [dict(row, context_date=trade_date, previous_trade_date=None,
                        yesterday_continuous_days=None) for row in rows]
@@ -168,11 +170,15 @@ class LimitUpContextService:
         codes = [code for code in codes if len(code) == 6 and code.isdigit()]
         if not codes:
             return result
-        previous = None
+        previous = previous_trade_date
+        if (not isinstance(previous, date) or isinstance(previous, datetime)
+                or previous >= trade_date or previous.weekday() >= 5):
+            previous = None
 
         async def populate():
             nonlocal previous
-            previous = await self._previous_session(trade_date)
+            if previous is None:
+                previous = await self._previous_session(trade_date)
             if previous:
                 await self._load_seals(previous, codes)
 

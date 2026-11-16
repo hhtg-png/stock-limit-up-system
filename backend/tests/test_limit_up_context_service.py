@@ -6,7 +6,7 @@ import time
 import unittest
 from datetime import date, datetime, time as wall_time
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 from sqlalchemy import event, update
@@ -560,6 +560,58 @@ class LimitUpContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result[0]["today_open_change_pct"], 2.5)
         self.assertEqual(original[0]["yesterday_continuous_days"], 88)
         history.assert_not_awaited()
+
+    async def test_cold_archive_board_read_uses_saved_previous_session_without_calendar(self):
+        from app.api.v1.limit_up import _load_archive_limit_up_items
+
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        self.addAsyncCleanup(engine.dispose)
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        async with sessions.begin() as db:
+            db.add(Stock(id=1, stock_code="000001", stock_name="one", market="SZ"))
+            db.add(LimitUpRecord(
+                stock_id=1, trade_date=PREVIOUS, is_final_sealed=True, continuous_limit_up_days=4,
+                first_limit_up_time=datetime(2026, 10, 9, 9, 30),
+                final_seal_time=datetime(2026, 10, 9, 10, 30),
+            ))
+        archive = SimpleNamespace(previous_trade_date=PREVIOUS, payload_json={"data": [{
+            "stock_code": "000001", "stock_name": "one", "trade_date": DAY,
+            "limit_up_price": 11, "current_price": 11, "market": "SZ",
+        }]})
+
+        def stalled_calendar(*args):
+            time.sleep(0.2)
+            return [PREVIOUS, DAY]
+
+        for source in (Mock(side_effect=RuntimeError("calendar offline")), Mock(side_effect=stalled_calendar)):
+            with self.subTest(calendar=source):
+                service = self.service(session_factory=sessions, calendar_loader=source,
+                                       request_timeout=0.05, budget_seconds=0.1)
+                with patch("app.services.limit_up_context_service.limit_up_context_service", service):
+                    result = await _load_archive_limit_up_items(DAY, archive)
+                self.assertEqual(result[0].previous_trade_date, PREVIOUS)
+                self.assertEqual(result[0].yesterday_continuous_days, 4)
+                source.assert_not_called()
+
+    async def test_invalid_saved_previous_session_uses_the_authoritative_calendar(self):
+        async def pool(day):
+            self.assertEqual(day, PREVIOUS)
+            return [{"stock_code": "000001", "is_final_sealed": True,
+                     "continuous_limit_up_days": 2, "first_limit_up_time": "09:30:00",
+                     "final_seal_time": "10:30:00"}]
+
+        for invalid in (DAY, date(2026, 10, 13), "2026-10-09", datetime(2026, 10, 9), date(2026, 10, 11)):
+            with self.subTest(previous=invalid):
+                calendar = Mock(return_value=[PREVIOUS, DAY])
+                service = self.service(calendar_loader=calendar, pool_fetcher=pool)
+                result = await service.enrich_previous_boards(
+                    DAY, [{"stock_code": "000001"}], previous_trade_date=invalid,
+                )
+                self.assertEqual(result[0]["previous_trade_date"], PREVIOUS)
+                self.assertEqual(result[0]["yesterday_continuous_days"], 2)
+                calendar.assert_called_once()
 
     async def test_previous_boards_batch_database_facts_and_complete_review_absence(self):
         engine = create_async_engine("sqlite+aiosqlite:///:memory:")
