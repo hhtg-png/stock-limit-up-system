@@ -54,6 +54,24 @@ class YesterdayBoardFilterApiTests(unittest.IsolatedAsyncioTestCase):
             context_date=TODAY, previous_trade_date=FRIDAY, limit_up_price=11, current_price=11,
             is_sealed=True,
         ) for i, (board, previous) in enumerate(zip((2, 2, 3, 2, 2), (1, 2, 3, 0, None)), 1)]
+        self.cohort_calls = []
+
+    async def cohort_rows(self, db, trade_date, current_rows, *, minimum=None, exact=None):
+        """Model the cohort boundary; dedicated service tests exercise real data sources."""
+        self.cohort_calls.append({"trade_date": trade_date, "minimum": minimum, "exact": exact,
+                                  "current_codes": {row["stock_code"] for row in current_rows}})
+        rows = [{**row, "trade_date": trade_date, "context_date": trade_date,
+                 "previous_trade_date": FRIDAY if trade_date == TODAY else THURSDAY} for row in self.rows]
+        if exact is not None:
+            return [row for row in rows if row["yesterday_continuous_days"] == exact]
+        if minimum is not None:
+            return [row for row in rows if row["yesterday_continuous_days"] is not None
+                    and row["yesterday_continuous_days"] >= minimum]
+        return rows
+
+    def cohort_patch(self):
+        return patch("app.services.limit_up_cohort_service.limit_up_cohort_service.get_rows",
+                     AsyncMock(side_effect=self.cohort_rows))
 
     async def asyncTearDown(self):
         await self.client.aclose()
@@ -63,7 +81,9 @@ class YesterdayBoardFilterApiTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(limit_up, "today_cn", return_value=TODAY), \
              patch.object(limit_up, "is_a_share_trading_day", AsyncMock(return_value=True)), \
              patch.object(limit_up.limit_up_monitor_archive_service, "is_closed_session", return_value=False), \
-             patch.object(limit_up.realtime_limit_up_service, "get_realtime_limit_up_list", AsyncMock(return_value=self.rows)):
+             patch.object(limit_up.realtime_limit_up_service, "get_fast_limit_up_pool", AsyncMock(return_value=self.rows)), \
+             patch.object(limit_up.realtime_limit_up_service, "get_realtime_limit_up_list", AsyncMock(return_value=self.rows)), \
+             self.cohort_patch():
             response = await self.client.get("/limit-up/realtime", params=params)
         self.assertEqual(response.status_code, 200)
         return response.json()
@@ -90,51 +110,47 @@ class YesterdayBoardFilterApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([row["stock_code"] for row in payload["data"]], ["000001"])
 
     async def test_historical_fallback_enriches_actual_session_before_yesterday_filtering(self):
-        calls = []
-
         async def enrich(day, rows, quotes=None):
-            calls.append(day)
             values = {"000001": 1, "000002": 2, "000003": 3, "000004": 0, "000005": None}
             return [{**row, "context_date": day, "previous_trade_date": THURSDAY,
                      "yesterday_continuous_days": values[row["stock_code"]]} for row in rows]
 
         with patch.object(limit_up, "today_cn", return_value=TODAY), \
              patch.object(limit_up, "_get_closed_monitor_archive", AsyncMock(return_value=None)), \
-             patch.object(limit_up_context_service, "enrich", AsyncMock(side_effect=enrich)):
+             patch.object(limit_up_context_service, "enrich", AsyncMock(side_effect=enrich)), \
+             self.cohort_patch():
             response = await self.client.get("/limit-up/realtime", params={
                 "trade_date": "2026-11-15", "continuous_days_exact": 2,
                 "yesterday_continuous_days_exact": 2,
             })
         self.assertEqual(response.status_code, 200)
         payload = response.json()
-        self.assertEqual(calls, [FRIDAY])
+        self.assertEqual([call["trade_date"] for call in self.cohort_calls], [FRIDAY])
+        self.assertEqual(self.cohort_calls[0]["exact"], 2)
         self.assertEqual(payload["trade_date"], "2026-11-13")
         self.assertTrue(payload["is_fallback"])
         self.assertEqual([row["stock_code"] for row in payload["data"]], ["000002"])
         self.assertEqual(payload["data"][0]["previous_trade_date"], "2026-11-12")
         self.assertEqual(payload["data"][0]["yesterday_continuous_days"], 2)
 
-    async def test_old_historical_archive_is_enriched_before_applying_yesterday_filter(self):
+    async def test_old_historical_archive_uses_complete_yesterday_cohort_before_filtering(self):
         archive_rows = [{key: value for key, value in row.items() if key != "yesterday_continuous_days"}
-                        for row in self.rows]
+                        for row in self.rows if row["stock_code"] != "000002"]
         for row in archive_rows:
             row.update(trade_date=FRIDAY, context_date=FRIDAY, previous_trade_date=THURSDAY)
         archive = SimpleNamespace(payload_json={"data": archive_rows})
 
-        async def enrich_previous(day, rows):
-            self.assertEqual(day, FRIDAY)
-            return [{**row, "yesterday_continuous_days": 2 if row["stock_code"] == "000002" else None}
-                    for row in rows]
-
         with patch.object(limit_up, "today_cn", return_value=TODAY), \
              patch.object(limit_up, "_get_closed_monitor_archive", AsyncMock(return_value=archive)), \
-             patch.object(limit_up_context_service, "enrich_previous_boards", AsyncMock(side_effect=enrich_previous), create=True):
+             patch.object(limit_up_context_service, "enrich_previous_boards", AsyncMock(side_effect=lambda day, rows: rows)), \
+             self.cohort_patch():
             response = await self.client.get("/limit-up/realtime", params={
                 "trade_date": "2026-11-13", "yesterday_continuous_days_exact": 2,
             })
         self.assertEqual(response.status_code, 200)
         self.assertEqual([row["stock_code"] for row in response.json()["data"]], ["000002"])
         self.assertEqual(response.json()["data"][0]["yesterday_continuous_days"], 2)
+        self.assertNotIn("000002", self.cohort_calls[0]["current_codes"])
 
     async def test_old_archive_unknown_yesterday_count_remains_null_without_a_filter(self):
         row = {key: value for key, value in self.rows[0].items() if key != "yesterday_continuous_days"}
@@ -142,7 +158,9 @@ class YesterdayBoardFilterApiTests(unittest.IsolatedAsyncioTestCase):
         archive = SimpleNamespace(payload_json={"data": [row]})
         with patch.object(limit_up, "today_cn", return_value=TODAY), \
              patch.object(limit_up, "_get_closed_monitor_archive", AsyncMock(return_value=archive)), \
-             patch.object(limit_up_context_service, "enrich_previous_boards", AsyncMock(side_effect=lambda day, rows: rows), create=True):
+             patch.object(limit_up_context_service, "enrich_previous_boards", AsyncMock(side_effect=lambda day, rows: rows), create=True), \
+             patch("app.services.limit_up_cohort_service.limit_up_cohort_service.enrich_prices",
+                   AsyncMock(side_effect=lambda db, day, rows: rows)):
             response = await self.client.get("/limit-up/realtime", params={"trade_date": "2026-11-13"})
         self.assertEqual(response.status_code, 200)
         self.assertIn("yesterday_continuous_days", response.json()["data"][0])
@@ -150,27 +168,24 @@ class YesterdayBoardFilterApiTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_closed_current_session_archive_uses_both_board_filters(self):
         rows = [{key: value for key, value in row.items() if key != "yesterday_continuous_days"}
-                for row in self.rows]
+                for row in self.rows if row["stock_code"] != "000003"]
         for row in rows:
             row["trade_date"] = TODAY
         archive = SimpleNamespace(payload_json={"data": rows})
-
-        async def enrich_previous(day, items):
-            self.assertEqual(day, TODAY)
-            return [{**row, "yesterday_continuous_days": 3 if row["stock_code"] == "000003" else None}
-                    for row in items]
 
         with patch.object(limit_up, "today_cn", return_value=TODAY), \
              patch.object(limit_up, "is_a_share_trading_day", AsyncMock(return_value=True)), \
              patch.object(limit_up.limit_up_monitor_archive_service, "is_closed_session", return_value=True), \
              patch.object(limit_up, "_get_closed_monitor_archive", AsyncMock(return_value=archive)), \
-             patch.object(limit_up_context_service, "enrich_previous_boards", AsyncMock(side_effect=enrich_previous), create=True):
+             patch.object(limit_up_context_service, "enrich_previous_boards", AsyncMock(side_effect=lambda day, rows: rows)), \
+             self.cohort_patch():
             response = await self.client.get("/limit-up/realtime", params={
                 "continuous_days_exact": 3, "yesterday_continuous_days_exact": 3,
             })
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["data"][0].get("yesterday_continuous_days", "missing"), 3)
         self.assertEqual([row["stock_code"] for row in response.json()["data"]], ["000003"])
+        self.assertNotIn("000003", self.cohort_calls[0]["current_codes"])
 
 
 if __name__ == "__main__":

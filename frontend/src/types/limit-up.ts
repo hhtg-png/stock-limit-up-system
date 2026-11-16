@@ -13,6 +13,8 @@ export interface LimitUpRecord {
   yesterday_continuous_days?: number | null
   yesterday_open_change_pct?: number | null
   today_open_change_pct?: number | null
+  change_pct?: number | null
+  today_touched_limit_up?: boolean | null
   limit_up_reason?: string
   reason_category?: string
   continuous_limit_up_days: number
@@ -20,7 +22,7 @@ export interface LimitUpRecord {
   open_count: number
   is_final_sealed: boolean
   is_one_word?: boolean
-  current_status?: 'sealed' | 'opened' | 'broken' | 'final_sealed' | 'unknown'
+  current_status?: 'sealed' | 'opened' | 'broken' | 'final_sealed' | 'unknown' | 'untouched'
   seal_amount?: number
   seal_volume?: number
   limit_up_price: number

@@ -14,6 +14,18 @@ export function formatOpeningChangePct(value: number | undefined | null): string
   return `${rounded > 0 ? '+' : ''}${rounded.toFixed(2)}%`
 }
 
+export function getLimitUpStatus(item: Pick<LimitUpRealtime, 'today_touched_limit_up' | 'current_status' | 'is_sealed'>): string {
+  if (item.today_touched_limit_up === false || item.current_status === 'untouched') return '未触板'
+  if (item.today_touched_limit_up === null) return '待确认'
+  return item.is_sealed ? '封板' : '炸板'
+}
+
+export function getTodayBoardCount(item: Pick<LimitUpRealtime, 'today_touched_limit_up' | 'current_status' | 'continuous_limit_up_days'>): number | null {
+  if (item.today_touched_limit_up === false || item.current_status === 'untouched') return 0
+  if (item.today_touched_limit_up === null) return null
+  return item.continuous_limit_up_days > 0 ? item.continuous_limit_up_days : 1
+}
+
 function sortTime(value: string | undefined | null): string {
   const raw = value?.trim() || ''
   return /^(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d$/.test(raw) ? raw : ''
@@ -79,20 +91,21 @@ function escapeCsvCell(value: string | number): string {
 export function buildLimitUpCsv(items: LimitUpRealtime[]): string {
   const headers = [
     '代码', '名称', '行情日期', '昨日日期', '连板', '首封时间', '昨日首封', '昨日终封', '昨日竞价', '今日竞价',
-    '状态', '封单(万)', '成交额(亿)', '实际流通值(亿)', '涨停原因'
+    '当前涨幅', '状态', '封单(万)', '成交额(亿)', '实际流通值(亿)', '涨停原因'
   ]
   const rows = items.map(item => [
     item.stock_code,
     item.stock_name,
     item.trade_date || '',
     item.previous_trade_date || '',
-    item.continuous_limit_up_days,
+    getTodayBoardCount(item) ?? '—',
     item.first_limit_up_time || '',
     formatLimitUpContextTime(item.yesterday_first_limit_up_time),
     formatLimitUpContextTime(item.yesterday_final_seal_time),
     formatOpeningChangePct(item.yesterday_open_change_pct),
     formatOpeningChangePct(item.today_open_change_pct),
-    item.is_sealed ? '封板' : '开板',
+    formatOpeningChangePct(item.change_pct),
+    getLimitUpStatus(item),
     item.seal_amount?.toFixed(0) || '',
     formatYi(item.amount),
     formatYi(item.tradable_market_value),

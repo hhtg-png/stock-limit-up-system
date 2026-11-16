@@ -43,7 +43,7 @@ async def _get_closed_monitor_archive(trade_date: date):
         return None
 
 
-async def _load_archive_limit_up_items(trade_date: date, archive) -> List[LimitUpRealtime]:
+async def _load_archive_limit_up_items(trade_date: date, archive, db=None) -> List[LimitUpRealtime]:
     from app.services.limit_up_context_service import limit_up_context_service
 
     rows = archive.payload_json["data"]
@@ -55,7 +55,35 @@ async def _load_archive_limit_up_items(trade_date: date, archive) -> List[LimitU
         rows = await limit_up_context_service.enrich_previous_boards(trade_date, rows, **context_options)
     except Exception as exc:
         logger.warning("Archived previous board context failed for {}: {}", trade_date, exc)
+    if isinstance(db, AsyncSession):
+        from app.services.limit_up_cohort_service import limit_up_cohort_service
+        rows = await limit_up_cohort_service.enrich_prices(db, trade_date, rows)
     return [LimitUpRealtime.model_validate(row) for row in rows]
+
+
+async def _get_yesterday_cohort_response(db, requested_date, *, current_session, **filters):
+    from app.services.limit_up_cohort_service import limit_up_cohort_service
+
+    actual_date, is_fallback = requested_date, False
+    if not current_session:
+        actual_date, is_fallback = await get_trade_date_with_fallback(db, requested_date)
+    archive = None
+    if not current_session or limit_up_monitor_archive_service.is_closed_session(actual_date):
+        archive = await _get_closed_monitor_archive(actual_date)
+    if archive is not None:
+        current_rows = archive.payload_json["data"]
+    elif current_session:
+        current_rows = await realtime_limit_up_service.get_fast_limit_up_pool(actual_date)
+    else:
+        current_rows = [item.model_dump() for item in await load_database_limit_up_items(db, actual_date)]
+    rows = await limit_up_cohort_service.get_rows(
+        db, actual_date, current_rows,
+        minimum=filters.get("yesterday_continuous_days"), exact=filters.get("yesterday_continuous_days_exact"),
+    )
+    return LimitUpRealtimeResponse(
+        trade_date=actual_date, is_fallback=is_fallback,
+        data=_filter_and_sort_limit_up_list([LimitUpRealtime.model_validate(row) for row in rows], **filters),
+    )
 
 
 def _positive_int_or_default(value, default: int = 1) -> int:
@@ -159,6 +187,12 @@ def _seal_amount_sort_key(item: LimitUpRealtime, reverse: bool):
     return (missing, value, not bool(item.is_one_word) if not missing else False)
 
 
+def _today_board_count(item: LimitUpRealtime) -> int:
+    if item.today_touched_limit_up is not True:
+        return 0
+    return _positive_int_or_default(item.continuous_limit_up_days)
+
+
 def _filter_and_sort_limit_up_list(
     limit_up_list: List[LimitUpRealtime],
     continuous_days: Optional[int],
@@ -182,12 +216,12 @@ def _filter_and_sort_limit_up_list(
     if continuous_days_exact is not None:
         limit_up_list = [
             item for item in limit_up_list
-            if _positive_int_or_default(item.continuous_limit_up_days) == continuous_days_exact
+            if _today_board_count(item) == continuous_days_exact
         ]
     elif continuous_days is not None:
         limit_up_list = [
             item for item in limit_up_list
-            if _positive_int_or_default(item.continuous_limit_up_days) >= continuous_days
+            if _today_board_count(item) >= continuous_days
         ]
     if yesterday_continuous_days_exact is not None:
         limit_up_list = [
@@ -208,7 +242,9 @@ def _filter_and_sort_limit_up_list(
     if status == "sealed":
         limit_up_list = [item for item in limit_up_list if item.is_sealed]
     elif status == "opened":
-        limit_up_list = [item for item in limit_up_list if not item.is_sealed]
+        limit_up_list = [item for item in limit_up_list if not item.is_sealed and item.today_touched_limit_up is True]
+    elif status == "untouched":
+        limit_up_list = [item for item in limit_up_list if item.today_touched_limit_up is False]
     if min_price is not None or max_price is not None:
         filtered_list = []
         for item in limit_up_list:
@@ -258,7 +294,7 @@ async def _get_database_limit_up_response(
             return LimitUpRealtimeResponse(
                 trade_date=actual_date, is_fallback=is_fallback,
                 data=_filter_and_sort_limit_up_list(
-                    await _load_archive_limit_up_items(actual_date, archive),
+                    await _load_archive_limit_up_items(actual_date, archive, db),
                     continuous_days, reason_category, status, sort_by, sort_order,
                     continuous_days_exact=continuous_days_exact,
                     yesterday_continuous_days=yesterday_continuous_days,
@@ -279,6 +315,13 @@ async def _get_database_limit_up_response(
             limit_up_list = [LimitUpRealtime.model_validate(item) for item in enriched]
         except Exception as exc:
             logger.warning("Historical limit-up context failed for {}: {}", actual_date, exc)
+
+    if limit_up_list and isinstance(db, AsyncSession):
+        from app.services.limit_up_cohort_service import limit_up_cohort_service
+        enriched = await limit_up_cohort_service.enrich_prices(
+            db, actual_date, [item.model_dump() for item in limit_up_list],
+        )
+        limit_up_list = [LimitUpRealtime.model_validate(row) for row in enriched]
 
     return LimitUpRealtimeResponse(
         trade_date=actual_date,
@@ -364,7 +407,17 @@ async def get_realtime_limit_up(
     if trade_date is None:
         trade_date = current_date
 
-    if trade_date != current_date or not await is_a_share_trading_day(trade_date):
+    current_session = trade_date == current_date and await is_a_share_trading_day(trade_date)
+    if yesterday_continuous_days is not None or yesterday_continuous_days_exact is not None:
+        return await _get_yesterday_cohort_response(
+            db, trade_date, current_session=current_session,
+            continuous_days=continuous_days, continuous_days_exact=continuous_days_exact,
+            yesterday_continuous_days=yesterday_continuous_days,
+            yesterday_continuous_days_exact=yesterday_continuous_days_exact,
+            reason_category=reason_category, status=status, sort_by=sort_by, sort_order=sort_order,
+            min_price=min_price, max_price=max_price,
+        )
+    if not current_session:
         return await _get_database_limit_up_response(
             db,
             trade_date,
@@ -386,7 +439,7 @@ async def get_realtime_limit_up(
             return LimitUpRealtimeResponse(
                 trade_date=trade_date, is_fallback=False,
                 data=_filter_and_sort_limit_up_list(
-                    await _load_archive_limit_up_items(trade_date, archive),
+                    await _load_archive_limit_up_items(trade_date, archive, db),
                     continuous_days, reason_category, status, sort_by, sort_order,
                     continuous_days_exact=continuous_days_exact,
                     yesterday_continuous_days=yesterday_continuous_days,
@@ -441,6 +494,8 @@ async def get_realtime_limit_up(
             context_date=item.get("context_date"),
             previous_trade_date=item.get("previous_trade_date"),
             yesterday_continuous_days=item.get("yesterday_continuous_days"),
+            today_touched_limit_up=True,
+            change_pct=item.get("change_pct"),
             first_limit_up_time=first_time_str,
             final_seal_time=final_time_str,
             yesterday_first_limit_up_time=item.get("yesterday_first_limit_up_time"),

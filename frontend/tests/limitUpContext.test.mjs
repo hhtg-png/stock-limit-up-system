@@ -56,6 +56,22 @@ test('opening percentages retain real zero, sign, precision and missing data', (
   }
 })
 
+test('cohort status and board counts distinguish untouched and unconfirmed stocks from opened boards', () => {
+  assert.equal(typeof helper.getLimitUpStatus, 'function')
+  assert.equal(typeof helper.getTodayBoardCount, 'function')
+  for (const [extra, expectedStatus, expectedBoard] of [
+    [{ today_touched_limit_up: false, continuous_limit_up_days: 0 }, '未触板', 0],
+    [{ today_touched_limit_up: null, continuous_limit_up_days: 0 }, '待确认', null],
+    [{ today_touched_limit_up: true, continuous_limit_up_days: 1 }, '炸板', 1],
+    [{ today_touched_limit_up: true, continuous_limit_up_days: 2, is_sealed: true }, '封板', 2],
+    [{ continuous_limit_up_days: 0 }, '炸板', 1]
+  ]) {
+    const row = { is_sealed: false, ...extra }
+    assert.equal(helper.getLimitUpStatus(row), expectedStatus)
+    assert.equal(helper.getTodayBoardCount(row), expectedBoard)
+  }
+})
+
 test('CSV exports the same context values including zero and missing data', () => {
   assert.ok(helper, 'shared limit-up context formatter is missing')
   const csv = helper.buildLimitUpCsv([
@@ -65,19 +81,35 @@ test('CSV exports the same context values including zero and missing data', () =
       first_limit_up_time: '09:32:00', is_sealed: true, seal_amount: 1200,
       amount: 20000, tradable_market_value: 30000, limit_up_reason: '原因,说明',
       yesterday_first_limit_up_time: '9:30:01', yesterday_final_seal_time: '14:56:00',
-      yesterday_open_change_pct: -1.08, today_open_change_pct: 3.25
+      yesterday_open_change_pct: -1.08, today_open_change_pct: 3.25, change_pct: 5.28
     },
     {
       stock_code: '000002', stock_name: '另一股份', continuous_limit_up_days: 1,
       context_date: '2026-10-23', trade_date: '2026-10-23', previous_trade_date: '2026-10-22',
-      is_sealed: false, yesterday_open_change_pct: 0, today_open_change_pct: null
+      is_sealed: false, yesterday_open_change_pct: 0, today_open_change_pct: null, change_pct: 0
     }
   ])
   assert.equal(csv, [
-    '代码,名称,行情日期,昨日日期,连板,首封时间,昨日首封,昨日终封,昨日竞价,今日竞价,状态,封单(万),成交额(亿),实际流通值(亿),涨停原因',
-    '000001,示例股份,2026-10-23,2026-10-22,2,09:32:00,09:30:01,14:56:00,-1.08%,+3.25%,封板,1200,2.00,3.00,"原因,说明"',
-    '000002,另一股份,2026-10-23,2026-10-22,1,,—,—,0.00%,—,开板,,-,-,'
+    '代码,名称,行情日期,昨日日期,连板,首封时间,昨日首封,昨日终封,昨日竞价,今日竞价,当前涨幅,状态,封单(万),成交额(亿),实际流通值(亿),涨停原因',
+    '000001,示例股份,2026-10-23,2026-10-22,2,09:32:00,09:30:01,14:56:00,-1.08%,+3.25%,+5.28%,封板,1200,2.00,3.00,"原因,说明"',
+    '000002,另一股份,2026-10-23,2026-10-22,1,,—,—,0.00%,—,0.00%,炸板,,-,-,'
   ].join('\n'))
+})
+
+test('desktop, mobile and CSV expose current changes and untouched cohort status', () => {
+  const desktop = readFileSync(resolve(root, 'src/views/LimitUpList.vue'), 'utf8')
+  const mobile = readFileSync(resolve(root, 'src/components/stock/MobileLimitUpCards.vue'), 'utf8')
+  assert.match(desktop, /prop="change_pct"[^>]*label="当前涨幅"/)
+  assert.match(desktop, /formatOpeningChangePct\(row\.change_pct\)/)
+  assert.match(mobile, /<span>当前涨幅<\/span>[\s\S]*?formatOpeningChangePct\(item\.change_pct\)/)
+  assert.match(desktop, /getLimitUpStatus\(row\)/)
+  assert.match(mobile, /getLimitUpStatus\(item\)/)
+  const csv = helper.buildLimitUpCsv([
+    { stock_code: '000001', continuous_limit_up_days: 0, today_touched_limit_up: false, change_pct: -1.28 },
+    { stock_code: '000002', continuous_limit_up_days: 0, today_touched_limit_up: null, change_pct: null }
+  ])
+  assert.match(csv, /-1.28%,未触板/)
+  assert.match(csv, /—,待确认/)
 })
 
 for (const view of ['Dashboard', 'LimitUpList']) test(`${view} desktop, mobile and CSV use shared context presentation`, () => {
@@ -134,8 +166,8 @@ for (const view of ['Dashboard', 'LimitUpList']) test(`${view} downloads context
     assert.equal(clicked, true)
     assert.equal(anchor.download, `涨停列表_${expectedDate}.csv`)
     assert.equal(await downloadBlob.text(), [
-      '代码,名称,行情日期,昨日日期,连板,首封时间,昨日首封,昨日终封,昨日竞价,今日竞价,状态,封单(万),成交额(亿),实际流通值(亿),涨停原因',
-      '000001,示例股份,2026-10-23,2026-10-22,1,09:32:00,09:30:01,14:56:00,0.00%,+3.25%,封板,,-,-,'
+      '代码,名称,行情日期,昨日日期,连板,首封时间,昨日首封,昨日终封,昨日竞价,今日竞价,当前涨幅,状态,封单(万),成交额(亿),实际流通值(亿),涨停原因',
+      '000001,示例股份,2026-10-23,2026-10-22,1,09:32:00,09:30:01,14:56:00,0.00%,+3.25%,—,封板,,-,-,'
     ].join('\n'))
     assert.deepEqual(revoked, ['blob:context-csv'])
   }
@@ -206,7 +238,7 @@ for (const view of ['Dashboard', 'LimitUpList']) test(`${view} keeps yesterday s
   const executable = ts.transpileModule(declarations, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText
   const sortBy = ref('yesterday_final_seal_time')
   const tableSort = ref({ prop: 'yesterday_final_seal_time', order: 'ascending' })
-  const scope = { computed, filters: { boardScope: '' }, limitUpStore: store, sortBy, sortDirection: ref(null), tableSort, sortByYesterdayFinalSealTime: helper.sortByYesterdayFinalSealTime, sortByOpeningChangePct: helper.sortByOpeningChangePct, sortByLimitUpField: helper.sortByLimitUpField }
+  const scope = { computed, filters: { boardScope: '' }, limitUpStore: store, sortBy, sortDirection: ref(null), tableSort, getTodayBoardCount: helper.getTodayBoardCount, sortByYesterdayFinalSealTime: helper.sortByYesterdayFinalSealTime, sortByOpeningChangePct: helper.sortByOpeningChangePct, sortByLimitUpField: helper.sortByLimitUpField }
   const state = new Function(...Object.keys(scope), `${executable}\nreturn { tableData, apiSort, previousTradeDate: typeof previousTradeDate === 'undefined' ? undefined : previousTradeDate }`)(...Object.values(scope))
   store.setSnapshot('2026-10-23', [
     { ...richRow, stock_code: '000003', yesterday_final_seal_time: '11:00:00' },

@@ -16,13 +16,20 @@
           <el-tag v-if="item.continuous_limit_up_days > 1" type="danger" size="small">
             {{ item.continuous_limit_up_days }}板
           </el-tag>
-          <el-tag :type="item.is_sealed ? 'danger' : 'warning'" size="small">
-            {{ item.is_sealed ? '封板' : '炸板' }}
+          <el-tag :type="item.is_sealed ? 'danger' : getLimitUpStatus(item) === '炸板' ? 'warning' : 'info'" size="small">
+            {{ getLimitUpStatus(item) }}
           </el-tag>
           <el-tag v-if="item.is_one_word" type="danger" size="small">
             一字
           </el-tag>
         </div>
+      </div>
+
+      <div class="mobile-stock-current-change">
+        <span>当前涨幅</span>
+        <strong :class="{ up: (item.change_pct ?? 0) > 0, down: (item.change_pct ?? 0) < 0 }">
+          {{ formatOpeningChangePct(item.change_pct) }}
+        </strong>
       </div>
 
       <div class="mobile-stock-metrics">
@@ -70,13 +77,13 @@
       </div>
     </button>
 
-    <el-empty v-if="!loading && items.length === 0" description="暂无涨停数据" />
+    <el-empty v-if="!loading && items.length === 0" description="暂无符合条件的数据" />
   </div>
 </template>
 
 <script setup lang="ts">
 import type { LimitUpRealtime } from '@/types/limit-up'
-import { formatLimitUpContextTime, formatOpeningChangePct } from '@/utils/limitUpContext'
+import { formatLimitUpContextTime, formatOpeningChangePct, getLimitUpStatus } from '@/utils/limitUpContext'
 
 defineProps<{
   items: LimitUpRealtime[]
@@ -147,6 +154,31 @@ function formatPercent(value: number | undefined | null): string {
     display: flex;
     flex-shrink: 0;
     gap: 6px;
+  }
+
+  .mobile-stock-current-change {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    margin-top: 8px;
+
+    span {
+      color: #64748b;
+      font-size: 12px;
+    }
+
+    strong {
+      color: #111827;
+      font-size: 16px;
+
+      &.up {
+        color: #ef232a;
+      }
+
+      &.down {
+        color: #14a058;
+      }
+    }
   }
 
   .mobile-stock-metrics {

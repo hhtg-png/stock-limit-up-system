@@ -163,14 +163,14 @@
               type="info" 
               size="small"
             >{{ row.continuous_limit_up_days }}板</el-tag>
-            <span v-else>首板</span>
+            <span v-else>{{ getTodayBoardCount(row) === 1 ? '首板' : '—' }}</span>
           </template>
         </el-table-column>
         <el-table-column prop="first_limit_up_time" label="首封时间" width="95" />
         <el-table-column label="状态" width="80" align="center">
           <template #default="{ row }">
-            <el-tag :type="row.is_sealed ? 'info' : 'warning'" size="small">
-              {{ row.is_sealed ? '封板' : '炸板' }}
+            <el-tag :type="getLimitUpStatus(row) === '炸板' ? 'warning' : 'info'" size="small">
+              {{ getLimitUpStatus(row) }}
             </el-tag>
             <el-tag v-if="row.is_one_word" class="one-word-tag" type="danger" size="small">
               一字
@@ -210,6 +210,13 @@
           <template #default="{ row }">
             <span class="auction-change" :class="{ up: row.today_open_change_pct > 0, down: row.today_open_change_pct < 0 }">
               {{ formatOpeningChangePct(row.today_open_change_pct) }}
+            </span>
+          </template>
+        </el-table-column>
+        <el-table-column prop="change_pct" label="当前涨幅" width="95" align="right">
+          <template #default="{ row }">
+            <span class="auction-change" :class="{ up: row.change_pct > 0, down: row.change_pct < 0 }">
+              {{ formatOpeningChangePct(row.change_pct) }}
             </span>
           </template>
         </el-table-column>
@@ -262,7 +269,7 @@ import { useTradingCalendar } from '@/composables/useTradingCalendar'
 import { useLimitUpStore } from '@/stores/limit-up'
 import type { LimitUpRealtime } from '@/types/limit-up'
 import MobileLimitUpCards from '@/components/stock/MobileLimitUpCards.vue'
-import { buildLimitUpCsv, formatLimitUpContextTime, formatOpeningChangePct, sortByYesterdayFinalSealTime, sortByOpeningChangePct, sortByLimitUpField } from '@/utils/limitUpContext'
+import { buildLimitUpCsv, formatLimitUpContextTime, formatOpeningChangePct, getLimitUpStatus, getTodayBoardCount, sortByYesterdayFinalSealTime, sortByOpeningChangePct, sortByLimitUpField } from '@/utils/limitUpContext'
 
 const router = useRouter()
 const limitUpStore = useLimitUpStore()
@@ -279,7 +286,9 @@ const { calendarReady, setTradingCalendar, isTradingDate, normalizeTradingDate, 
 const sortBy = ref<MonitorSort>('time')
 const sortDirection = ref<'asc' | 'desc' | null>(null)
 const RESYNC_INTERVAL = 90000
+const COHORT_REFRESH_INTERVAL = 15000
 let refreshTimer: number | null = null
+let refreshInterval = RESYNC_INTERVAL
 let priceQueryTimer: number | null = null
 let requestSequence = 0
 let calendarSequence = 0
@@ -347,7 +356,7 @@ const effectiveOrder = computed(() => sortDirection.value || (
 const tableData = computed(() => {
   // Realtime snapshots cover the whole market; retain both selected board scopes.
   const list = limitUpStore.realtimeList.filter(item => {
-    const days = item.continuous_limit_up_days > 0 ? item.continuous_limit_up_days : 1
+    const days = getTodayBoardCount(item)
     return matchesBoardFilter(days, boardFilter.value)
       && matchesBoardFilter(item.yesterday_continuous_days, yesterdayBoardFilter.value)
   })
@@ -511,7 +520,12 @@ function handleCustomPriceChange() {
 }
 
 function updateRealtimeMode() {
-  limitUpStore.setAcceptRealtimeUpdates(calendarReady.value && isSelectedToday.value)
+  limitUpStore.setAcceptRealtimeUpdates(calendarReady.value && isSelectedToday.value && !filters.yesterdayBoardScope)
+  const interval = filters.yesterdayBoardScope ? COHORT_REFRESH_INTERVAL : RESYNC_INTERVAL
+  if (refreshTimer != null && refreshInterval === interval) return
+  if (refreshTimer != null) window.clearInterval(refreshTimer)
+  refreshInterval = interval
+  refreshTimer = window.setInterval(refreshVisibleData, interval)
 }
 
 function handleDateChange() {
@@ -625,22 +639,23 @@ function exportData() {
   URL.revokeObjectURL(url)
 }
 
+function refreshVisibleData() {
+  if (disposed || document.visibilityState !== 'visible') return
+  const today = getChinaDateString()
+  if (today !== todayDate.value) {
+    const wasViewingLatest = selectedDate.value === (normalizeTradingDate(todayDate.value) || todayDate.value)
+    todayDate.value = today
+    updateRealtimeMode()
+    void loadNavigationDates(wasViewingLatest ? today : undefined)
+    return
+  }
+  if (!isSelectedToday.value || (filters.yesterdayBoardScope && activeRequest)) return
+  void fetchData({ showLoading: false, silent: true })
+}
+
 onMounted(() => {
   loadNavigationDates()
   updateRealtimeMode()
-  refreshTimer = window.setInterval(() => {
-    if (document.visibilityState !== 'visible') return
-    const today = getChinaDateString()
-    if (today !== todayDate.value) {
-      const wasViewingLatest = selectedDate.value === (normalizeTradingDate(todayDate.value) || todayDate.value)
-      todayDate.value = today
-      updateRealtimeMode()
-      void loadNavigationDates(wasViewingLatest ? today : undefined)
-      return
-    }
-    if (!isSelectedToday.value) return
-    fetchData({ showLoading: false, silent: true })
-  }, RESYNC_INTERVAL)
 })
 
 

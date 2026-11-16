@@ -74,10 +74,11 @@ function loadView(view, autoResolve = true, options = {}) {
     loadNavigationDates: typeof loadNavigationDates === 'undefined' ? undefined : loadNavigationDates
   }`)(...Object.values(scope)))
   return {
-    ...state, source, requests, messages, store, calendarRequests,
+    ...state, source, requests, messages, store, calendarRequests, intervals,
+    setVisibility(value) { scope.document.visibilityState = value },
     async exportedCodes() { state.exportData(); return (await exportedBlob.text()).split('\n').slice(1).map(line => line.split(',')[0]) },
     async mount() { mounted.forEach(callback => callback()); await flush() },
-    async tick() { for (const timer of intervals.values()) timer.callback(); await flush() },
+    async tick() { for (const timer of [...intervals.values()]) timer.callback(); await flush() },
     async advance(ms) {
       now += ms
       for (const [id, timer] of [...timers]) if (timer.due <= now) { timers.delete(id); timer.callback() }
@@ -122,7 +123,7 @@ test('LimitUpList combines yesterday board choices with current boards, date nav
   } finally { state.dispose() }
 })
 
-test('LimitUpList keeps yesterday board filters after market-wide websocket updates and in exports', async () => {
+test('LimitUpList retains yesterday and current board intersections in selected cohort responses and exports', async () => {
   const state = loadView('LimitUpList')
   try {
     await state.mount()
@@ -137,9 +138,9 @@ test('LimitUpList keeps yesterday board filters after market-wide websocket upda
       { stock_code: '000005', continuous_limit_up_days: 3, yesterday_continuous_days: 0 },
       { stock_code: '000006', continuous_limit_up_days: 3 }
     ]
-    state.store.setRealtimeSnapshot('2026-10-26', rows)
+    state.store.setSnapshot('2026-10-26', rows)
     assert.deepEqual(state.tableData.value.map(row => row.stock_code), ['000001'])
-    state.store.applyRealtimeDelta([
+    state.store.applyDelta([
       { stock_code: '000001', yesterday_continuous_days: 3 },
       { stock_code: '000003', yesterday_continuous_days: 2 }
     ], [], '2026-10-26')
@@ -147,18 +148,84 @@ test('LimitUpList keeps yesterday board filters after market-wide websocket upda
     assert.deepEqual(await state.exportedCodes(), ['000003'])
     state.filters.yesterdayBoardScope = 'min-2'
     await state.applyFilters()
-    state.store.setRealtimeSnapshot('2026-10-26', rows)
+    state.store.setSnapshot('2026-10-26', rows)
     assert.deepEqual(state.tableData.value.map(row => row.stock_code).sort(), ['000001', '000003'])
     state.filters.yesterdayBoardScope = 'first'
     await state.applyFilters()
-    state.store.setRealtimeSnapshot('2026-10-26', [
+    state.store.setSnapshot('2026-10-26', [
       ...rows, { stock_code: '000007', continuous_limit_up_days: 3, yesterday_continuous_days: 1 }
     ])
     assert.deepEqual(state.tableData.value.map(row => row.stock_code), ['000007'], 'yesterday zero and unknown are excluded from first boards')
     state.filters.yesterdayBoardScope = ''
     await state.applyFilters()
-    state.store.setRealtimeSnapshot('2026-10-26', rows)
+    state.store.setSnapshot('2026-10-26', rows)
     assert.deepEqual(state.tableData.value.map(row => row.stock_code).sort(), ['000001', '000003', '000004', '000005', '000006'])
+  } finally { state.dispose() }
+})
+
+test('LimitUpList refreshes the complete yesterday cohort every 15 seconds and rejects destructive market snapshots', async () => {
+  const state = loadView('LimitUpList', false)
+  const day = '2026-10-26'
+  try {
+    await state.mount()
+    state.requests[0].resolve({ trade_date: day, data: [] })
+    await flush()
+    state.filters.yesterdayBoardScope = 'exact-2'
+    const query = state.applyFilters()
+    await flush()
+    assert.equal(state.store.acceptRealtimeUpdates, false)
+    const fullCohort = [
+      { stock_code: '000001', yesterday_continuous_days: 2, continuous_limit_up_days: 0, today_touched_limit_up: false, change_pct: -1.23 },
+      { stock_code: '000002', yesterday_continuous_days: 2, continuous_limit_up_days: 3, today_touched_limit_up: true, change_pct: 10 }
+    ]
+    state.requests.at(-1).resolve({ trade_date: day, data: fullCohort })
+    await query
+    assert.deepEqual(state.tableData.value.map(row => row.stock_code).sort(), ['000001', '000002'])
+    state.store.setRealtimeSnapshot(day, [fullCohort[1]])
+    state.store.applyRealtimeDelta([], ['000001'], day)
+    assert.deepEqual(state.tableData.value.map(row => row.stock_code).sort(), ['000001', '000002'])
+    assert.deepEqual([...state.intervals.values()].map(timer => timer.delay), [15000])
+    state.setVisibility('hidden')
+    const before = state.requests.length
+    await state.tick()
+    assert.equal(state.requests.length, before)
+    state.setVisibility('visible')
+    await state.tick()
+    assert.equal(state.requests.length, before + 1)
+    assert.equal(state.requests.at(-1).params.yesterday_continuous_days_exact, 2)
+    await state.tick()
+    assert.equal(state.requests.length, before + 1, 'a slow cohort refresh remains a single in-flight request')
+    state.requests.at(-1).resolve({ trade_date: day, data: [
+      { ...fullCohort[0], change_pct: 1.05 }, fullCohort[1]
+    ] })
+    await flush()
+    assert.equal(state.tableData.value.find(row => row.stock_code === '000001').change_pct, 1.05)
+    assert.deepEqual((await state.exportedCodes()).sort(), ['000001', '000002'])
+    state.filters.yesterdayBoardScope = ''
+    const clear = state.applyFilters()
+    await flush()
+    assert.equal(state.store.acceptRealtimeUpdates, true)
+    assert.deepEqual([...state.intervals.values()].map(timer => timer.delay), [90000])
+    state.requests.at(-1).resolve({ trade_date: day, data: [fullCohort[1]] })
+    await clear
+    state.store.setRealtimeSnapshot(day, [fullCohort[1]])
+    assert.deepEqual(state.tableData.value.map(row => row.stock_code), ['000002'])
+  } finally { state.dispose() }
+})
+
+test('LimitUpList first-board filtering excludes untouched and unconfirmed yesterday members', async () => {
+  const state = loadView('LimitUpList')
+  try {
+    await state.mount()
+    state.filters.boardScope = 'first'
+    state.filters.yesterdayBoardScope = 'first'
+    await state.applyFilters()
+    state.store.setSnapshot('2026-10-26', [
+      { stock_code: '000001', yesterday_continuous_days: 1, continuous_limit_up_days: 0, today_touched_limit_up: false },
+      { stock_code: '000002', yesterday_continuous_days: 1, continuous_limit_up_days: 0, today_touched_limit_up: null },
+      { stock_code: '000003', yesterday_continuous_days: 1, continuous_limit_up_days: 1, today_touched_limit_up: true }
+    ])
+    assert.deepEqual(state.tableData.value.map(row => row.stock_code), ['000003'])
   } finally { state.dispose() }
 })
 

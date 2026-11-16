@@ -516,6 +516,7 @@ class RealtimeLimitUpService:
             bid1_volume = 0
 
         is_sealed = bool(merged.get("is_final_sealed", True))
+        merged["today_touched_limit_up"] = True
         merged["is_sealed"] = is_sealed
         merged["current_status"] = "sealed" if is_sealed else "opened"
         merged["current_price"] = current_price
