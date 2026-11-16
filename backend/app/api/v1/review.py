@@ -558,6 +558,15 @@ def _read_archive_sample(
             ):
                 raise ValueError("Invalid archive stock rows")
             stock_rows = [{**row, "data_quality_flag": _MONITOR_ARCHIVE_SOURCE} for row in stock_rows]
+            states_known = (
+                len(stock_rows) == metric_data.get("limit_up_count")
+                and all(row.get("today_touched_limit_up") is True
+                        and ((row.get("today_sealed_close") is True) != (row.get("today_opened_close") is True))
+                        for row in stock_rows)
+            )
+            metric_data = {**metric_data, "sealed_count": (
+                sum(row.get("today_sealed_close") is True for row in stock_rows) if states_known else None
+            )}
         else:
             raise ValueError("Invalid archive source")
 
@@ -629,7 +638,6 @@ async def _attach_board_height_labels(
         .where(
             MarketReviewStockDaily.trade_date.in_(trade_dates),
             MarketReviewStockDaily.today_touched_limit_up.is_(True),
-            MarketReviewStockDaily.today_continuous_days > 0,
         )
         .order_by(
             MarketReviewStockDaily.trade_date.asc(),
@@ -647,7 +655,11 @@ async def _attach_board_height_labels(
     rows: list[MarketReviewDailyMetricRow] = []
     for metric_row in metric_rows:
         stock_rows = stocks_by_date.get(metric_row.trade_date, [])
+        states_known = all(bool(row.today_sealed_close) != bool(row.today_opened_close) for row in stock_rows)
+        complete = (metric_row.source_status in {"primary", "partial"}
+                    and len(stock_rows) == metric_row.limit_up_count and states_known)
         labels = {
+            "sealed_count": sum(bool(row.today_sealed_close) for row in stock_rows) if complete else None,
             "max_board_label": _format_board_height_label(stock_rows, metric_row.max_board_height),
             "second_board_label": _format_board_height_label(stock_rows, metric_row.second_board_height),
             "gem_board_label": _format_board_height_label(

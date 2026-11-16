@@ -263,6 +263,7 @@ def _sample_metrics(day: date, rows: list[dict], turnover: float | None) -> dict
         "trade_date": day.isoformat(),
         "source_status": SOURCE_STATUS if rows else TURNOVER_SOURCE_STATUS,
         "limit_up_count": len(rows) if rows else None,
+        "sealed_count": len(sealed) if status_known else None,
         "limit_down_count": None,
         "continuous_count": sum(row["today_continuous_days"] >= 2 for row in sealed) if boards_known else None,
         "max_board_height": max_height,

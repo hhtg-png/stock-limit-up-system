@@ -14,6 +14,7 @@ class MarketReviewDailyMetricRow(BaseModel):
     trade_date: date
     source_status: str | None = None
     limit_up_count: int | None
+    sealed_count: int | None = None
     limit_down_count: int | None
     continuous_count: int | None
     max_board_height: int | None

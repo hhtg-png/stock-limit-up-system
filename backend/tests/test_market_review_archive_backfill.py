@@ -96,6 +96,7 @@ class MarketReviewArchiveBackfillTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sample.metric_json["source_status"], "monitor_archive")
         self.assertEqual(sample.metric_json["market_turnover"], 22111.99)
         self.assertEqual(sample.metric_json["limit_up_count"], 2)
+        self.assertEqual(sample.metric_json["sealed_count"], 1)
         self.assertEqual(sample.metric_json["max_board_height"], 3)
         self.assertEqual(sample.metric_json["seal_rate"], 50)
         for field in (

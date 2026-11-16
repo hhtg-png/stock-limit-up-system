@@ -21,6 +21,10 @@ class MarketReviewMetricsService:
         touched_rows = [row for row in stock_rows if row.get("today_touched_limit_up")]
         sealed_rows = [row for row in touched_rows if row.get("today_sealed_close")]
         opened_rows = [row for row in touched_rows if row.get("today_opened_close")]
+        seal_states_known = all(
+            (row.get("today_sealed_close") is True) != (row.get("today_opened_close") is True)
+            for row in touched_rows
+        )
 
         board_heights = sorted(
             {
@@ -79,6 +83,7 @@ class MarketReviewMetricsService:
         return {
             "trade_date": trade_date,
             "limit_up_count": len(touched_rows),
+            "sealed_count": len(sealed_rows) if seal_states_known else None,
             "limit_down_count": self._to_int(limit_down_count),
             "continuous_count": len(
                 [row for row in sealed_rows if self._to_int(row.get("today_continuous_days")) >= 2]

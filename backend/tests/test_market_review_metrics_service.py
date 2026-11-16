@@ -65,6 +65,7 @@ class MarketReviewMetricsServiceTests(unittest.TestCase):
 
         self.assertEqual(metric["trade_date"], date(2026, 4, 27))
         self.assertEqual(metric["limit_up_count"], 2)
+        self.assertEqual(metric["sealed_count"], 1)
         self.assertEqual(metric["continuous_count"], 1)
         self.assertEqual(metric["max_board_height"], 2)
         self.assertEqual(metric["second_board_height"], 0)
@@ -80,6 +81,14 @@ class MarketReviewMetricsServiceTests(unittest.TestCase):
         self.assertAlmostEqual(metric["limit_up_amount"], 200000.0)
         self.assertAlmostEqual(metric["broken_amount"], 80000.0)
 
+    def test_unknown_touched_status_keeps_sealed_total_unknown(self):
+        metric = self.service.aggregate_daily_metrics(
+            date(2026, 4, 27), [{"today_touched_limit_up": True,
+                                 "today_sealed_close": False, "today_opened_close": False}],
+            0, 0, 0, 0,
+        )
+        self.assertIsNone(metric["sealed_count"])
+
     def test_aggregate_daily_metrics_handles_empty_rows(self):
         metric = self.service.aggregate_daily_metrics(
             trade_date=date(2026, 4, 27),
@@ -91,6 +100,7 @@ class MarketReviewMetricsServiceTests(unittest.TestCase):
         )
 
         self.assertEqual(metric["limit_up_count"], 0)
+        self.assertEqual(metric["sealed_count"], 0)
         self.assertEqual(metric["continuous_count"], 0)
         self.assertEqual(metric["max_board_height"], 0)
         self.assertEqual(metric["second_board_height"], 0)

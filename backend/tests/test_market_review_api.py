@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, Mock
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
@@ -326,6 +327,49 @@ class MarketReviewApiTests(unittest.TestCase):
             "broken_amount",
         ):
             self.assertIn(field, rows[0])
+
+    def test_daily_sealed_count_uses_complete_facts_including_unknown_board_height(self):
+        async def prepare():
+            async with self.session_factory() as db:
+                await db.execute(update(MarketReviewDailyMetric).where(
+                    MarketReviewDailyMetric.trade_date == date(2026, 4, 28),
+                ).values(limit_up_count=6, source_status="partial"))
+                await db.execute(update(MarketReviewStockDaily).where(
+                    MarketReviewStockDaily.stock_code == "600004",
+                ).values(today_touched_limit_up=True, today_sealed_close=True,
+                         today_opened_close=False, today_continuous_days=0))
+                await db.commit()
+        asyncio.run(prepare())
+        payload = self.client.get("/api/v1/statistics/review/daily", params={
+            "start_date": "2026-04-28", "end_date": "2026-04-28",
+        }).json()
+        self.assertEqual(payload["data"]["rows"][0]["sealed_count"], 4)
+        exact = self.client.get("/api/v1/statistics/review/intraday", params={"trade_date": "2026-04-28"}).json()
+        self.assertEqual(exact["data"]["rows"][0]["sealed_count"], 4)
+
+    def test_daily_sealed_count_is_null_when_fact_coverage_is_missing(self):
+        payload = self.client.get("/api/v1/statistics/review/daily", params={
+            "start_date": "2026-04-27", "end_date": "2026-04-28",
+        }).json()
+        self.assertEqual([row["sealed_count"] for row in payload["data"]["rows"]], [None, None])
+
+    def test_daily_verified_zero_and_unknown_seal_state_remain_distinct(self):
+        async def prepare():
+            async with self.session_factory() as db:
+                await db.execute(update(MarketReviewDailyMetric).where(
+                    MarketReviewDailyMetric.trade_date == date(2026, 4, 28),
+                ).values(limit_up_count=5))
+                await db.execute(update(MarketReviewStockDaily).where(
+                    MarketReviewStockDaily.stock_code == "600001",
+                ).values(today_sealed_close=False, today_opened_close=False))
+                db.add(MarketReviewDailyMetric(trade_date=date(2026, 4, 30), limit_up_count=0))
+                await db.commit()
+        asyncio.run(prepare())
+        self.review_module._TRADING_DAY_CACHE[date(2026, 4, 30)] = True
+        payload = self.client.get("/api/v1/statistics/review/daily", params={
+            "start_date": "2026-04-28", "end_date": "2026-04-30",
+        }).json()
+        self.assertEqual([row["sealed_count"] for row in payload["data"]["rows"]], [None, 0])
 
     def test_daily_endpoint_includes_board_height_stock_labels(self):
         response = self.client.get(
@@ -719,6 +763,7 @@ class MarketReviewApiTests(unittest.TestCase):
             return_value={
                 "trade_date": date(2026, 5, 6),
                 "limit_up_count": 3,
+                "sealed_count": 2,
                 "limit_down_count": 2,
                 "continuous_count": 3,
                 "max_board_height": 3,
@@ -762,6 +807,7 @@ class MarketReviewApiTests(unittest.TestCase):
         row = payload["data"]["rows"][0]
         self.assertEqual(payload.get("source_status"), "partial")
         self.assertEqual(row["source_status"], "partial")
+        self.assertEqual(row["sealed_count"], 2)
         stock = next(stock for stock in payload["detail"]["stocks"] if stock["stock_code"] == "600010")
         self.assertEqual(stock["first_limit_time"], "09:29:08")
         self.assertEqual(stock["final_seal_time"], "09:40:09")
@@ -874,6 +920,7 @@ class MarketReviewApiTests(unittest.TestCase):
         row, = payload["data"]["rows"]
         self.assertEqual(row["source_status"], "monitor_archive")
         self.assertEqual(row["limit_up_count"], 1)
+        self.assertEqual(row["sealed_count"], 1)
         self.assertEqual(row["market_turnover"], 9001.25)
         self.assertEqual(row["broken_amount"], 0.0)
         self.assertIsNone(row["limit_down_count"])
@@ -890,6 +937,20 @@ class MarketReviewApiTests(unittest.TestCase):
         self.assertIsNone(ladder["cohort_count"])
         self.assertIsNone(ladder["cohort_seal_rate"])
         self.assertEqual(ladder["cohort_stocks"], [])
+
+    def test_monitor_archive_uses_actual_known_states_instead_of_saved_seal_rate(self):
+        async def prepare(day, opened):
+            await self._seed_monitor_archive_sample(day)
+            async with self.session_factory() as db:
+                sample = await db.scalar(select(MarketReviewArchiveSample).where(MarketReviewArchiveSample.trade_date == day))
+                sample.stocks_json = [{**sample.stocks_json[0], "today_sealed_close": False,
+                                       "today_opened_close": opened}]
+                await db.commit()
+        for day, opened, expected in ((date(2026, 4, 23), True, 0), (date(2026, 4, 24), False, None)):
+            with self.subTest(trade_date=day):
+                asyncio.run(prepare(day, opened))
+                payload = self.client.get("/api/v1/statistics/review/intraday", params={"trade_date": day.isoformat()}).json()
+                self.assertEqual(payload["data"]["rows"][0]["sealed_count"], expected)
 
     def test_monitor_archive_does_not_replace_a_formal_review_or_enter_trends(self):
         asyncio.run(self._seed_monitor_archive_sample(date(2026, 4, 24)))

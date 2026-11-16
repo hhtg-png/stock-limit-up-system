@@ -167,6 +167,7 @@ export interface StockSearchItem {
 export interface MarketReviewDailyRow {
   trade_date: string
   source_status?: string | null
+  sealed_count?: number | null
   limit_up_count: number | null
   limit_down_count: number | null
   continuous_count: number | null

@@ -1106,23 +1106,23 @@ function updateCharts() {
       },
       series: [
         {
-          name: '连板家数',
-          type: 'line',
-          smooth: true,
-          data: dailyRows.value.map(row => row.continuous_count),
-          itemStyle: { color: '#722ed1' }
-        },
-        {
-          name: '触板数',
+          name: '封板数',
           type: 'bar',
-          data: dailyRows.value.map(row => row.limit_up_count),
+          data: dailyRows.value.map(row => row.sealed_count ?? null),
           itemStyle: { color: '#f5222d' },
           barMaxWidth: 22
         },
         {
+          name: '连板数',
+          type: 'line',
+          smooth: true,
+          data: dailyRows.value.map(row => row.continuous_count ?? null),
+          itemStyle: { color: '#722ed1' }
+        },
+        {
           name: '跌停数',
           type: 'bar',
-          data: dailyRows.value.map(row => row.limit_down_count),
+          data: dailyRows.value.map(row => row.limit_down_count ?? null),
           itemStyle: { color: '#52c41a' },
           barMaxWidth: 22
         }
