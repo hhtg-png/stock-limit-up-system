@@ -18,6 +18,9 @@
             value-format="YYYY-MM-DD"
             format="YYYY-MM-DD"
             :clearable="false"
+            :editable="false"
+            :disabled="!calendarReady"
+            :disabled-date="isDateDisabled"
             style="width: 150px"
             @change="handleDateChange"
             />
@@ -28,6 +31,9 @@
               :disabled="datesLoading || loading || !nextDate"
               @click="moveDate(1)"
             />
+            <el-button v-if="calendarError" class="calendar-retry" link type="primary" :loading="datesLoading" @click="loadNavigationDates()">
+              重试交易日历
+            </el-button>
           </div>
         </el-form-item>
         <el-form-item label="连板天数">
@@ -239,6 +245,7 @@ import { ElMessage } from 'element-plus'
 import { ArrowLeft, ArrowRight } from '@element-plus/icons-vue'
 import { getRealtimeLimitUp, getLimitUpDates } from '@/api/limit-up'
 import { getChinaDateString } from '@/utils/chinaDate'
+import { useTradingCalendar } from '@/composables/useTradingCalendar'
 import { useLimitUpStore } from '@/stores/limit-up'
 import type { LimitUpRealtime } from '@/types/limit-up'
 import MobileLimitUpCards from '@/components/stock/MobileLimitUpCards.vue'
@@ -250,15 +257,19 @@ const limitUpStore = useLimitUpStore()
 const loading = ref(false)
 const refreshing = ref(false)
 const tableRef = ref<any>()
-const selectedDate = ref(getChinaDateString())
+const todayDate = ref(getChinaDateString())
+const selectedDate = ref(todayDate.value)
 const navigationDates = ref<string[]>([])
 const datesLoading = ref(true)
+const calendarError = ref(false)
+const { calendarReady, setTradingCalendar, isTradingDate, normalizeTradingDate, isDateDisabled } = useTradingCalendar()
 const sortBy = ref<MonitorSort>('time')
 const sortDirection = ref<'asc' | 'desc' | null>(null)
 const RESYNC_INTERVAL = 90000
 let refreshTimer: number | null = null
 let priceQueryTimer: number | null = null
 let requestSequence = 0
+let calendarSequence = 0
 let disposed = false
 let activeRequest: { key: string; sequence: number; promise: Promise<boolean> } | null = null
 
@@ -295,7 +306,7 @@ interface FetchOptions {
 
 const displayTradeDate = computed(() => limitUpStore.tradeDate)
 const previousTradeDate = computed(() => limitUpStore.realtimeList.find(item => item.previous_trade_date)?.previous_trade_date || '')
-const isSelectedToday = computed(() => selectedDate.value === getChinaDateString())
+const isSelectedToday = computed(() => selectedDate.value === todayDate.value)
 // A weekend selection can show Friday. Step from that displayed session so
 // "previous" reaches Thursday rather than requesting Friday a second time.
 const navigationAnchor = computed(() => displayTradeDate.value || selectedDate.value)
@@ -403,7 +414,11 @@ function cancelPriceQuery() {
 
 async function fetchData(options: FetchOptions = {}): Promise<boolean> {
   cancelPriceQuery()
-  if (disposed) return false
+  if (disposed || !calendarReady.value) return false
+  const tradeDate = normalizeTradingDate(selectedDate.value)
+  if (!tradeDate) return false
+  selectedDate.value = tradeDate
+  updateRealtimeMode()
   const { showLoading = limitUpStore.realtimeList.length === 0, silent = false } = options
   const params = {
     trade_date: selectedDate.value,
@@ -473,7 +488,7 @@ function handleCustomPriceChange() {
 }
 
 function updateRealtimeMode() {
-  limitUpStore.setAcceptRealtimeUpdates(isSelectedToday.value)
+  limitUpStore.setAcceptRealtimeUpdates(calendarReady.value && isSelectedToday.value)
 }
 
 function handleDateChange() {
@@ -481,16 +496,26 @@ function handleDateChange() {
   return applyFilters()
 }
 
-async function loadNavigationDates() {
+async function loadNavigationDates(preferredDate?: string) {
+  if (disposed) return
+  const sequence = ++calendarSequence
   datesLoading.value = true
   try {
     const response = await getLimitUpDates()
-    if (disposed) return
-    navigationDates.value = [...new Set(response.dates)].filter(day => day <= response.today).sort()
+    if (disposed || sequence !== calendarSequence) return
+    setTradingCalendar(response.calendar_dates, response.today)
+    calendarError.value = !calendarReady.value
+    navigationDates.value = [...new Set(response.dates)].filter(isTradingDate).sort()
+    const target = normalizeTradingDate(preferredDate ?? selectedDate.value)
+    if (target) selectedDate.value = target
+    await handleDateChange()
   } catch (error) {
-    if (!disposed) ElMessage.warning('日期导航加载失败，刷新页面可重试')
+    if (!disposed && sequence === calendarSequence) {
+      calendarError.value = true
+      ElMessage.warning('交易日历加载失败，请点击重试交易日历')
+    }
   } finally {
-    if (!disposed) datesLoading.value = false
+    if (!disposed && sequence === calendarSequence) datesLoading.value = false
   }
 }
 
@@ -579,9 +604,16 @@ function exportData() {
 onMounted(() => {
   loadNavigationDates()
   updateRealtimeMode()
-  fetchData({ showLoading: limitUpStore.realtimeList.length === 0 })
   refreshTimer = window.setInterval(() => {
     if (document.visibilityState !== 'visible') return
+    const today = getChinaDateString()
+    if (today !== todayDate.value) {
+      const wasViewingLatest = selectedDate.value === (normalizeTradingDate(todayDate.value) || todayDate.value)
+      todayDate.value = today
+      updateRealtimeMode()
+      void loadNavigationDates(wasViewingLatest ? today : undefined)
+      return
+    }
     if (!isSelectedToday.value) return
     fetchData({ showLoading: false, silent: true })
   }, RESYNC_INTERVAL)
@@ -614,6 +646,7 @@ onUnmounted(() => {
 
     .date-navigation {
       display: flex;
+      flex-wrap: wrap;
       align-items: center;
       gap: 6px;
 
@@ -622,6 +655,11 @@ onUnmounted(() => {
         flex: 0 0 32px;
         margin-left: 0;
         padding: 8px;
+      }
+
+      :deep(.calendar-retry) {
+        width: auto;
+        flex: none;
       }
     }
 

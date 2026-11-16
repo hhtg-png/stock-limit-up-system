@@ -275,16 +275,27 @@ async def get_limit_up_dates(db: AsyncSession = Depends(get_db)):
         # Keep scheduler imports lazy and synchronous provider I/O off the event loop.
         from app.data_collectors.scheduler import _get_cn_trading_dates
 
-        trading_dates = set(await asyncio.wait_for(
-            asyncio.to_thread(_get_cn_trading_dates, min(available_dates), current_date),
+        calendar_start = date(1990, 1, 1)
+        provider_dates = await asyncio.wait_for(
+            asyncio.to_thread(_get_cn_trading_dates, calendar_start, current_date),
             timeout=6.0,
-        ))
+        )
+        if any(not isinstance(day, date) or isinstance(day, datetime) for day in provider_dates):
+            raise ValueError("Trading calendar contains an invalid date")
+        trading_dates = {
+            day for day in provider_dates
+            if calendar_start <= day <= current_date and day.weekday() < 5
+        }
+        if not trading_dates:
+            raise ValueError("Trading calendar has no verified exchange sessions")
     except Exception as exc:
         logger.warning("Unable to load monitor navigation calendar: {}", exc)
         raise HTTPException(status_code=503, detail="交易日历暂不可用，请稍后重试") from exc
     return {
         "dates": [day.isoformat() for day in sorted(available_dates & trading_dates)],
         "today": current_date.isoformat(),
+        "calendar_dates": [day.isoformat() for day in sorted(trading_dates)],
+        "latest_trade_date": max(trading_dates).isoformat(),
     }
 
 

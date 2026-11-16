@@ -12,7 +12,7 @@
               :icon="ArrowLeft"
               aria-label="前一交易日"
               title="前一交易日"
-              :disabled="!previousDate"
+              :disabled="!calendarReady || !previousDate"
               @click="moveDate(-1)"
             />
             <el-date-picker
@@ -22,16 +22,21 @@
               format="YYYY-MM-DD"
               aria-label="查看日期"
               :clearable="false"
-              :disabled-date="isFutureReviewDate"
+              :editable="false"
+              :disabled="!calendarReady"
+              :disabled-date="isDateDisabled"
             />
             <el-button
               :icon="ArrowRight"
               aria-label="后一交易日"
               title="后一交易日"
-              :disabled="!nextDate"
+              :disabled="!calendarReady || !nextDate"
               @click="moveDate(1)"
             />
-            <el-button :disabled="selectedDate === todayDate" @click="goToToday">今天</el-button>
+            <el-button :disabled="!calendarReady || selectedDate === todayTradeDate" @click="goToToday">今天</el-button>
+            <el-button v-if="calendarError" link type="primary" :loading="datesLoading" @click="loadNavigationDates()">
+              重试交易日历
+            </el-button>
           </div>
           <el-radio-group v-model="timeRange" size="small">
             <el-radio-button label="7">近7天</el-radio-button>
@@ -339,6 +344,7 @@ import dayjs from 'dayjs'
 import { ArrowLeft, ArrowRight } from '@element-plus/icons-vue'
 import { getLimitUpDates, getMarketReviewArchiveDates, getMarketReviewDaily, getMarketReviewIntraday } from '@/api'
 import { getChinaDateString } from '@/utils/chinaDate'
+import { useTradingCalendar } from '@/composables/useTradingCalendar'
 import { getBrokenBoardPerformance, type BrokenBoardPoint } from '@/api/review'
 import { buildReviewRange } from '@/utils/reviewRange'
 import type {
@@ -359,6 +365,10 @@ const activeStartDate = ref(todayDate.value)
 const activeEndDate = ref(todayDate.value)
 const navigationDates = ref<string[]>([])
 const archiveDates = ref<string[]>([])
+const datesLoading = ref(true)
+const calendarError = ref(false)
+const { calendarReady, setTradingCalendar, isTradingDate, normalizeTradingDate, isDateDisabled } = useTradingCalendar()
+const todayTradeDate = computed(() => normalizeTradingDate(todayDate.value))
 
 const dailySeries = ref<string[]>([])
 const dailyRows = ref<MarketReviewDailyRow[]>([])
@@ -400,7 +410,7 @@ const isMonitoringSample = computed(() => selectedDayRow.value?.source_status ==
 const isExchangeTurnoverArchive = computed(() => selectedDayRow.value?.source_status === 'exchange_turnover_archive')
 const availableDates = computed(() => [...new Set([
   ...navigationDates.value, ...archiveDates.value, ...dailyRows.value.map(row => row.trade_date)
-])].filter(day => day <= todayDate.value).sort())
+])].filter(day => day <= todayDate.value && isTradingDate(day)).sort())
 const previousDate = computed(() => availableDates.value.filter(day => day < selectedDate.value).pop())
 const nextDate = computed(() => availableDates.value.find(day => day > selectedDate.value))
 const selectedBrokenBoardPoint = computed(() => brokenBoardPoints.value.find(point => point.trade_date === selectedDate.value))
@@ -467,25 +477,41 @@ const strongestReason = computed(() => {
   return winner
 })
 
-function isFutureReviewDate(value: Date) {
-  return dayjs(value).format('YYYY-MM-DD') > todayDate.value
-}
-
 function moveDate(direction: -1 | 1) {
+  if (!calendarReady.value) return
   const next = direction < 0 ? previousDate.value : nextDate.value
   if (next) selectedDate.value = next
 }
 
 function goToToday() {
-  todayDate.value = getChinaDateString()
-  selectedDate.value = todayDate.value
+  const today = getChinaDateString()
+  if (today !== todayDate.value) {
+    todayDate.value = today
+    void loadNavigationDates(today)
+    return
+  }
+  if (todayTradeDate.value) selectedDate.value = todayTradeDate.value
 }
 
-async function loadNavigationDates() {
+async function loadNavigationDates(preferredDate?: string) {
   const request = ++navigationSequence
+  datesLoading.value = true
   await Promise.allSettled([
-    getLimitUpDates().then(({ dates }) => {
-      if (!disposed && request === navigationSequence) navigationDates.value = dates
+    getLimitUpDates().then(response => {
+      if (disposed || request !== navigationSequence) return
+      setTradingCalendar(response.calendar_dates, response.today)
+      navigationDates.value = response.dates
+      calendarError.value = !calendarReady.value
+      const target = normalizeTradingDate(preferredDate ?? selectedDate.value)
+      if (target && target !== selectedDate.value) {
+        selectedDate.value = target
+      } else {
+        void fetchData()
+      }
+    }).catch(() => {
+      if (!disposed && request === navigationSequence) calendarError.value = true
+    }).finally(() => {
+      if (!disposed && request === navigationSequence) datesLoading.value = false
     }),
     getMarketReviewArchiveDates().then(({ dates }) => {
       if (!disposed && request === navigationSequence) archiveDates.value = dates
@@ -1273,7 +1299,13 @@ function isPartialReviewSource(source: string | null | undefined) {
 }
 
 async function fetchData(options: FetchDataOptions = {}) {
-  if (disposed || (options.silent && requestInFlight)) return
+  if (disposed || !calendarReady.value || (options.silent && requestInFlight)) return
+  const tradeDate = normalizeTradingDate(selectedDate.value)
+  if (!tradeDate) return
+  if (tradeDate !== selectedDate.value) {
+    selectedDate.value = tradeDate
+    return
+  }
   const currentSequence = ++fetchSequence
   const targetDate = selectedDate.value
   const { startDate, endDate, query } = buildReviewRange(timeRange.value, targetDate)
@@ -1370,13 +1402,10 @@ function clearReviewRefreshTimer() {
 function refreshReviewSilently() {
   const today = getChinaDateString()
   if (today !== todayDate.value) {
-    const wasViewingToday = selectedDate.value === todayDate.value
+    const wasViewingToday = selectedDate.value === todayTradeDate.value
     todayDate.value = today
-    void loadNavigationDates()
-    if (wasViewingToday) {
-      selectedDate.value = today
-      return
-    }
+    void loadNavigationDates(wasViewingToday ? today : undefined)
+    return
   }
   if (selectedDate.value !== today || document.visibilityState === 'hidden') return
   void fetchData({ silent: true })

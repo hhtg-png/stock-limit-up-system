@@ -12,31 +12,45 @@ const storeCode = transpile(readFileSync(resolve(root, 'src/stores/limit-up.ts')
   .replace(/from ['"](pinia|vue)['"]/g, (_, name) => `from '${import.meta.resolve(name)}'`)
 const { useLimitUpStore } = await import(`data:text/javascript,${encodeURIComponent(storeCode)}`)
 const context = await import(`data:text/javascript,${encodeURIComponent(transpile(readFileSync(resolve(root, 'src/utils/limitUpContext.ts'), 'utf8')))}`)
+const calendarCode = transpile(readFileSync(resolve(root, 'src/composables/useTradingCalendar.ts'), 'utf8'))
+  .replace(/from ['"]vue['"]/g, `from '${import.meta.resolve('vue')}'`)
+const { useTradingCalendar } = await import(`data:text/javascript,${encodeURIComponent(calendarCode)}`)
 const flush = async () => { await new Promise(resolve => setImmediate(resolve)) }
 
-function loadView(view, autoResolve = true) {
+const monitorCalendar = {
+  dates: ['2026-10-22', '2026-10-23', '2026-10-26'], today: '2026-10-26',
+  calendar_dates: ['2026-09-30', '2026-10-09', '2026-10-21', '2026-10-22', '2026-10-23', '2026-10-26'],
+  latest_trade_date: '2026-10-26'
+}
+
+function loadView(view, autoResolve = true, options = {}) {
   setActivePinia(createPinia())
   const store = useLimitUpStore()
   const source = readFileSync(resolve(root, `src/views/${view}.vue`), 'utf8')
   const script = source.match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1]
   const ast = ts.createSourceFile(`${view}.ts`, script, ts.ScriptTarget.ES2022, true, ts.ScriptKind.TS)
   const code = transpile(ast.statements.filter(node => !ts.isImportDeclaration(node)).map(node => node.getText(ast)).join('\n'))
-  const mounted = [], unmounted = [], requests = [], messages = [], timers = new Map()
+  const mounted = [], unmounted = [], requests = [], messages = [], calendarRequests = [], timers = new Map(), intervals = new Map()
   let now = 0, nextTimer = 0, exportedBlob
   const scope = {
-    ...vue, ...context,
+    ...vue, ...context, useTradingCalendar,
     onMounted(callback) { mounted.push(callback) }, onUnmounted(callback) { unmounted.push(callback) },
     useLimitUpStore: () => store, useRouter: () => ({ push() {} }), dayjs: () => ({ format: () => '2026-10-26' }),
-    getChinaDateString: () => '2026-10-26',
-    getLimitUpDates: async () => ({ dates: ['2026-10-22', '2026-10-23', '2026-10-26'], today: '2026-10-26' }),
+    getChinaDateString: () => options.todayProvider?.() ?? options.today ?? '2026-10-26',
+    getLimitUpDates: () => {
+      calendarRequests.push(true)
+      return (options.getLimitUpDates ?? (async () => monitorCalendar))()
+    },
     ElMessage: Object.fromEntries(['warning', 'error', 'success'].map(type => [type, value => messages.push([type, value])])),
     console: { error() {} }, document: { visibilityState: 'visible', createElement: () => ({ click() {} }) },
     Blob, URL: { createObjectURL(blob) { exportedBlob = blob; return 'blob:csv' }, revokeObjectURL() {} },
     window: {
       setTimeout(callback, delay) { const id = ++nextTimer; timers.set(id, { callback, due: now + delay }); return id },
-      clearTimeout(id) { timers.delete(id) }, setInterval() { return ++nextTimer }, clearInterval() {}
+      clearTimeout(id) { timers.delete(id) },
+      setInterval(callback, delay) { const id = ++nextTimer; intervals.set(id, { callback, delay }); return id },
+      clearInterval(id) { intervals.delete(id) }
     },
-    clearInterval() {},
+    clearInterval(id) { intervals.delete(id) },
     getRealtimeLimitUp(params) {
       let complete, fail
       const promise = new Promise((resolve, reject) => { complete = resolve; fail = reject })
@@ -55,12 +69,15 @@ function loadView(view, autoResolve = true) {
     exportData,
     moveDate: typeof moveDate === 'undefined' ? undefined : moveDate,
     previousDate: typeof previousDate === 'undefined' ? undefined : previousDate,
-    nextDate: typeof nextDate === 'undefined' ? undefined : nextDate
+    nextDate: typeof nextDate === 'undefined' ? undefined : nextDate,
+    isDateDisabled: typeof isDateDisabled === 'undefined' ? undefined : isDateDisabled,
+    loadNavigationDates: typeof loadNavigationDates === 'undefined' ? undefined : loadNavigationDates
   }`)(...Object.values(scope)))
   return {
-    ...state, source, requests, messages, store,
+    ...state, source, requests, messages, store, calendarRequests,
     async exportedCodes() { state.exportData(); return (await exportedBlob.text()).split('\n').slice(1).map(line => line.split(',')[0]) },
     async mount() { mounted.forEach(callback => callback()); await flush() },
+    async tick() { for (const timer of intervals.values()) timer.callback(); await flush() },
     async advance(ms) {
       now += ms
       for (const [id, timer] of [...timers]) if (timer.due <= now) { timers.delete(id); timer.callback() }
@@ -69,6 +86,110 @@ function loadView(view, autoResolve = true) {
     dispose() { unmounted.forEach(callback => callback()); effects.stop() }
   }
 }
+
+test('LimitUpList reloads the calendar once across Friday to Monday, follows latest and preserves historical dates', async () => {
+  for (const historical of [false, true]) {
+    let clock = '2026-10-23'
+    const state = loadView('LimitUpList', true, {
+      todayProvider: () => clock,
+      getLimitUpDates: async () => ({ ...monitorCalendar, today: clock,
+        dates: monitorCalendar.dates.filter(day => day <= clock),
+        calendar_dates: monitorCalendar.calendar_dates.filter(day => day <= clock),
+        latest_trade_date: clock })
+    })
+    try {
+      await state.mount()
+      if (historical) {
+        state.selectedDate.value = '2026-10-22'
+        await state.handleDateChange()
+      }
+      await state.tick()
+      assert.equal(state.calendarRequests.length, 1, 'same-day refresh reuses the calendar')
+      clock = '2026-10-26'
+      await state.tick()
+      assert.equal(state.calendarRequests.length, 2, 'new China date reloads the calendar exactly once')
+      assert.equal(state.isDateDisabled(new Date(2026, 9, 26)), false)
+      const expected = historical ? '2026-10-22' : '2026-10-26'
+      assert.equal(state.selectedDate.value, expected)
+      assert.equal(state.requests.at(-1).params.trade_date, expected)
+      assert.equal(state.store.acceptRealtimeUpdates, !historical)
+      const requests = state.requests.length
+      await state.tick()
+      assert.equal(state.calendarRequests.length, 2)
+      assert.equal(state.requests.length, requests + (historical ? 0 : 1))
+    } finally { state.dispose() }
+  }
+})
+
+test('LimitUpList blocks unknown calendar, holidays and weekends while allowing a real session with no stored rows', async () => {
+  let resolveCalendar
+  const state = loadView('LimitUpList', true, {
+    getLimitUpDates: () => new Promise(resolve => { resolveCalendar = resolve })
+  })
+  try {
+    await state.mount()
+    assert.equal(state.requests.length, 0, 'wait for the authoritative calendar before querying')
+    assert.equal(state.isDateDisabled(new Date(2026, 9, 22)), true)
+    resolveCalendar(monitorCalendar)
+    await flush()
+    assert.equal(state.requests.length, 1)
+    for (const [day, disabled] of [[1, true], [21, false], [22, false], [24, true], [25, true], [27, true]]) {
+      assert.equal(state.isDateDisabled(new Date(2026, 9, day)), disabled, `October ${day}`)
+    }
+    state.selectedDate.value = '2026-10-21'
+    await state.handleDateChange()
+    assert.equal(state.requests.at(-1).params.trade_date, '2026-10-21')
+    state.selectedDate.value = '2026-10-25'
+    await state.handleDateChange()
+    assert.equal(state.selectedDate.value, '2026-10-23')
+    assert.equal(state.requests.some(request => request.params.trade_date === '2026-10-25'), false)
+    assert.match(state.source, /:editable="false"/)
+    assert.match(state.source, /:disabled-date="isDateDisabled"/)
+  } finally { state.dispose() }
+})
+
+test('LimitUpList opens a weekend on the preceding session and keeps failed calendars disabled', async () => {
+  const weekend = loadView('LimitUpList', true, {
+    today: '2026-10-25', getLimitUpDates: async () => ({ ...monitorCalendar, today: '2026-10-25',
+      calendar_dates: monitorCalendar.calendar_dates.filter(day => day <= '2026-10-25'), latest_trade_date: '2026-10-23' })
+  })
+  try {
+    await weekend.mount()
+    assert.equal(weekend.selectedDate.value, '2026-10-23')
+    assert.deepEqual(weekend.requests.map(request => request.params.trade_date), ['2026-10-23'])
+    assert.equal(weekend.store.acceptRealtimeUpdates, false)
+  } finally { weekend.dispose() }
+  let calendarOffline = true
+  const failed = loadView('LimitUpList', true, { getLimitUpDates: async () => {
+    if (calendarOffline) throw Error('calendar down')
+    return monitorCalendar
+  } })
+  try {
+    await failed.mount()
+    await failed.applyFilters()
+    assert.equal(failed.requests.length, 0)
+    assert.equal(failed.isDateDisabled(new Date(2026, 9, 26)), true)
+    calendarOffline = false
+    await failed.loadNavigationDates()
+    assert.equal(failed.requests.length, 1, 'calendar retry resumes the pending selected-day query')
+    assert.equal(failed.isDateDisabled(new Date(2026, 9, 26)), false)
+  } finally { failed.dispose() }
+})
+
+test('LimitUpList interprets picker cells in the local timezone', async () => {
+  const originalTZ = process.env.TZ
+  process.env.TZ = 'Pacific/Auckland'
+  const state = loadView('LimitUpList')
+  try {
+    await state.mount()
+    assert.equal(state.isDateDisabled(new Date(2026, 9, 21)), false)
+    assert.equal(state.isDateDisabled(new Date(2026, 9, 24)), true)
+  } finally {
+    state.dispose()
+    if (originalTZ === undefined) delete process.env.TZ
+    else process.env.TZ = originalTZ
+  }
+})
 
 test('LimitUpList date arrows query adjacent sessions and retain filters and explicit ordering', async () => {
   const state = loadView('LimitUpList')

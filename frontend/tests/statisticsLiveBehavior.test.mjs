@@ -12,6 +12,7 @@ function setup(intraday, dailyError = false) {
   const context = {
     console: { error() {}, warn() {} }, fetchSequence: 0, disposed: false, requestInFlight: false,
     loading: ref(false), isLiveIntraday: ref(false), intradaySnapshotTime: ref(null),
+    calendarReady: ref(true), normalizeTradingDate: day => day,
     currentDataUnavailable: ref(false), brokenBoardPoints: ref([]),
     dailySeries: ref([today]), dailyRows: ref([{ trade_date: today }]), selectedDayRow: ref({ trade_date: today }),
     activeStartDate: ref(today), activeEndDate: ref(today), detailResponse: ref({ trade_date: '2026-09-10' }), ladderResponse: ref(null),

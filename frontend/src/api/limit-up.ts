@@ -12,7 +12,12 @@ const api = axios.create({
   timeout: 30000
 })
 
-export async function getLimitUpDates(): Promise<{ dates: string[]; today: string }> {
+export async function getLimitUpDates(): Promise<{
+  dates: string[]
+  today: string
+  calendar_dates: string[]
+  latest_trade_date: string
+}> {
   const { data } = await api.get('/limit-up/dates')
   return data
 }

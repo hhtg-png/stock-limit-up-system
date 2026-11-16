@@ -12,6 +12,9 @@ const transpile = text => ts.transpileModule(text, {
 const { buildReviewRange } = await import(`data:text/javascript,${encodeURIComponent(transpile(
   readFileSync(new URL('../src/utils/reviewRange.ts', import.meta.url), 'utf8')
 ))}`)
+const calendarCode = transpile(readFileSync(new URL('../src/composables/useTradingCalendar.ts', import.meta.url), 'utf8'))
+  .replace(/from ['"]vue['"]/g, `from '${import.meta.resolve('vue')}'`)
+const { useTradingCalendar } = await import(`data:text/javascript,${encodeURIComponent(calendarCode)}`)
 const script = source.match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1]
 const ast = ts.createSourceFile('Statistics.ts', script, ts.ScriptTarget.ES2022, true)
 const code = transpile(ast.statements.filter(statement => !ts.isImportDeclaration(statement))
@@ -36,7 +39,12 @@ const snapshot = (day, extra = {}) => ({
 })
 const flush = () => new Promise(resolve => setImmediate(resolve))
 
-function loadReport(auto = true, getMarketReviewArchiveDates = async () => ({ dates: [] })) {
+const reviewCalendar = {
+  today, dates: [friday, monday, today], latest_trade_date: today,
+  calendar_dates: [archiveDay, '2026-09-30', '2026-10-09', friday, monday, '2026-11-10', today]
+}
+
+function loadReport(auto = true, getMarketReviewArchiveDates = async () => ({ dates: [] }), options = {}) {
   const mounted = [], unmounted = [], requests = [], intervals = new Map()
   let timerId = 0
   function request(kind, day, response, query) {
@@ -46,11 +54,11 @@ function loadReport(auto = true, getMarketReviewArchiveDates = async () => ({ da
     })
   }
   const scope = {
-    ...vue, dayjs, buildReviewRange,
-    useRouter: () => ({ push() {} }), getChinaDateString: () => today,
+    ...vue, dayjs, buildReviewRange, useTradingCalendar,
+    useRouter: () => ({ push() {} }), getChinaDateString: () => options.todayProvider?.() ?? options.today ?? today,
     onMounted(callback) { mounted.push(callback) },
     onUnmounted(callback) { unmounted.push(callback) },
-    getLimitUpDates: async () => ({ today, dates: [friday, monday, today] }),
+    getLimitUpDates: options.getLimitUpDates ?? (async () => reviewCalendar),
     getMarketReviewArchiveDates,
     getMarketReviewDaily: query => request('daily', query.end_date, daily(row(friday)), query),
     getMarketReviewIntraday: day => request('snapshot', day, snapshot(day)),
@@ -70,6 +78,9 @@ function loadReport(auto = true, getMarketReviewArchiveDates = async () => ({ da
     overviewMetrics: typeof overviewMetrics === 'undefined' ? undefined : overviewMetrics,
     dailyRows, detailStocks, ladderLevels, isLiveIntraday, loading,
     currentDataUnavailable, brokenBoardPoints, availableDates, detailResponse,
+    isDateDisabled: typeof isDateDisabled === 'undefined' ? undefined : isDateDisabled,
+    todayTradeDate: typeof todayTradeDate === 'undefined' ? undefined : todayTradeDate,
+    loadNavigationDates,
     isExchangeTurnoverArchive: typeof isExchangeTurnoverArchive === 'undefined' ? undefined : isExchangeTurnoverArchive
   }`)(...Object.values(scope)))
   return {
@@ -88,6 +99,98 @@ function loadReport(auto = true, getMarketReviewArchiveDates = async () => ({ da
     dispose() { unmounted.forEach(callback => callback()); effects.stop() }
   }
 }
+
+test('report date controls wait for the calendar and reject nontrading manual values without losing missing-data sessions', async () => {
+  let resolveCalendar
+  const state = loadReport(true, undefined, {
+    getLimitUpDates: () => new Promise(resolve => { resolveCalendar = resolve })
+  })
+  try {
+    await state.mount()
+    assert.equal(state.requests.length, 0)
+    assert.equal(state.isDateDisabled(new Date(2026, 10, 6)), true)
+    resolveCalendar(reviewCalendar)
+    await flush()
+    assert.equal(state.requests.filter(request => request.kind === 'snapshot').length, 1)
+    for (const [month, day, disabled] of [[9, 1, true], [10, 7, true], [10, 8, true], [10, 10, false], [10, 12, true]]) {
+      assert.equal(state.isDateDisabled(new Date(2026, month, day)), disabled)
+    }
+    await state.select('2026-11-10')
+    assert.equal(state.requests.at(-1).day, '2026-11-10')
+    await state.select('2026-11-08')
+    assert.equal(state.selectedDate.value, friday)
+    assert.equal(state.requests.some(request => request.day === '2026-11-08'), false)
+    assert.match(source, /:editable="false"/)
+    assert.match(source, /:disabled-date="isDateDisabled"/)
+  } finally { state.dispose() }
+})
+
+test('weekend reports and Today choose the latest trading session while calendar failures stay closed', async () => {
+  const weekendDay = '2026-11-08'
+  const state = loadReport(true, undefined, {
+    today: weekendDay, getLimitUpDates: async () => ({ ...reviewCalendar, today: weekendDay,
+      calendar_dates: reviewCalendar.calendar_dates.filter(day => day <= weekendDay), latest_trade_date: friday })
+  })
+  try {
+    await state.mount()
+    assert.equal(state.selectedDate.value, friday)
+    assert.equal(state.todayTradeDate.value, friday)
+    assert.equal(state.requests.some(request => request.day === weekendDay), false)
+    await state.select(archiveDay)
+    state.goToToday()
+    await flush()
+    assert.equal(state.selectedDate.value, friday)
+    assert.equal(state.isLiveIntraday.value, false)
+    const before = state.requests.length
+    await state.tick()
+    assert.equal(state.requests.length, before)
+    assert.match(source, /selectedDate === todayTradeDate/)
+  } finally { state.dispose() }
+  let calendarOffline = true
+  const failed = loadReport(true, undefined, { getLimitUpDates: async () => {
+    if (calendarOffline) throw Error('calendar down')
+    return reviewCalendar
+  } })
+  try {
+    await failed.mount()
+    await failed.select(monday)
+    assert.equal(failed.requests.length, 0)
+    assert.equal(failed.isDateDisabled(new Date(2026, 10, 9)), true)
+    calendarOffline = false
+    await failed.loadNavigationDates()
+    await flush()
+    assert.equal(failed.requests.at(-1).day, monday)
+    assert.equal(failed.isDateDisabled(new Date(2026, 10, 9)), false)
+  } finally { failed.dispose() }
+})
+
+test('report picker dates retain local day boundaries and realtime follows a new trading day', async () => {
+  const originalTZ = process.env.TZ
+  process.env.TZ = 'Pacific/Auckland'
+  let clock = today
+  const nextTradingDay = '2026-11-12'
+  const state = loadReport(true, undefined, {
+    todayProvider: () => clock,
+    getLimitUpDates: async () => clock === today ? reviewCalendar : {
+      ...reviewCalendar, today: clock, dates: [...reviewCalendar.dates, clock],
+      calendar_dates: [...reviewCalendar.calendar_dates, clock], latest_trade_date: clock
+    }
+  })
+  try {
+    await state.mount()
+    assert.equal(state.isDateDisabled(new Date(2026, 10, 6)), false)
+    assert.equal(state.isDateDisabled(new Date(2026, 10, 7)), true)
+    clock = nextTradingDay
+    await state.tick()
+    assert.equal(state.selectedDate.value, nextTradingDay)
+    assert.equal(state.requests.at(-1).day, nextTradingDay)
+    assert.equal(state.requests.filter(request => request.kind === 'snapshot' && request.day === nextTradingDay).length, 1)
+  } finally {
+    state.dispose()
+    if (originalTZ === undefined) delete process.env.TZ
+    else process.env.TZ = originalTZ
+  }
+})
 
 test('selected date scopes trend, snapshot and broken-board comparison, with arrows and return to live today', async () => {
   const state = loadReport()

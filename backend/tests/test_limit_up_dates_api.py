@@ -1,6 +1,6 @@
 import threading
 import unittest
-from datetime import date
+from datetime import date, datetime
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -64,7 +64,11 @@ class LimitUpDatesApiTests(unittest.IsolatedAsyncioTestCase):
             date(2026, 9, 30), date(2026, 10, 9), date(2026, 10, 12), date(2026, 10, 13)])
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {
-            "dates": ["2026-09-30", "2026-10-09", "2026-10-12"], "today": "2026-10-12"})
+            "dates": ["2026-09-30", "2026-10-09", "2026-10-12"],
+            "today": "2026-10-12",
+            "calendar_dates": ["2026-09-30", "2026-10-09", "2026-10-12"],
+            "latest_trade_date": "2026-10-12",
+        })
 
     async def test_includes_live_today_even_before_its_first_database_record(self):
         await self.seed([(1, date(2026, 11, 9))])
@@ -72,19 +76,29 @@ class LimitUpDatesApiTests(unittest.IsolatedAsyncioTestCase):
             date(2026, 11, 9), date(2026, 11, 10)])
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {
-            "dates": ["2026-11-09", "2026-11-10"], "today": "2026-11-10"})
+            "dates": ["2026-11-09", "2026-11-10"],
+            "today": "2026-11-10",
+            "calendar_dates": ["2026-11-09", "2026-11-10"],
+            "latest_trade_date": "2026-11-10",
+        })
 
     async def test_weekend_today_is_not_added_and_weekend_record_is_excluded(self):
         await self.seed([(1, date(2026, 11, 6)), (1, date(2026, 11, 7))])
-        response = await self.request_dates(date(2026, 11, 8), lambda start, end: [date(2026, 11, 6)])
+        response = await self.request_dates(date(2026, 11, 8), lambda start, end: [date(2026, 11, 6), date(2026, 11, 7), date(2026, 11, 8)])
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"dates": ["2026-11-06"], "today": "2026-11-08"})
+        self.assertEqual(response.json(), {
+            "dates": ["2026-11-06"], "today": "2026-11-08",
+            "calendar_dates": ["2026-11-06"], "latest_trade_date": "2026-11-06",
+        })
 
     async def test_weekday_holiday_today_is_not_added(self):
         await self.seed([(1, date(2026, 9, 30))])
         response = await self.request_dates(date(2026, 10, 1), lambda start, end: [date(2026, 9, 30)])
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"dates": ["2026-09-30"], "today": "2026-10-01"})
+        self.assertEqual(response.json(), {
+            "dates": ["2026-09-30"], "today": "2026-10-01",
+            "calendar_dates": ["2026-09-30"], "latest_trade_date": "2026-09-30",
+        })
 
     async def test_calendar_failure_returns_503_instead_of_guessing_weekdays(self):
         await self.seed([(1, date(2026, 10, 1))])
@@ -99,7 +113,42 @@ class LimitUpDatesApiTests(unittest.IsolatedAsyncioTestCase):
     async def test_empty_database_still_includes_verified_current_session(self):
         response = await self.request_dates(date(2026, 11, 10), lambda start, end: [date(2026, 11, 10)])
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"dates": ["2026-11-10"], "today": "2026-11-10"})
+        self.assertEqual(response.json(), {
+            "dates": ["2026-11-10"], "today": "2026-11-10",
+            "calendar_dates": ["2026-11-10"], "latest_trade_date": "2026-11-10",
+        })
+
+    async def test_full_calendar_retains_true_sessions_without_stock_records(self):
+        await self.seed([(1, date(2026, 11, 6))])
+        requested_ranges = []
+
+        def calendar(start, end):
+            requested_ranges.append((start, end))
+            return [
+                date(2026, 11, 11), date(2026, 11, 10), date(1990, 12, 19),
+                date(2026, 11, 9), date(1989, 12, 29), date(2026, 11, 6),
+                date(2026, 11, 9),
+            ]
+
+        response = await self.request_dates(date(2026, 11, 10), calendar)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {
+            "dates": ["2026-11-06", "2026-11-10"],
+            "today": "2026-11-10",
+            "calendar_dates": ["1990-12-19", "2026-11-06", "2026-11-09", "2026-11-10"],
+            "latest_trade_date": "2026-11-10",
+        })
+        self.assertEqual(requested_ranges, [(date(1990, 1, 1), date(2026, 11, 10))])
+
+    async def test_invalid_or_empty_exchange_calendar_returns_503(self):
+        for invalid in (
+            [], None, ["2026-11-10"], [datetime(2026, 11, 10)],
+            [date(2026, 11, 14)], [date(2026, 11, 11)],
+        ):
+            with self.subTest(calendar=invalid):
+                response = await self.request_dates(date(2026, 11, 10), lambda start, end: invalid)
+                self.assertEqual(response.status_code, 503)
+                self.assertNotIn("calendar_dates", response.json())
 
     async def test_calendar_provider_runs_off_the_request_event_loop(self):
         request_thread = threading.get_ident()
