@@ -42,6 +42,7 @@ class LimitUpRealtime(LimitUpBase):
     board_label: str = Field("", description="涨停标签，与连续板数分别传递")
     first_limit_up_time: Optional[str] = Field(None, description="首次涨停时间(HH:MM:SS)")
     final_seal_time: Optional[str] = Field(None, description="最终封板时间(HH:MM:SS)")
+    yesterday_continuous_days: Optional[int] = Field(None, ge=0, description="前一交易日收盘连续涨停天数，非封板为0，未知为空")
     yesterday_first_limit_up_time: Optional[str] = Field(None, description="前一交易日首封时间(HH:MM:SS)")
     yesterday_final_seal_time: Optional[str] = Field(None, description="前一交易日终封时间(HH:MM:SS)")
     yesterday_open_change_pct: Optional[float] = Field(None, description="前一交易日开盘竞价涨幅(%)")

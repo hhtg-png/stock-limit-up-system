@@ -43,6 +43,17 @@ async def _get_closed_monitor_archive(trade_date: date):
         return None
 
 
+async def _load_archive_limit_up_items(trade_date: date, archive) -> List[LimitUpRealtime]:
+    from app.services.limit_up_context_service import limit_up_context_service
+
+    rows = archive.payload_json["data"]
+    try:
+        rows = await limit_up_context_service.enrich_previous_boards(trade_date, rows)
+    except Exception as exc:
+        logger.warning("Archived previous board context failed for {}: {}", trade_date, exc)
+    return [LimitUpRealtime.model_validate(row) for row in rows]
+
+
 def _positive_int_or_default(value, default: int = 1) -> int:
     try:
         parsed = int(value)
@@ -154,9 +165,13 @@ def _filter_and_sort_limit_up_list(
     continuous_days_exact: Optional[int] = None,
     min_price: Optional[float] = None,
     max_price: Optional[float] = None,
+    yesterday_continuous_days: Optional[int] = None,
+    yesterday_continuous_days_exact: Optional[int] = None,
 ) -> List[LimitUpRealtime]:
     continuous_days = _positive_int_or_none(continuous_days)
     continuous_days_exact = _positive_int_or_none(continuous_days_exact)
+    yesterday_continuous_days = _positive_int_or_none(yesterday_continuous_days)
+    yesterday_continuous_days_exact = _positive_int_or_none(yesterday_continuous_days_exact)
     min_price = _positive_float_or_none(min_price)
     max_price = _positive_float_or_none(max_price)
 
@@ -169,6 +184,17 @@ def _filter_and_sort_limit_up_list(
         limit_up_list = [
             item for item in limit_up_list
             if _positive_int_or_default(item.continuous_limit_up_days) >= continuous_days
+        ]
+    if yesterday_continuous_days_exact is not None:
+        limit_up_list = [
+            item for item in limit_up_list
+            if item.yesterday_continuous_days == yesterday_continuous_days_exact
+        ]
+    elif yesterday_continuous_days is not None:
+        limit_up_list = [
+            item for item in limit_up_list
+            if item.yesterday_continuous_days is not None
+            and item.yesterday_continuous_days >= yesterday_continuous_days
         ]
     if reason_category:
         limit_up_list = [
@@ -218,6 +244,8 @@ async def _get_database_limit_up_response(
     continuous_days_exact: Optional[int] = None,
     min_price: Optional[float] = None,
     max_price: Optional[float] = None,
+    yesterday_continuous_days: Optional[int] = None,
+    yesterday_continuous_days_exact: Optional[int] = None,
 ) -> LimitUpRealtimeResponse:
     actual_date, is_fallback = await get_trade_date_with_fallback(db, trade_date)
     if isinstance(db, AsyncSession):
@@ -226,9 +254,13 @@ async def _get_database_limit_up_response(
             return LimitUpRealtimeResponse(
                 trade_date=actual_date, is_fallback=is_fallback,
                 data=_filter_and_sort_limit_up_list(
-                    [LimitUpRealtime.model_validate(row) for row in archive.payload_json["data"]],
+                    await _load_archive_limit_up_items(actual_date, archive),
                     continuous_days, reason_category, status, sort_by, sort_order,
-                    continuous_days_exact=continuous_days_exact, min_price=min_price, max_price=max_price,
+                    continuous_days_exact=continuous_days_exact,
+                    yesterday_continuous_days=yesterday_continuous_days,
+                    yesterday_continuous_days_exact=yesterday_continuous_days_exact,
+                    min_price=min_price,
+                    max_price=max_price,
                 ),
             )
     limit_up_list = await load_database_limit_up_items(db, actual_date)
@@ -255,6 +287,8 @@ async def _get_database_limit_up_response(
             sort_by,
             sort_order,
             continuous_days_exact=continuous_days_exact,
+            yesterday_continuous_days=yesterday_continuous_days,
+            yesterday_continuous_days_exact=yesterday_continuous_days_exact,
             min_price=min_price,
             max_price=max_price,
         ),
@@ -310,11 +344,15 @@ async def get_realtime_limit_up(
     max_price: Optional[float] = Query(None, description="最高涨停价筛选"),
     sort_by: str = Query("time", description="排序字段(time/yesterday_final_seal_time/yesterday_open_change_pct/today_open_change_pct/seal_amount/continuous_days)"),
     sort_order: Optional[str] = Query(None, description="排序方向(asc/desc)"),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    yesterday_continuous_days: Optional[int] = Query(None, description="昨日收盘连板天数下限"),
+    yesterday_continuous_days_exact: Optional[int] = Query(None, description="昨日收盘连板天数精确筛选"),
 ):
     """获取实时涨停列表（东方财富数据+同花顺涨停原因）"""
     continuous_days = _positive_int_or_none(continuous_days)
     continuous_days_exact = _positive_int_or_none(continuous_days_exact)
+    yesterday_continuous_days = _positive_int_or_none(yesterday_continuous_days)
+    yesterday_continuous_days_exact = _positive_int_or_none(yesterday_continuous_days_exact)
     min_price = _positive_float_or_none(min_price)
     max_price = _positive_float_or_none(max_price)
 
@@ -332,6 +370,8 @@ async def get_realtime_limit_up(
             sort_by,
             sort_order,
             continuous_days_exact=continuous_days_exact,
+            yesterday_continuous_days=yesterday_continuous_days,
+            yesterday_continuous_days_exact=yesterday_continuous_days_exact,
             min_price=min_price,
             max_price=max_price,
         )
@@ -342,9 +382,13 @@ async def get_realtime_limit_up(
             return LimitUpRealtimeResponse(
                 trade_date=trade_date, is_fallback=False,
                 data=_filter_and_sort_limit_up_list(
-                    [LimitUpRealtime.model_validate(row) for row in archive.payload_json["data"]],
+                    await _load_archive_limit_up_items(trade_date, archive),
                     continuous_days, reason_category, status, sort_by, sort_order,
-                    continuous_days_exact=continuous_days_exact, min_price=min_price, max_price=max_price,
+                    continuous_days_exact=continuous_days_exact,
+                    yesterday_continuous_days=yesterday_continuous_days,
+                    yesterday_continuous_days_exact=yesterday_continuous_days_exact,
+                    min_price=min_price,
+                    max_price=max_price,
                 ),
             )
 
@@ -362,6 +406,8 @@ async def get_realtime_limit_up(
             sort_by,
             sort_order,
             continuous_days_exact=continuous_days_exact,
+            yesterday_continuous_days=yesterday_continuous_days,
+            yesterday_continuous_days_exact=yesterday_continuous_days_exact,
             min_price=min_price,
             max_price=max_price,
         )
@@ -390,6 +436,7 @@ async def get_realtime_limit_up(
             trade_date=trade_date,
             context_date=item.get("context_date"),
             previous_trade_date=item.get("previous_trade_date"),
+            yesterday_continuous_days=item.get("yesterday_continuous_days"),
             first_limit_up_time=first_time_str,
             final_seal_time=final_time_str,
             yesterday_first_limit_up_time=item.get("yesterday_first_limit_up_time"),
@@ -426,6 +473,8 @@ async def get_realtime_limit_up(
             sort_by,
             sort_order,
             continuous_days_exact=continuous_days_exact,
+            yesterday_continuous_days=yesterday_continuous_days,
+            yesterday_continuous_days_exact=yesterday_continuous_days_exact,
             min_price=min_price,
             max_price=max_price,
         )

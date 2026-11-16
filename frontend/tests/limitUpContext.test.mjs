@@ -199,9 +199,10 @@ for (const view of ['Dashboard', 'LimitUpList']) test(`${view} keeps yesterday s
   const source = readFileSync(resolve(root, `src/views/${view}.vue`), 'utf8')
   const script = source.match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1]
   const ast = ts.createSourceFile(`${view}.ts`, script, ts.ScriptTarget.ES2022, true, ts.ScriptKind.TS)
-  const declarations = ast.statements.filter(node => ts.isVariableStatement(node) && node.declarationList.declarations.some(
-    item => ['tableData', 'apiSort', 'previousTradeDate', 'effectiveOrder', 'boardFilter'].includes(item.name.getText(ast))
-  )).map(node => node.getText(ast)).join('\n')
+  const declarations = ast.statements.filter(node => (ts.isVariableStatement(node) && node.declarationList.declarations.some(
+    item => ['tableData', 'apiSort', 'previousTradeDate', 'effectiveOrder', 'boardFilter', 'yesterdayBoardFilter'].includes(item.name.getText(ast))
+  )) || (ts.isFunctionDeclaration(node) && ['parseBoardScope', 'matchesBoardFilter'].includes(node.name?.getText(ast))))
+    .map(node => node.getText(ast)).join('\n')
   const executable = ts.transpileModule(declarations, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText
   const sortBy = ref('yesterday_final_seal_time')
   const tableSort = ref({ prop: 'yesterday_final_seal_time', order: 'ascending' })

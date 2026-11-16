@@ -87,6 +87,81 @@ function loadView(view, autoResolve = true, options = {}) {
   }
 }
 
+test('LimitUpList combines yesterday board choices with current boards, date navigation, clearing and reset', async () => {
+  const state = loadView('LimitUpList')
+  try {
+    await state.mount()
+    assert.match(state.source, /label="昨日连板天数"[\s\S]*?v-model="filters\.yesterdayBoardScope"[^>]*@change="applyFilters"/)
+    state.filters.boardScope = 'exact-3'
+    for (const [scope, min, exact] of [
+      ['first', undefined, 1], ['exact-2', undefined, 2], ['exact-3', undefined, 3],
+      ['exact-4', undefined, 4], ['exact-5', undefined, 5],
+      ['min-2', 2, undefined], ['min-3', 3, undefined], ['min-4', 4, undefined], ['min-5', 5, undefined]
+    ]) {
+      state.filters.yesterdayBoardScope = scope
+      const before = state.requests.length
+      await state.applyFilters()
+      const query = state.requests.at(-1).params
+      assert.equal(state.requests.length, before + 1)
+      assert.equal(query.continuous_days_exact, 3)
+      assert.equal(query.yesterday_continuous_days, min, scope)
+      assert.equal(query.yesterday_continuous_days_exact, exact, scope)
+    }
+    await state.moveDate(-1)
+    assert.equal(state.requests.at(-1).params.trade_date, '2026-10-23')
+    assert.equal(state.requests.at(-1).params.yesterday_continuous_days, 5)
+    state.filters.yesterdayBoardScope = ''
+    await state.applyFilters()
+    assert.equal(state.requests.at(-1).params.yesterday_continuous_days, undefined)
+    assert.equal(state.requests.at(-1).params.yesterday_continuous_days_exact, undefined)
+    state.filters.yesterdayBoardScope = 'first'
+    await state.resetFilters()
+    assert.equal(state.filters.yesterdayBoardScope, '')
+    assert.equal(state.requests.at(-1).params.continuous_days_exact, undefined)
+    assert.equal(state.requests.at(-1).params.yesterday_continuous_days_exact, undefined)
+  } finally { state.dispose() }
+})
+
+test('LimitUpList keeps yesterday board filters after market-wide websocket updates and in exports', async () => {
+  const state = loadView('LimitUpList')
+  try {
+    await state.mount()
+    state.filters.boardScope = 'exact-3'
+    state.filters.yesterdayBoardScope = 'exact-2'
+    await state.applyFilters()
+    const rows = [
+      { stock_code: '000001', continuous_limit_up_days: 3, yesterday_continuous_days: 2 },
+      { stock_code: '000002', continuous_limit_up_days: 2, yesterday_continuous_days: 2 },
+      { stock_code: '000003', continuous_limit_up_days: 3, yesterday_continuous_days: 3 },
+      { stock_code: '000004', continuous_limit_up_days: 3, yesterday_continuous_days: null },
+      { stock_code: '000005', continuous_limit_up_days: 3, yesterday_continuous_days: 0 },
+      { stock_code: '000006', continuous_limit_up_days: 3 }
+    ]
+    state.store.setRealtimeSnapshot('2026-10-26', rows)
+    assert.deepEqual(state.tableData.value.map(row => row.stock_code), ['000001'])
+    state.store.applyRealtimeDelta([
+      { stock_code: '000001', yesterday_continuous_days: 3 },
+      { stock_code: '000003', yesterday_continuous_days: 2 }
+    ], [], '2026-10-26')
+    assert.deepEqual(state.tableData.value.map(row => row.stock_code), ['000003'])
+    assert.deepEqual(await state.exportedCodes(), ['000003'])
+    state.filters.yesterdayBoardScope = 'min-2'
+    await state.applyFilters()
+    state.store.setRealtimeSnapshot('2026-10-26', rows)
+    assert.deepEqual(state.tableData.value.map(row => row.stock_code).sort(), ['000001', '000003'])
+    state.filters.yesterdayBoardScope = 'first'
+    await state.applyFilters()
+    state.store.setRealtimeSnapshot('2026-10-26', [
+      ...rows, { stock_code: '000007', continuous_limit_up_days: 3, yesterday_continuous_days: 1 }
+    ])
+    assert.deepEqual(state.tableData.value.map(row => row.stock_code), ['000007'], 'yesterday zero and unknown are excluded from first boards')
+    state.filters.yesterdayBoardScope = ''
+    await state.applyFilters()
+    state.store.setRealtimeSnapshot('2026-10-26', rows)
+    assert.deepEqual(state.tableData.value.map(row => row.stock_code).sort(), ['000001', '000003', '000004', '000005', '000006'])
+  } finally { state.dispose() }
+})
+
 test('LimitUpList reloads the calendar once across Friday to Monday, follows latest and preserves historical dates', async () => {
   for (const historical of [false, true]) {
     let clock = '2026-10-23'

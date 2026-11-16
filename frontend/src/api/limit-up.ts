@@ -27,6 +27,8 @@ export async function getRealtimeLimitUp(params?: {
   trade_date?: string
   continuous_days?: number
   continuous_days_exact?: number
+  yesterday_continuous_days?: number
+  yesterday_continuous_days_exact?: number
   reason_category?: string
   status?: string
   min_price?: number

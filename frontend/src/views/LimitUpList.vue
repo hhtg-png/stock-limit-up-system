@@ -36,8 +36,21 @@
             </el-button>
           </div>
         </el-form-item>
-        <el-form-item label="连板天数">
+        <el-form-item label="连板天数" class="board-filter">
           <el-select v-model="filters.boardScope" placeholder="全部" clearable style="width: 120px" @change="applyFilters">
+            <el-option label="首板" value="first" />
+            <el-option label="二板" value="exact-2" />
+            <el-option label="三板" value="exact-3" />
+            <el-option label="四板" value="exact-4" />
+            <el-option label="五板" value="exact-5" />
+            <el-option label="2板以上" value="min-2" />
+            <el-option label="3板以上" value="min-3" />
+            <el-option label="4板以上" value="min-4" />
+            <el-option label="5板以上" value="min-5" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="昨日连板天数" class="board-filter">
+          <el-select v-model="filters.yesterdayBoardScope" placeholder="全部" clearable style="width: 120px" @change="applyFilters">
             <el-option label="首板" value="first" />
             <el-option label="二板" value="exact-2" />
             <el-option label="三板" value="exact-3" />
@@ -292,6 +305,7 @@ const priceRanges: PriceRange[] = [
 
 const filters = reactive({
   boardScope: '' as BoardScope,
+  yesterdayBoardScope: '' as BoardScope,
   reasonCategory: '',
   status: '',
   minPrice: '',
@@ -331,13 +345,11 @@ const effectiveOrder = computed(() => sortDirection.value || (
 ))
 
 const tableData = computed(() => {
-  // Realtime snapshots cover the whole market; retain the selected board scope.
-  const { continuousDays, continuousDaysExact } = boardFilter.value
+  // Realtime snapshots cover the whole market; retain both selected board scopes.
   const list = limitUpStore.realtimeList.filter(item => {
     const days = item.continuous_limit_up_days > 0 ? item.continuous_limit_up_days : 1
-    return continuousDaysExact !== undefined
-      ? days === continuousDaysExact
-      : continuousDays === undefined || days >= continuousDays
+    return matchesBoardFilter(days, boardFilter.value)
+      && matchesBoardFilter(item.yesterday_continuous_days, yesterdayBoardFilter.value)
   })
   switch (sortBy.value) {
     case 'time':
@@ -353,8 +365,11 @@ const tableData = computed(() => {
   }
 })
 
-const boardFilter = computed(() => {
-  const scope = filters.boardScope || ''
+const boardFilter = computed(() => parseBoardScope(filters.boardScope))
+const yesterdayBoardFilter = computed(() => parseBoardScope(filters.yesterdayBoardScope))
+
+function parseBoardScope(value: BoardScope) {
+  const scope = value || ''
   if (scope === 'first') {
     return { continuousDays: undefined, continuousDaysExact: 1 }
   }
@@ -373,7 +388,13 @@ const boardFilter = computed(() => {
     }
   }
   return { continuousDays: undefined, continuousDaysExact: undefined }
-})
+}
+
+function matchesBoardFilter(days: number | null | undefined, filter: ReturnType<typeof parseBoardScope>) {
+  if (filter.continuousDaysExact !== undefined) return days === filter.continuousDaysExact
+  return filter.continuousDays === undefined
+    || (days != null && Number.isFinite(days) && days >= filter.continuousDays)
+}
 
 const normalizedPriceRange = computed(() => ({
   min: parsePriceInput(filters.minPrice),
@@ -424,6 +445,8 @@ async function fetchData(options: FetchOptions = {}): Promise<boolean> {
     trade_date: selectedDate.value,
     continuous_days: boardFilter.value.continuousDays,
     continuous_days_exact: boardFilter.value.continuousDaysExact,
+    yesterday_continuous_days: yesterdayBoardFilter.value.continuousDays,
+    yesterday_continuous_days_exact: yesterdayBoardFilter.value.continuousDaysExact,
     reason_category: filters.reasonCategory || undefined,
     status: filters.status || undefined,
     min_price: normalizedPriceRange.value.min,
@@ -536,6 +559,7 @@ function setSortOrder(order: 'asc' | 'desc') {
 
 function resetFilters() {
   filters.boardScope = ''
+  filters.yesterdayBoardScope = ''
   filters.reasonCategory = ''
   filters.status = ''
   filters.minPrice = ''
@@ -792,6 +816,21 @@ onUnmounted(() => {
 
       :deep(.el-form-item__label) {
         display: none;
+      }
+
+      .board-filter {
+        flex-direction: column;
+        align-items: stretch;
+        min-width: 0;
+      }
+
+      .board-filter :deep(.el-form-item__label) {
+        display: flex;
+        justify-content: flex-start;
+        height: auto;
+        padding: 0 0 2px;
+        font-size: 12px;
+        line-height: 18px;
       }
 
       :deep(.el-form-item__content),

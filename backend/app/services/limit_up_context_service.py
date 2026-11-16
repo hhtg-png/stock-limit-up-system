@@ -76,6 +76,7 @@ class LimitUpContextService:
         self._http_client = http_client
         self._daily_cache = OrderedDict()
         self._seal_cache = OrderedDict()
+        self._board_cache = OrderedDict()
         self._seal_complete_cache = OrderedDict()
         self._calendar_cache = OrderedDict()
         self._pool_cache = OrderedDict()
@@ -117,6 +118,15 @@ class LimitUpContextService:
         percentage = (opened / reference - 1) * 100
         return round(percentage, 4) if math.isfinite(percentage) else None
 
+    @classmethod
+    def _continuous_days(cls, value, sealed):
+        if sealed is False:
+            return 0
+        if sealed is not True or isinstance(value, bool):
+            return None
+        number = cls._number(value)
+        return int(number) if number is not None and number >= 1 and number.is_integer() else None
+
     @staticmethod
     def _time(value):
         if isinstance(value, (datetime, wall_time)):
@@ -150,6 +160,36 @@ class LimitUpContextService:
     async def enrich(self, trade_date: date, rows: list[dict], quotes: dict | None = None) -> list[dict]:
         return await self._enrich(trade_date, rows, quotes, budget_seconds=self.budget_seconds)
 
+    async def enrich_previous_boards(self, trade_date: date, rows: list[dict]) -> list[dict]:
+        """Refresh previous-session board facts for old archived monitor rows."""
+        result = [dict(row, context_date=trade_date, previous_trade_date=None,
+                       yesterday_continuous_days=None) for row in rows]
+        codes = list(dict.fromkeys(str(row.get("stock_code") or "") for row in rows))
+        codes = [code for code in codes if len(code) == 6 and code.isdigit()]
+        if not codes:
+            return result
+        previous = None
+
+        async def populate():
+            nonlocal previous
+            previous = await self._previous_session(trade_date)
+            if previous:
+                await self._load_seals(previous, codes)
+
+        try:
+            await asyncio.wait_for(populate(), timeout=self.budget_seconds)
+        except asyncio.TimeoutError:
+            logger.debug("Previous board context exceeded its time budget for {}", trade_date)
+        except Exception as exc:
+            logger.debug("Previous board context unavailable for {}: {}", trade_date, exc)
+        for row in result:
+            row["previous_trade_date"] = previous
+            if previous:
+                row["yesterday_continuous_days"] = self._get(
+                    self._board_cache, (previous, str(row.get("stock_code") or "")),
+                )[1]
+        return result
+
     async def enrich_for_archive(self, trade_date: date, rows: list[dict]) -> tuple[list[dict], bool]:
         """Batch-fill a closed session outside the monitor's short live budget.
 
@@ -173,6 +213,7 @@ class LimitUpContextService:
             for code in codes:
                 self._daily_cache.pop((day, code), None)
                 self._seal_cache.pop((day, code), None)
+                self._board_cache.pop((day, code), None)
                 self._seal_complete_cache.pop((day, code), None)
             self._pool_cache.pop(day, None)
 
@@ -185,7 +226,8 @@ class LimitUpContextService:
         """
         result = [dict(row, context_date=trade_date, previous_trade_date=None,
                        yesterday_first_limit_up_time=None, yesterday_final_seal_time=None,
-                       yesterday_open_change_pct=None, today_open_change_pct=None) for row in rows]
+                       yesterday_open_change_pct=None, today_open_change_pct=None,
+                       yesterday_continuous_days=None) for row in rows]
         codes = list(dict.fromkeys(str(row.get("stock_code") or "") for row in rows))
         codes = [code for code in codes if len(code) == 6 and code.isdigit()]
         if not codes:
@@ -229,6 +271,7 @@ class LimitUpContextService:
             if self._opening_finished(trade_date):
                 row["today_open_change_pct"] = live.get(code, self._get(self._daily_cache, (trade_date, code))[1])
             if previous:
+                row["yesterday_continuous_days"] = self._get(self._board_cache, (previous, code))[1]
                 row["yesterday_open_change_pct"] = self._get(self._daily_cache, (previous, code))[1]
                 seal = self._get(self._seal_cache, (previous, code))[1]
                 if seal:
@@ -345,7 +388,8 @@ class LimitUpContextService:
 
     async def _load_seals(self, day, codes):
         async with self._seal_lock:
-            missing = [code for code in codes if not self._get(self._seal_cache, (day, code))[0]]
+            missing = [code for code in codes if not self._get(self._seal_cache, (day, code))[0]
+                       or not self._get(self._board_cache, (day, code))[0]]
             if not missing:
                 return
             values = {}
@@ -356,13 +400,16 @@ class LimitUpContextService:
                     logger.debug("Previous seals unavailable from database for {}: {}", day, exc)
             # Publish DB facts before the optional slower pool fallback finishes.
             for code, seal in values.items():
+                count = seal.get("continuous_days")
+                self._put(self._board_cache, (day, code), count, missing=count is None)
                 partial = seal["touched"] and (not seal["first"] or (seal["sealed"] and not seal["final"]))
                 self._put(self._seal_cache, (day, code), (seal["first"], seal["final"]), missing=partial)
                 self._put(self._seal_complete_cache, (day, code), not partial, missing=partial)
             gaps = [code for code in missing if code not in values or (
-                values[code]["touched"] and (not values[code]["first"] or (
+                values[code].get("continuous_days") is None
+                or (values[code]["touched"] and (not values[code]["first"] or (
                     values[code]["sealed"] and not values[code]["final"]
-                ))
+                )))
             )]
             if gaps:
                 found, pool = self._get(self._pool_cache, day)
@@ -379,6 +426,14 @@ class LimitUpContextService:
                 for code in gaps:
                     item = (pool or {}).get(code) or {}
                     existing = values.get(code) or {}
+                    count = existing.get("continuous_days")
+                    if count is None:
+                        count = self._continuous_days(
+                            item.get("continuous_limit_up_days"),
+                            existing.get("sealed") if existing.get("sealed") is not None
+                            else item.get("is_final_sealed", item.get("is_sealed")),
+                        )
+                    self._put(self._board_cache, (day, code), count, missing=count is None)
                     can_final = existing.get("sealed", item.get("is_final_sealed") is not False)
                     first = existing.get("first") or self._time(item.get("first_limit_up_time"))
                     final = existing.get("final") or (
@@ -395,23 +450,28 @@ class LimitUpContextService:
             records = (await session.execute(select(
                 Stock.stock_code, LimitUpRecord.first_limit_up_time,
                 LimitUpRecord.final_seal_time, LimitUpRecord.is_final_sealed,
+                LimitUpRecord.continuous_limit_up_days,
             ).join(Stock, Stock.id == LimitUpRecord.stock_id).where(
                 LimitUpRecord.trade_date == day, Stock.stock_code.in_(codes),
             ))).all()
-            for code, first, final, sealed in records:
+            for code, first, final, sealed, continuous_days in records:
                 values[code] = {"first": self._time(first), "final": self._time(final) if sealed else None,
-                                "sealed": bool(sealed), "touched": True}
+                                "sealed": sealed, "touched": True,
+                                "continuous_days": self._continuous_days(continuous_days, sealed)}
             facts = (await session.execute(select(
                 MarketReviewStockDaily.stock_code, MarketReviewStockDaily.first_limit_time,
                 MarketReviewStockDaily.final_seal_time, MarketReviewStockDaily.today_sealed_close,
-                MarketReviewStockDaily.today_touched_limit_up,
+                MarketReviewStockDaily.today_touched_limit_up, MarketReviewStockDaily.today_continuous_days,
             ).where(MarketReviewStockDaily.trade_date == day, MarketReviewStockDaily.stock_code.in_(codes)))).all()
-            for code, first, final, sealed, touched in facts:
+            for code, first, final, sealed, touched, continuous_days in facts:
                 if code not in values:
                     values[code] = {"first": self._time(first) if touched else None,
                                     "final": self._time(final) if touched and sealed else None,
-                                    "sealed": bool(sealed), "touched": bool(touched)}
+                                    "sealed": bool(sealed), "touched": bool(touched),
+                                    "continuous_days": self._continuous_days(continuous_days, sealed)}
                 elif touched:
+                    if values[code].get("continuous_days") is None and values[code]["sealed"] == bool(sealed):
+                        values[code]["continuous_days"] = self._continuous_days(continuous_days, sealed)
                     values[code]["first"] = values[code]["first"] or self._time(first)
                     if values[code]["sealed"] and sealed:
                         values[code]["final"] = values[code]["final"] or self._time(final)
@@ -427,7 +487,8 @@ class LimitUpContextService:
                     # The final review covers the entire touched pool. Absence
                     # is a known negative, so it needs no historical network call.
                     for code in codes:
-                        values.setdefault(code, {"first": None, "final": None, "sealed": False, "touched": False})
+                        values.setdefault(code, {"first": None, "final": None, "sealed": False,
+                                                 "touched": False, "continuous_days": 0})
         return values
 
     async def _client(self):

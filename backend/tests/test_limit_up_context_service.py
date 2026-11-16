@@ -9,11 +9,12 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import httpx
+from sqlalchemy import event, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.database import Base
 from app.models.limit_up import LimitUpRecord
-from app.models.market_review import MarketReviewStockDaily
+from app.models.market_review import MarketReviewDailyMetric, MarketReviewStockDaily
 from app.models.stock import Stock
 
 if importlib.util.find_spec("app.services.limit_up_context_service"):
@@ -27,7 +28,7 @@ PREVIOUS = date(2026, 10, 9)
 FIELDS = {
     "context_date", "previous_trade_date",
     "yesterday_first_limit_up_time", "yesterday_final_seal_time",
-    "yesterday_open_change_pct", "today_open_change_pct",
+    "yesterday_open_change_pct", "today_open_change_pct", "yesterday_continuous_days",
 }
 
 
@@ -505,6 +506,91 @@ class LimitUpContextTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(client.aclose)
         result = await self.service(history_fetcher=None, http_client=client).enrich(DAY, [{"stock_code": "000001"}])
         self.assertIsNone(result[0]["today_open_change_pct"])
+
+    async def test_previous_boards_use_actual_preholiday_session_and_prior_sealed_count(self):
+        session, previous = date(2026, 10, 9), date(2026, 9, 30)
+        calls = []
+
+        async def pool(day):
+            calls.append(day)
+            return [
+                {"stock_code": "000001", "is_final_sealed": True, "continuous_limit_up_days": 4},
+                {"stock_code": "000002", "is_final_sealed": False, "continuous_limit_up_days": 6},
+                {"stock_code": "000003", "continuous_limit_up_days": 3},
+            ]
+
+        service = self.service(calendar_loader=lambda *args: [previous, session], pool_fetcher=pool)
+        rows = [{"stock_code": f"{code:06d}", "continuous_limit_up_days": 1} for code in range(1, 5)]
+        enriched = await service.enrich(session, rows)
+        self.assertEqual([row.get("yesterday_continuous_days") for row in enriched], [4, 0, None, None])
+        self.assertTrue(all(row["previous_trade_date"] == previous for row in enriched))
+        self.assertEqual(calls, [previous])
+
+    async def test_previous_boards_keep_invalid_and_missing_counts_unknown(self):
+        bad_counts = [True, float("inf"), float("nan"), -1, 2.5, "?", None]
+
+        async def pool(day):
+            return [
+                {"stock_code": f"{index:06d}", "is_final_sealed": True, "continuous_limit_up_days": count}
+                for index, count in enumerate(bad_counts, 1)
+            ]
+
+        rows = [{"stock_code": f"{index:06d}", "continuous_limit_up_days": 9}
+                for index in range(1, len(bad_counts) + 1)]
+        result = await self.service(pool_fetcher=pool).enrich(DAY, rows)
+        self.assertTrue(all("yesterday_continuous_days" in row for row in result))
+        self.assertTrue(all(row["yesterday_continuous_days"] is None for row in result))
+
+    async def test_previous_boards_only_archive_read_has_a_batch_budget_and_no_quote_history(self):
+        entered = asyncio.Event()
+
+        async def slow_pool(day):
+            entered.set()
+            await asyncio.sleep(1)
+
+        history = AsyncMock(side_effect=AssertionError("previous boards must not trigger quote history"))
+        service = self.service(history_fetcher=history, pool_fetcher=slow_pool, budget_seconds=0.03)
+        original = [{"stock_code": "000001", "today_open_change_pct": 2.5,
+                     "yesterday_continuous_days": 88}]
+        started = time.monotonic()
+        result = await service.enrich_previous_boards(DAY, original)
+        self.assertLess(time.monotonic() - started, 0.2)
+        self.assertTrue(entered.is_set())
+        self.assertIsNone(result[0]["yesterday_continuous_days"])
+        self.assertEqual(result[0]["today_open_change_pct"], 2.5)
+        self.assertEqual(original[0]["yesterday_continuous_days"], 88)
+        history.assert_not_awaited()
+
+    async def test_previous_boards_batch_database_facts_and_complete_review_absence(self):
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        self.addAsyncCleanup(engine.dispose)
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        async with sessions() as db:
+            db.add_all([Stock(id=code, stock_code=f"{code:06d}", stock_name=str(code), market="SZ")
+                        for code in range(1, 5)])
+            db.add_all([
+                LimitUpRecord(stock_id=1, trade_date=PREVIOUS, is_final_sealed=True, continuous_limit_up_days=4),
+                LimitUpRecord(stock_id=2, trade_date=PREVIOUS, is_final_sealed=False, continuous_limit_up_days=9),
+                LimitUpRecord(stock_id=4, trade_date=PREVIOUS, is_final_sealed=True, continuous_limit_up_days=6),
+                MarketReviewStockDaily(stock_id=3, stock_code="000003", stock_name="three",
+                                       trade_date=PREVIOUS, today_touched_limit_up=True,
+                                       today_sealed_close=True, today_continuous_days=2),
+                MarketReviewDailyMetric(trade_date=PREVIOUS, limit_up_count=1, calc_version=1, source_status="primary"),
+            ])
+            await db.flush()
+            await db.execute(update(LimitUpRecord).where(LimitUpRecord.stock_id == 4).values(is_final_sealed=None))
+            await db.commit()
+        queries = []
+        event.listen(engine.sync_engine, "before_cursor_execute",
+                     lambda conn, cursor, statement, parameters, context, many: queries.append(statement))
+        service = self.service(session_factory=sessions, pool_fetcher=AsyncMock(return_value=[]))
+        rows = [{"stock_code": f"{code:06d}"} for code in range(1, 50)]
+        result = await service.enrich_previous_boards(DAY, rows)
+        self.assertEqual([row["yesterday_continuous_days"] for row in result[:5]], [4, 0, 2, None, 0])
+        self.assertTrue(all(row["yesterday_continuous_days"] == 0 for row in result[4:]))
+        self.assertLessEqual(len(queries), 4)
 
     async def test_db_prior_seals_merge_review_facts_and_pool_gaps(self):
         engine = create_async_engine("sqlite+aiosqlite:///:memory:")

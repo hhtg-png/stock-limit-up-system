@@ -6,7 +6,7 @@ from app.api.v1 import limit_up
 from app.services.realtime_limit_up_service import RealtimeLimitUpService
 
 
-CONTEXT = dict(yesterday_first_limit_up_time='09:31:02',
+CONTEXT = dict(yesterday_continuous_days=3, yesterday_first_limit_up_time='09:31:02',
                yesterday_final_seal_time='14:22:31',
                yesterday_open_change_pct=0.0, today_open_change_pct=-1.25)
 
